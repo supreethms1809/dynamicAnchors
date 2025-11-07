@@ -115,12 +115,10 @@ def train_and_evaluate_dynamic_anchors(
     from trainers.vecEnv import AnchorEnv, make_dummy_vec_env
     from trainers.PPO_trainer import train_ppo_model
     from trainers.dynAnchors_inference import evaluate_all_classes
+    from trainers.device_utils import get_device_pair
     
-    # Convert device to string if it's a torch.device object
-    if hasattr(device, 'type'):  # It's a torch.device object
-        device_str = device.type
-    else:
-        device_str = device
+    # Standardize device handling: get both object and string
+    device_obj, device_str = get_device_pair(device)
     
     # Prepare data
     print("Preparing data...")
@@ -156,7 +154,7 @@ def train_and_evaluate_dynamic_anchors(
             y=y_train,
             feature_names=feature_names,
             classifier=classifier,
-            device=device_str,
+            device=device_str,  # Pass string to environment
             target_class=target_cls,
             step_fracs=step_fracs,
             min_width=min_width,
@@ -219,6 +217,10 @@ def train_and_evaluate_dynamic_anchors(
     
     # Evaluate on test set
     print(f"\nEvaluating on test set...")
+    print(f"Note: By default, coverage and precision are computed on training data.")
+    print(f"      This explains the classifier's behavior on training data.")
+    print(f"      To evaluate on test data, set eval_on_test_data=True in evaluate_all_classes.")
+    
     eval_results = evaluate_all_classes(
         X_test=X_test_scaled,
         y_test=y_test,
@@ -228,7 +230,9 @@ def train_and_evaluate_dynamic_anchors(
         n_instances_per_class=n_eval_instances_per_class,
         max_features_in_rule=max_features_in_rule,
         steps_per_episode=steps_per_episode,
-        random_seed=42
+        random_seed=42,
+        # Optional: Set eval_on_test_data=True to compute metrics on test data
+        eval_on_test_data=False,  # Default: use training data (backward compatible)
     )
     
     vec_env.close()

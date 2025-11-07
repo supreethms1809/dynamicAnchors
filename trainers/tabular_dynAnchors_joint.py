@@ -234,14 +234,10 @@ def train_and_evaluate_joint(
     from trainers.PPO_trainer import train_ppo_model, DynamicAnchorPPOTrainer
     from trainers.DDPG_trainer import DynamicAnchorDDPGTrainer, create_ddpg_trainer
     from trainers.dynAnchors_inference import evaluate_all_classes
+    from trainers.device_utils import get_device_pair
     
-    # Convert device to string if it's a torch.device object
-    if hasattr(device, 'type'):  # It's a torch.device object
-        device_str = device.type
-        device_obj = device
-    else:
-        device_str = device
-        device_obj = torch.device(device)
+    # Standardize device handling: get both object and string
+    device_obj, device_str = get_device_pair(device)
     
     # Prepare data
     print("\n" + "="*80)
@@ -670,132 +666,139 @@ def train_and_evaluate_joint(
                     except ImportError:
                         GYM_VERSION = "gym"
                 
-                if GYM_VERSION == "gymnasium":
-                    obs, _ = gym_env.reset(seed=42 + cls + ep)
-                else:
-                    obs = gym_env.reset()
-                
-                episode_reward = 0.0
-                # Track reward components for debugging
-                reward_components = {
-                    "precision_gain": 0.0,
-                    "coverage_gain": 0.0,
-                    "coverage_bonus": 0.0,
-                    "target_class_bonus": 0.0,
-                    "overlap_penalty": 0.0,
-                    "drift_penalty": 0.0,
-                    "anchor_drift_penalty": 0.0,
-                    "js_penalty": 0.0,
-                    "total_reward": 0.0,
-                    "final_precision": 0.0,
-                    "final_coverage": 0.0,
-                    "final_n_points": 0,
-                    "n_steps": 0,  # Track actual number of steps
-                }
-                
-                for t in range(steps_per_episode):
-                    # Get action from DDPG trainer
-                    action, _ = ddpg_trainer.predict(obs, deterministic=False)
-                    
-                    # Step environment
+                try:
                     if GYM_VERSION == "gymnasium":
-                        next_obs, reward, terminated, truncated, step_info = gym_env.step(action)
-                        done = terminated or truncated
+                        obs, _ = gym_env.reset(seed=42 + cls + ep)
                     else:
-                        step_result = gym_env.step(action)
-                        if len(step_result) == 5:
-                            next_obs, reward, terminated, truncated, step_info = step_result
+                        obs = gym_env.reset()
+                    
+                    episode_reward = 0.0
+                    # Track reward components for debugging
+                    reward_components = {
+                        "precision_gain": 0.0,
+                        "coverage_gain": 0.0,
+                        "coverage_bonus": 0.0,
+                        "target_class_bonus": 0.0,
+                        "overlap_penalty": 0.0,
+                        "drift_penalty": 0.0,
+                        "anchor_drift_penalty": 0.0,
+                        "js_penalty": 0.0,
+                        "total_reward": 0.0,
+                        "final_precision": 0.0,
+                        "final_coverage": 0.0,
+                        "final_n_points": 0,
+                        "n_steps": 0,  # Track actual number of steps
+                    }
+                    
+                    for t in range(steps_per_episode):
+                        # Get action from DDPG trainer
+                        action, _ = ddpg_trainer.predict(obs, deterministic=False)
+                        
+                        # Step environment
+                        if GYM_VERSION == "gymnasium":
+                            next_obs, reward, terminated, truncated, step_info = gym_env.step(action)
                             done = terminated or truncated
                         else:
-                            next_obs, reward, done, step_info = step_result
-                    
-                    episode_reward += reward
-                    
-                    # Track reward components from step_info (if available)
-                    # Note: step_info may have all components from AnchorEnv.step()
-                    if isinstance(step_info, dict):
-                        # Update final metrics (from last step)
-                        if "precision" in step_info:
-                            reward_components["final_precision"] = step_info["precision"]
-                        if "coverage" in step_info:
-                            reward_components["final_coverage"] = step_info["coverage"]
-                        if "n_points" in step_info:
-                            reward_components["final_n_points"] = step_info["n_points"]
+                            step_result = gym_env.step(action)
+                            if len(step_result) == 5:
+                                next_obs, reward, terminated, truncated, step_info = step_result
+                                done = terminated or truncated
+                            else:
+                                next_obs, reward, done, step_info = step_result
                         
-                        # Accumulate reward components (sum over all steps in episode)
-                        if "precision_gain_component" in step_info:
-                            reward_components["precision_gain"] += step_info["precision_gain_component"]
-                        if "coverage_gain_component" in step_info:
-                            reward_components["coverage_gain"] += step_info["coverage_gain_component"]
-                        if "coverage_bonus" in step_info:
-                            reward_components["coverage_bonus"] += step_info["coverage_bonus"]
-                        if "target_class_bonus" in step_info:
-                            reward_components["target_class_bonus"] += step_info["target_class_bonus"]
-                        if "overlap_penalty" in step_info:
-                            reward_components["overlap_penalty"] += abs(step_info["overlap_penalty"])
-                        if "drift_penalty" in step_info:
-                            reward_components["drift_penalty"] += abs(step_info["drift_penalty"])
-                        if "anchor_drift_penalty" in step_info:
-                            reward_components["anchor_drift_penalty"] += abs(step_info["anchor_drift_penalty"])
-                        if "js_penalty" in step_info:
-                            reward_components["js_penalty"] += abs(step_info["js_penalty"])
+                        episode_reward += reward
+                        
+                        # Track reward components from step_info (if available)
+                        # Note: step_info may have all components from AnchorEnv.step()
+                        if isinstance(step_info, dict):
+                            # Update final metrics (from last step)
+                            if "precision" in step_info:
+                                reward_components["final_precision"] = step_info["precision"]
+                            if "coverage" in step_info:
+                                reward_components["final_coverage"] = step_info["coverage"]
+                            if "n_points" in step_info:
+                                reward_components["final_n_points"] = step_info["n_points"]
+                            
+                            # Accumulate reward components (sum over all steps in episode)
+                            if "precision_gain_component" in step_info:
+                                reward_components["precision_gain"] += step_info["precision_gain_component"]
+                            if "coverage_gain_component" in step_info:
+                                reward_components["coverage_gain"] += step_info["coverage_gain_component"]
+                            if "coverage_bonus" in step_info:
+                                reward_components["coverage_bonus"] += step_info["coverage_bonus"]
+                            if "target_class_bonus" in step_info:
+                                reward_components["target_class_bonus"] += step_info["target_class_bonus"]
+                            if "overlap_penalty" in step_info:
+                                reward_components["overlap_penalty"] += abs(step_info["overlap_penalty"])
+                            if "drift_penalty" in step_info:
+                                reward_components["drift_penalty"] += abs(step_info["drift_penalty"])
+                            if "anchor_drift_penalty" in step_info:
+                                reward_components["anchor_drift_penalty"] += abs(step_info["anchor_drift_penalty"])
+                            if "js_penalty" in step_info:
+                                reward_components["js_penalty"] += abs(step_info["js_penalty"])
+                        
+                        # Add to replay buffer and train
+                        ddpg_trainer.add_to_replay_buffer(
+                            obs=obs,
+                            next_obs=next_obs,
+                            action=action,
+                            reward=reward,
+                            done=done,
+                            info=step_info
+                        )
+                        
+                        # Train DDPG if enough samples
+                        trained = ddpg_trainer.train_step(gradient_steps=1)
+                        
+                        obs = next_obs
+                        reward_components["n_steps"] += 1
+                        if done:
+                            break
                     
-                    # Add to replay buffer and train
-                    ddpg_trainer.add_to_replay_buffer(
-                        obs=obs,
-                        next_obs=next_obs,
-                        action=action,
-                        reward=reward,
-                        done=done,
-                        info=step_info
-                    )
+                    reward_components["total_reward"] = episode_reward
+                    episode_rewards_per_class[cls] = episode_reward
                     
-                    # Train DDPG if enough samples
-                    trained = ddpg_trainer.train_step(gradient_steps=1)
+                    # Store training metrics for this class (to use when evaluation doesn't run)
+                    # These are the final metrics from the training episode
+                    training_metrics_per_class[cls] = {
+                        "precision": reward_components['final_precision'],
+                        "hard_precision": reward_components['final_precision'],  # Use final precision as hard_precision
+                        "coverage": reward_components['final_coverage'],
+                        "n_points": reward_components['final_n_points'],
+                    }
                     
-                    obs = next_obs
-                    reward_components["n_steps"] += 1
-                    if done:
-                        break
-                
-                reward_components["total_reward"] = episode_reward
-                episode_rewards_per_class[cls] = episode_reward
-                
-                # Store training metrics for this class (to use when evaluation doesn't run)
-                # These are the final metrics from the training episode
-                training_metrics_per_class[cls] = {
-                    "precision": reward_components['final_precision'],
-                    "hard_precision": reward_components['final_precision'],  # Use final precision as hard_precision
-                    "coverage": reward_components['final_coverage'],
-                    "n_points": reward_components['final_n_points'],
-                }
-                
-                # Print detailed reward breakdown for debugging (every 10 episodes or when verbose >= 2)
-                if verbose >= 2 or (ep % 10 == 0 and verbose >= 1):
-                    # Calculate average per-step values
-                    n_steps_actual = reward_components["n_steps"]
-                    avg_js_per_step = reward_components['js_penalty'] / max(1, n_steps_actual)
-                    avg_drift_per_step = reward_components['drift_penalty'] / max(1, n_steps_actual)
-                    
-                    print(f"    [DDPG cls={cls}] Reward breakdown:")
-                    print(f"      Total reward: {episode_reward:.6f} (over {n_steps_actual} steps)")
-                    print(f"      Final precision: {reward_components['final_precision']:.6f} | "
-                          f"Final coverage: {reward_components['final_coverage']:.6f} | "
-                          f"Final n_points: {reward_components['final_n_points']}")
-                    print(f"      Gains: precision={reward_components['precision_gain']:.6f}, "
-                          f"coverage={reward_components['coverage_gain']:.6f}")
-                    print(f"      Bonuses: coverage={reward_components['coverage_bonus']:.6f}, "
-                          f"target_class={reward_components['target_class_bonus']:.6f}")
-                    print(f"      Penalties (total): overlap={reward_components['overlap_penalty']:.6f}, "
-                          f"drift={reward_components['drift_penalty']:.6f}, "
-                          f"anchor_drift={reward_components['anchor_drift_penalty']:.6f}, "
-                          f"js={reward_components['js_penalty']:.6f}")
-                    print(f"      Penalties (per-step avg): drift={avg_drift_per_step:.6f}, "
-                          f"js={avg_js_per_step:.6f}")
-                    if avg_js_per_step > 0.04:
-                        print(f"      ⚠ WARNING: JS penalty per step is high ({avg_js_per_step:.6f}) - box is changing too much!")
-                    if reward_components['precision_gain'] == 0.0 and reward_components['coverage_gain'] == 0.0:
-                        print(f"      ⚠ WARNING: No precision/coverage gains - agent isn't improving the box!")
+                    # Print detailed reward breakdown for debugging (every 10 episodes or when verbose >= 2)
+                    if verbose >= 2 or (ep % 10 == 0 and verbose >= 1):
+                        # Calculate average per-step values
+                        n_steps_actual = reward_components["n_steps"]
+                        avg_js_per_step = reward_components['js_penalty'] / max(1, n_steps_actual)
+                        avg_drift_per_step = reward_components['drift_penalty'] / max(1, n_steps_actual)
+                        
+                        print(f"    [DDPG cls={cls}] Reward breakdown:")
+                        print(f"      Total reward: {episode_reward:.6f} (over {n_steps_actual} steps)")
+                        print(f"      Final precision: {reward_components['final_precision']:.6f} | "
+                              f"Final coverage: {reward_components['final_coverage']:.6f} | "
+                              f"Final n_points: {reward_components['final_n_points']}")
+                        print(f"      Gains: precision={reward_components['precision_gain']:.6f}, "
+                              f"coverage={reward_components['coverage_gain']:.6f}")
+                        print(f"      Bonuses: coverage={reward_components['coverage_bonus']:.6f}, "
+                              f"target_class={reward_components['target_class_bonus']:.6f}")
+                        print(f"      Penalties (total): overlap={reward_components['overlap_penalty']:.6f}, "
+                              f"drift={reward_components['drift_penalty']:.6f}, "
+                              f"anchor_drift={reward_components['anchor_drift_penalty']:.6f}, "
+                              f"js={reward_components['js_penalty']:.6f}")
+                        print(f"      Penalties (per-step avg): drift={avg_drift_per_step:.6f}, "
+                              f"js={avg_js_per_step:.6f}")
+                        if avg_js_per_step > 0.04:
+                            print(f"      ⚠ WARNING: JS penalty per step is high ({avg_js_per_step:.6f}) - box is changing too much!")
+                        if reward_components['precision_gain'] == 0.0 and reward_components['coverage_gain'] == 0.0:
+                            print(f"      ⚠ WARNING: No precision/coverage gains - agent isn't improving the box!")
+                finally:
+                    # Cleanup: close environment
+                    try:
+                        gym_env.close()
+                    except:
+                        pass
             
             # Average reward across classes
             avg_reward = np.mean(list(episode_rewards_per_class.values()))
@@ -805,99 +808,110 @@ def train_and_evaluate_joint(
         else:
             # PPO: Use vectorized environment and SB3's learn() method
             # Update environment with current classifier (classifier may have changed)
+            old_vec_env = None
             if rl_trainer is not None and hasattr(rl_trainer, 'vec_env'):
+                old_vec_env = rl_trainer.vec_env
                 try:
-                    rl_trainer.vec_env.close()
+                    old_vec_env.close()
                 except:
                     pass
             
             # Create new vectorized environment with updated classifier
-            if len(target_classes) > 1 and n_envs > 1:
-                env_fns = []
-                for i in range(n_envs):
-                    target_cls = target_classes[i % len(target_classes)]
-                    factory_fn = partial(create_anchor_env, target_cls)
-                    env_fns.append(lambda i=i, f=factory_fn, s=42+i: make_dynamic_anchor_env(f, seed=s))
-                vec_env = DummyVecEnv(env_fns)
-            else:
-                from trainers.vecEnv import make_dummy_vec_env
-                vec_env = make_dummy_vec_env(make_anchor_env, n_envs=n_envs, seed=42)
-            
-            # Calculate timesteps for this episode: n_steps * n_envs (one rollout per episode)
-            timesteps_per_episode = n_steps * n_envs
-            
-            # Create callback to track rewards
-            reward_callback = RewardCallback(verbose=0)
-            
-            if rl_trainer is None:
-                # First episode: create new trainer
-                episode_output_dir = f"{output_dir}/episode_{ep+1}/"
-                os.makedirs(episode_output_dir, exist_ok=True)
+            try:
+                if len(target_classes) > 1 and n_envs > 1:
+                    env_fns = []
+                    for i in range(n_envs):
+                        target_cls = target_classes[i % len(target_classes)]
+                        factory_fn = partial(create_anchor_env, target_cls)
+                        env_fns.append(lambda i=i, f=factory_fn, s=42+i: make_dynamic_anchor_env(f, seed=s))
+                    vec_env = DummyVecEnv(env_fns)
+                else:
+                    from trainers.vecEnv import make_dummy_vec_env
+                    vec_env = make_dummy_vec_env(make_anchor_env, n_envs=n_envs, seed=42)
                 
-                # Create trainer manually to pass callback
-                rl_trainer = DynamicAnchorPPOTrainer(
-                    vec_env=vec_env,
-                    policy_type="MlpPolicy",
-                    learning_rate=learning_rate,
-                    n_steps=n_steps,
-                    batch_size=batch_size,
-                    n_epochs=n_epochs,
-                    verbose=verbose,
-                    tensorboard_log=tensorboard_log_dir,
-                    device=device_str,
-                )
-                # Train with callback
-                rl_trainer.learn(
-                    total_timesteps=timesteps_per_episode,
-                    callback=reward_callback,
-                    progress_bar=False,
-                    log_interval=10,
-                    save_checkpoints=save_checkpoints and (ep % 10 == 0),
-                    checkpoint_freq=checkpoint_freq,
-                    eval_freq=0,
-                )
-                # Save model
-                final_model_path = f"{episode_output_dir}/ppo_model_final"
-                rl_trainer.save(final_model_path)
-                if verbose >= 1:
-                    print(f"Training complete! Model saved to {final_model_path}")
-            else:
-                # Continue training existing model - update environment and continue learning
-                rl_trainer.model.set_env(vec_env)
-                rl_trainer.vec_env = vec_env  # Update trainer's vec_env reference
-                # Reset callback for this episode
+                # Calculate timesteps for this episode: n_steps * n_envs (one rollout per episode)
+                timesteps_per_episode = n_steps * n_envs
+                
+                # Create callback to track rewards
                 reward_callback = RewardCallback(verbose=0)
-                rl_trainer.learn(
-                    total_timesteps=timesteps_per_episode,
-                    callback=reward_callback,  # Track rewards
-                    progress_bar=False,  # Less verbose for per-episode updates
-                    log_interval=10,
-                    save_checkpoints=save_checkpoints and (ep % 10 == 0),
-                    checkpoint_freq=checkpoint_freq,
-                    eval_freq=0,  # No evaluation during joint training
-                )
-            
-            # Extract episode rewards from callback
-            episode_rewards = reward_callback.get_episode_rewards()
-            if len(episode_rewards) > 0:
-                # Average reward across all completed episodes in this training step
-                avg_reward = np.mean(episode_rewards)
-                episode_rewards_history.append(avg_reward)
-                if verbose >= 2:
-                    print(f"  [DEBUG] Episode rewards: {len(episode_rewards)} episodes, avg={avg_reward:.6f}, "
-                          f"min={min(episode_rewards):.6f}, max={max(episode_rewards):.6f}")
-            else:
-                # If no episodes completed, try to get total reward from accumulated sums
-                if hasattr(reward_callback, 'episode_reward_sums') and len(reward_callback.episode_reward_sums) > 0:
-                    total_reward = sum(reward_callback.episode_reward_sums.values())
-                    total_length = sum(reward_callback.episode_lengths_track.values())
-                    if total_reward != 0 and total_length > 0:
-                        avg_reward_per_env = total_reward / max(1, len(reward_callback.episode_reward_sums))
-                        episode_rewards_history.append(avg_reward_per_env)
+                
+                if rl_trainer is None:
+                    # First episode: create new trainer
+                    episode_output_dir = f"{output_dir}/episode_{ep+1}/"
+                    os.makedirs(episode_output_dir, exist_ok=True)
+                    
+                    # Create trainer manually to pass callback
+                    rl_trainer = DynamicAnchorPPOTrainer(
+                        vec_env=vec_env,
+                        policy_type="MlpPolicy",
+                        learning_rate=learning_rate,
+                        n_steps=n_steps,
+                        batch_size=batch_size,
+                        n_epochs=n_epochs,
+                        verbose=verbose,
+                        tensorboard_log=tensorboard_log_dir,
+                        device=device_str,
+                    )
+                    # Train with callback
+                    rl_trainer.learn(
+                        total_timesteps=timesteps_per_episode,
+                        callback=reward_callback,
+                        progress_bar=False,
+                        log_interval=10,
+                        save_checkpoints=save_checkpoints and (ep % 10 == 0),
+                        checkpoint_freq=checkpoint_freq,
+                        eval_freq=0,
+                    )
+                    # Save model
+                    final_model_path = f"{episode_output_dir}/ppo_model_final"
+                    rl_trainer.save(final_model_path)
+                    if verbose >= 1:
+                        print(f"Training complete! Model saved to {final_model_path}")
+                else:
+                    # Continue training existing model - update environment and continue learning
+                    rl_trainer.model.set_env(vec_env)
+                    rl_trainer.vec_env = vec_env  # Update trainer's vec_env reference
+                    # Reset callback for this episode
+                    reward_callback = RewardCallback(verbose=0)
+                    rl_trainer.learn(
+                        total_timesteps=timesteps_per_episode,
+                        callback=reward_callback,  # Track rewards
+                        progress_bar=False,  # Less verbose for per-episode updates
+                        log_interval=10,
+                        save_checkpoints=save_checkpoints and (ep % 10 == 0),
+                        checkpoint_freq=checkpoint_freq,
+                        eval_freq=0,  # No evaluation during joint training
+                    )
+                
+                # Extract episode rewards from callback
+                episode_rewards = reward_callback.get_episode_rewards()
+                if len(episode_rewards) > 0:
+                    # Average reward across all completed episodes in this training step
+                    avg_reward = np.mean(episode_rewards)
+                    episode_rewards_history.append(avg_reward)
+                    if verbose >= 2:
+                        print(f"  [DEBUG] Episode rewards: {len(episode_rewards)} episodes, avg={avg_reward:.6f}, "
+                              f"min={min(episode_rewards):.6f}, max={max(episode_rewards):.6f}")
+                else:
+                    # If no episodes completed, try to get total reward from accumulated sums
+                    if hasattr(reward_callback, 'episode_reward_sums') and len(reward_callback.episode_reward_sums) > 0:
+                        total_reward = sum(reward_callback.episode_reward_sums.values())
+                        total_length = sum(reward_callback.episode_lengths_track.values())
+                        if total_reward != 0 and total_length > 0:
+                            avg_reward_per_env = total_reward / max(1, len(reward_callback.episode_reward_sums))
+                            episode_rewards_history.append(avg_reward_per_env)
+                        else:
+                            episode_rewards_history.append(0.0)
                     else:
                         episode_rewards_history.append(0.0)
-                else:
-                    episode_rewards_history.append(0.0)
+            except Exception as e:
+                # Ensure cleanup even if training fails
+                if 'vec_env' in locals():
+                    try:
+                        vec_env.close()
+                    except:
+                        pass
+                raise e
         
         # ======================================================================
         # STEP 3: Evaluate RL Policy (compute metrics for every episode for plotting)
@@ -940,21 +954,53 @@ def train_and_evaluate_joint(
                     }
         
         # Always compute metrics for plotting (even if not printing)
+        # Evaluation should run every episode for accurate metrics tracking
         try:
             if should_print:
                 print(f"\n[Episode {ep + 1}] Evaluating RL Policy (after {classifier_update_every} RL episodes)...")
+            elif verbose >= 2:
+                print(f"\n[Episode {ep + 1}] Computing RL metrics (silent evaluation)...")
             from trainers.dynAnchors_inference import greedy_rollout
             from trainers.vecEnv import DynamicAnchorEnv
             
+            # ALWAYS evaluate (not just when should_evaluate is True)
+            # This ensures metrics are tracked for every episode
             for cls in target_classes:
+                # Sample a specific training instance for this class to evaluate
+                # This matches how final evaluation works (evaluates specific instances)
+                cls_indices = np.where(y_train == cls)[0]
+                if len(cls_indices) == 0:
+                    # No instances of this class, skip
+                    per_class_stats[cls] = {
+                        "precision": 0.0,
+                        "hard_precision": 0.0,
+                        "coverage": 0.0,
+                        "n_points": 0,
+                        "rule": "no instances",
+                        "lower": None,
+                        "upper": None
+                    }
+                    continue
+                
+                # Sample one instance for evaluation (use episode number as seed for consistency)
+                rng_eval = np.random.default_rng(seed=42 + cls + ep)
+                eval_instance_idx = rng_eval.choice(cls_indices)
+                X_eval_instance = X_train_scaled[eval_instance_idx]
+                
+                # Convert to unit space for x_star_unit
+                X_eval_instance_unit = (X_eval_instance - X_min) / X_range
+                X_eval_instance_unit = np.clip(X_eval_instance_unit, 0.0, 1.0).astype(np.float32)
+                
                 # Create environment for this class for evaluation
                 # IMPORTANT: Match final evaluation settings exactly
                 # 1. Use larger initial_window (0.3) to match evaluate_single_instance
                 # 2. Use same perturbation settings as final evaluation
-                # 3. Sample from training data like final evaluation does (via make_env_fn)
+                # 3. Set x_star_unit to the sampled instance location (like final evaluation)
                 anchor_env = create_anchor_env(target_cls=cls)
                 # Set larger initial_window for evaluation (matches evaluate_single_instance)
                 anchor_env.initial_window = 0.3  # Match final evaluation settings
+                # Set x_star_unit to the instance location (like final evaluation)
+                anchor_env.x_star_unit = X_eval_instance_unit
                 # Ensure perturbation settings match (already set in create_anchor_env, but verify)
                 # Note: create_anchor_env uses use_perturbation and perturbation_mode from function args
                 
@@ -1062,7 +1108,21 @@ def train_and_evaluate_joint(
                         upper = anchor_env.upper.copy()
                 else:
                     # PPO: Use PPO trainer
-                    # Run greedy rollout (greedy_rollout expects DynamicAnchorEnv but accesses anchor_env properties)
+                    # IMPORTANT: Capture initial bounds BEFORE greedy_rollout (which resets internally)
+                    # Reset first to get initial state and bounds
+                    reset_result = wrapped_env.reset(seed=42 + cls + ep)
+                    if isinstance(reset_result, tuple):
+                        state, _ = reset_result
+                    else:
+                        state = reset_result
+                    state = np.array(state, dtype=np.float32)
+                    
+                    # Capture initial bounds after reset (before greedy_rollout modifies them)
+                    initial_lower = anchor_env.lower.copy()
+                    initial_upper = anchor_env.upper.copy()
+                    initial_width = (initial_upper - initial_lower)
+                    
+                    # Run greedy rollout (greedy_rollout will reset again internally, but we have initial bounds)
                     try:
                         info, rule, lower, upper = greedy_rollout(
                             env=wrapped_env,
@@ -1073,16 +1133,7 @@ def train_and_evaluate_joint(
                         )
                     except (AttributeError, TypeError) as e:
                         # If greedy_rollout can't access properties directly, run a simple greedy rollout
-                        reset_result = wrapped_env.reset()
-                        if isinstance(reset_result, tuple):
-                            state, _ = reset_result
-                        else:
-                            state = reset_result
-                        state = np.array(state, dtype=np.float32)
-                        
-                        initial_lower = anchor_env.lower.copy()
-                        initial_upper = anchor_env.upper.copy()
-                        initial_width = (initial_upper - initial_lower)
+                        # State already reset above, initial_width already set
                         
                         # Run greedy rollout
                         for t in range(eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode):
@@ -1294,6 +1345,12 @@ def train_and_evaluate_joint(
     # STEP 3: Final Evaluation with Frozen Policy
     # ======================================================================
     print(f"\nEvaluating on test set with frozen models...")
+    print(f"Note: By default, coverage and precision are computed on training data.")
+    print(f"      This explains the classifier's behavior on training data.")
+    print(f"      To evaluate on test data, set eval_on_test_data=True in evaluate_all_classes.")
+    
+    # Prepare test data in unit space for optional test-set evaluation
+    X_test_unit = (X_test_scaled - X_min) / X_range
     
     if use_continuous_actions:
         # DDPG: Use DDPG trainers for evaluation
@@ -1309,7 +1366,11 @@ def train_and_evaluate_joint(
                 n_instances_per_class=n_eval_instances_per_class,
                 max_features_in_rule=max_features_in_rule,
                 steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
-                random_seed=42
+                random_seed=42,
+                # Optional: Set eval_on_test_data=True to compute metrics on test data
+                eval_on_test_data=False,  # Default: use training data (backward compatible)
+                X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
+                X_test_std=X_test_scaled if False else None,
             )
         else:
             raise ValueError("No DDPG trainers available for evaluation")
@@ -1324,7 +1385,11 @@ def train_and_evaluate_joint(
             n_instances_per_class=n_eval_instances_per_class,
             max_features_in_rule=max_features_in_rule,
             steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
-            random_seed=42
+            random_seed=42,
+            # Optional: Set eval_on_test_data=True to compute metrics on test data
+            eval_on_test_data=False,  # Default: use training data (backward compatible)
+            X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
+            X_test_std=X_test_scaled if False else None,
         )
     
     # Close environments
@@ -1333,6 +1398,16 @@ def train_and_evaluate_joint(
             rl_trainer.vec_env.close()
         except:
             pass
+    
+    # Cleanup DDPG environments if used
+    if use_continuous_actions and ddpg_trainers:
+        # DDPG environments are already closed in the training loop, but ensure cleanup
+        for cls, ddpg_trainer in ddpg_trainers.items():
+            if hasattr(ddpg_trainer, 'env') and ddpg_trainer.env is not None:
+                try:
+                    ddpg_trainer.env.close()
+                except:
+                    pass
     
     # ======================================================================
     # STEP 4: Save RL Models (Policy and Value Networks)
@@ -1650,14 +1725,20 @@ def train_and_evaluate_joint(
             print(f"\nClass {cls} Analysis:")
             print(f"  Precision:")
             print(f"    Initial: {initial_prec:.6f} → Final: {final_prec:.6f} → Max: {max_prec:.6f}")
-            print(f"    Improvement: {prec_improvement:+.6f} ({prec_improvement/initial_prec*100:+.1f}% if initial > 0)")
+            if initial_prec > 0:
+                print(f"    Improvement: {prec_improvement:+.6f} ({prec_improvement/initial_prec*100:+.1f}%)")
+            else:
+                print(f"    Improvement: {prec_improvement:+.6f} (N/A - initial precision was 0)")
             print(f"    Average: {avg_prec:.6f}, Recent average: {recent_avg_prec:.6f}")
             print(f"    Target ({precision_target:.3f}): {'✓ MET' if prec_target_met else '✗ NOT MET'}")
             print(f"    Trend: {'↑ IMPROVING' if prec_trending_up else '→ STABLE' if abs(recent_avg_prec - avg_prec) < 0.01 else '↓ DECLINING'}")
             
             print(f"  Coverage:")
             print(f"    Initial: {initial_cov:.6f} → Final: {final_cov:.6f} → Max: {max_cov:.6f}")
-            print(f"    Improvement: {cov_improvement:+.6f} ({cov_improvement/initial_cov*100:+.1f}% if initial > 0)")
+            if initial_cov > 0:
+                print(f"    Improvement: {cov_improvement:+.6f} ({cov_improvement/initial_cov*100:+.1f}%)")
+            else:
+                print(f"    Improvement: {cov_improvement:+.6f} (N/A - initial coverage was 0)")
             print(f"    Average: {avg_cov:.6f}, Recent average: {recent_avg_cov:.6f}")
             print(f"    Target ({coverage_target:.3f}): {'✓ MET' if cov_target_met else '✗ NOT MET'}")
             print(f"    Trend: {'↑ IMPROVING' if cov_trending_up else '→ STABLE' if abs(recent_avg_cov - avg_cov) < 0.01 else '↓ DECLINING'}")

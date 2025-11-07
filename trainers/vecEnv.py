@@ -55,6 +55,11 @@ class AnchorEnv:
         * magnitude in {small, medium, large} -> applied as fraction of feature range
     - Reward: precision_gain * alpha + coverage_gain * beta - overlap_penalty - invalid_penalty
               computed w.r.t. the classifier predictions.
+    
+    Evaluation Mode:
+        By default, precision and coverage are computed on training data (X_unit, X_std, y).
+        Set eval_on_test_data=True and provide X_test_unit, X_test_std, y_test to compute
+        metrics on test data instead. This allows assessing anchor generalization.
     """
 
     def __init__(
@@ -85,6 +90,11 @@ class AnchorEnv:
         js_penalty_weight: float = 0.05,
         x_star_unit: np.ndarray | None = None,
         initial_window: float = 0.1,
+        # Optional test data for evaluation (if provided, metrics computed on test data)
+        X_test_unit: np.ndarray | None = None,
+        X_test_std: np.ndarray | None = None,
+        y_test: np.ndarray | None = None,
+        eval_on_test_data: bool = False,
     ):
         self.X_unit = X_unit
         self.X_std = X_std
@@ -92,7 +102,9 @@ class AnchorEnv:
         self.feature_names = feature_names
         self.n_features = X_unit.shape[1]
         self.classifier = classifier
-        self.device = torch.device(device)
+        # Standardize device handling
+        from trainers.device_utils import get_device
+        self.device = get_device(device)
         self.target_class = int(target_class)
         self.step_fracs = step_fracs
         self.min_width = min_width
@@ -125,12 +137,38 @@ class AnchorEnv:
         self.js_penalty_weight = float(js_penalty_weight)
         self.x_star_unit = x_star_unit.astype(np.float32) if x_star_unit is not None else None
         self.initial_window = float(initial_window)
+        
+        # Test data evaluation support
+        self.eval_on_test_data = bool(eval_on_test_data)
+        if self.eval_on_test_data:
+            if X_test_unit is None or X_test_std is None or y_test is None:
+                raise ValueError("eval_on_test_data=True requires X_test_unit, X_test_std, and y_test")
+            self.X_test_unit = X_test_unit
+            self.X_test_std = X_test_std
+            self.y_test = y_test.astype(int)
+        else:
+            self.X_test_unit = None
+            self.X_test_std = None
+            self.y_test = None
 
     def _mask_in_box(self) -> np.ndarray:
+        """
+        Compute mask of data points that fall within the anchor box.
+        
+        Returns:
+            Boolean mask indicating which points are in the box.
+            Uses test data if eval_on_test_data=True, otherwise uses training data.
+        """
+        # Use test data for evaluation if requested, otherwise use training data
+        if self.eval_on_test_data:
+            X_eval_unit = self.X_test_unit
+        else:
+            X_eval_unit = self.X_unit
+        
         conds = []
         for j in range(self.n_features):
-            conds.append((self.X_unit[:, j] >= self.lower[j]) & (self.X_unit[:, j] <= self.upper[j]))
-        mask = np.logical_and.reduce(conds) if conds else np.ones(self.X_unit.shape[0], dtype=bool)
+            conds.append((X_eval_unit[:, j] >= self.lower[j]) & (X_eval_unit[:, j] <= self.upper[j]))
+        mask = np.logical_and.reduce(conds) if conds else np.ones(X_eval_unit.shape[0], dtype=bool)
         return mask
 
     def _unit_to_std(self, X_unit_samples: np.ndarray) -> np.ndarray:
@@ -139,30 +177,66 @@ class AnchorEnv:
         return (X_unit_samples * self.X_range) + self.X_min
 
     def _current_metrics(self) -> tuple:
+        """
+        Compute precision and coverage metrics.
+        
+        Returns:
+            Tuple of (precision_proxy, coverage, details_dict)
+            
+        Note:
+            - If eval_on_test_data=True: metrics computed on test data
+            - If eval_on_test_data=False: metrics computed on training data (default)
+            - Coverage: fraction of data points (training or test) that fall within the box
+            - Precision: fraction of predictions in the box that are correct (for target class)
+        """
         mask = self._mask_in_box()
         covered = np.where(mask)[0]
         coverage = float(mask.mean())
         
         # If no empirical points covered and not using uniform perturbation, return early
         if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode == "uniform"):
-            return 0.0, coverage, {"hard_precision": 0.0, "avg_prob": 0.0, "n_points": 0, "sampler": "none"}
+            data_source = "test" if self.eval_on_test_data else "training"
+            return 0.0, coverage, {
+                "hard_precision": 0.0, 
+                "avg_prob": 0.0, 
+                "n_points": 0, 
+                "sampler": "none",
+                "data_source": data_source
+            }
+
+        # Select data source based on evaluation mode
+        if self.eval_on_test_data:
+            X_data_std = self.X_test_std
+            y_data = self.y_test
+            data_source = "test"
+        else:
+            X_data_std = self.X_std
+            y_data = self.y
+            data_source = "training"
 
         if not self.use_perturbation:
-            X_eval = self.X_std[covered]
-            y_eval = self.y[covered]
+            X_eval = X_data_std[covered]
+            y_eval = y_data[covered]
             n_points = int(X_eval.shape[0])
-            sampler_note = "empirical"
+            sampler_note = f"empirical_{data_source}"
         else:
             if self.perturbation_mode == "bootstrap":
                 # Bootstrap requires empirical points
                 if covered.size == 0:
-                    return 0.0, coverage, {"hard_precision": 0.0, "avg_prob": 0.0, "n_points": 0, "sampler": "none"}
+                    data_source = "test" if self.eval_on_test_data else "training"
+                    return 0.0, coverage, {
+                        "hard_precision": 0.0, 
+                        "avg_prob": 0.0, 
+                        "n_points": 0, 
+                        "sampler": "none",
+                        "data_source": data_source
+                    }
                 n_samp = min(self.n_perturb, max(1, covered.size))
                 idx = self.rng.choice(covered, size=n_samp, replace=True)
-                X_eval = self.X_std[idx]
-                y_eval = self.y[idx]
+                X_eval = X_data_std[idx]
+                y_eval = y_data[idx]
                 n_points = int(n_samp)
-                sampler_note = "bootstrap"
+                sampler_note = f"bootstrap_{data_source}"
             elif self.perturbation_mode == "uniform":
                 # Uniform perturbation: generate samples within box bounds, even if box covers 0 empirical points
                 # This allows evaluation of boxes that are too small to contain training data
@@ -179,7 +253,7 @@ class AnchorEnv:
                 X_eval = self._unit_to_std(U)
                 y_eval = None  # No ground truth labels for synthetic samples
                 n_points = int(n_samp)
-                sampler_note = "uniform"
+                sampler_note = f"uniform_{data_source}"
             else:
                 raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap' or 'uniform'.")
 
@@ -227,6 +301,7 @@ class AnchorEnv:
             "n_points": int(n_points),
             "sampler": sampler_note,
             "target_class_fraction": target_class_fraction,  # Fraction of samples that are actually target class
+            "data_source": data_source,  # "training" or "test" - indicates which dataset metrics are computed on
         }
 
     def reset(self):
@@ -326,15 +401,36 @@ class AnchorEnv:
         
         precision, coverage, details = self._current_metrics()
 
+        # Validate metrics: check for NaN/Inf values
+        if not np.isfinite(precision):
+            precision = 0.0
+        if not np.isfinite(coverage):
+            coverage = 0.0
+        if not np.isfinite(prev_precision):
+            prev_precision = 0.0
+        if not np.isfinite(prev_coverage):
+            prev_coverage = 0.0
+
         coverage_clipped = False
         if coverage < self.min_coverage_floor:
             self.lower = prev_lower
             self.upper = prev_upper
             precision, coverage, details = self._current_metrics()
+            # Re-validate after reset
+            if not np.isfinite(precision):
+                precision = 0.0
+            if not np.isfinite(coverage):
+                coverage = 0.0
             coverage_clipped = True
 
         precision_gain = precision - prev_precision
         coverage_gain = coverage - prev_coverage
+        
+        # Validate gains
+        if not np.isfinite(precision_gain):
+            precision_gain = 0.0
+        if not np.isfinite(coverage_gain):
+            coverage_gain = 0.0
 
         widths = self.upper - self.lower
         overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
@@ -343,16 +439,7 @@ class AnchorEnv:
         drift_penalty = self.drift_penalty_weight * drift
 
         # Anchor drift penalty: penalize if box drifts away from x_star_unit (instance location)
-        anchor_drift_penalty = 0.0
-        if self.x_star_unit is not None:
-            # Compute distance from box center to instance location
-            box_center = 0.5 * (self.lower + self.upper)
-            anchor_distance = float(np.linalg.norm(box_center - self.x_star_unit))
-            # Penalize if distance exceeds initial_window (box has drifted too far)
-            max_allowed_distance = self.initial_window * 2.0  # Allow 2x initial window
-            if anchor_distance > max_allowed_distance:
-                excess = anchor_distance - max_allowed_distance
-                anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5  # Penalize drifting away
+        anchor_drift_penalty = self._compute_anchor_drift_penalty(prev_lower, prev_upper)
 
         inter_lower = np.maximum(self.lower, prev_lower)
         inter_upper = np.minimum(self.upper, prev_upper)
@@ -367,60 +454,19 @@ class AnchorEnv:
             js_proxy = 1.0 - float(inter_vol / (0.5 * (prev_vol + curr_vol) + eps))
             js_proxy = float(np.clip(js_proxy, 0.0, 1.0))
         
-        # Reward structure: Prioritize precision first, then conditionally reward coverage
-        # Only reward coverage if precision is already high enough (valid rule)
+        # Compute reward weights and penalties
         precision_threshold = self.precision_target * 0.8  # Require 80% of target precision
-        if precision >= precision_threshold:
-            # Precision is high enough, now we can optimize coverage
-            # Scale coverage gain by how much we exceed precision threshold
-            precision_weight = 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps)
-            coverage_weight = self.beta * min(1.0, precision / (precision_threshold + eps))
-            
-            # If precision is at target and we're increasing coverage, reduce JS penalty
-            # This encourages expanding coverage when precision is already high
-            if precision >= self.precision_target * 0.95 and coverage_gain > 0:
-                # Reduce JS penalty when expanding coverage with high precision
-                js_penalty = self.js_penalty_weight * js_proxy * 0.3  # 70% reduction
-            else:
-                js_penalty = self.js_penalty_weight * js_proxy
-        else:
-            # Precision is low, focus only on precision
-            # Penalize coverage gain if precision is not high enough
-            precision_weight = 2.0  # Higher weight for precision when it's low
-            coverage_weight = self.beta * 0.1 * (precision / (precision_threshold + eps))  # Very low coverage weight
-            js_penalty = self.js_penalty_weight * js_proxy
+        precision_weight, coverage_weight, js_penalty = self._compute_reward_weights_and_penalties(
+            precision, precision_gain, coverage_gain, js_proxy, eps
+        )
         
-        # Add bonus for reaching coverage target when precision is already high
-        coverage_bonus = 0.0
-        if precision >= precision_threshold and coverage >= self.coverage_target:
-            # Bonus for meeting both targets - scales with coverage above target
-            coverage_bonus = 0.1 * (coverage / self.coverage_target)  # Bonus scales with coverage above target
-        elif precision >= precision_threshold and coverage_gain > 0:
-            # Progressive bonus for increasing coverage when precision is high
-            # The closer we get to target, the larger the bonus becomes
-            # This creates a gradient that encourages reaching the target
-            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            # Bonus increases as we approach target (from 0.01 to 0.05)
-            coverage_bonus = (0.01 + 0.04 * progress_to_target) * coverage_gain / (self.coverage_target + eps)
-            
-            # Extra incentive when below target but precision is high
-            if coverage < self.coverage_target:
-                # Additional bonus proportional to how far we are from target
-                # This makes reaching the target more rewarding
-                distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
-                coverage_bonus += 0.03 * coverage_gain * (1.0 - distance_to_target) / (self.coverage_target + eps)
-
-        # Add bonus for finding regions with target class samples (helps when classifier is biased)
-        # This is especially important when classifier doesn't predict target class but box contains target samples
-        target_class_bonus = 0.0
-        target_class_fraction = details.get("target_class_fraction", 0.0)
-        if target_class_fraction > 0.0 and precision < precision_threshold:
-            # Box contains target class samples but precision is low (classifier bias issue)
-            # Give bonus proportional to fraction of target class samples
-            # This helps RL agent find good regions even when classifier is biased
-            target_class_bonus = 0.2 * target_class_fraction * (1.0 - precision / (precision_threshold + eps))
-            # Scale down as precision improves (less needed when classifier is working)
-            target_class_bonus *= max(0.1, 1.0 - precision / (precision_threshold + eps))
+        # Compute bonuses
+        coverage_bonus = self._compute_coverage_bonus(
+            precision, coverage, coverage_gain, precision_threshold, eps
+        )
+        target_class_bonus = self._compute_target_class_bonus(
+            details, precision, precision_threshold, eps
+        )
 
         reward = (self.alpha * precision_weight * precision_gain + 
                  coverage_weight * coverage_gain + 
@@ -430,6 +476,10 @@ class AnchorEnv:
                  drift_penalty - 
                  anchor_drift_penalty - 
                  js_penalty)
+        
+        # Validate final reward
+        if not np.isfinite(reward):
+            reward = 0.0
 
         self.box_history.append((self.lower.copy(), self.upper.copy()))
         self.prev_lower = prev_lower
@@ -462,6 +512,98 @@ class AnchorEnv:
             **details
         }
         return state, reward, done, info
+    
+    def _compute_anchor_drift_penalty(self, prev_lower: np.ndarray, prev_upper: np.ndarray) -> float:
+        """Compute penalty for anchor drifting away from instance location."""
+        anchor_drift_penalty = 0.0
+        if self.x_star_unit is not None:
+            # Compute distance from box center to instance location
+            box_center = 0.5 * (self.lower + self.upper)
+            anchor_distance = float(np.linalg.norm(box_center - self.x_star_unit))
+            # Penalize if distance exceeds initial_window (box has drifted too far)
+            max_allowed_distance = self.initial_window * 2.0  # Allow 2x initial window
+            if anchor_distance > max_allowed_distance:
+                excess = anchor_distance - max_allowed_distance
+                anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5  # Penalize drifting away
+        return anchor_drift_penalty
+    
+    def _compute_reward_weights_and_penalties(
+        self, precision: float, precision_gain: float, coverage_gain: float, 
+        js_proxy: float, eps: float
+    ) -> tuple:
+        """
+        Compute reward weights and JS penalty based on precision threshold.
+        
+        Returns:
+            Tuple of (precision_weight, coverage_weight, js_penalty)
+        """
+        precision_threshold = self.precision_target * 0.8  # Require 80% of target precision
+        
+        if precision >= precision_threshold:
+            # Precision is high enough, now we can optimize coverage
+            # Scale coverage gain by how much we exceed precision threshold
+            precision_weight = 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps)
+            coverage_weight = self.beta * min(1.0, precision / (precision_threshold + eps))
+            
+            # If precision is at target and we're increasing coverage, reduce JS penalty
+            # This encourages expanding coverage when precision is already high
+            if precision >= self.precision_target * 0.95 and coverage_gain > 0:
+                # Reduce JS penalty when expanding coverage with high precision
+                js_penalty = self.js_penalty_weight * js_proxy * 0.3  # 70% reduction
+            else:
+                js_penalty = self.js_penalty_weight * js_proxy
+        else:
+            # Precision is low, focus only on precision
+            # Penalize coverage gain if precision is not high enough
+            precision_weight = 2.0  # Higher weight for precision when it's low
+            coverage_weight = self.beta * 0.1 * (precision / (precision_threshold + eps))  # Very low coverage weight
+            js_penalty = self.js_penalty_weight * js_proxy
+        
+        return precision_weight, coverage_weight, js_penalty
+    
+    def _compute_coverage_bonus(
+        self, precision: float, coverage: float, coverage_gain: float, 
+        precision_threshold: float, eps: float
+    ) -> float:
+        """Compute bonus for reaching coverage target when precision is high."""
+        coverage_bonus = 0.0
+        
+        if precision >= precision_threshold and coverage >= self.coverage_target:
+            # Bonus for meeting both targets - scales with coverage above target
+            coverage_bonus = 0.1 * (coverage / self.coverage_target)  # Bonus scales with coverage above target
+        elif precision >= precision_threshold and coverage_gain > 0:
+            # Progressive bonus for increasing coverage when precision is high
+            # The closer we get to target, the larger the bonus becomes
+            # This creates a gradient that encourages reaching the target
+            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
+            # Bonus increases as we approach target (from 0.01 to 0.05)
+            coverage_bonus = (0.01 + 0.04 * progress_to_target) * coverage_gain / (self.coverage_target + eps)
+            
+            # Extra incentive when below target but precision is high
+            if coverage < self.coverage_target:
+                # Additional bonus proportional to how far we are from target
+                # This makes reaching the target more rewarding
+                distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
+                coverage_bonus += 0.03 * coverage_gain * (1.0 - distance_to_target) / (self.coverage_target + eps)
+        
+        return coverage_bonus
+    
+    def _compute_target_class_bonus(
+        self, details: dict, precision: float, precision_threshold: float, eps: float
+    ) -> float:
+        """Compute bonus for finding regions with target class samples."""
+        target_class_bonus = 0.0
+        target_class_fraction = details.get("target_class_fraction", 0.0)
+        
+        if target_class_fraction > 0.0 and precision < precision_threshold:
+            # Box contains target class samples but precision is low (classifier bias issue)
+            # Give bonus proportional to fraction of target class samples
+            # This helps RL agent find good regions even when classifier is biased
+            target_class_bonus = 0.2 * target_class_fraction * (1.0 - precision / (precision_threshold + eps))
+            # Scale down as precision improves (less needed when classifier is working)
+            target_class_bonus *= max(0.1, 1.0 - precision / (precision_threshold + eps))
+        
+        return target_class_bonus
 
 
 # ============================================================================
@@ -506,28 +648,30 @@ class DynamicAnchorEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
         
-        # Sample an instance from the training data matching the target class
-        # This ensures each episode starts with a small box around a relevant instance
-        target_class = self.anchor_env.target_class
-        mask_target = (self.anchor_env.y == target_class)
-        indices_target = np.where(mask_target)[0]
-        
-        if len(indices_target) > 0:
-            # Sample a random instance of the target class
-            instance_idx = self.anchor_env.rng.choice(indices_target)
-            sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+        # IMPORTANT: If x_star_unit is already set (e.g., for evaluation), use it instead of sampling
+        # This allows final evaluation to use specific instances while training can still sample randomly
+        if self.anchor_env.x_star_unit is None:
+            # Sample an instance from the training data matching the target class
+            # This ensures each episode starts with a small box around a relevant instance
+            target_class = self.anchor_env.target_class
+            mask_target = (self.anchor_env.y == target_class)
+            indices_target = np.where(mask_target)[0]
             
-            # Set x_star_unit to the sampled instance location
-            self.anchor_env.x_star_unit = sampled_instance_unit
-            # Use a smaller initial_window for training (0.15) - starts with small box
-            # IMPORTANT: Only override if it's still at default (0.1) to allow evaluation to use larger window (0.3)
-            # Don't override if it's already been set to a specific value (e.g., 0.3 for evaluation)
-            if self.anchor_env.initial_window == 0.1:  # Only override default value
-                self.anchor_env.initial_window = 0.15
-            # If initial_window is already set to 0.3 (for evaluation), keep it at 0.3
-        else:
-            # No instances of target class, fall back to full range
-            self.anchor_env.x_star_unit = None
+            if len(indices_target) > 0:
+                # Sample a random instance of the target class
+                instance_idx = self.anchor_env.rng.choice(indices_target)
+                sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+                
+                # Set x_star_unit to the sampled instance location
+                self.anchor_env.x_star_unit = sampled_instance_unit
+            # If no instances found, x_star_unit remains None (will use full range)
+        
+        # Use a smaller initial_window for training (0.15) - starts with small box
+        # IMPORTANT: Only override if it's still at default (0.1) to allow evaluation to use larger window (0.3)
+        # Don't override if it's already been set to a specific value (e.g., 0.3 for evaluation)
+        if self.anchor_env.initial_window == 0.1:  # Only override default value
+            self.anchor_env.initial_window = 0.15
+        # If initial_window is already set to 0.3 (for evaluation), keep it at 0.3
         
         state = self.anchor_env.reset()
         obs = np.array(state, dtype=np.float32)
@@ -698,20 +842,23 @@ class ContinuousAnchorEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
         
-        # Sample an instance from the training data matching the target class
-        target_class = self.anchor_env.target_class
-        mask_target = (self.anchor_env.y == target_class)
-        indices_target = np.where(mask_target)[0]
+        # IMPORTANT: If x_star_unit is already set (e.g., for evaluation), use it instead of sampling
+        # This allows final evaluation to use specific instances while training can still sample randomly
+        if self.anchor_env.x_star_unit is None:
+            # Sample an instance from the training data matching the target class
+            target_class = self.anchor_env.target_class
+            mask_target = (self.anchor_env.y == target_class)
+            indices_target = np.where(mask_target)[0]
+            
+            if len(indices_target) > 0:
+                instance_idx = self.anchor_env.rng.choice(indices_target)
+                sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+                self.anchor_env.x_star_unit = sampled_instance_unit
+            # If no instances found, x_star_unit remains None (will use full range)
         
-        if len(indices_target) > 0:
-            instance_idx = self.anchor_env.rng.choice(indices_target)
-            sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
-            self.anchor_env.x_star_unit = sampled_instance_unit
-            # Use smaller initial_window for training (0.15) unless already set (e.g., 0.3 for evaluation)
-            if self.anchor_env.initial_window == 0.1:  # Only override default
-                self.anchor_env.initial_window = 0.15
-        else:
-            self.anchor_env.x_star_unit = None
+        # Use smaller initial_window for training (0.15) unless already set (e.g., 0.3 for evaluation)
+        if self.anchor_env.initial_window == 0.1:  # Only override default
+            self.anchor_env.initial_window = 0.15
         
         state = self.anchor_env.reset()
         obs = np.array(state, dtype=np.float32)

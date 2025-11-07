@@ -62,14 +62,19 @@ def greedy_rollout(
         initial_upper = anchor_env.upper.copy()
         # Get initial metrics from anchor_env
         prec, cov, _ = anchor_env._current_metrics()
+        # Note: DynamicAnchorEnv already includes target_class in observation space,
+        # so we don't need to append it here
     else:
         # AnchorEnv: access properties directly
         anchor_env = env
         initial_lower = env.lower.copy()
         initial_upper = env.upper.copy()
         prec, cov, _ = env._current_metrics()
-        # For AnchorEnv with PPO, we need to append target_class to state
-        if is_ppo and not is_ddpg:
+        # For AnchorEnv (not wrapped), we need to append target_class to state
+        # only if the model expects it (check observation space)
+        # However, if using PPO with DynamicAnchorEnv wrapper, target_class is already included
+        # So we only append for raw AnchorEnv usage
+        if is_ppo and not is_ddpg and not is_dynamic_env:
             target_class_value = float(env.target_class)
             state = np.concatenate([state, np.array([target_class_value], dtype=np.float32)])
     
@@ -115,8 +120,9 @@ def greedy_rollout(
         # Ensure state is numpy array
         state = np.array(state, dtype=np.float32)
         
-        # For AnchorEnv with PPO (not wrapped), append target_class
-        if is_anchor_env and is_ppo and not is_ddpg:
+        # For AnchorEnv (not wrapped), append target_class only if needed
+        # DynamicAnchorEnv already includes target_class in observation space
+        if is_anchor_env and is_ppo and not is_ddpg and not is_dynamic_env:
             target_class_value = float(env.target_class)
             state = np.concatenate([state, np.array([target_class_value], dtype=np.float32)])
         
@@ -165,8 +171,23 @@ def greedy_rollout(
     }
     
     # Build rule string
+    # Compare final width to initial width to find tightened features
     lw = (anchor_env.upper - anchor_env.lower)
-    tightened = np.where(lw < initial_width * 0.95)[0]
+    
+    # A feature is "tightened" if its width is at least 2% smaller than initial width
+    # This threshold is more lenient than 5% to catch smaller tightenings
+    # Also consider features that are significantly smaller than full range (1.0)
+    tightened = np.where((lw < initial_width * 0.98) | (lw < 0.98))[0]
+    
+    # If no features tightened by 2%, try a more lenient threshold (1%)
+    if tightened.size == 0:
+        tightened = np.where((lw < initial_width * 0.99) | (lw < 0.99))[0]
+    
+    # If still no tightened features, check if any features are smaller than full range
+    # This handles cases where box started at full range and was tightened
+    if tightened.size == 0:
+        # Check if any feature is significantly smaller than 1.0 (full range)
+        tightened = np.where(lw < 0.95)[0]
     
     if tightened.size == 0:
         rule = "any values (no tightened features)"
@@ -194,7 +215,12 @@ def evaluate_single_instance(
     steps_per_episode: int = 100,
     max_features_in_rule: int = 5,
     X_min: Optional[np.ndarray] = None,
-    X_range: Optional[np.ndarray] = None
+    X_range: Optional[np.ndarray] = None,
+    eval_on_test_data: bool = False,
+    X_test_unit: Optional[np.ndarray] = None,
+    X_test_std: Optional[np.ndarray] = None,
+    y_test: Optional[np.ndarray] = None,
+    initial_window: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchor for a single instance.
@@ -209,9 +235,16 @@ def evaluate_single_instance(
         max_features_in_rule: Maximum features in rule
         X_min: Optional min values for normalization (to unit space)
         X_range: Optional range values for normalization (to unit space)
+        eval_on_test_data: If True, compute metrics on test data instead of training data
+        X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
+        X_test_std: Test data in standardized space (required if eval_on_test_data=True)
+        y_test: Test labels (required if eval_on_test_data=True)
+        initial_window: Initial window size for anchor box (default: 0.3 for eval, matches training if None)
     
     Returns:
-        Dictionary with anchor explanation and metrics
+        Dictionary with anchor explanation and metrics.
+        Note: Coverage and precision are computed on training data by default.
+        Set eval_on_test_data=True to compute on test data.
     """
     # Detect model type: DDPG has actor/critic, PPO has policy
     is_ddpg = hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic')
@@ -234,13 +267,24 @@ def evaluate_single_instance(
         X_instance_unit = None
     
     # Create environment with x_star_unit set to the instance location
-    # Use a larger initial_window for evaluation to ensure the box contains training points
-    # The policy was trained on full-range boxes, so we need a larger initial box during eval
+    # Default initial_window: use training default (0.15) if not specified, or use provided value
+    # Note: Previous code used 0.3 for evaluation, but this may not match training conditions
     from trainers.vecEnv import AnchorEnv, DynamicAnchorEnv, ContinuousAnchorEnv
     
-    # Use a larger initial window (0.3) for evaluation to ensure coverage
-    # This gives the policy a reasonable starting point similar to training
-    eval_initial_window = 0.3  # Larger than training default (0.1)
+    # Set initial_window: use provided value, or default to training value (0.15) for consistency
+    if initial_window is None:
+        # Default to training value for consistency, unless explicitly overridden
+        eval_initial_window = temp_env.initial_window if hasattr(temp_env, 'initial_window') else 0.15
+    else:
+        eval_initial_window = initial_window
+    
+    # Prepare test data if evaluation on test data is requested
+    if eval_on_test_data:
+        if X_test_unit is None or X_test_std is None or y_test is None:
+            raise ValueError(
+                "eval_on_test_data=True requires X_test_unit, X_test_std, and y_test. "
+                "These should be provided when calling evaluate_single_instance."
+            )
     
     # Create base AnchorEnv
     anchor_env = AnchorEnv(
@@ -269,7 +313,12 @@ def evaluate_single_instance(
         min_coverage_floor=temp_env.min_coverage_floor,
         js_penalty_weight=temp_env.js_penalty_weight,
         x_star_unit=X_instance_unit,  # Set to instance location
-        initial_window=eval_initial_window,  # Use larger window for evaluation
+        initial_window=eval_initial_window,
+        # Test data evaluation support
+        eval_on_test_data=eval_on_test_data,
+        X_test_unit=X_test_unit if eval_on_test_data else None,
+        X_test_std=X_test_std if eval_on_test_data else None,
+        y_test=y_test if eval_on_test_data else None,
     )
     
     # Wrap with appropriate gym wrapper based on model type
@@ -282,55 +331,12 @@ def evaluate_single_instance(
         env = ContinuousAnchorEnv(anchor_env, seed=42)
     else:
         # PPO: Use DynamicAnchorEnv
+        # IMPORTANT: x_star_unit is already set on anchor_env, so DynamicAnchorEnv.reset() will preserve it
         env = DynamicAnchorEnv(anchor_env, seed=42)
     
-    # Check initial coverage after reset
-    env.reset()
-    initial_prec, initial_cov, _ = anchor_env._current_metrics()
-    
-    # If initial coverage is too low (< 0.001), fall back to full-range initialization
-    # This handles edge cases where the instance is in a sparse region
-    if initial_cov < 0.001:
-        # Recreate env without x_star_unit to start from full range
-        anchor_env = AnchorEnv(
-            X_unit=temp_env.X_unit,
-            X_std=temp_env.X_std,
-            y=temp_env.y,
-            feature_names=temp_env.feature_names,
-            classifier=temp_env.classifier,
-            device=str(temp_env.device),
-            target_class=target_class,
-            step_fracs=temp_env.step_fracs,
-            min_width=temp_env.min_width,
-            alpha=temp_env.alpha,
-            beta=temp_env.beta,
-            gamma=temp_env.gamma,
-            precision_target=temp_env.precision_target,
-            coverage_target=temp_env.coverage_target,
-            precision_blend_lambda=temp_env.precision_blend_lambda,
-            drift_penalty_weight=temp_env.drift_penalty_weight,
-            use_perturbation=temp_env.use_perturbation,
-            perturbation_mode=temp_env.perturbation_mode,
-            n_perturb=temp_env.n_perturb,
-            X_min=temp_env.X_min,
-            X_range=temp_env.X_range,
-            rng=temp_env.rng,
-            min_coverage_floor=temp_env.min_coverage_floor,
-            js_penalty_weight=temp_env.js_penalty_weight,
-            x_star_unit=None,  # Fall back to full range
-            initial_window=temp_env.initial_window if hasattr(temp_env, 'initial_window') else 0.1,
-        )
-        # Re-wrap with appropriate gym wrapper
-        if is_ddpg:
-            anchor_env.n_actions = 2 * anchor_env.n_features
-            anchor_env.max_action_scale = max(temp_env.step_fracs) if temp_env.step_fracs else 0.02
-            anchor_env.min_absolute_step = max(0.05, temp_env.min_width * 0.5)
-            env = ContinuousAnchorEnv(anchor_env, seed=42)
-        else:
-            env = DynamicAnchorEnv(anchor_env, seed=42)
-        # Reset the new environment
-        env.reset()
-    # Note: If we didn't fall back, env was already reset above
+    # Note: Don't reset here - greedy_rollout will reset internally
+    # This avoids double reset and ensures initial_width is captured correctly
+    # Check initial coverage will be done inside greedy_rollout after reset
     
     # Run greedy evaluation
     info, rule, lower, upper = greedy_rollout(
@@ -347,6 +353,7 @@ def evaluate_single_instance(
         "coverage": info.get("coverage", 0.0),
         "lower_bounds": lower.tolist(),
         "upper_bounds": upper.tolist(),
+        "data_source": info.get("data_source", "training"),  # Indicates which dataset metrics are computed on
     }
 
 
@@ -360,7 +367,11 @@ def evaluate_class(
     n_instances: int = 20,
     steps_per_episode: int = 100,
     max_features_in_rule: int = 5,
-    random_seed: int = 42
+    random_seed: int = 42,
+    eval_on_test_data: bool = False,
+    X_test_unit: Optional[np.ndarray] = None,
+    X_test_std: Optional[np.ndarray] = None,
+    initial_window: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchors for multiple instances of a class.
@@ -369,19 +380,25 @@ def evaluate_class(
     for each, and returns aggregated statistics.
     
     Args:
-        X_test: Test instances
-        y_test: Test labels
+        X_test: Test instances (used to sample instances to explain)
+        y_test: Test labels (used to sample instances to explain)
         trained_model: Trained PPO model
-        make_env_fn: Function that creates AnchorEnv instance
+        make_env_fn: Function that creates an AnchorEnv instance
         feature_names: List of feature names
         target_class: Target class to evaluate
         n_instances: Number of instances to evaluate
         steps_per_episode: Maximum rollout steps
         max_features_in_rule: Maximum features in rule
         random_seed: Random seed for sampling
+        eval_on_test_data: If True, compute metrics on test data instead of training data
+        X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
+        X_test_std: Test data in standardized space (required if eval_on_test_data=True)
+        initial_window: Initial window size for anchor box (default: matches training)
     
     Returns:
-        Dictionary with aggregated metrics and individual results
+        Dictionary with aggregated metrics and individual results.
+        Note: By default, coverage and precision are computed on training data.
+        Set eval_on_test_data=True to compute on test data.
     """
     # Sample instances from target class
     rng = np.random.default_rng(random_seed)
@@ -403,6 +420,14 @@ def evaluate_class(
     X_min = temp_env.X_min
     X_range = temp_env.X_range
     
+    # Prepare test data if evaluation on test data is requested
+    if eval_on_test_data:
+        if X_test_unit is None or X_test_std is None:
+            raise ValueError(
+                "eval_on_test_data=True requires X_test_unit and X_test_std. "
+                "These should be provided when calling evaluate_class."
+            )
+    
     # Evaluate each instance
     individual_results = []
     for i, instance_idx in enumerate(sel):
@@ -415,7 +440,12 @@ def evaluate_class(
             steps_per_episode=steps_per_episode,
             max_features_in_rule=max_features_in_rule,
             X_min=X_min,
-            X_range=X_range
+            X_range=X_range,
+            eval_on_test_data=eval_on_test_data,
+            X_test_unit=X_test_unit,
+            X_test_std=X_test_std,
+            y_test=y_test,
+            initial_window=initial_window,
         )
         result["instance_idx"] = int(instance_idx)
         individual_results.append(result)
@@ -428,14 +458,31 @@ def evaluate_class(
     # Find best anchor (by hard precision)
     best_result = max(individual_results, key=lambda r: r["hard_precision"])
     
+    # Compute union coverage: how many unique test instances are covered by at least one anchor
+    union_coverage = None
+    if eval_on_test_data and X_test_unit is not None:
+        # Check which test instances are covered by at least one anchor
+        covered_mask = np.zeros(X_test_unit.shape[0], dtype=bool)
+        for result in individual_results:
+            lower = np.array(result["lower_bounds"])
+            upper = np.array(result["upper_bounds"])
+            # Check which test instances fall in this anchor box
+            instance_mask = np.all(
+                (X_test_unit >= lower) & (X_test_unit <= upper), axis=1
+            )
+            covered_mask |= instance_mask
+        union_coverage = float(covered_mask.mean())
+    
     return {
         "avg_precision": float(avg_precision),
         "avg_hard_precision": float(avg_hard_precision),
         "avg_coverage": float(avg_coverage),
+        "union_coverage": union_coverage,  # Union coverage across all anchors (test data only)
         "n_instances": len(individual_results),
         "best_rule": best_result["rule"],
         "best_precision": best_result["hard_precision"],
-        "individual_results": individual_results
+        "individual_results": individual_results,
+        "data_source": individual_results[0].get("data_source", "training") if individual_results else "training",
     }
 
 
@@ -448,14 +495,18 @@ def evaluate_all_classes(
     n_instances_per_class: int = 20,
     steps_per_episode: int = 100,
     max_features_in_rule: int = 5,
-    random_seed: int = 42
+    random_seed: int = 42,
+    eval_on_test_data: bool = False,
+    X_test_unit: Optional[np.ndarray] = None,
+    X_test_std: Optional[np.ndarray] = None,
+    initial_window: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchors for all classes.
     
     Args:
-        X_test: Test instances
-        y_test: Test labels
+        X_test: Test instances (used to sample instances to explain)
+        y_test: Test labels (used to sample instances to explain)
         trained_model: Trained PPO model, DDPG model, or dict of DDPG trainers per class
         make_env_fn: Function that creates AnchorEnv instance
         feature_names: List of feature names
@@ -463,9 +514,15 @@ def evaluate_all_classes(
         steps_per_episode: Maximum rollout steps
         max_features_in_rule: Maximum features in rule
         random_seed: Random seed for sampling
+        eval_on_test_data: If True, compute metrics on test data instead of training data
+        X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
+        X_test_std: Test data in standardized space (required if eval_on_test_data=True)
+        initial_window: Initial window size for anchor box (default: matches training)
     
     Returns:
-        Dictionary with per-class results and overall statistics
+        Dictionary with per-class results and overall statistics.
+        Note: By default, coverage and precision are computed on training data.
+        Set eval_on_test_data=True to compute on test data.
     """
     unique_classes = np.unique(y_test)
     n_classes = len(unique_classes)
@@ -498,7 +555,11 @@ def evaluate_all_classes(
                 n_instances=n_instances_per_class,
                 steps_per_episode=steps_per_episode,
                 max_features_in_rule=max_features_in_rule,
-                random_seed=random_seed
+                random_seed=random_seed,
+                eval_on_test_data=eval_on_test_data,
+                X_test_unit=X_test_unit,
+                X_test_std=X_test_std,
+                initial_window=initial_window,
             )
             per_class_results[cls_int] = result
             
@@ -540,7 +601,11 @@ def evaluate_all_classes(
                 n_instances=n_instances_per_class,
                 steps_per_episode=steps_per_episode,
                 max_features_in_rule=max_features_in_rule,
-                random_seed=random_seed
+                random_seed=random_seed,
+                eval_on_test_data=eval_on_test_data,
+                X_test_unit=X_test_unit,
+                X_test_std=X_test_std,
+                initial_window=initial_window,
             )
             per_class_results[int(cls)] = result
         
@@ -570,17 +635,32 @@ def evaluate_all_classes(
     overall_precision = np.mean([r["avg_hard_precision"] for r in per_class_results.values()])
     overall_coverage = np.mean([r["avg_coverage"] for r in per_class_results.values()])
     
+    # Compute overall union coverage if test data evaluation was used
+    overall_union_coverage = None
+    if eval_on_test_data:
+        union_coverages = [r.get("union_coverage") for r in per_class_results.values() if r.get("union_coverage") is not None]
+        if union_coverages:
+            overall_union_coverage = np.mean(union_coverages)
+    
+    # Get data source from first result
+    data_source = list(per_class_results.values())[0].get("data_source", "training") if per_class_results else "training"
+    
     print("\n" + "=" * 70)
     print("OVERALL RESULTS")
     print("=" * 70)
     print(f"Average precision across all classes: {overall_precision:.3f}")
     print(f"Average coverage across all classes: {overall_coverage:.3f}")
+    if overall_union_coverage is not None:
+        print(f"Average union coverage across all classes: {overall_union_coverage:.3f}")
+    print(f"Metrics computed on: {data_source} data")
     
     return {
         "per_class_results": per_class_results,
         "overall_precision": float(overall_precision),
         "overall_coverage": float(overall_coverage),
-        "n_classes": n_classes
+        "overall_union_coverage": float(overall_union_coverage) if overall_union_coverage is not None else None,
+        "n_classes": n_classes,
+        "data_source": data_source,
     }
 
 
@@ -598,4 +678,27 @@ def load_trained_model(model_path: str, vec_env) -> PPO:
     model = PPO.load(model_path, env=vec_env)
     print(f"Loaded trained model from {model_path}")
     return model
+
+
+def prepare_test_data_for_evaluation(
+    X_test_scaled: np.ndarray,
+    X_min: np.ndarray,
+    X_range: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Helper function to prepare test data for evaluation.
+    
+    Converts test data from standardized space to unit space [0, 1] for evaluation.
+    
+    Args:
+        X_test_scaled: Test data in standardized space
+        X_min: Min values from training data (for normalization)
+        X_range: Range values from training data (for normalization)
+    
+    Returns:
+        Tuple of (X_test_unit, X_test_scaled) ready for evaluation
+    """
+    X_test_unit = (X_test_scaled - X_min) / X_range
+    X_test_unit = np.clip(X_test_unit, 0.0, 1.0).astype(np.float32)
+    return X_test_unit, X_test_scaled
 

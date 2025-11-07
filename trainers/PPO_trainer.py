@@ -64,6 +64,10 @@ class DynamicAnchorPPOTrainer:
         """
         self.vec_env = vec_env
         
+        # Standardize device handling: convert to string for SB3 (SB3 handles "auto" correctly)
+        from trainers.device_utils import get_device_str
+        device_str = get_device_str(device) if device != "auto" else "auto"
+        
         # Initialize PPO model from Stable-Baselines3
         self.model = PPO(
             policy=policy_type,
@@ -80,7 +84,7 @@ class DynamicAnchorPPOTrainer:
             max_grad_norm=max_grad_norm,
             verbose=verbose,
             tensorboard_log=tensorboard_log,
-            device=device,
+            device=device_str,
         )
         
         print(f"PPO Trainer initialized with policy: {policy_type}")

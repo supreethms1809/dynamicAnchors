@@ -62,6 +62,10 @@ class DynamicAnchorDDPGTrainer:
         """
         self.env = env
         
+        # Standardize device handling: convert to string for SB3 (SB3 handles "auto" correctly)
+        from trainers.device_utils import get_device_str
+        device_str = get_device_str(device) if device != "auto" else "auto"
+        
         # Create default action noise if not provided
         if action_noise is None:
             n_actions = env.action_space.shape[0]
@@ -90,7 +94,7 @@ class DynamicAnchorDDPGTrainer:
             action_noise=action_noise,
             policy_kwargs=policy_kwargs,
             verbose=verbose,
-            device=device,
+            device=device_str,
         )
         
         # Initialize logger if not already initialized (needed for train() method)
@@ -149,16 +153,43 @@ class DynamicAnchorDDPGTrainer:
             info: Additional info dict
         """
         if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer is not None:
-            # Ensure observations are properly shaped as (1, obs_dim) arrays
+            # Validate input shapes and values
             obs_array = np.array(obs, dtype=np.float32)
+            next_obs_array = np.array(next_obs, dtype=np.float32)
+            action_array = np.array(action, dtype=np.float32)
+            
+            # Validate shapes match
             if obs_array.ndim == 1:
                 obs_array = obs_array.reshape(1, -1)
-            next_obs_array = np.array(next_obs, dtype=np.float32)
             if next_obs_array.ndim == 1:
                 next_obs_array = next_obs_array.reshape(1, -1)
-            action_array = np.array(action, dtype=np.float32)
             if action_array.ndim == 1:
                 action_array = action_array.reshape(1, -1)
+            
+            # Validate observation dimensions match
+            if obs_array.shape[1] != next_obs_array.shape[1]:
+                raise ValueError(
+                    f"Observation shape mismatch: obs has {obs_array.shape[1]} features, "
+                    f"next_obs has {next_obs_array.shape[1]} features"
+                )
+            
+            # Validate action dimension matches expected action space
+            expected_action_dim = self.env.action_space.shape[0]
+            if action_array.shape[1] != expected_action_dim:
+                raise ValueError(
+                    f"Action shape mismatch: action has {action_array.shape[1]} dimensions, "
+                    f"expected {expected_action_dim} (from action_space)"
+                )
+            
+            # Validate values are finite
+            if not np.all(np.isfinite(obs_array)):
+                raise ValueError("obs contains NaN or Inf values")
+            if not np.all(np.isfinite(next_obs_array)):
+                raise ValueError("next_obs contains NaN or Inf values")
+            if not np.all(np.isfinite(action_array)):
+                raise ValueError("action contains NaN or Inf values")
+            if not np.isfinite(reward):
+                raise ValueError(f"reward is not finite: {reward}")
             
             # Add to replay buffer
             self.model.replay_buffer.add(

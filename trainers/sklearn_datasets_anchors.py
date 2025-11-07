@@ -206,10 +206,11 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
     print(f"Test set: {X_test.shape}")
     
     # ==========================================================================
-    # STEP 2: Choose Training Mode
+    # STEP 2: Set Device (Standardized - Set Once at Beginning)
     # ==========================================================================
-    device = torch.device("cpu")
-    print(f"\nUsing device: {device}")
+    from trainers.device_utils import get_device_pair
+    device, device_str = get_device_pair("auto")  # Can be changed to "cuda" or "mps" or "cpu"
+    print(f"\nUsing device: {device} ({device_str})")
     
     n_features = X_train.shape[1]
     n_classes = len(class_names)
@@ -512,14 +513,21 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         all_results = results['overall_stats'].get('all_individual_results', [])
         if all_results:
             print(f"\nNote on Coverage:")
-            print(f"  - Coverage is per-anchor (fraction of test data in that anchor box)")
+            data_source = results.get('eval_results', {}).get('data_source', 'training')
+            print(f"  - Coverage is per-anchor (fraction of {data_source} data in that anchor box)")
             print(f"  - Each anchor is evaluated independently on different test instances")
+            print(f"  - By default, metrics are computed on TRAINING data (explains classifier behavior)")
+            print(f"  - Set eval_on_test_data=True to compute metrics on test data")
             print(f"  - Total coverage is NOT necessarily 100% because:")
-            print(f"    1. Anchors may overlap (same test instance covered by multiple anchors)")
-            print(f"    2. Some test instances may not be covered by any anchor")
+            print(f"    1. Anchors may overlap (same instance covered by multiple anchors)")
+            print(f"    2. Some instances may not be covered by any anchor")
             print(f"    3. Coverage is calculated per-anchor, not as a union")
-            print(f"  - To get true total coverage (union), we would need to check which")
-            print(f"    test instances are covered by at least one anchor")
+            if data_source == "test" and 'overall_union_coverage' in results.get('eval_results', {}):
+                union_cov = results['eval_results'].get('overall_union_coverage')
+                if union_cov is not None:
+                    print(f"  - Union coverage (unique instances covered by at least one anchor): {union_cov:.3f}")
+            else:
+                print(f"  - To get union coverage, use eval_on_test_data=True")
     
     return results
 
