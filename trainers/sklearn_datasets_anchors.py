@@ -20,7 +20,7 @@ import torch.optim as optim
 import argparse
 import sys
 import os
-from sklearn.datasets import load_breast_cancer, fetch_covtype
+from sklearn.datasets import load_breast_cancer, fetch_covtype, load_wine, fetch_california_housing
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, TensorDataset
@@ -41,8 +41,8 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
     Load a sklearn dataset.
     
     Args:
-        dataset_name: Name of dataset ("breast_cancer" or "covtype")
-        sample_size: Optional size to sample (for large datasets like covtype)
+        dataset_name: Name of dataset ("breast_cancer", "covtype", "wine", or "housing")
+        sample_size: Optional size to sample (for large datasets like covtype or housing)
         seed: Random seed for sampling
         
     Returns:
@@ -60,8 +60,38 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         y = y.astype(int) - 1  # Convert from 1-7 to 0-6
         feature_names = [f"feature_{i}" for i in range(X.shape[1])]
         class_names = [f"covertype_{i+1}" for i in range(7)]
+    elif dataset_name == "wine":
+        data = load_wine()
+        X = data.data.astype(np.float32)
+        y = data.target.astype(int)
+        feature_names = list(data.feature_names)
+        class_names = list(data.target_names)
+    elif dataset_name == "housing":
+        # California Housing dataset - convert regression to classification by binning prices
+        data = fetch_california_housing()
+        X = data.data.astype(np.float32)
+        prices = data.target.astype(np.float32)
+        
+        # Convert regression target to classification by binning prices into quartiles
+        # This creates 4 classes: very_low, low, medium, high
+        # Note: Prices are in hundreds of thousands of dollars (e.g., 1.5 = $150,000)
+        quartiles = np.percentile(prices, [25, 50, 75])
+        y = np.digitize(prices, quartiles).astype(int)  # Creates 0, 1, 2, 3, 4
+        y = np.clip(y - 1, 0, 3)  # Map to 0-3 (4 classes)
+        
+        feature_names = list(data.feature_names)
+        class_names = ["very_low_price", "low_price", "medium_price", "high_price"]
+        
+        print(f"\nConverted housing prices to 4 classes:")
+        print(f"  Class 0 (very_low): < ${quartiles[0]*100:.0f}K")
+        print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K")
+        print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K")
+        print(f"  Class 3 (high): > ${quartiles[2]*100:.0f}K")
     else:
-        raise ValueError(f"Unknown dataset '{dataset_name}'. Choose 'breast_cancer' or 'covtype'.")
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Choose from: 'breast_cancer', 'covtype', 'wine', or 'housing'."
+        )
     
     # Sample subset if requested (for faster execution on large datasets)
     if sample_size is not None and len(X) > sample_size:
@@ -163,7 +193,7 @@ def train_classifier(
     return classifier, best_test_acc
 
 
-def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False):
+def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, classifier_type: str = "dnn"):
     """
     Main function: Complete pipeline for sklearn datasets.
     
@@ -213,7 +243,16 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
     print(f"\nUsing device: {device} ({device_str})")
     
     n_features = X_train.shape[1]
-    n_classes = len(class_names)
+    
+    # Get actual unique classes from training data (after split, some classes might be missing)
+    unique_classes_train = np.unique(y_train)
+    unique_classes_test = np.unique(y_test)
+    n_classes_train = len(unique_classes_train)
+    n_classes_total = len(class_names)
+    
+    # Use classes that are actually present in training data
+    # This ensures the classifier has the right number of output classes
+    target_classes = tuple(unique_classes_train)
     
     if joint:
         # ======================================================================
@@ -230,12 +269,14 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         # It supports both discrete and continuous actions via use_continuous_actions parameter
         from trainers.tabular_dynAnchors_joint import train_and_evaluate_joint
         
-        # Note: Classifier is initialized inside joint training
-        # For multi-class datasets, use all classes; for binary, use both
-        if n_classes == 2:
-            target_classes = (0, 1)  # Both classes
-        else:
-            target_classes = tuple(range(n_classes))  # All classes
+        # Warn if some classes are missing from training data
+        if len(unique_classes_train) < n_classes_total:
+            missing_classes = set(range(n_classes_total)) - set(unique_classes_train)
+            print(f"\n⚠ WARNING: Some classes are missing from training data after split:")
+            print(f"  Expected classes: {list(range(n_classes_total))}")
+            print(f"  Classes in training: {list(unique_classes_train)}")
+            print(f"  Missing classes: {list(missing_classes)}")
+            print(f"  Will only train on classes present in training data: {target_classes}")
         
         # Dataset-specific presets (adaptive based on dataset complexity)
         dataset_presets = {
@@ -251,6 +292,20 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 "steps_per_episode": 500,
                 "classifier_epochs_per_round": 2,  # Larger dataset, 2 epochs per update
                 "classifier_update_every": 5,  # Update every 5 episodes (many RL episodes between updates)
+                "n_envs": 4,
+            },
+            "wine": {
+                "episodes": 80,
+                "steps_per_episode": 400,
+                "classifier_epochs_per_round": 1,  # Small dataset, 1 epoch is enough
+                "classifier_update_every": 8,  # Update every 8 episodes
+                "n_envs": 3,
+            },
+            "housing": {
+                "episodes": 100,
+                "steps_per_episode": 500,
+                "classifier_epochs_per_round": 2,  # Larger dataset, 2 epochs per update
+                "classifier_update_every": 5,  # Update every 5 episodes
                 "n_envs": 4,
             },
             "default": {
@@ -297,6 +352,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             device=device,
             episodes=episodes,
             steps_per_episode=steps_per_episode,
+            classifier_type=classifier_type,  # "dnn" or "random_forest"
             classifier_epochs_per_round=classifier_epochs_per_round,
             classifier_update_every=classifier_update_every,
             classifier_lr=1e-3,
@@ -339,7 +395,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         classifier, test_acc = train_classifier(
             X_train, y_train, X_test, y_test,
             n_features=n_features,
-            n_classes=n_classes,
+            n_classes=n_classes_train,  # Use actual number of classes in training data
             device=device,
             epochs=100,
             batch_size=256,
@@ -358,11 +414,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         print("="*80)
     
         # Note: We pass raw unscaled data - tabular_dynAnchors will standardize
-        # For multi-class datasets, use all classes; for binary, use both
-        if n_classes == 2:
-            target_classes = (0, 1)  # Both classes
-        else:
-            target_classes = tuple(range(n_classes))  # All classes
+        # Use classes that are actually present in training data (already set above)
+        # target_classes is already set from unique_classes_train
 
         # Training configuration using episodes and steps_per_episode convention
         # From POC: Breast Cancer uses 25 episodes × 40 steps
@@ -540,10 +593,16 @@ if __name__ == "__main__":
 Examples:
   python -m trainers.sklearn_datasets_anchors --dataset breast_cancer
   python -m trainers.sklearn_datasets_anchors --dataset covtype --sample_size 10000
+  python -m trainers.sklearn_datasets_anchors --dataset wine
+  python -m trainers.sklearn_datasets_anchors --dataset housing --sample_size 10000
   
 Datasets:
   breast_cancer  - Binary classification (2 classes, 30 features, 569 samples)
   covtype        - Multi-class classification (7 classes, 54 features, 581k samples)
+                   Use --sample_size to limit samples for faster execution
+  wine           - Multi-class classification (3 classes, 13 features, 178 samples)
+  housing        - Multi-class classification (4 classes, 8 features, 20640 samples)
+                   Converted from regression by binning prices into quartiles
                    Use --sample_size to limit samples for faster execution
         """
     )
@@ -551,7 +610,7 @@ Datasets:
         "--dataset",
         type=str,
         default="breast_cancer",
-        choices=["breast_cancer", "covtype"],
+        choices=["breast_cancer", "covtype", "wine", "housing"],
         help="Dataset to use (default: breast_cancer)"
     )
     parser.add_argument(
@@ -574,7 +633,20 @@ Datasets:
         default=False,
         help="Use continuous actions version (from POC) with GAE (default: False, uses discrete actions)"
     )
+    parser.add_argument(
+        "--classifier-type",
+        type=str,
+        default="dnn",
+        choices=["dnn", "random_forest", "gradient_boosting"],
+        help="Classifier type: 'dnn' (default), 'random_forest', or 'gradient_boosting'"
+    )
     
     args = parser.parse_args()
-    main(dataset_name=args.dataset, sample_size=args.sample_size, joint=args.joint, use_continuous_actions=args.use_continuous_actions)
+    main(
+        dataset_name=args.dataset,
+        sample_size=args.sample_size,
+        joint=args.joint,
+        use_continuous_actions=args.use_continuous_actions,
+        classifier_type=args.classifier_type
+    )
 

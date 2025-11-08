@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+#Custom 
+housing_joint_output/*
+wine_joint_output/*
+breast_cancer_joint_output/*
+covtype_joint_output/*
+
+*.pth

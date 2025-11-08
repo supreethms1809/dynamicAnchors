@@ -142,9 +142,21 @@ def train_and_evaluate_joint(
     classifier_epochs_per_round: int = 2,  # Default: 2 epochs per update (fewer for simple classifiers)
     classifier_update_every: int = 3,  # Default: update every 3 episodes (allows more RL episodes between updates)
     # Classifier training parameters
+    classifier_type: str = "dnn",  # "dnn", "random_forest", or "gradient_boosting"
     classifier_lr: float = 1e-3,
     classifier_batch_size: int = 256,
     classifier_patience: int = 5,
+    # Random Forest specific parameters (only used if classifier_type="random_forest")
+    rf_n_estimators: int = 100,
+    rf_max_depth: int = 10,
+    rf_min_samples_split: int = 2,
+    rf_min_samples_leaf: int = 1,
+    # Gradient Boosting specific parameters (only used if classifier_type="gradient_boosting")
+    gb_n_estimators: int = 100,
+    gb_max_depth: int = 5,
+    gb_learning_rate: float = 0.1,
+    gb_min_samples_split: int = 2,
+    gb_min_samples_leaf: int = 1,
     # RL training parameters
     use_continuous_actions: bool = False,  # Use DDPG (continuous) instead of PPO (discrete)
     n_envs: int = 4,
@@ -164,6 +176,7 @@ def train_and_evaluate_joint(
     n_eval_instances_per_class: int = 20,
     max_features_in_rule: int = 5,
     eval_steps_per_episode: int = None,  # Defaults to steps_per_episode if None
+    num_rollouts_per_instance: int = 1,  # Number of greedy rollouts per instance (default: 1)
     # Output parameters
     output_dir: str = "./dynamic_anchors_joint_output/",
     save_checkpoints: bool = True,
@@ -214,6 +227,8 @@ def train_and_evaluate_joint(
         n_eval_instances_per_class: Instances per class for evaluation
         max_features_in_rule: Max features to show in rules
         eval_steps_per_episode: Max steps for greedy rollouts (defaults to steps_per_episode)
+        num_rollouts_per_instance: Number of greedy rollouts per instance (default: 1)
+                                  If > 1, metrics are averaged across rollouts for each instance
         output_dir: Directory for outputs
         save_checkpoints: Save checkpoints during training
         checkpoint_freq: Checkpoint frequency
@@ -229,7 +244,7 @@ def train_and_evaluate_joint(
             - metadata: Configuration and setup info
             - joint_training_history: History of training metrics per round
     """
-    from trainers.networks import SimpleClassifier
+    from trainers.networks import SimpleClassifier, UnifiedClassifier
     from trainers.vecEnv import AnchorEnv, make_dummy_vec_env, DummyVecEnv, make_dynamic_anchor_env, ContinuousAnchorEnv
     from trainers.PPO_trainer import train_ppo_model, DynamicAnchorPPOTrainer
     from trainers.DDPG_trainer import DynamicAnchorDDPGTrainer, create_ddpg_trainer
@@ -440,12 +455,66 @@ def train_and_evaluate_joint(
     print(f"  Recommendation: {recommendation}")
     print("="*80)
     
-    # Initialize classifier
+    # Initialize classifier (using UnifiedClassifier which supports DNN, RF, and GB)
     print("\n" + "="*80)
-    print("Initializing Classifier")
+    print(f"Initializing Classifier (type: {classifier_type})")
     print("="*80)
-    classifier = SimpleClassifier(n_features, n_classes).to(device_obj)
-    criterion = nn.CrossEntropyLoss()
+    
+    clf_type_lower = classifier_type.lower()
+    if clf_type_lower == "random_forest":
+        classifier = UnifiedClassifier(
+            classifier_type="random_forest",
+            device=device_str,
+            n_estimators=rf_n_estimators,
+            max_depth=rf_max_depth,
+            min_samples_split=rf_min_samples_split,
+            min_samples_leaf=rf_min_samples_leaf,
+            random_state=42,
+            n_jobs=-1,
+        )
+        # Train Random Forest initially
+        print("  Training Random Forest classifier...")
+        classifier.fit(X_train_scaled, y_train)
+        train_preds = classifier.predict(X_train_scaled)
+        train_acc = accuracy_score(y_train, train_preds)
+        print(f"  Random Forest train accuracy: {train_acc:.3f}")
+        
+        # For Random Forest, we don't need optimizer/criterion
+        clf_optimizer = None
+        criterion = None
+    elif clf_type_lower == "gradient_boosting":
+        classifier = UnifiedClassifier(
+            classifier_type="gradient_boosting",
+            device=device_str,
+            n_estimators=gb_n_estimators,
+            max_depth=gb_max_depth,
+            learning_rate=gb_learning_rate,
+            min_samples_split=gb_min_samples_split,
+            min_samples_leaf=gb_min_samples_leaf,
+            random_state=42,
+        )
+        # Train Gradient Boosting initially
+        print("  Training Gradient Boosting classifier...")
+        classifier.fit(X_train_scaled, y_train)
+        train_preds = classifier.predict(X_train_scaled)
+        train_acc = accuracy_score(y_train, train_preds)
+        print(f"  Gradient Boosting train accuracy: {train_acc:.3f}")
+        
+        # For Gradient Boosting, we don't need optimizer/criterion
+        clf_optimizer = None
+        criterion = None
+    else:  # DNN
+        classifier = UnifiedClassifier(
+            classifier_type="dnn",
+            input_dim=n_features,
+            num_classes=n_classes,
+            device=device_str,
+        )
+        classifier.to(device_obj)
+        
+        # Initialize optimizer and loss for DNN
+        clf_optimizer = optim.Adam(classifier.parameters(), lr=classifier_lr)
+        criterion = nn.CrossEntropyLoss()
     
     # Training history
     joint_training_history = []
@@ -492,9 +561,6 @@ def train_and_evaluate_joint(
     # Set n_steps default to steps_per_episode if not provided
     if n_steps is None:
         n_steps = steps_per_episode
-    
-    # Initialize classifier optimizer
-    clf_optimizer = optim.Adam(classifier.parameters(), lr=classifier_lr)
     
     # Initialize RL trainer(s) based on action type
     if use_continuous_actions:
@@ -581,44 +647,72 @@ def train_and_evaluate_joint(
         # ======================================================================
         if (ep % max(1, int(classifier_update_every))) == 0:
             print(f"\n[Episode {ep + 1}] Training Classifier...")
-            classifier.train()
             
-            dataset = TensorDataset(
-                torch.from_numpy(X_train_scaled).float(),
-                torch.from_numpy(y_train).long()
-            )
-            loader = DataLoader(dataset, batch_size=classifier_batch_size, shuffle=True)
-            
-            last_loss = None
-            last_train_acc = None
-            
-            for e in range(1, classifier_epochs_per_round + 1):
-                classifier.train()
-                epoch_loss_sum = 0.0
-                epoch_correct = 0
-                epoch_count = 0
+            clf_type_lower = classifier_type.lower()
+            if clf_type_lower == "random_forest":
+                # Random Forest: Retrain from scratch
+                print("  Retraining Random Forest classifier...")
+                classifier.fit(X_train_scaled, y_train)
                 
-                for xb, yb in loader:
-                    xb = xb.to(device_obj)
-                    yb = yb.to(device_obj)
-                    clf_optimizer.zero_grad()
-                    logits = classifier(xb)
-                    loss = criterion(logits, yb)
-                    loss.backward()
-                    clf_optimizer.step()
-                    
-                    with torch.no_grad():
-                        preds = logits.argmax(dim=1)
-                        correct = (preds == yb).sum().item()
-                        epoch_correct += correct
-                        epoch_count += yb.size(0)
-                        epoch_loss_sum += loss.item() * yb.size(0)
-                
-                last_loss = epoch_loss_sum / max(1, epoch_count)
-                last_train_acc = epoch_correct / max(1, epoch_count)
+                # Compute training accuracy
+                train_preds = classifier.predict(X_train_scaled)
+                last_train_acc = accuracy_score(y_train, train_preds)
+                last_loss = None  # Random Forest doesn't have loss
                 
                 if verbose >= 1:
-                    print(f"  [clf] epoch {e}/{classifier_epochs_per_round} | loss={last_loss:.4f} | train_acc={last_train_acc:.3f} | samples={epoch_count}")
+                    print(f"  [clf] Random Forest retrained | train_acc={last_train_acc:.3f}")
+            elif clf_type_lower == "gradient_boosting":
+                # Gradient Boosting: Retrain from scratch
+                print("  Retraining Gradient Boosting classifier...")
+                classifier.fit(X_train_scaled, y_train)
+                
+                # Compute training accuracy
+                train_preds = classifier.predict(X_train_scaled)
+                last_train_acc = accuracy_score(y_train, train_preds)
+                last_loss = None  # Gradient Boosting doesn't have loss
+                
+                if verbose >= 1:
+                    print(f"  [clf] Gradient Boosting retrained | train_acc={last_train_acc:.3f}")
+            else:  # DNN
+                # DNN: Gradient-based updates
+                classifier.train()
+                
+                dataset = TensorDataset(
+                    torch.from_numpy(X_train_scaled).float(),
+                    torch.from_numpy(y_train).long()
+                )
+                loader = DataLoader(dataset, batch_size=classifier_batch_size, shuffle=True)
+                
+                last_loss = None
+                last_train_acc = None
+                
+                for e in range(1, classifier_epochs_per_round + 1):
+                    classifier.train()
+                    epoch_loss_sum = 0.0
+                    epoch_correct = 0
+                    epoch_count = 0
+                    
+                    for xb, yb in loader:
+                        xb = xb.to(device_obj)
+                        yb = yb.to(device_obj)
+                        clf_optimizer.zero_grad()
+                        logits = classifier(xb)
+                        loss = criterion(logits, yb)
+                        loss.backward()
+                        clf_optimizer.step()
+                        
+                        with torch.no_grad():
+                            preds = logits.argmax(dim=1)
+                            correct = (preds == yb).sum().item()
+                            epoch_correct += correct
+                            epoch_count += yb.size(0)
+                            epoch_loss_sum += loss.item() * yb.size(0)
+                    
+                    last_loss = epoch_loss_sum / max(1, epoch_count)
+                    last_train_acc = epoch_correct / max(1, epoch_count)
+                    
+                    if verbose >= 1:
+                        print(f"  [clf] epoch {e}/{classifier_epochs_per_round} | loss={last_loss:.4f} | train_acc={last_train_acc:.3f} | samples={epoch_count}")
             
             classifier.eval()  # Set to eval mode for RL training
         # else: Preserve previous loss and accuracy values when classifier is not updated
@@ -626,10 +720,15 @@ def train_and_evaluate_joint(
         
         # Evaluate classifier on test set
         classifier.eval()
-        with torch.no_grad():
-            test_logits = classifier(torch.from_numpy(X_test_scaled).float().to(device_obj))
-            test_preds = test_logits.argmax(dim=1).cpu().numpy()
+        clf_type_lower = classifier_type.lower()
+        if clf_type_lower in ["random_forest", "gradient_boosting"]:
+            test_preds = classifier.predict(X_test_scaled)
             test_acc = accuracy_score(y_test, test_preds)
+        else:  # DNN
+            with torch.no_grad():
+                test_logits = classifier(torch.from_numpy(X_test_scaled).float().to(device_obj))
+                test_preds = test_logits.argmax(dim=1).cpu().numpy()
+                test_acc = accuracy_score(y_test, test_preds)
         test_acc_history.append(test_acc)
         
         # ======================================================================
@@ -1371,6 +1470,7 @@ def train_and_evaluate_joint(
                 eval_on_test_data=False,  # Default: use training data (backward compatible)
                 X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
                 X_test_std=X_test_scaled if False else None,
+                num_rollouts_per_instance=num_rollouts_per_instance,
             )
         else:
             raise ValueError("No DDPG trainers available for evaluation")
@@ -1390,6 +1490,7 @@ def train_and_evaluate_joint(
             eval_on_test_data=False,  # Default: use training data (backward compatible)
             X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
             X_test_std=X_test_scaled if False else None,
+            num_rollouts_per_instance=num_rollouts_per_instance,
         )
     
     # Close environments
@@ -1462,9 +1563,30 @@ def train_and_evaluate_joint(
                 print(f"    [WARNING] Could not save policy/value separately: {e}")
     
     # Save classifier model
-    classifier_path = f"{models_dir}/classifier_final.pth"
-    torch.save(classifier.state_dict(), classifier_path)
-    print(f"  Saved classifier model: {classifier_path}")
+    clf_type_lower = classifier_type.lower()
+    if clf_type_lower == "random_forest":
+        # Save Random Forest using joblib (sklearn's recommended way)
+        try:
+            import joblib
+            classifier_path = f"{models_dir}/classifier_final_rf.joblib"
+            joblib.dump(classifier.rf_model, classifier_path)
+            print(f"  Saved Random Forest classifier: {classifier_path}")
+        except ImportError:
+            print(f"  [WARNING] joblib not available, skipping Random Forest save")
+    elif clf_type_lower == "gradient_boosting":
+        # Save Gradient Boosting using joblib (sklearn's recommended way)
+        try:
+            import joblib
+            classifier_path = f"{models_dir}/classifier_final_gb.joblib"
+            joblib.dump(classifier.gb_model, classifier_path)
+            print(f"  Saved Gradient Boosting classifier: {classifier_path}")
+        except ImportError:
+            print(f"  [WARNING] joblib not available, skipping Gradient Boosting save")
+    else:  # DNN
+        # Save DNN using PyTorch
+        classifier_path = f"{models_dir}/classifier_final.pth"
+        torch.save(classifier.state_dict(), classifier_path)
+        print(f"  Saved DNN classifier: {classifier_path}")
     
     # ======================================================================
     # STEP 5: Save Full Metrics and Rules to JSON
@@ -1497,27 +1619,69 @@ def train_and_evaluate_joint(
     for cls_int in target_classes:
         if cls_int in eval_results.get("per_class_results", {}):
             cls_result = eval_results["per_class_results"][cls_int]
-            metrics_data["per_class_results"][f"class_{cls_int}"] = {
-                "precision": float(cls_result.get("precision", 0.0)),
-                "hard_precision": float(cls_result.get("hard_precision", cls_result.get("precision", 0.0))),
-                "coverage": float(cls_result.get("coverage", 0.0)),
-                "n_points": int(cls_result.get("n_points", 0)),
-                "n_instances_evaluated": int(cls_result.get("n_instances", 0)),
-                "rules": cls_result.get("rules", []),
-                "anchors": []
-            }
             
-            # Add anchor details (lower/upper bounds) for each instance
-            if "anchors" in cls_result:
-                for anchor in cls_result["anchors"]:
-                    metrics_data["per_class_results"][f"class_{cls_int}"]["anchors"].append({
-                        "lower_bounds": anchor.get("lower", []),
-                        "upper_bounds": anchor.get("upper", []),
-                        "precision": float(anchor.get("precision", 0.0)),
-                        "coverage": float(anchor.get("coverage", 0.0)),
-                        "n_points": int(anchor.get("n_points", 0)),
-                        "rule": anchor.get("rule", ""),
+            # Extract rules and instance information from individual_results
+            rules_list = []  # Simple list of rule strings
+            rules_with_instances = []  # Rules with instance indices
+            anchors_list = []
+            instance_indices_used = []  # Track which instances were evaluated
+            
+            if "individual_results" in cls_result:
+                for individual_result in cls_result["individual_results"]:
+                    instance_idx = int(individual_result.get("instance_idx", -1))
+                    rule = individual_result.get("rule", "")
+                    
+                    # Track instance index
+                    if instance_idx >= 0:
+                        instance_indices_used.append(instance_idx)
+                    
+                    # Add to rules list (all rules, including empty ones)
+                    rules_list.append(rule)
+                    
+                    # Add rule with instance information
+                    rules_with_instances.append({
+                        "instance_idx": instance_idx,
+                        "rule": rule,
+                        "precision": float(individual_result.get("precision", 0.0)),
+                        "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                        "coverage": float(individual_result.get("coverage", 0.0)),
+                        "n_points": int(individual_result.get("n_points", 0)),
                     })
+                    
+                    # Add anchor details (lower/upper bounds) for each instance
+                    anchors_list.append({
+                        "instance_idx": instance_idx,
+                        "lower_bounds": individual_result.get("lower_bounds", []),
+                        "upper_bounds": individual_result.get("upper_bounds", []),
+                        "precision": float(individual_result.get("precision", 0.0)),
+                        "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                        "coverage": float(individual_result.get("coverage", 0.0)),
+                        "n_points": int(individual_result.get("n_points", 0)),
+                        "rule": rule,
+                    })
+            
+            # Count unique rules
+            unique_rules = list(set([r for r in rules_list if r]))  # Only non-empty rules
+            unique_rules_count = len(unique_rules)
+            
+            metrics_data["per_class_results"][f"class_{cls_int}"] = {
+                "precision": float(cls_result.get("precision", cls_result.get("avg_precision", 0.0))),
+                "hard_precision": float(cls_result.get("hard_precision", cls_result.get("avg_hard_precision", cls_result.get("precision", 0.0)))),
+                "coverage": float(cls_result.get("coverage", cls_result.get("avg_coverage", 0.0))),
+                "n_points": int(cls_result.get("n_points", 0)),
+                "n_instances_evaluated": int(cls_result.get("n_instances", len(anchors_list))),
+                "best_rule": cls_result.get("best_rule", ""),
+                "best_precision": float(cls_result.get("best_precision", 0.0)),
+                # Rules information
+                "rules": rules_list,  # All rules (one per instance, in order)
+                "rules_with_instances": rules_with_instances,  # Rules with instance indices and metrics
+                "unique_rules": unique_rules,  # List of unique rule strings
+                "unique_rules_count": unique_rules_count,  # Number of unique rules
+                # Instance information
+                "instance_indices_used": instance_indices_used,  # Which test instances were evaluated
+                # Full anchor details
+                "anchors": anchors_list  # Complete anchor details for each instance (includes bounds, metrics, rule)
+            }
     
     # Add training history (per episode)
     for hist_entry in joint_training_history:
@@ -1578,6 +1742,42 @@ def train_and_evaluate_joint(
     with open(json_path, 'w') as f:
         json.dump(metrics_data, f, indent=2, ensure_ascii=False)
     print(f"\nSaved metrics and rules to: {json_path}")
+    
+    # ======================================================================
+    # STEP 6: Create 2D Visualization of Rules
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("CREATING 2D VISUALIZATION OF RULES")
+    print(f"{'='*80}")
+    
+    try:
+        from trainers.dynAnchors_inference import plot_rules_2d
+        
+        plot_path = f"{output_dir}/plots/rules_2d_visualization.png"
+        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        
+        # Get X_min and X_range (they're defined earlier in the function)
+        # X_min and X_range are computed from X_train_scaled for unit space conversion
+        # For plotting, we need them to convert bounds from unit space to standardized space
+        
+        # Create 2D plot of rules
+        plot_path = plot_rules_2d(
+            eval_results=eval_results,
+            X_test=X_test_scaled,  # Use standardized test data
+            y_test=y_test,
+            feature_names=feature_names,
+            class_names=None,  # Can be passed if available, but not required
+            output_path=plot_path,
+            X_min=X_min,  # Available from earlier in function
+            X_range=X_range,  # Available from earlier in function
+        )
+        print(f"  Saved 2D rules visualization: {plot_path}")
+    except Exception as e:
+        if verbose >= 1:
+            print(f"  [WARNING] Could not create 2D visualization: {e}")
+        import traceback
+        if verbose >= 2:
+            traceback.print_exc()
     
     # Prepare results
     if use_continuous_actions:

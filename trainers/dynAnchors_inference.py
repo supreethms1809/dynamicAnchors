@@ -7,6 +7,10 @@ dynamic anchor explanations for individual instances and classes.
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import Counter
 from stable_baselines3 import PPO, DDPG
@@ -221,6 +225,7 @@ def evaluate_single_instance(
     X_test_std: Optional[np.ndarray] = None,
     y_test: Optional[np.ndarray] = None,
     initial_window: Optional[float] = None,
+    num_rollouts_per_instance: int = 1,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchor for a single instance.
@@ -240,11 +245,14 @@ def evaluate_single_instance(
         X_test_std: Test data in standardized space (required if eval_on_test_data=True)
         y_test: Test labels (required if eval_on_test_data=True)
         initial_window: Initial window size for anchor box (default: 0.3 for eval, matches training if None)
+        num_rollouts_per_instance: Number of greedy rollouts to run per instance (default: 1)
+                                  If > 1, metrics are averaged across rollouts
     
     Returns:
         Dictionary with anchor explanation and metrics.
         Note: Coverage and precision are computed on training data by default.
         Set eval_on_test_data=True to compute on test data.
+        If num_rollouts_per_instance > 1, metrics are averaged across rollouts.
     """
     # Detect model type: DDPG has actor/critic, PPO has policy
     is_ddpg = hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic')
@@ -338,23 +346,81 @@ def evaluate_single_instance(
     # This avoids double reset and ensures initial_width is captured correctly
     # Check initial coverage will be done inside greedy_rollout after reset
     
-    # Run greedy evaluation
-    info, rule, lower, upper = greedy_rollout(
-        env,
-        trained_model,
-        steps_per_episode=steps_per_episode,
-        max_features_in_rule=max_features_in_rule
-    )
-    
-    return {
-        "rule": rule,
-        "precision": info.get("precision", 0.0),
-        "hard_precision": info.get("hard_precision", 0.0),
-        "coverage": info.get("coverage", 0.0),
-        "lower_bounds": lower.tolist(),
-        "upper_bounds": upper.tolist(),
-        "data_source": info.get("data_source", "training"),  # Indicates which dataset metrics are computed on
-    }
+    # Run multiple greedy rollouts if requested
+    if num_rollouts_per_instance > 1:
+        # Collect results from multiple rollouts
+        rollout_results = []
+        for rollout_idx in range(num_rollouts_per_instance):
+            # Create a new environment for each rollout to ensure fresh state
+            # Use different seed for each rollout to introduce variation
+            if is_ddpg:
+                env_rollout = ContinuousAnchorEnv(anchor_env, seed=42 + rollout_idx)
+            else:
+                env_rollout = DynamicAnchorEnv(anchor_env, seed=42 + rollout_idx)
+            
+            info, rule, lower, upper = greedy_rollout(
+                env_rollout,
+                trained_model,
+                steps_per_episode=steps_per_episode,
+                max_features_in_rule=max_features_in_rule
+            )
+            rollout_results.append({
+                "info": info,
+                "rule": rule,
+                "lower": lower,
+                "upper": upper
+            })
+        
+        # Average metrics across rollouts
+        precisions = [r["info"].get("precision", 0.0) for r in rollout_results]
+        hard_precisions = [r["info"].get("hard_precision", r["info"].get("precision", 0.0)) for r in rollout_results]
+        coverages = [r["info"].get("coverage", 0.0) for r in rollout_results]
+        
+        avg_precision = np.mean(precisions)
+        avg_hard_precision = np.mean(hard_precisions)
+        avg_coverage = np.mean(coverages)
+        
+        # Use the best rollout (by hard precision) for the rule and bounds
+        best_idx = np.argmax(hard_precisions)
+        best_result = rollout_results[best_idx]
+        
+        # Also compute std dev for reporting
+        std_precision = np.std(precisions) if len(precisions) > 1 else 0.0
+        std_hard_precision = np.std(hard_precisions) if len(hard_precisions) > 1 else 0.0
+        std_coverage = np.std(coverages) if len(coverages) > 1 else 0.0
+        
+        return {
+            "rule": best_result["rule"],
+            "precision": float(avg_precision),
+            "hard_precision": float(avg_hard_precision),
+            "coverage": float(avg_coverage),
+            "lower_bounds": best_result["lower"].tolist(),
+            "upper_bounds": best_result["upper"].tolist(),
+            "data_source": best_result["info"].get("data_source", "training"),
+            "num_rollouts": num_rollouts_per_instance,
+            "std_precision": float(std_precision),
+            "std_hard_precision": float(std_hard_precision),
+            "std_coverage": float(std_coverage),
+        }
+    else:
+        # Single rollout (original behavior)
+        info, rule, lower, upper = greedy_rollout(
+            env,
+            trained_model,
+            steps_per_episode=steps_per_episode,
+            max_features_in_rule=max_features_in_rule
+        )
+        
+        return {
+            "rule": rule,
+            "precision": info.get("precision", 0.0),
+            "hard_precision": info.get("hard_precision", 0.0),
+            "coverage": info.get("coverage", 0.0),
+            "lower_bounds": lower.tolist(),
+            "upper_bounds": upper.tolist(),
+            "data_source": info.get("data_source", "training"),
+            "num_rollouts": 1,
+        }
 
 
 def evaluate_class(
@@ -372,6 +438,7 @@ def evaluate_class(
     X_test_unit: Optional[np.ndarray] = None,
     X_test_std: Optional[np.ndarray] = None,
     initial_window: Optional[float] = None,
+    num_rollouts_per_instance: int = 1,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchors for multiple instances of a class.
@@ -394,11 +461,14 @@ def evaluate_class(
         X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
         X_test_std: Test data in standardized space (required if eval_on_test_data=True)
         initial_window: Initial window size for anchor box (default: matches training)
+        num_rollouts_per_instance: Number of greedy rollouts per instance (default: 1)
+                                  If > 1, metrics are averaged across rollouts for each instance
     
     Returns:
         Dictionary with aggregated metrics and individual results.
         Note: By default, coverage and precision are computed on training data.
         Set eval_on_test_data=True to compute on test data.
+        If num_rollouts_per_instance > 1, metrics are averaged across rollouts per instance.
     """
     # Sample instances from target class
     rng = np.random.default_rng(random_seed)
@@ -446,6 +516,7 @@ def evaluate_class(
             X_test_std=X_test_std,
             y_test=y_test,
             initial_window=initial_window,
+            num_rollouts_per_instance=num_rollouts_per_instance,
         )
         result["instance_idx"] = int(instance_idx)
         individual_results.append(result)
@@ -500,6 +571,7 @@ def evaluate_all_classes(
     X_test_unit: Optional[np.ndarray] = None,
     X_test_std: Optional[np.ndarray] = None,
     initial_window: Optional[float] = None,
+    num_rollouts_per_instance: int = 1,
 ) -> Dict[str, Any]:
     """
     Evaluate and generate anchors for all classes.
@@ -518,11 +590,14 @@ def evaluate_all_classes(
         X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
         X_test_std: Test data in standardized space (required if eval_on_test_data=True)
         initial_window: Initial window size for anchor box (default: matches training)
+        num_rollouts_per_instance: Number of greedy rollouts per instance (default: 1)
+                                  If > 1, metrics are averaged across rollouts for each instance
     
     Returns:
         Dictionary with per-class results and overall statistics.
         Note: By default, coverage and precision are computed on training data.
         Set eval_on_test_data=True to compute on test data.
+        If num_rollouts_per_instance > 1, metrics are averaged across rollouts per instance.
     """
     unique_classes = np.unique(y_test)
     n_classes = len(unique_classes)
@@ -560,6 +635,7 @@ def evaluate_all_classes(
                 X_test_unit=X_test_unit,
                 X_test_std=X_test_std,
                 initial_window=initial_window,
+                num_rollouts_per_instance=num_rollouts_per_instance,
             )
             per_class_results[cls_int] = result
             
@@ -606,6 +682,7 @@ def evaluate_all_classes(
                 X_test_unit=X_test_unit,
                 X_test_std=X_test_std,
                 initial_window=initial_window,
+                num_rollouts_per_instance=num_rollouts_per_instance,
             )
             per_class_results[int(cls)] = result
         
@@ -701,4 +778,334 @@ def prepare_test_data_for_evaluation(
     X_test_unit = (X_test_scaled - X_min) / X_range
     X_test_unit = np.clip(X_test_unit, 0.0, 1.0).astype(np.float32)
     return X_test_unit, X_test_scaled
+
+
+def plot_rules_2d(
+    eval_results: Dict[str, Any],
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    feature_names: List[str],
+    class_names: Optional[List[str]] = None,
+    feature_indices: Optional[Tuple[int, int]] = None,
+    output_path: str = "./rules_2d_visualization.png",
+    figsize: Tuple[int, int] = (14, 10),
+    alpha_anchors: float = 0.3,
+    alpha_points: float = 0.6,
+    show_instances_used: bool = True,
+    X_min: Optional[np.ndarray] = None,
+    X_range: Optional[np.ndarray] = None,
+) -> str:
+    """
+    Visualize anchor rules as 2D rectangles.
+    
+    Creates a 2D plot showing:
+    - Data points colored by class
+    - Anchor boxes (rules) as rectangles
+    - Instances used for evaluation (highlighted)
+    
+    Args:
+        eval_results: Results from evaluate_all_classes() containing rules and anchors
+        X_test: Test data (in standardized space, used for plotting)
+        y_test: Test labels
+        feature_names: List of feature names
+        class_names: Optional list of class names (for legend)
+        feature_indices: Optional tuple (feat_idx1, feat_idx2) to specify which 2 features to plot
+                       If None, auto-selects features that appear most frequently in rules
+        output_path: Path to save the plot
+        figsize: Figure size (width, height)
+        alpha_anchors: Transparency for anchor rectangles (0-1)
+        alpha_points: Transparency for data points (0-1)
+        show_instances_used: If True, highlight instances used for evaluation
+        X_min: Optional min values for converting bounds from unit space to standardized space
+        X_range: Optional range values for converting bounds from unit space to standardized space
+    
+    Returns:
+        Path to saved plot file
+    """
+    
+    per_class_results = eval_results.get("per_class_results", {})
+    if not per_class_results:
+        raise ValueError("eval_results must contain per_class_results with anchors")
+    
+    # Auto-select features if not specified
+    if feature_indices is None:
+        # Count feature frequency in rules
+        feature_counts = {}
+        for cls_result in per_class_results.values():
+            if "anchors" in cls_result:
+                for anchor in cls_result["anchors"]:
+                    lower = np.array(anchor.get("lower_bounds", []))
+                    upper = np.array(anchor.get("upper_bounds", []))
+                    if len(lower) > 0 and len(upper) > 0:
+                        # Find features that were tightened (width < 0.95 of full range)
+                        widths = upper - lower
+                        tightened = np.where(widths < 0.95)[0]
+                        for feat_idx in tightened:
+                            feature_counts[feat_idx] = feature_counts.get(feat_idx, 0) + 1
+        
+        if len(feature_counts) >= 2:
+            # Select top 2 most frequently tightened features
+            top_features = sorted(feature_counts.items(), key=lambda x: x[1], reverse=True)[:2]
+            feature_indices = (top_features[0][0], top_features[1][0])
+        elif len(feature_counts) == 1:
+            # Use the one tightened feature and the first feature
+            feature_indices = (list(feature_counts.keys())[0], 0)
+        else:
+            # Fallback: use first two features
+            feature_indices = (0, min(1, len(feature_names) - 1))
+    
+    feat_idx1, feat_idx2 = feature_indices
+    
+    # Validate feature indices
+    if feat_idx1 >= len(feature_names) or feat_idx2 >= len(feature_names):
+        raise ValueError(f"Feature indices {feature_indices} out of range (max: {len(feature_names)-1})")
+    
+    # Get feature names for axes
+    feat_name1 = feature_names[feat_idx1]
+    feat_name2 = feature_names[feat_idx2]
+    
+    # Create figure with subplots for each class
+    unique_classes = sorted([int(k.split('_')[1]) for k in per_class_results.keys()])
+    n_classes = len(unique_classes)
+    
+    # Determine grid layout
+    if n_classes <= 2:
+        n_rows, n_cols = 1, n_classes
+    elif n_classes <= 4:
+        n_rows, n_cols = 2, 2
+    elif n_classes <= 6:
+        n_rows, n_cols = 2, 3
+    else:
+        n_rows, n_cols = 3, 3
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    if n_classes == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten() if n_rows > 1 else axes
+    
+    # Color map for classes
+    colors = plt.cm.tab10(np.linspace(0, 1, max(10, len(unique_classes))))
+    
+    # Plot each class
+    for plot_idx, cls_int in enumerate(unique_classes):
+        if plot_idx >= len(axes):
+            break
+        
+        ax = axes[plot_idx]
+        cls_key = f"class_{cls_int}"
+        
+        if cls_key not in per_class_results:
+            ax.text(0.5, 0.5, f"No data for class {cls_int}", 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f"Class {cls_int}")
+            continue
+        
+        cls_result = per_class_results[cls_key]
+        cls_name = class_names[cls_int] if class_names and cls_int < len(class_names) else f"Class {cls_int}"
+        
+        # Get anchors for this class
+        anchors = cls_result.get("anchors", [])
+        instance_indices_used = cls_result.get("instance_indices_used", [])
+        
+        # Plot all data points (colored by class)
+        for other_cls in unique_classes:
+            mask = y_test == other_cls
+            if np.any(mask):
+                ax.scatter(
+                    X_test[mask, feat_idx1],
+                    X_test[mask, feat_idx2],
+                    c=[colors[other_cls % len(colors)]],
+                    alpha=alpha_points * 0.5 if other_cls != cls_int else alpha_points,
+                    s=20,
+                    label=f"Class {other_cls}" if other_cls == cls_int else None,
+                    edgecolors='none',
+                    zorder=1
+                )
+        
+        # Highlight instances used for evaluation
+        if show_instances_used and len(instance_indices_used) > 0:
+            used_mask = np.zeros(len(X_test), dtype=bool)
+            for idx in instance_indices_used:
+                if 0 <= idx < len(X_test):
+                    used_mask[idx] = True
+            
+            if np.any(used_mask):
+                ax.scatter(
+                    X_test[used_mask, feat_idx1],
+                    X_test[used_mask, feat_idx2],
+                    c='red',
+                    marker='x',
+                    s=100,
+                    linewidths=2,
+                    label='Instances evaluated',
+                    zorder=4,
+                    alpha=0.8
+                )
+        
+        # Draw anchor rectangles
+        anchor_colors = plt.cm.Set3(np.linspace(0, 1, max(len(anchors), 1)))
+        for anchor_idx, anchor in enumerate(anchors):
+            lower = np.array(anchor.get("lower_bounds", []))
+            upper = np.array(anchor.get("upper_bounds", []))
+            
+            if len(lower) == 0 or len(upper) == 0:
+                continue
+            
+            # Get bounds for the two features we're plotting
+            # Bounds are stored in unit space [0, 1], but X_test is in standardized space
+            # We need to convert bounds from unit space to standardized space
+            # Conversion: standardized = unit * X_range + X_min
+            # But we don't have X_min and X_range here, so we'll use the data range
+            # For visualization purposes, we can approximate using X_test range
+            
+            # Get data range for conversion
+            # Use provided X_min/X_range if available, otherwise use X_test range
+            if X_min is not None and X_range is not None:
+                X_min_feat1 = X_min[feat_idx1]
+                X_range_feat1 = X_range[feat_idx1]
+                X_min_feat2 = X_min[feat_idx2]
+                X_range_feat2 = X_range[feat_idx2]
+            else:
+                # Fallback: use X_test range (approximation)
+                X_min_feat1 = X_test[:, feat_idx1].min()
+                X_max_feat1 = X_test[:, feat_idx1].max()
+                X_range_feat1 = X_max_feat1 - X_min_feat1
+                
+                X_min_feat2 = X_test[:, feat_idx2].min()
+                X_max_feat2 = X_test[:, feat_idx2].max()
+                X_range_feat2 = X_max_feat2 - X_min_feat2
+            
+            # Convert bounds from unit space [0,1] to standardized space
+            if feat_idx1 < len(lower) and feat_idx1 < len(upper):
+                # Bounds are in [0,1], convert to standardized space
+                lower_feat1 = X_min_feat1 + lower[feat_idx1] * X_range_feat1
+                upper_feat1 = X_min_feat1 + upper[feat_idx1] * X_range_feat1
+            else:
+                lower_feat1 = X_test[:, feat_idx1].min()
+                upper_feat1 = X_test[:, feat_idx1].max()
+            
+            if feat_idx2 < len(lower) and feat_idx2 < len(upper):
+                lower_feat2 = X_min_feat2 + lower[feat_idx2] * X_range_feat2
+                upper_feat2 = X_min_feat2 + upper[feat_idx2] * X_range_feat2
+            else:
+                lower_feat2 = X_test[:, feat_idx2].min()
+                upper_feat2 = X_test[:, feat_idx2].max()
+            
+            width1 = upper_feat1 - lower_feat1
+            width2 = upper_feat2 - lower_feat2
+            
+            # Draw rectangle
+            rect = Rectangle(
+                (lower_feat1, lower_feat2),
+                width1,
+                width2,
+                linewidth=2,
+                edgecolor=colors[cls_int % len(colors)],
+                facecolor=colors[cls_int % len(colors)],
+                alpha=alpha_anchors,
+                zorder=2
+            )
+            ax.add_patch(rect)
+            
+            # Add text label with precision/coverage if space allows
+            if width1 > 0 and width2 > 0:
+                prec = anchor.get("precision", 0.0)
+                cov = anchor.get("coverage", 0.0)
+                if prec > 0 or cov > 0:
+                    ax.text(
+                        lower_feat1 + width1/2,
+                        lower_feat2 + width2/2,
+                        f"P:{prec:.2f}\nC:{cov:.2f}",
+                        ha='center',
+                        va='center',
+                        fontsize=8,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7),
+                        zorder=3
+                    )
+        
+        ax.set_xlabel(feat_name1, fontsize=10)
+        ax.set_ylabel(feat_name2, fontsize=10)
+        ax.set_title(f"{cls_name}\n({len(anchors)} anchors)", fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+    
+    # Hide unused subplots
+    for idx in range(n_classes, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle(
+        f'2D Visualization of Anchor Rules\nFeatures: {feat_name1} vs {feat_name2}',
+        fontsize=14,
+        fontweight='bold',
+        y=0.995
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return output_path
+
+
+def plot_rules_2d_from_json(
+    json_path: str,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    feature_names: List[str],
+    class_names: Optional[List[str]] = None,
+    feature_indices: Optional[Tuple[int, int]] = None,
+    output_path: Optional[str] = None,
+    **plot_kwargs
+) -> str:
+    """
+    Visualize anchor rules from saved JSON file.
+    
+    Convenience function to load rules from JSON and create 2D visualization.
+    
+    Args:
+        json_path: Path to metrics_and_rules.json file
+        X_test: Test data (in standardized space)
+        y_test: Test labels
+        feature_names: List of feature names
+        class_names: Optional list of class names
+        feature_indices: Optional tuple (feat_idx1, feat_idx2) to specify which 2 features to plot
+        output_path: Optional output path (defaults to same directory as JSON with _2d_plot suffix)
+        **plot_kwargs: Additional arguments passed to plot_rules_2d()
+    
+    Returns:
+        Path to saved plot file
+    """
+    import json
+    
+    # Load JSON
+    with open(json_path, 'r') as f:
+        metrics_data = json.load(f)
+    
+    # Convert to eval_results format
+    eval_results = {
+        "per_class_results": {}
+    }
+    
+    for cls_key, cls_data in metrics_data.get("per_class_results", {}).items():
+        cls_int = int(cls_key.split('_')[1])
+        eval_results["per_class_results"][cls_int] = cls_data
+    
+    # Set default output path
+    if output_path is None:
+        import os
+        base_dir = os.path.dirname(json_path)
+        base_name = os.path.splitext(os.path.basename(json_path))[0]
+        output_path = os.path.join(base_dir, f"{base_name}_2d_plot.png")
+    
+    # Create plot
+    return plot_rules_2d(
+        eval_results=eval_results,
+        X_test=X_test,
+        y_test=y_test,
+        feature_names=feature_names,
+        class_names=class_names,
+        feature_indices=feature_indices,
+        output_path=output_path,
+        **plot_kwargs
+    )
 
