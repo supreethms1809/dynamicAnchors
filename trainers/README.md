@@ -142,7 +142,7 @@ python trainers/test_inference.py --test-all
 
 ### Reward
 - `α * precision_gain + β * coverage_gain - penalties`
-- Penalties for overlap, drift, JS-divergence
+- Penalties for overlap, drift, volume/overlap proxy (JS-like penalty)
 - Coverage floor enforcement
 
 ## License

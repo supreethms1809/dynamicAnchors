@@ -56,7 +56,7 @@ def train_and_evaluate_dynamic_anchors(
     max_features_in_rule: int = 5,
     steps_per_episode: int = 100,
     # Output parameters
-    output_dir: str = "./dynamic_anchors_output/",
+    output_dir: str = "./output/anchors/",
     save_checkpoints: bool = True,
     checkpoint_freq: int = 10000,
     eval_freq: int = 5000,
@@ -116,6 +116,9 @@ def train_and_evaluate_dynamic_anchors(
     from trainers.PPO_trainer import train_ppo_model
     from trainers.dynAnchors_inference import evaluate_all_classes
     from trainers.device_utils import get_device_pair
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     
     # Standardize device handling: get both object and string
     device_obj, device_str = get_device_pair(device)

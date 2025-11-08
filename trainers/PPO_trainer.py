@@ -39,7 +39,7 @@ class DynamicAnchorPPOTrainer:
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         verbose: int = 1,
-        tensorboard_log: Optional[str] = "./ppo_tensorboard/",
+        tensorboard_log: Optional[str] = "./output/ppo/tensorboard/",
         device: str = "auto",
     ):
         """
@@ -124,7 +124,7 @@ class DynamicAnchorPPOTrainer:
         # Add checkpoint callback if requested
         if save_checkpoints:
             if checkpoint_dir is None:
-                checkpoint_dir = "./ppo_checkpoints/"
+                checkpoint_dir = "./output/ppo/checkpoints/"
             os.makedirs(checkpoint_dir, exist_ok=True)
             
             checkpoint_callback = CheckpointCallback(
@@ -140,7 +140,7 @@ class DynamicAnchorPPOTrainer:
         # A separate eval env would require passing env factory from caller
         if eval_freq > 0:
             if eval_log_path is None:
-                eval_log_path = "./ppo_eval_logs/"
+                eval_log_path = "./output/ppo/eval_logs/"
             os.makedirs(eval_log_path, exist_ok=True)
             
             eval_callback = EvalCallback(
@@ -226,7 +226,7 @@ def train_ppo_model(
     total_timesteps: int,
     policy_type: str = "MlpPolicy",
     learning_rate: float = 3e-4,
-    output_dir: str = "./ppo_output/",
+    output_dir: str = "./output/ppo/",
     save_checkpoints: bool = True,
     checkpoint_freq: int = 10000,
     eval_freq: int = 5000,

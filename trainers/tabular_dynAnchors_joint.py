@@ -41,6 +41,88 @@ from functools import partial
 from stable_baselines3.common.callbacks import BaseCallback
 
 
+def compute_bootstrapped_return(
+    rewards: list, 
+    last_obs: np.ndarray, 
+    model, 
+    gamma: float = 0.99,
+    truncated: bool = False
+) -> float:
+    """
+    Compute episode return with bootstrap for truncated episodes.
+    
+    If episode ended due to horizon (truncated=True), bootstrap with V(last_state)
+    to reduce bias. Otherwise, return sum of rewards.
+    
+    Args:
+        rewards: List of rewards for the episode
+        last_obs: Last observation (state) before episode ended
+        model: RL model (PPO or DDPG) with value function
+        gamma: Discount factor
+        truncated: Whether episode ended due to horizon (True) or termination (False)
+    
+    Returns:
+        Bootstrapped return: sum(rewards) + gamma * V(last_state) if truncated, else sum(rewards)
+    """
+    total_reward = sum(rewards)
+    
+    if truncated and model is not None:
+        try:
+            # Get value function estimate for last state
+            # For PPO: use policy.value() or extract from model
+            # For DDPG: use critic network
+            import torch
+            
+            # Convert observation to tensor
+            if isinstance(last_obs, np.ndarray):
+                obs_tensor = torch.from_numpy(last_obs).float()
+            else:
+                obs_tensor = torch.tensor(last_obs, dtype=torch.float32)
+            
+            # Handle batch dimension
+            if len(obs_tensor.shape) == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+            
+            with torch.no_grad():
+                # Get device from model
+                device = model.device if hasattr(model, 'device') else torch.device('cpu')
+                obs_tensor = obs_tensor.to(device)
+                
+                if hasattr(model, 'policy') and hasattr(model.policy, 'predict_values'):
+                    # PPO: use policy's value function
+                    value_tensor = model.policy.predict_values(obs_tensor)
+                    value = value_tensor.item() if value_tensor.numel() == 1 else value_tensor[0].item()
+                elif hasattr(model, 'critic'):
+                    # DDPG: use critic network (Q-function, need to get action too)
+                    # For DDPG, we need action - use actor to get action, then critic
+                    if hasattr(model, 'actor'):
+                        action = model.actor(obs_tensor)
+                        value_tensor = model.critic(obs_tensor, action)
+                        value = value_tensor.item() if value_tensor.numel() == 1 else value_tensor[0].item()
+                    else:
+                        # Fallback: just use critic with zero action (not ideal but better than nothing)
+                        action_shape = model.critic.observation_space.shape if hasattr(model.critic, 'observation_space') else (obs_tensor.shape[-1],)
+                        zero_action = torch.zeros((obs_tensor.shape[0], action_shape[0] if len(action_shape) > 0 else 1), device=device)
+                        value_tensor = model.critic(obs_tensor, zero_action)
+                        value = value_tensor.item() if value_tensor.numel() == 1 else value_tensor[0].item()
+                elif hasattr(model, 'predict_values'):
+                    # Direct value prediction method
+                    value_tensor = model.predict_values(obs_tensor)
+                    value = value_tensor.item() if value_tensor.numel() == 1 else value_tensor[0].item()
+                else:
+                    # No value function available
+                    value = 0.0
+            
+            # Bootstrap: add discounted value estimate
+            bootstrapped_return = total_reward + gamma * value
+            return float(bootstrapped_return)
+        except Exception:
+            # If value function access fails, return sum of rewards
+            return total_reward
+    
+    return total_reward
+
+
 class RewardCallback(BaseCallback):
     """Callback to track episode rewards during training."""
     def __init__(self, verbose=0):
@@ -49,6 +131,8 @@ class RewardCallback(BaseCallback):
         self.episode_lengths = []
         self.episode_reward_sums = {}  # Track per-environment reward sums
         self.episode_lengths_track = {}  # Track per-environment episode lengths
+        self.episode_reward_lists = {}  # Track rewards per environment for bootstrapping
+        self.last_observations = {}  # Track last observations for bootstrapping
         
     def _on_training_start(self) -> None:
         # Initialize tracking when training starts
@@ -68,12 +152,15 @@ class RewardCallback(BaseCallback):
         for env_idx in range(self.n_envs):
             self.episode_reward_sums[env_idx] = 0.0
             self.episode_lengths_track[env_idx] = 0
+            self.episode_reward_lists[env_idx] = []
+            self.last_observations[env_idx] = None
     
     def _on_step(self) -> bool:
         # Track rewards from infos (Monitor wrapper provides episode info)
         infos = self.locals.get('infos', [])
         rewards = self.locals.get('rewards', [])
         dones = self.locals.get('dones', [])
+        observations = self.locals.get('new_obs', None)  # Get observations for bootstrapping
         
         # First, check if episode info is available from Monitor wrapper
         has_episode_info = False
@@ -101,6 +188,16 @@ class RewardCallback(BaseCallback):
                 else:
                     dones_list = dones if isinstance(dones, list) else [dones]
             
+            # Get truncated flags if available (gymnasium API)
+            truncated_list = []
+            if 'truncated' in self.locals:
+                truncated = self.locals.get('truncated', [])
+                if len(truncated) > 0:
+                    if isinstance(truncated, np.ndarray):
+                        truncated_list = truncated.flatten().tolist()
+                    else:
+                        truncated_list = truncated if isinstance(truncated, list) else [truncated]
+            
             # Track rewards for each environment
             n_track = min(len(rewards_list), len(dones_list) if len(dones_list) > 0 else len(rewards_list), self.n_envs)
             for env_idx in range(n_track):
@@ -109,17 +206,69 @@ class RewardCallback(BaseCallback):
                 if env_idx not in self.episode_reward_sums:
                     self.episode_reward_sums[env_idx] = 0.0
                     self.episode_lengths_track[env_idx] = 0
+                    self.episode_reward_lists[env_idx] = []
+                    self.last_observations[env_idx] = None
                 
                 self.episode_reward_sums[env_idx] += reward_val
+                self.episode_reward_lists[env_idx].append(reward_val)
                 self.episode_lengths_track[env_idx] += 1
                 
-                # If episode is done, store the accumulated reward
+                # Store last observation for bootstrapping
+                if observations is not None:
+                    if isinstance(observations, np.ndarray):
+                        if len(observations.shape) > 1:
+                            self.last_observations[env_idx] = observations[env_idx].copy()
+                        else:
+                            self.last_observations[env_idx] = observations.copy()
+                    else:
+                        self.last_observations[env_idx] = observations[env_idx] if env_idx < len(observations) else None
+                
+                # If episode is done, compute bootstrapped return if truncated
                 if len(dones_list) > env_idx and dones_list[env_idx]:
-                    self.episode_rewards.append(self.episode_reward_sums[env_idx])
+                    # Check if episode ended due to truncation (horizon) vs termination
+                    is_truncated = False
+                    if len(truncated_list) > env_idx:
+                        is_truncated = bool(truncated_list[env_idx])
+                    elif len(infos) > env_idx and isinstance(infos[env_idx], dict):
+                        # Try to get truncated flag from info dict
+                        is_truncated = infos[env_idx].get('TimeLimit.truncated', False)
+                    
+                    # Compute return with bootstrap if truncated
+                    if is_truncated and self.last_observations[env_idx] is not None:
+                        # Get model from callback's parent (SB3 provides it via self.model)
+                        model = getattr(self, 'model', None)
+                        if model is None:
+                            # Try to get from training environment
+                            try:
+                                if hasattr(self.training_env, 'get_attr'):
+                                    model = self.training_env.get_attr('model', [0])[0]
+                            except:
+                                pass
+                        
+                        # Get gamma from model or use default
+                        gamma = 0.99
+                        if model is not None and hasattr(model, 'gamma'):
+                            gamma = model.gamma
+                        
+                        # Compute bootstrapped return
+                        bootstrapped_return = compute_bootstrapped_return(
+                            rewards=self.episode_reward_lists[env_idx],
+                            last_obs=self.last_observations[env_idx],
+                            model=model,
+                            gamma=gamma,
+                            truncated=True
+                        )
+                        self.episode_rewards.append(bootstrapped_return)
+                    else:
+                        # Terminal episode: use sum of rewards
+                        self.episode_rewards.append(self.episode_reward_sums[env_idx])
+                    
                     self.episode_lengths.append(self.episode_lengths_track[env_idx])
                     # Reset tracking for this environment
                     self.episode_reward_sums[env_idx] = 0.0
                     self.episode_lengths_track[env_idx] = 0
+                    self.episode_reward_lists[env_idx] = []
+                    self.last_observations[env_idx] = None
         
         return True
     
@@ -178,7 +327,7 @@ def train_and_evaluate_joint(
     eval_steps_per_episode: int = None,  # Defaults to steps_per_episode if None
     num_rollouts_per_instance: int = 1,  # Number of greedy rollouts per instance (default: 1)
     # Output parameters
-    output_dir: str = "./dynamic_anchors_joint_output/",
+    output_dir: str = "./output/joint/",
     save_checkpoints: bool = True,
     checkpoint_freq: int = 10000,
     verbose: int = 1,
@@ -553,6 +702,9 @@ def train_and_evaluate_joint(
     # Create default factory (for evaluation)
     def make_anchor_env():
         return create_anchor_env()
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     
     # Setup single tensorboard log directory for all episodes (for unified logging)
     tensorboard_log_dir = os.path.join(output_dir, "tensorboard")

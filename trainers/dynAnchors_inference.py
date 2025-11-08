@@ -5,6 +5,7 @@ This module provides functions to evaluate trained PPO/DDPG policies and generat
 dynamic anchor explanations for individual instances and classes.
 """
 
+import os
 import numpy as np
 import torch
 import matplotlib
@@ -14,6 +15,31 @@ from matplotlib.patches import Rectangle
 from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import Counter
 from stable_baselines3 import PPO, DDPG
+
+
+def compute_coverage_on_data(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    X_unit: np.ndarray
+) -> float:
+    """
+    Compute coverage of a box on a dataset.
+    
+    Args:
+        lower: Lower bounds of the box (in unit space [0,1])
+        upper: Upper bounds of the box (in unit space [0,1])
+        X_unit: Data points in unit space [0,1], shape (n_samples, n_features)
+    
+    Returns:
+        Coverage: fraction of data points that fall within the box
+    """
+    if X_unit is None or X_unit.shape[0] == 0:
+        return 0.0
+    
+    # Check which points fall within the box
+    mask = np.all((X_unit >= lower) & (X_unit <= upper), axis=1)
+    coverage = float(mask.mean())
+    return coverage
 
 
 def greedy_rollout(
@@ -250,8 +276,11 @@ def evaluate_single_instance(
     
     Returns:
         Dictionary with anchor explanation and metrics.
-        Note: Coverage and precision are computed on training data by default.
-        Set eval_on_test_data=True to compute on test data.
+        Note: 
+        - Coverage and precision are computed on training data by default.
+        - Set eval_on_test_data=True to compute on test data.
+        - local_coverage: coverage on the data used during greedy (micro-set)
+        - global_coverage: coverage on full test split (if X_test_unit provided)
         If num_rollouts_per_instance > 1, metrics are averaged across rollouts.
     """
     # Detect model type: DDPG has actor/critic, PPO has policy
@@ -374,11 +403,19 @@ def evaluate_single_instance(
         # Average metrics across rollouts
         precisions = [r["info"].get("precision", 0.0) for r in rollout_results]
         hard_precisions = [r["info"].get("hard_precision", r["info"].get("precision", 0.0)) for r in rollout_results]
-        coverages = [r["info"].get("coverage", 0.0) for r in rollout_results]
+        local_coverages = [r["info"].get("coverage", 0.0) for r in rollout_results]
+        
+        # Compute global coverage for each rollout (on full test split)
+        global_coverages = []
+        if X_test_unit is not None:
+            for r in rollout_results:
+                global_cov = compute_coverage_on_data(r["lower"], r["upper"], X_test_unit)
+                global_coverages.append(global_cov)
         
         avg_precision = np.mean(precisions)
         avg_hard_precision = np.mean(hard_precisions)
-        avg_coverage = np.mean(coverages)
+        avg_local_coverage = np.mean(local_coverages)
+        avg_global_coverage = np.mean(global_coverages) if global_coverages else None
         
         # Use the best rollout (by hard precision) for the rule and bounds
         best_idx = np.argmax(hard_precisions)
@@ -387,20 +424,25 @@ def evaluate_single_instance(
         # Also compute std dev for reporting
         std_precision = np.std(precisions) if len(precisions) > 1 else 0.0
         std_hard_precision = np.std(hard_precisions) if len(hard_precisions) > 1 else 0.0
-        std_coverage = np.std(coverages) if len(coverages) > 1 else 0.0
+        std_local_coverage = np.std(local_coverages) if len(local_coverages) > 1 else 0.0
+        std_global_coverage = np.std(global_coverages) if len(global_coverages) > 1 else None
         
         return {
             "rule": best_result["rule"],
             "precision": float(avg_precision),
             "hard_precision": float(avg_hard_precision),
-            "coverage": float(avg_coverage),
+            "coverage": float(avg_local_coverage),  # Keep for backward compatibility
+            "local_coverage": float(avg_local_coverage),  # Coverage on micro-set used during greedy
+            "global_coverage": float(avg_global_coverage) if avg_global_coverage is not None else None,  # Coverage on full test split
             "lower_bounds": best_result["lower"].tolist(),
             "upper_bounds": best_result["upper"].tolist(),
             "data_source": best_result["info"].get("data_source", "training"),
             "num_rollouts": num_rollouts_per_instance,
             "std_precision": float(std_precision),
             "std_hard_precision": float(std_hard_precision),
-            "std_coverage": float(std_coverage),
+            "std_coverage": float(std_local_coverage),  # Keep for backward compatibility
+            "std_local_coverage": float(std_local_coverage),
+            "std_global_coverage": float(std_global_coverage) if std_global_coverage is not None else None,
         }
     else:
         # Single rollout (original behavior)
@@ -411,11 +453,21 @@ def evaluate_single_instance(
             max_features_in_rule=max_features_in_rule
         )
         
+        # Get local coverage (from greedy rollout - coverage on data used during greedy)
+        local_coverage = info.get("coverage", 0.0)
+        
+        # Compute global coverage (on full test split) if test data is available
+        global_coverage = None
+        if X_test_unit is not None:
+            global_coverage = compute_coverage_on_data(lower, upper, X_test_unit)
+        
         return {
             "rule": rule,
             "precision": info.get("precision", 0.0),
             "hard_precision": info.get("hard_precision", 0.0),
-            "coverage": info.get("coverage", 0.0),
+            "coverage": local_coverage,  # Keep for backward compatibility
+            "local_coverage": local_coverage,  # Coverage on micro-set used during greedy
+            "global_coverage": global_coverage,  # Coverage on full test split (None if not available)
             "lower_bounds": lower.tolist(),
             "upper_bounds": upper.tolist(),
             "data_source": info.get("data_source", "training"),
@@ -524,7 +576,13 @@ def evaluate_class(
     # Aggregate statistics
     avg_precision = np.mean([r["precision"] for r in individual_results])
     avg_hard_precision = np.mean([r["hard_precision"] for r in individual_results])
-    avg_coverage = np.mean([r["coverage"] for r in individual_results])
+    avg_coverage = np.mean([r["coverage"] for r in individual_results])  # Backward compatibility
+    
+    # Aggregate local and global coverage separately
+    local_coverages = [r.get("local_coverage", r.get("coverage", 0.0)) for r in individual_results]
+    global_coverages = [r.get("global_coverage") for r in individual_results if r.get("global_coverage") is not None]
+    avg_local_coverage = np.mean(local_coverages) if local_coverages else None
+    avg_global_coverage = np.mean(global_coverages) if global_coverages else None
     
     # Find best anchor (by hard precision)
     best_result = max(individual_results, key=lambda r: r["hard_precision"])
@@ -547,7 +605,9 @@ def evaluate_class(
     return {
         "avg_precision": float(avg_precision),
         "avg_hard_precision": float(avg_hard_precision),
-        "avg_coverage": float(avg_coverage),
+        "avg_coverage": float(avg_coverage),  # Backward compatibility
+        "avg_local_coverage": float(avg_local_coverage) if avg_local_coverage is not None else None,
+        "avg_global_coverage": float(avg_global_coverage) if avg_global_coverage is not None else None,
         "union_coverage": union_coverage,  # Union coverage across all anchors (test data only)
         "n_instances": len(individual_results),
         "best_rule": best_result["rule"],
@@ -787,7 +847,7 @@ def plot_rules_2d(
     feature_names: List[str],
     class_names: Optional[List[str]] = None,
     feature_indices: Optional[Tuple[int, int]] = None,
-    output_path: str = "./rules_2d_visualization.png",
+    output_path: str = "./output/visualizations/rules_2d_visualization.png",
     figsize: Tuple[int, int] = (14, 10),
     alpha_anchors: float = 0.3,
     alpha_points: float = 0.6,
@@ -1041,6 +1101,8 @@ def plot_rules_2d(
         y=0.995
     )
     plt.tight_layout(rect=[0, 0, 1, 0.97])
+    # Create output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     

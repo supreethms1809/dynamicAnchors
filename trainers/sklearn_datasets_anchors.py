@@ -373,7 +373,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             coverage_target=0.5,  # 50% coverage - very high threshold, requires large boxes
             n_eval_instances_per_class=20,
             max_features_in_rule=5,
-            output_dir=f"./{dataset_name}_joint_output/",
+            output_dir=f"./output/{dataset_name}_joint/",
             save_checkpoints=True,
             checkpoint_freq=2000,
             verbose=1,
@@ -465,7 +465,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             n_eval_instances_per_class=20,
             max_features_in_rule=5,
             steps_per_episode=eval_steps_per_episode,
-            output_dir=f"./{dataset_name}_anchors_output/",
+            output_dir=f"./output/{dataset_name}_anchors/",
             save_checkpoints=True,
             checkpoint_freq=2000,
             eval_freq=0,

@@ -138,6 +138,9 @@ class AnchorEnv:
         self.x_star_unit = x_star_unit.astype(np.float32) if x_star_unit is not None else None
         self.initial_window = float(initial_window)
         
+        # Track coverage floor hits (reset per episode)
+        self.coverage_floor_hits = 0
+        
         # Test data evaluation support
         self.eval_on_test_data = bool(eval_on_test_data)
         if self.eval_on_test_data:
@@ -315,6 +318,8 @@ class AnchorEnv:
         self.prev_lower = self.lower.copy()
         self.prev_upper = self.upper.copy()
         self.box_history = [(self.lower.copy(), self.upper.copy())]
+        # Reset coverage floor hits counter for new episode
+        self.coverage_floor_hits = 0
         precision, coverage, _ = self._current_metrics()
         state = np.concatenate([self.lower, self.upper, np.array([precision, coverage], dtype=np.float32)])
         return state
@@ -412,15 +417,24 @@ class AnchorEnv:
             prev_coverage = 0.0
 
         coverage_clipped = False
+        coverage_before_revert = None
+        coverage_after_revert = None
         if coverage < self.min_coverage_floor:
+            # Store coverage before revert for tracking
+            coverage_before_revert = float(coverage)
+            # Revert bounds
             self.lower = prev_lower
             self.upper = prev_upper
+            # Recompute metrics after revert
             precision, coverage, details = self._current_metrics()
             # Re-validate after reset
             if not np.isfinite(precision):
                 precision = 0.0
             if not np.isfinite(coverage):
                 coverage = 0.0
+            # Store coverage after revert and increment counter
+            coverage_after_revert = float(coverage)
+            self.coverage_floor_hits += 1
             coverage_clipped = True
 
         precision_gain = precision - prev_precision
@@ -441,6 +455,12 @@ class AnchorEnv:
         # Anchor drift penalty: penalize if box drifts away from x_star_unit (instance location)
         anchor_drift_penalty = self._compute_anchor_drift_penalty(prev_lower, prev_upper)
 
+        # Volume/overlap proxy penalty (JS-like): penalize large changes in box volume
+        # This is NOT actual JS divergence (which would require log terms), but a simple
+        # volume-based proxy that measures how much the box overlaps with its previous state.
+        # Formula: 1 - (intersection_volume / average_volume)
+        # - 0.0 when boxes fully overlap (no change)
+        # - 1.0 when boxes don't overlap (large change)
         inter_lower = np.maximum(self.lower, prev_lower)
         inter_upper = np.minimum(self.upper, prev_upper)
         inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
@@ -449,8 +469,9 @@ class AnchorEnv:
         curr_vol = float(np.prod(curr_widths))
         eps = 1e-12
         if inter_vol <= eps:
-            js_proxy = 1.0
+            js_proxy = 1.0  # No overlap, maximum penalty
         else:
+            # Compute overlap ratio: intersection / average volume
             js_proxy = 1.0 - float(inter_vol / (0.5 * (prev_vol + curr_vol) + eps))
             js_proxy = float(np.clip(js_proxy, 0.0, 1.0))
         
@@ -498,6 +519,10 @@ class AnchorEnv:
             "anchor_drift": anchor_drift_penalty,
             "js_penalty": js_penalty, 
             "coverage_clipped": coverage_clipped,
+            # Coverage floor tracking (for debugging learning stalls)
+            "coverage_floor_hits": self.coverage_floor_hits,  # Total hits this episode
+            "coverage_before_revert": coverage_before_revert,  # Coverage before revert (if revert occurred)
+            "coverage_after_revert": coverage_after_revert,   # Coverage after revert (if revert occurred)
             # Reward components for debugging
             "precision_gain": precision_gain,
             "coverage_gain": coverage_gain,
@@ -532,7 +557,11 @@ class AnchorEnv:
         js_proxy: float, eps: float
     ) -> tuple:
         """
-        Compute reward weights and JS penalty based on precision threshold.
+        Compute reward weights and volume/overlap proxy penalty based on precision threshold.
+        
+        Args:
+            js_proxy: Volume/overlap proxy value (0.0 = no change, 1.0 = large change)
+                     This is NOT actual JS divergence, but a simple volume-based proxy.
         
         Returns:
             Tuple of (precision_weight, coverage_weight, js_penalty)
@@ -709,6 +738,9 @@ class DynamicAnchorEnv(gym.Env):
             "drift": info.get("drift", 0.0),
             "js_penalty": info.get("js_penalty", 0.0),
             "coverage_clipped": info.get("coverage_clipped", False),
+            "coverage_floor_hits": info.get("coverage_floor_hits", 0),
+            "coverage_before_revert": info.get("coverage_before_revert"),
+            "coverage_after_revert": info.get("coverage_after_revert"),
             "sampler": info.get("sampler", "unknown"),
             "n_points": info.get("n_points", 0),
         }
@@ -887,6 +919,9 @@ class ContinuousAnchorEnv(gym.Env):
             "drift": info.get("drift", 0.0),
             "js_penalty": info.get("js_penalty", 0.0),
             "coverage_clipped": info.get("coverage_clipped", False),
+            "coverage_floor_hits": info.get("coverage_floor_hits", 0),
+            "coverage_before_revert": info.get("coverage_before_revert"),
+            "coverage_after_revert": info.get("coverage_after_revert"),
             "sampler": info.get("sampler", "unknown"),
             "n_points": info.get("n_points", 0),
         }
