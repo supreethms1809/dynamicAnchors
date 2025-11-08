@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from typing import Dict, List, Optional, Tuple, Any, Union
 from collections import Counter
-from stable_baselines3 import PPO, DDPG
+from stable_baselines3 import PPO, DDPG, TD3
 
 
 def compute_coverage_on_data(
@@ -44,7 +44,7 @@ def compute_coverage_on_data(
 
 def greedy_rollout(
     env,
-    trained_model: Union[PPO, DDPG],
+    trained_model: Union[PPO, DDPG, TD3],
     steps_per_episode: int = 100,
     max_features_in_rule: int = 5,
     device: str = "cpu"
@@ -62,8 +62,11 @@ def greedy_rollout(
         Tuple of (info_dict, rule_string, lower_bounds, upper_bounds)
     """
     
-    # Detect model type: DDPG has actor/critic, PPO has policy
-    is_ddpg = hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic')
+    # Detect model type: DDPG/TD3 have actor/critic, PPO has policy
+    # TD3 also has actor/critic, so we treat it similarly to DDPG
+    is_continuous = (hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic'))
+    is_ddpg = is_continuous  # For backward compatibility
+    is_td3 = is_continuous  # TD3 has same structure as DDPG
     is_ppo = hasattr(trained_model, 'policy')
     
     # Detect environment type
@@ -126,8 +129,8 @@ def greedy_rollout(
             action, _states = trained_model.predict(state, deterministic=True)
             
             # Handle action type based on model
-            if is_ddpg:
-                # DDPG: action is already a numpy array (continuous)
+            if is_continuous:
+                # DDPG/TD3: action is already a numpy array (continuous)
                 if isinstance(action, torch.Tensor):
                     action = action.cpu().numpy()
                 action = np.clip(action, -1.0, 1.0)
@@ -204,20 +207,47 @@ def greedy_rollout(
     # Compare final width to initial width to find tightened features
     lw = (anchor_env.upper - anchor_env.lower)
     
-    # A feature is "tightened" if its width is at least 2% smaller than initial width
-    # This threshold is more lenient than 5% to catch smaller tightenings
-    # Also consider features that are significantly smaller than full range (1.0)
-    tightened = np.where((lw < initial_width * 0.98) | (lw < 0.98))[0]
+    # Ensure initial_width is valid (should be > 0 for all features)
+    # If initial_width has zeros or invalid values, something went wrong
+    if np.any(initial_width <= 0) or np.any(np.isnan(initial_width)) or np.any(np.isinf(initial_width)):
+        # If initial_width is invalid, use full range (1.0) as reference
+        # This handles edge cases where reset() might have set invalid bounds
+        initial_width_ref = np.ones_like(initial_width)
+    else:
+        initial_width_ref = initial_width.copy()
     
-    # If no features tightened by 2%, try a more lenient threshold (1%)
-    if tightened.size == 0:
-        tightened = np.where((lw < initial_width * 0.99) | (lw < 0.99))[0]
-    
-    # If still no tightened features, check if any features are smaller than full range
-    # This handles cases where box started at full range and was tightened
-    if tightened.size == 0:
-        # Check if any feature is significantly smaller than 1.0 (full range)
-        tightened = np.where(lw < 0.95)[0]
+    # Ensure lw is also valid
+    if np.any(lw <= 0) or np.any(np.isnan(lw)) or np.any(np.isinf(lw)):
+        # If final width is invalid, no features can be tightened
+        tightened = np.array([], dtype=int)
+    else:
+        # A feature is "tightened" if its width is smaller than initial width
+        # Use multiple thresholds to catch different levels of tightening
+        
+        # First, check for significant tightening (2% reduction)
+        tightened = np.where(lw < initial_width_ref * 0.98)[0]
+        
+        # If no features tightened by 2%, try a more lenient threshold (1%)
+        if tightened.size == 0:
+            tightened = np.where(lw < initial_width_ref * 0.99)[0]
+        
+        # If still no tightened features, check absolute thresholds
+        # This handles cases where initial_width might be small
+        if tightened.size == 0:
+            # Check if any feature is significantly smaller than full range (1.0)
+            # This catches cases where we started near full range
+            tightened = np.where(lw < 0.95)[0]
+        
+        # Additional check: if initial_width was close to full range (>= 0.9), 
+        # any feature with width < 0.9 should be considered tightened
+        if tightened.size == 0:
+            if np.all(initial_width_ref >= 0.9):
+                tightened = np.where(lw < 0.9)[0]
+        
+        # Final fallback: check if ANY feature has width smaller than its initial width
+        # This is the most lenient check - any reduction counts
+        if tightened.size == 0:
+            tightened = np.where(lw < initial_width_ref)[0]
     
     if tightened.size == 0:
         rule = "any values (no tightened features)"
@@ -238,7 +268,7 @@ def greedy_rollout(
 
 def evaluate_single_instance(
     X_instance: np.ndarray,
-    trained_model: Union[PPO, DDPG],
+    trained_model: Union[PPO, DDPG, TD3],
     make_env_fn,
     feature_names: List[str],
     target_class: int,
@@ -283,8 +313,11 @@ def evaluate_single_instance(
         - global_coverage: coverage on full test split (if X_test_unit provided)
         If num_rollouts_per_instance > 1, metrics are averaged across rollouts.
     """
-    # Detect model type: DDPG has actor/critic, PPO has policy
-    is_ddpg = hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic')
+    # Detect model type: DDPG/TD3 have actor/critic, PPO has policy
+    # TD3 also has actor/critic, so we treat it similarly to DDPG
+    is_continuous = (hasattr(trained_model, 'actor') and hasattr(trained_model, 'critic'))
+    is_ddpg = is_continuous  # For backward compatibility
+    is_td3 = is_continuous  # TD3 has same structure as DDPG
     is_ppo = hasattr(trained_model, 'policy')
     
     # Create a temporary environment to extract normalization parameters if needed
@@ -359,8 +392,8 @@ def evaluate_single_instance(
     )
     
     # Wrap with appropriate gym wrapper based on model type
-    if is_ddpg:
-        # DDPG: Use ContinuousAnchorEnv
+    if is_continuous:
+        # DDPG/TD3: Use ContinuousAnchorEnv
         # Enable continuous actions in AnchorEnv
         anchor_env.n_actions = 2 * anchor_env.n_features
         anchor_env.max_action_scale = max(temp_env.step_fracs) if temp_env.step_fracs else 0.02
@@ -620,7 +653,7 @@ def evaluate_class(
 def evaluate_all_classes(
     X_test: np.ndarray,
     y_test: np.ndarray,
-    trained_model: Union[PPO, DDPG, Dict[int, Any]],
+    trained_model: Union[PPO, DDPG, TD3, Dict[int, Any]],
     make_env_fn,
     feature_names: List[str],
     n_instances_per_class: int = 20,
@@ -664,8 +697,8 @@ def evaluate_all_classes(
     
     # Handle DDPG trainers dict (per-class trainers)
     if isinstance(trained_model, dict):
-        # DDPG: Use per-class trainers
-        print(f"Evaluating anchors for {n_classes} classes with {n_instances_per_class} instances each (DDPG per-class trainers)")
+        # DDPG/TD3: Use per-class trainers
+        print(f"Evaluating anchors for {n_classes} classes with {n_instances_per_class} instances each (Continuous action per-class trainers)")
         
         per_class_results = {}
         for cls in unique_classes:
@@ -675,7 +708,7 @@ def evaluate_all_classes(
                 continue
             
             print(f"\nEvaluating class {cls}...")
-            # Get the DDPG trainer for this class
+            # Get the continuous action trainer (DDPG/TD3) for this class
             ddpg_trainer = trained_model[cls_int]
             # Extract the model from the trainer
             cls_model = ddpg_trainer.model if hasattr(ddpg_trainer, 'model') else ddpg_trainer
@@ -721,7 +754,7 @@ def evaluate_all_classes(
                         percentage = (count / len(all_rules)) * 100
                         print(f"    [{count}/{len(all_rules)} ({percentage:.1f}%)] {rule}")
     else:
-        # PPO or single DDPG model: Use same model for all classes
+        # PPO or single continuous action model (DDPG/TD3): Use same model for all classes
         print(f"Evaluating anchors for {n_classes} classes with {n_instances_per_class} instances each")
         
         per_class_results = {}
@@ -925,8 +958,34 @@ def plot_rules_2d(
     feat_name2 = feature_names[feat_idx2]
     
     # Create figure with subplots for each class
-    unique_classes = sorted([int(k.split('_')[1]) for k in per_class_results.keys()])
+    # Handle both integer keys (from evaluate_all_classes) and string keys (from JSON)
+    unique_classes = []
+    for k in per_class_results.keys():
+        if isinstance(k, int):
+            unique_classes.append(k)
+        elif isinstance(k, str):
+            # Handle "class_0" format
+            if k.startswith("class_"):
+                try:
+                    unique_classes.append(int(k.split('_')[1]))
+                except (ValueError, IndexError):
+                    # Try to extract number from string
+                    try:
+                        unique_classes.append(int(k.replace("class_", "")))
+                    except ValueError:
+                        pass
+            else:
+                # Try to convert directly
+                try:
+                    unique_classes.append(int(k))
+                except ValueError:
+                    pass
+    
+    unique_classes = sorted(unique_classes)
     n_classes = len(unique_classes)
+    
+    if n_classes == 0:
+        raise ValueError("No valid class keys found in per_class_results")
     
     # Determine grid layout
     if n_classes <= 2:
@@ -953,15 +1012,18 @@ def plot_rules_2d(
             break
         
         ax = axes[plot_idx]
-        cls_key = f"class_{cls_int}"
         
-        if cls_key not in per_class_results:
+        # Try to get class result - handle both integer and string keys
+        cls_result = None
+        if cls_int in per_class_results:
+            cls_result = per_class_results[cls_int]
+        elif f"class_{cls_int}" in per_class_results:
+            cls_result = per_class_results[f"class_{cls_int}"]
+        else:
             ax.text(0.5, 0.5, f"No data for class {cls_int}", 
                    ha='center', va='center', transform=ax.transAxes)
             ax.set_title(f"Class {cls_int}")
             continue
-        
-        cls_result = per_class_results[cls_key]
         cls_name = class_names[cls_int] if class_names and cls_int < len(class_names) else f"Class {cls_int}"
         
         # Get anchors for this class
@@ -1144,12 +1206,29 @@ def plot_rules_2d_from_json(
         metrics_data = json.load(f)
     
     # Convert to eval_results format
+    # JSON has string keys like "class_0", need to convert to integer keys
     eval_results = {
         "per_class_results": {}
     }
     
     for cls_key, cls_data in metrics_data.get("per_class_results", {}).items():
-        cls_int = int(cls_key.split('_')[1])
+        # Extract class integer from key (handle both "class_0" and integer keys)
+        if isinstance(cls_key, int):
+            cls_int = cls_key
+        elif isinstance(cls_key, str) and cls_key.startswith("class_"):
+            try:
+                cls_int = int(cls_key.split('_')[1])
+            except (ValueError, IndexError):
+                try:
+                    cls_int = int(cls_key.replace("class_", ""))
+                except ValueError:
+                    continue  # Skip invalid keys
+        else:
+            try:
+                cls_int = int(cls_key)
+            except ValueError:
+                continue  # Skip invalid keys
+        
         eval_results["per_class_results"][cls_int] = cls_data
     
     # Set default output path

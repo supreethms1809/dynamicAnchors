@@ -193,7 +193,7 @@ def train_classifier(
     return classifier, best_test_acc
 
 
-def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, classifier_type: str = "dnn"):
+def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, continuous_algorithm: str = "ddpg", classifier_type: str = "dnn"):
     """
     Main function: Complete pipeline for sklearn datasets.
     
@@ -338,7 +338,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         
         # Use stable-baselines3 trainer (supports both discrete and continuous actions)
         if use_continuous_actions:
-            print(f"\n[Continuous Actions] Using DDPG (Stable Baselines 3)")
+            algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
+            print(f"\n[Continuous Actions] Using {algorithm_name} (Stable Baselines 3)")
         else:
             print(f"\n[Discrete Actions] Using PPO (Stable Baselines 3)")
         
@@ -359,6 +360,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             classifier_batch_size=256,
             classifier_patience=5,
             use_continuous_actions=use_continuous_actions,  # Enable continuous actions if requested
+            continuous_algorithm=continuous_algorithm,  # "ddpg" or "td3"
             n_envs=n_envs if not use_continuous_actions else 1,  # DDPG doesn't use vectorized envs the same way
             learning_rate=3e-4,
             n_steps=steps_per_episode,
@@ -505,13 +507,43 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
     eval_results = results['eval_results']
     if 'per_class_results' in eval_results:
         for cls, class_results in eval_results['per_class_results'].items():
-            cls_name = class_names[int(cls)]
-            print(f"\n  Class {cls} ({cls_name}):")
+            cls_int = int(cls) if isinstance(cls, (int, str)) else cls
+            cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
+            print(f"\n  Class {cls_int} ({cls_name}):")
             if 'avg_precision' in class_results:
                 print(f"    Avg Precision: {class_results['avg_precision']:.3f}")
                 print(f"    Avg Coverage:  {class_results['avg_coverage']:.3f}")
+            elif 'precision' in class_results:
+                print(f"    Precision: {class_results['precision']:.3f}")
+                print(f"    Coverage:  {class_results['coverage']:.3f}")
             if 'best_rule' in class_results:
                 print(f"    Best Rule: {class_results['best_rule']}")
+            
+            # Try to create 2D visualization if not already created
+            if 'anchors' in class_results and len(class_results.get('anchors', [])) > 0:
+                try:
+                    from trainers.dynAnchors_inference import plot_rules_2d
+                    # Only create if it doesn't exist
+                    plot_path = f"{results.get('metadata', {}).get('output_dir', './output/')}/plots/rules_2d_visualization.png"
+                    import os
+                    if not os.path.exists(plot_path):
+                        print(f"\n  Creating 2D visualization...")
+                        # Need X_test_scaled, X_min, X_range from results
+                        # These might not be available, so skip if missing
+                        if 'X_test_scaled' in results and 'X_min' in results and 'X_range' in results:
+                            plot_path = plot_rules_2d(
+                                eval_results=eval_results,
+                                X_test=results['X_test_scaled'],
+                                y_test=y_test,
+                                feature_names=feature_names,
+                                class_names=class_names,
+                                output_path=plot_path,
+                                X_min=results['X_min'],
+                                X_range=results['X_range'],
+                            )
+                            print(f"    Saved: {plot_path}")
+                except Exception as e:
+                    pass  # Silently skip if visualization fails
             
             # Show all rules with their individual coverage
             if 'individual_results' in class_results and len(class_results['individual_results']) > 0:
@@ -631,7 +663,14 @@ Datasets:
         dest="use_continuous_actions",
         action="store_true",
         default=False,
-        help="Use continuous actions version (from POC) with GAE (default: False, uses discrete actions)"
+        help="Use continuous actions version (DDPG or TD3) instead of discrete actions (PPO)"
+    )
+    parser.add_argument(
+        "--continuous-algorithm",
+        type=str,
+        default="ddpg",
+        choices=["ddpg", "td3"],
+        help="Continuous action algorithm: 'ddpg' (default) or 'td3' (only used with --continuous-actions)"
     )
     parser.add_argument(
         "--classifier-type",
@@ -647,6 +686,7 @@ Datasets:
         sample_size=args.sample_size,
         joint=args.joint,
         use_continuous_actions=args.use_continuous_actions,
+        continuous_algorithm=args.continuous_algorithm,
         classifier_type=args.classifier_type
     )
 

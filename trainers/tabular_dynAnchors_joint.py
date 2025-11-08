@@ -116,8 +116,10 @@ def compute_bootstrapped_return(
             # Bootstrap: add discounted value estimate
             bootstrapped_return = total_reward + gamma * value
             return float(bootstrapped_return)
-        except Exception:
+        except Exception as e:
             # If value function access fails, return sum of rewards
+            # This is fine - bootstrapping is only for tracking, not training
+            # Don't log to avoid spam, but return sum of rewards
             return total_reward
     
     return total_reward
@@ -234,31 +236,38 @@ class RewardCallback(BaseCallback):
                         is_truncated = infos[env_idx].get('TimeLimit.truncated', False)
                     
                     # Compute return with bootstrap if truncated
+                    # NOTE: Bootstrapping is only for tracking/plotting, not for training
+                    # SB3 handles rewards internally, so we just track the sum for visualization
                     if is_truncated and self.last_observations[env_idx] is not None:
-                        # Get model from callback's parent (SB3 provides it via self.model)
+                        # Try to get model for bootstrapping (optional, fallback to sum if fails)
                         model = getattr(self, 'model', None)
                         if model is None:
                             # Try to get from training environment
                             try:
                                 if hasattr(self.training_env, 'get_attr'):
                                     model = self.training_env.get_attr('model', [0])[0]
-                            except:
-                                pass
+                            except Exception:
+                                model = None
                         
                         # Get gamma from model or use default
                         gamma = 0.99
                         if model is not None and hasattr(model, 'gamma'):
                             gamma = model.gamma
                         
-                        # Compute bootstrapped return
-                        bootstrapped_return = compute_bootstrapped_return(
-                            rewards=self.episode_reward_lists[env_idx],
-                            last_obs=self.last_observations[env_idx],
-                            model=model,
-                            gamma=gamma,
-                            truncated=True
-                        )
-                        self.episode_rewards.append(bootstrapped_return)
+                        # Compute bootstrapped return (for tracking only)
+                        try:
+                            bootstrapped_return = compute_bootstrapped_return(
+                                rewards=self.episode_reward_lists[env_idx],
+                                last_obs=self.last_observations[env_idx],
+                                model=model,
+                                gamma=gamma,
+                                truncated=True
+                            )
+                            self.episode_rewards.append(bootstrapped_return)
+                        except Exception as e:
+                            # If bootstrapping fails, just use sum of rewards (this is fine)
+                            # This doesn't affect training, only affects reward tracking for plots
+                            self.episode_rewards.append(self.episode_reward_sums[env_idx])
                     else:
                         # Terminal episode: use sum of rewards
                         self.episode_rewards.append(self.episode_reward_sums[env_idx])
@@ -307,7 +316,8 @@ def train_and_evaluate_joint(
     gb_min_samples_split: int = 2,
     gb_min_samples_leaf: int = 1,
     # RL training parameters
-    use_continuous_actions: bool = False,  # Use DDPG (continuous) instead of PPO (discrete)
+    use_continuous_actions: bool = False,  # Use continuous actions (DDPG/TD3) instead of PPO (discrete)
+    continuous_algorithm: str = "ddpg",  # "ddpg" or "td3" (only used if use_continuous_actions=True)
     n_envs: int = 4,
     learning_rate: float = 3e-4,
     n_steps: int = None,  # Will default to steps_per_episode
@@ -397,6 +407,7 @@ def train_and_evaluate_joint(
     from trainers.vecEnv import AnchorEnv, make_dummy_vec_env, DummyVecEnv, make_dynamic_anchor_env, ContinuousAnchorEnv
     from trainers.PPO_trainer import train_ppo_model, DynamicAnchorPPOTrainer
     from trainers.DDPG_trainer import DynamicAnchorDDPGTrainer, create_ddpg_trainer
+    from trainers.TD3_trainer import DynamicAnchorTD3Trainer, create_td3_trainer
     from trainers.dynAnchors_inference import evaluate_all_classes
     from trainers.device_utils import get_device_pair
     
@@ -716,38 +727,69 @@ def train_and_evaluate_joint(
     
     # Initialize RL trainer(s) based on action type
     if use_continuous_actions:
-        # DDPG: Create separate trainers for each class (DDPG doesn't use vectorized envs the same way)
-        print(f"\n[Continuous Actions] Using DDPG (Stable Baselines 3) for continuous action control")
-        print(f"  - Creating DDPG trainers for {len(target_classes)} class(es)")
-        ddpg_trainers = {}
+        # Continuous actions: Create separate trainers for each class (DDPG/TD3 don't use vectorized envs the same way)
+        continuous_algorithm_lower = continuous_algorithm.lower()
+        if continuous_algorithm_lower == "td3":
+            print(f"\n[Continuous Actions] Using TD3 (Twin Delayed DDPG) for continuous action control")
+            print(f"  - Creating TD3 trainers for {len(target_classes)} class(es)")
+        else:
+            print(f"\n[Continuous Actions] Using DDPG (Stable Baselines 3) for continuous action control")
+            print(f"  - Creating DDPG trainers for {len(target_classes)} class(es)")
+        
+        continuous_trainers = {}
         for cls in target_classes:
             anchor_env = create_anchor_env(target_cls=cls)
             # Enable continuous actions in AnchorEnv
             anchor_env.n_actions = 2 * anchor_env.n_features
             anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
             anchor_env.min_absolute_step = max(0.05, min_width * 0.5)
-            # Wrap with ContinuousAnchorEnv for DDPG
+            # Wrap with ContinuousAnchorEnv
             gym_env = ContinuousAnchorEnv(anchor_env, seed=42 + cls)
-            # Create DDPG trainer
-            ddpg_trainer = create_ddpg_trainer(
-                env=gym_env,
-                policy_type="MlpPolicy",
-                learning_rate=1e-4,  # Smaller LR for stability
-                buffer_size=100000,
-                learning_starts=0,
-                batch_size=64,
-                tau=0.005,
-                gamma=0.99,
-                train_freq=(1, "step"),
-                gradient_steps=1,
-                action_noise_sigma=0.3,  # Stronger exploration
-                policy_kwargs=dict(net_arch=[256, 256]),
-                verbose=0,
-                device=device_str,
-            )
-            ddpg_trainers[cls] = ddpg_trainer
-        rl_trainer = None  # Not used for DDPG
-        vec_env = None  # Not used for DDPG
+            
+            # Create trainer based on algorithm choice
+            if continuous_algorithm_lower == "td3":
+                # Create TD3 trainer
+                trainer = create_td3_trainer(
+                    env=gym_env,
+                    policy_type="MlpPolicy",
+                    learning_rate=1e-4,  # Smaller LR for stability
+                    buffer_size=100000,
+                    learning_starts=0,
+                    batch_size=64,
+                    tau=0.005,
+                    gamma=0.99,
+                    train_freq=(1, "step"),
+                    gradient_steps=1,
+                    action_noise_sigma=0.3,  # Stronger exploration
+                    policy_delay=2,  # TD3-specific: delay policy updates
+                    policy_kwargs=dict(net_arch=[256, 256]),
+                    verbose=0,
+                    device=device_str,
+                )
+            else:
+                # Create DDPG trainer (default)
+                trainer = create_ddpg_trainer(
+                    env=gym_env,
+                    policy_type="MlpPolicy",
+                    learning_rate=1e-4,  # Smaller LR for stability
+                    buffer_size=100000,
+                    learning_starts=0,
+                    batch_size=64,
+                    tau=0.005,
+                    gamma=0.99,
+                    train_freq=(1, "step"),
+                    gradient_steps=1,
+                    action_noise_sigma=0.3,  # Stronger exploration
+                    policy_kwargs=dict(net_arch=[256, 256]),
+                    verbose=0,
+                    device=device_str,
+                )
+            continuous_trainers[cls] = trainer
+        
+        # Keep backward compatibility: ddpg_trainers for existing code
+        ddpg_trainers = continuous_trainers
+        rl_trainer = None  # Not used for continuous actions
+        vec_env = None  # Not used for continuous actions
     else:
         # PPO: Create vectorized environment
         print(f"\n[Discrete Actions] Using PPO (Stable Baselines 3) for discrete action control")
@@ -773,7 +815,8 @@ def train_and_evaluate_joint(
     print(f"  - Classifier epochs per update: {classifier_epochs_per_round}")
     print(f"  - Classifier update every: {classifier_update_every} episode(s)")
     if use_continuous_actions:
-        print(f"  - RL algorithm: DDPG (continuous actions)")
+        algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
+        print(f"  - RL algorithm: {algorithm_name} (continuous actions)")
     else:
         print(f"  - RL algorithm: PPO (discrete actions)")
         print(f"  - RL n_steps per update: {n_steps}")
@@ -889,9 +932,9 @@ def train_and_evaluate_joint(
         print(f"\n[Episode {ep + 1}] Training RL Policy...")
         
         if use_continuous_actions:
-            # DDPG: Manual training loop (collect experiences, add to replay buffer, train)
+            # Continuous actions (DDPG/TD3): Manual training loop (collect experiences, add to replay buffer, train)
             # Calculate timesteps for this episode: steps_per_episode * number of classes
-            # (DDPG runs one episode per class, not using vectorized envs)
+            # (Continuous action algorithms run one episode per class, not using vectorized envs)
             timesteps_per_episode = steps_per_episode * len(target_classes)
             
             episode_rewards_per_class = {}
@@ -971,10 +1014,11 @@ def train_and_evaluate_joint(
                                 reward_components["final_n_points"] = step_info["n_points"]
                             
                             # Accumulate reward components (sum over all steps in episode)
-                            if "precision_gain_component" in step_info:
-                                reward_components["precision_gain"] += step_info["precision_gain_component"]
-                            if "coverage_gain_component" in step_info:
-                                reward_components["coverage_gain"] += step_info["coverage_gain_component"]
+                            # Use raw gains for logging (not weighted components) to see actual improvements
+                            if "precision_gain" in step_info:
+                                reward_components["precision_gain"] += step_info["precision_gain"]
+                            if "coverage_gain" in step_info:
+                                reward_components["coverage_gain"] += step_info["coverage_gain"]
                             if "coverage_bonus" in step_info:
                                 reward_components["coverage_bonus"] += step_info["coverage_bonus"]
                             if "target_class_bonus" in step_info:
@@ -1264,10 +1308,10 @@ def train_and_evaluate_joint(
                 
                 # Run greedy rollout based on action type
                 if use_continuous_actions:
-                    # DDPG: Use DDPG trainer for this class
-                    ddpg_trainer_eval = ddpg_trainers[cls]
+                    # Continuous actions (DDPG/TD3): Use trainer for this class
+                    continuous_trainer_eval = ddpg_trainers[cls]
                     # Get the model from the trainer
-                    ddpg_model = ddpg_trainer_eval.model if hasattr(ddpg_trainer_eval, 'model') else ddpg_trainer_eval
+                    continuous_model = continuous_trainer_eval.model if hasattr(continuous_trainer_eval, 'model') else continuous_trainer_eval
                     
                     # Enable continuous actions in AnchorEnv
                     anchor_env.n_actions = 2 * anchor_env.n_features
@@ -1277,19 +1321,31 @@ def train_and_evaluate_joint(
                     # Wrap with ContinuousAnchorEnv
                     gym_env_eval = ContinuousAnchorEnv(anchor_env, seed=42 + cls + ep)
                     
+                    # IMPORTANT: Capture initial bounds BEFORE greedy_rollout (which resets internally)
+                    # Reset to get initial state and bounds
+                    reset_result = gym_env_eval.reset(seed=42 + cls + ep)
+                    if isinstance(reset_result, tuple):
+                        obs, _ = reset_result
+                    else:
+                        obs = reset_result
+                    obs = np.array(obs, dtype=np.float32)
+                    
+                    # Capture initial bounds BEFORE greedy_rollout modifies them
+                    initial_lower = anchor_env.lower.copy()
+                    initial_upper = anchor_env.upper.copy()
+                    initial_width = (initial_upper - initial_lower)
+                    
                     # Use greedy_rollout function for consistency (it now handles DDPG)
+                    # Note: greedy_rollout will reset again internally, but we have initial bounds
                     try:
                         info, rule, lower, upper = greedy_rollout(
                             env=gym_env_eval,
-                            trained_model=ddpg_model,
+                            trained_model=continuous_model,
                             steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
                             max_features_in_rule=max_features_in_rule,
                             device=device_str
                         )
-                        # Get initial bounds for expansion ratio calculation
-                        initial_lower = anchor_env.lower.copy()
-                        initial_upper = anchor_env.upper.copy()
-                        initial_width = (initial_upper - initial_lower)
+                        # Rule is already computed correctly by greedy_rollout with improved tightening detection
                     except Exception as e:
                         # Fallback: manual rollout if greedy_rollout fails
                         if verbose >= 2:
@@ -1316,7 +1372,7 @@ def train_and_evaluate_joint(
                         
                         # Run greedy rollout (deterministic for evaluation)
                         for t in range(eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode):
-                            action, _ = ddpg_model.predict(obs, deterministic=True)
+                            action, _ = continuous_model.predict(obs, deterministic=True)
                             if isinstance(action, torch.Tensor):
                                 action = action.cpu().numpy()
                             action = np.clip(action, -1.0, 1.0)
@@ -1382,9 +1438,12 @@ def train_and_evaluate_joint(
                             max_features_in_rule=max_features_in_rule,
                             device=device_str
                         )
+                        # Rule is already computed correctly by greedy_rollout with improved tightening detection
                     except (AttributeError, TypeError) as e:
                         # If greedy_rollout can't access properties directly, run a simple greedy rollout
                         # State already reset above, initial_width already set
+                        if verbose >= 2:
+                            print(f"    [WARNING] greedy_rollout failed for PPO, using manual rollout: {e}")
                         
                         # Run greedy rollout
                         for t in range(eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode):
@@ -1397,10 +1456,67 @@ def train_and_evaluate_joint(
                             state = np.array(state, dtype=np.float32)
                             if done:
                                 break
-                    
+                        
+                        # Get final metrics after manual rollout
+                        prec, cov, det = anchor_env._current_metrics()
+                        info = {
+                            "precision": prec,
+                            "hard_precision": det.get("hard_precision", prec),
+                            "coverage": cov,
+                            "avg_prob": det.get("avg_prob", prec),
+                            "sampler": det.get("sampler", "empirical"),
+                            "n_points": det.get("n_points", 0),
+                        }
+                        
+                        # Build rule manually using improved tightening detection (same as greedy_rollout)
+                        lw = (anchor_env.upper - anchor_env.lower)
+                        # Use improved tightening detection logic (same as in greedy_rollout)
+                        if np.any(initial_width <= 0) or np.any(np.isnan(initial_width)) or np.any(np.isinf(initial_width)):
+                            initial_width_ref = np.ones_like(initial_width)
+                        else:
+                            initial_width_ref = initial_width.copy()
+                        
+                        if np.any(lw <= 0) or np.any(np.isnan(lw)) or np.any(np.isinf(lw)):
+                            tightened = np.array([], dtype=int)
+                        else:
+                            tightened = np.where(lw < initial_width_ref * 0.98)[0]
+                            if tightened.size == 0:
+                                tightened = np.where(lw < initial_width_ref * 0.99)[0]
+                            if tightened.size == 0:
+                                tightened = np.where(lw < 0.95)[0]
+                            if tightened.size == 0:
+                                if np.all(initial_width_ref >= 0.9):
+                                    tightened = np.where(lw < 0.9)[0]
+                            if tightened.size == 0:
+                                tightened = np.where(lw < initial_width_ref)[0]
+                        
+                        if tightened.size == 0:
+                            rule = "any values (no tightened features)"
+                        else:
+                            tightened_sorted = np.argsort(lw[tightened])
+                            to_show = tightened[tightened_sorted[:max_features_in_rule]] if max_features_in_rule > 0 else tightened
+                            if to_show.size == 0:
+                                rule = "any values (no tightened features)"
+                            else:
+                                cond_parts = [f"{feature_names[i]} ∈ [{anchor_env.lower[i]:.2f}, {anchor_env.upper[i]:.2f}]" for i in to_show]
+                                rule = " and ".join(cond_parts)
+                        lower = anchor_env.lower.copy()
+                        upper = anchor_env.upper.copy()
+                
                 # Get final metrics after greedy rollout (for both PPO and DDPG)
                 # IMPORTANT: Always recompute metrics from final state to ensure accuracy
+                # (greedy_rollout already returns info, but we recompute to be safe)
                 prec, cov, det = anchor_env._current_metrics()
+                
+                # Update info with recomputed metrics (but keep rule from greedy_rollout)
+                info = {
+                    "precision": prec,
+                    "hard_precision": det.get("hard_precision", prec),
+                    "coverage": cov,
+                    "avg_prob": det.get("avg_prob", prec),
+                    "sampler": det.get("sampler", "empirical"),
+                    "n_points": det.get("n_points", 0),
+                }
                 
                 # Debug: Check if box actually expanded
                 final_width = (anchor_env.upper - anchor_env.lower)
@@ -1409,22 +1525,11 @@ def train_and_evaluate_joint(
                 expansion_ratio = final_vol / initial_vol if initial_vol > 0 else 1.0
                 box_size_ratio = np.mean(final_width) / np.mean(initial_width) if np.mean(initial_width) > 0 else 1.0
                 
-                info = {
-                    "precision": prec,
-                    "hard_precision": det.get("hard_precision", prec),
-                    "coverage": cov,
-                    "avg_prob": det.get("avg_prob", prec),
-                    "sampler": det.get("sampler", "empirical"),
-                    "n_points": det.get("n_points", 0),
-                    "expansion_ratio": float(expansion_ratio),  # Debug: how much box expanded
-                    "box_size_ratio": float(box_size_ratio),  # Debug: average box size ratio
-                    "initial_vol": float(initial_vol),  # Debug: initial box volume
-                    "final_vol": float(final_vol),  # Debug: final box volume
-                }
-                
                 # Enhanced debug output
                 if verbose >= 2 or should_print:
-                    print(f"  [EVAL cls={cls}] prec={prec:.6f} | cov={cov:.6f} | n_pts={det.get('n_points', 0)}")
+                    # Use hard_precision for consistency with RL logging (both should show the same metric)
+                    hard_prec = det.get("hard_precision", prec)
+                    print(f"  [EVAL cls={cls}] prec={hard_prec:.6f} | cov={cov:.6f} | n_pts={det.get('n_points', 0)}")
                     print(f"    Box: initial_vol={initial_vol:.6f} | final_vol={final_vol:.6f} | "
                           f"expansion={expansion_ratio:.3f}x | size_ratio={box_size_ratio:.3f}x")
                     print(f"    Initial box: min={np.min(initial_width):.4f} | max={np.max(initial_width):.4f} | "
@@ -1434,23 +1539,8 @@ def train_and_evaluate_joint(
                     if det.get('n_points', 0) == 0:
                         print(f"    ⚠ WARNING: No points found in box! Box may be too small or in wrong region.")
                 
-                # Build rule from final bounds
-                lw = (anchor_env.upper - anchor_env.lower)
-                tightened = np.where(lw < initial_width * 0.95)[0]
-                if tightened.size > 0:
-                    tightened_sorted = np.argsort(lw[tightened])
-                    to_show = tightened[tightened_sorted[:max_features_in_rule]] if max_features_in_rule > 0 else tightened
-                    cond_parts = [f"{feature_names[i]} ∈ [{anchor_env.lower[i]:.2f}, {anchor_env.upper[i]:.2f}]" for i in to_show]
-                    rule = " and ".join(cond_parts) if cond_parts else "any values (no tightened features)"
-                else:
-                    rule = "any values (no tightened features)"
-                lower = anchor_env.lower.copy()
-                upper = anchor_env.upper.copy()
-                
-                # For PPO, info/rule/lower/upper are already set by greedy_rollout, so only set for DDPG
-                if use_continuous_actions:
-                    # DDPG: info/rule/lower/upper are set above
-                    pass
+                # Rule is already set by greedy_rollout (with improved tightening detection)
+                # Don't overwrite it! The rule from greedy_rollout uses the improved logic.
                 
                 # Store statistics
                 # Get detailed metrics for debugging
@@ -1604,10 +1694,10 @@ def train_and_evaluate_joint(
     X_test_unit = (X_test_scaled - X_min) / X_range
     
     if use_continuous_actions:
-        # DDPG: Use DDPG trainers for evaluation
-        # DDPG has separate trainers per class, so pass the dict of trainers
+        # Continuous actions (DDPG/TD3): Use trainers for evaluation
+        # Continuous action algorithms have separate trainers per class, so pass the dict of trainers
         if ddpg_trainers and len(ddpg_trainers) > 0:
-            # Pass the dict of DDPG trainers (evaluate_all_classes will handle per-class trainers)
+            # Pass the dict of continuous action trainers (evaluate_all_classes will handle per-class trainers)
             eval_results = evaluate_all_classes(
                 X_test=X_test_scaled,
                 y_test=y_test,
@@ -1652,13 +1742,13 @@ def train_and_evaluate_joint(
         except:
             pass
     
-    # Cleanup DDPG environments if used
+    # Cleanup continuous action environments if used (DDPG/TD3)
     if use_continuous_actions and ddpg_trainers:
-        # DDPG environments are already closed in the training loop, but ensure cleanup
-        for cls, ddpg_trainer in ddpg_trainers.items():
-            if hasattr(ddpg_trainer, 'env') and ddpg_trainer.env is not None:
+        # Continuous action environments are already closed in the training loop, but ensure cleanup
+        for cls, continuous_trainer in ddpg_trainers.items():
+            if hasattr(continuous_trainer, 'env') and continuous_trainer.env is not None:
                 try:
-                    ddpg_trainer.env.close()
+                    continuous_trainer.env.close()
                 except:
                     pass
     
@@ -1673,22 +1763,24 @@ def train_and_evaluate_joint(
     os.makedirs(models_dir, exist_ok=True)
     
     if use_continuous_actions:
-        # DDPG: Save each class's DDPG model (actor and critic networks)
-        print(f"\nSaving DDPG models (actor and critic networks)...")
-        for cls, ddpg_trainer in ddpg_trainers.items():
-            model_path = f"{models_dir}/ddpg_class_{cls}_final"
-            ddpg_trainer.save(model_path)
-            print(f"  Saved DDPG model for class {cls}: {model_path}")
+        # Continuous actions (DDPG/TD3): Save each class's model (actor and critic networks)
+        algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
+        print(f"\nSaving {algorithm_name} models (actor and critic networks)...")
+        for cls, continuous_trainer in ddpg_trainers.items():
+            model_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_final"
+            continuous_trainer.save(model_path)
+            print(f"  Saved {algorithm_name} model for class {cls}: {model_path}")
             
             # Also save actor and critic separately for easier inspection
-            actor_path = f"{models_dir}/ddpg_class_{cls}_actor"
-            critic_path = f"{models_dir}/ddpg_class_{cls}_critic"
+            # Note: TD3 has twin critics, but SB3 exposes them through unified critic interface
+            actor_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_actor"
+            critic_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_critic"
             try:
-                # Save actor network
-                torch.save(ddpg_trainer.model.actor.state_dict(), f"{actor_path}.pth")
+                # Save actor network (same for DDPG and TD3)
+                torch.save(continuous_trainer.model.actor.state_dict(), f"{actor_path}.pth")
                 print(f"    Saved actor network: {actor_path}.pth")
-                # Save critic network
-                torch.save(ddpg_trainer.model.critic.state_dict(), f"{critic_path}.pth")
+                # Save critic network (for TD3, this saves the unified critic interface)
+                torch.save(continuous_trainer.model.critic.state_dict(), f"{critic_path}.pth")
                 print(f"    Saved critic network: {critic_path}.pth")
             except Exception as e:
                 if verbose >= 1:
@@ -1755,7 +1847,7 @@ def train_and_evaluate_joint(
             "classifier_epochs_per_round": classifier_epochs_per_round,
             "classifier_update_every": classifier_update_every,
             "use_continuous_actions": use_continuous_actions,
-            "algorithm": "DDPG" if use_continuous_actions else "PPO",
+            "algorithm": continuous_algorithm.upper() if use_continuous_actions else "PPO",
         },
         "overall_statistics": {
             "overall_precision": float(eval_results["overall_precision"]),
@@ -1912,32 +2004,115 @@ def train_and_evaluate_joint(
         # X_min and X_range are computed from X_train_scaled for unit space conversion
         # For plotting, we need them to convert bounds from unit space to standardized space
         
-        # Create 2D plot of rules
-        plot_path = plot_rules_2d(
-            eval_results=eval_results,
-            X_test=X_test_scaled,  # Use standardized test data
-            y_test=y_test,
-            feature_names=feature_names,
-            class_names=None,  # Can be passed if available, but not required
-            output_path=plot_path,
-            X_min=X_min,  # Available from earlier in function
-            X_range=X_range,  # Available from earlier in function
-        )
-        print(f"  Saved 2D rules visualization: {plot_path}")
+        # eval_results should already have the correct structure from evaluate_all_classes
+        # It has per_class_results with integer keys (class indices)
+        # Verify structure before plotting
+        if "per_class_results" not in eval_results:
+            raise ValueError("eval_results missing 'per_class_results'")
+        
+        # IMPORTANT: evaluate_all_classes returns individual_results, but plot_rules_2d expects anchors
+        # Extract anchors from individual_results before plotting
+        per_class_results = eval_results.get("per_class_results", {}).copy()
+        for cls_key, cls_result in per_class_results.items():
+            # If anchors don't exist, extract them from individual_results
+            if "anchors" not in cls_result and "individual_results" in cls_result:
+                anchors_list = []
+                instance_indices_used = []
+                for individual_result in cls_result["individual_results"]:
+                    instance_idx = int(individual_result.get("instance_idx", -1))
+                    if instance_idx >= 0:
+                        instance_indices_used.append(instance_idx)
+                    anchors_list.append({
+                        "instance_idx": instance_idx,
+                        "lower_bounds": individual_result.get("lower_bounds", []),
+                        "upper_bounds": individual_result.get("upper_bounds", []),
+                        "precision": float(individual_result.get("precision", 0.0)),
+                        "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                        "coverage": float(individual_result.get("coverage", 0.0)),
+                        "n_points": int(individual_result.get("n_points", 0)),
+                        "rule": individual_result.get("rule", ""),
+                    })
+                cls_result["anchors"] = anchors_list
+                cls_result["instance_indices_used"] = instance_indices_used
+        
+        # Create a copy of eval_results with anchors added
+        eval_results_with_anchors = eval_results.copy()
+        eval_results_with_anchors["per_class_results"] = per_class_results
+        if len(per_class_results) == 0:
+            print(f"  [WARNING] No per_class_results found in eval_results, skipping 2D visualization")
+            if verbose >= 1:
+                print(f"    eval_results keys: {list(eval_results.keys())}")
+        else:
+            # Debug: Check structure
+            if verbose >= 2:
+                print(f"  [DEBUG] per_class_results keys: {list(per_class_results.keys())[:5]}")
+                sample_key = list(per_class_results.keys())[0]
+                sample_result = per_class_results[sample_key]
+                print(f"  [DEBUG] Sample class result keys: {list(sample_result.keys())}")
+            
+            # Check if anchors are present
+            has_anchors = False
+            anchor_count = 0
+            for cls_key, cls_result in per_class_results.items():
+                if "anchors" in cls_result:
+                    anchors = cls_result.get("anchors", [])
+                    if len(anchors) > 0:
+                        has_anchors = True
+                        anchor_count += len(anchors)
+                        if verbose >= 2:
+                            print(f"  [DEBUG] Class {cls_key} has {len(anchors)} anchors")
+            
+            if not has_anchors:
+                print(f"  [WARNING] No anchors found in eval_results, skipping 2D visualization")
+                print(f"    Hint: This might happen if all rules are 'any values (no tightened features)'")
+                if verbose >= 1:
+                    print(f"    Total classes checked: {len(per_class_results)}")
+                    print(f"    Sample class keys: {list(per_class_results.keys())[:3]}")
+            else:
+                if verbose >= 1:
+                    print(f"  Found {anchor_count} anchors across {len(per_class_results)} classes")
+                # Create 2D plot of rules
+                try:
+                    plot_path = plot_rules_2d(
+                        eval_results=eval_results_with_anchors,  # Use eval_results with anchors added
+                        X_test=X_test_scaled,  # Use standardized test data
+                        y_test=y_test,
+                        feature_names=feature_names,
+                        class_names=None,  # Can be passed if available, but not required
+                        output_path=plot_path,
+                        X_min=X_min,  # Available from earlier in function
+                        X_range=X_range,  # Available from earlier in function
+                    )
+                    print(f"  ✓ Saved 2D rules visualization: {plot_path}")
+                except Exception as plot_error:
+                    print(f"  [ERROR] Failed to create 2D visualization: {plot_error}")
+                    import traceback
+                    traceback.print_exc()  # Always print traceback for debugging
+                    # Try to provide helpful error message
+                    print(f"    Check that:")
+                    print(f"    - eval_results contains per_class_results with anchors")
+                    print(f"    - anchors have lower_bounds and upper_bounds")
+                    print(f"    - X_test_scaled, X_min, X_range are valid")
+                    print(f"    - X_test_scaled shape: {X_test_scaled.shape if hasattr(X_test_scaled, 'shape') else 'N/A'}")
+                    print(f"    - y_test shape: {y_test.shape if hasattr(y_test, 'shape') else 'N/A'}")
+                    print(f"    - feature_names length: {len(feature_names) if feature_names else 'N/A'}")
     except Exception as e:
         if verbose >= 1:
             print(f"  [WARNING] Could not create 2D visualization: {e}")
         import traceback
         if verbose >= 2:
             traceback.print_exc()
+        elif verbose >= 1:
+            # Print a bit more detail even at verbose=1
+            print(f"    Error type: {type(e).__name__}")
     
     # Prepare results
     if use_continuous_actions:
-        # DDPG: Return DDPG trainers
+        # Continuous actions (DDPG/TD3): Return trainers
         results = {
-            "trained_model": ddpg_trainers,  # Dictionary of DDPG trainers per class
+            "trained_model": ddpg_trainers,  # Dictionary of continuous action trainers per class
             "classifier": classifier,
-            "trainer": ddpg_trainers,  # Dictionary of DDPG trainers
+            "trainer": ddpg_trainers,  # Dictionary of continuous action trainers
             "eval_results": eval_results,
         "overall_stats": {
             "avg_precision": eval_results["overall_precision"],
