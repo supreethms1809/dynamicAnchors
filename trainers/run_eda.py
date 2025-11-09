@@ -38,8 +38,10 @@ def load_dataset(dataset_name, sample_size=None, seed=42):
         prices = data.target
         # Convert to classification
         quartiles = np.percentile(prices, [25, 50, 75])
-        y = np.digitize(prices, quartiles).astype(int)
-        y = np.clip(y - 1, 0, 3)
+        # np.digitize returns: 0 for <q1, 1 for q1-<q2, 2 for q2-<q3, 3 for >=q3
+        # This gives us 4 bins (0,1,2,3) which is what we want!
+        y = np.digitize(prices, quartiles).astype(int)  # Creates 0, 1, 2, 3 (4 classes)
+        # No need to subtract 1 - np.digitize already gives us 0-3
         feature_names = list(data.feature_names)
         class_names = ["very_low_price", "low_price", "medium_price", "high_price"]
     else:

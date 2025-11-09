@@ -607,18 +607,27 @@ def evaluate_class(
         individual_results.append(result)
     
     # Aggregate statistics
-    avg_precision = np.mean([r["precision"] for r in individual_results])
-    avg_hard_precision = np.mean([r["hard_precision"] for r in individual_results])
-    avg_coverage = np.mean([r["coverage"] for r in individual_results])  # Backward compatibility
-    
-    # Aggregate local and global coverage separately
-    local_coverages = [r.get("local_coverage", r.get("coverage", 0.0)) for r in individual_results]
-    global_coverages = [r.get("global_coverage") for r in individual_results if r.get("global_coverage") is not None]
-    avg_local_coverage = np.mean(local_coverages) if local_coverages else None
-    avg_global_coverage = np.mean(global_coverages) if global_coverages else None
-    
-    # Find best anchor (by hard precision)
-    best_result = max(individual_results, key=lambda r: r["hard_precision"])
+    # Check if individual_results is empty to prevent np.mean on empty list (returns nan)
+    if len(individual_results) == 0:
+        avg_precision = 0.0
+        avg_hard_precision = 0.0
+        avg_coverage = 0.0
+        avg_local_coverage = None
+        avg_global_coverage = None
+        best_result = None
+    else:
+        avg_precision = np.mean([r["precision"] for r in individual_results])
+        avg_hard_precision = np.mean([r["hard_precision"] for r in individual_results])
+        avg_coverage = np.mean([r["coverage"] for r in individual_results])  # Backward compatibility
+        
+        # Aggregate local and global coverage separately
+        local_coverages = [r.get("local_coverage", r.get("coverage", 0.0)) for r in individual_results]
+        global_coverages = [r.get("global_coverage") for r in individual_results if r.get("global_coverage") is not None]
+        avg_local_coverage = np.mean(local_coverages) if local_coverages else None
+        avg_global_coverage = np.mean(global_coverages) if global_coverages else None
+        
+        # Find best anchor (by hard precision)
+        best_result = max(individual_results, key=lambda r: r["hard_precision"])
     
     # Compute union coverage: how many unique test instances are covered by at least one anchor
     union_coverage = None
@@ -643,8 +652,8 @@ def evaluate_class(
         "avg_global_coverage": float(avg_global_coverage) if avg_global_coverage is not None else None,
         "union_coverage": union_coverage,  # Union coverage across all anchors (test data only)
         "n_instances": len(individual_results),
-        "best_rule": best_result["rule"],
-        "best_precision": best_result["hard_precision"],
+        "best_rule": best_result["rule"] if best_result is not None else "",
+        "best_precision": best_result["hard_precision"] if best_result is not None else 0.0,
         "individual_results": individual_results,
         "data_source": individual_results[0].get("data_source", "training") if individual_results else "training",
     }

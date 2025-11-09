@@ -76,17 +76,19 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         # This creates 4 classes: very_low, low, medium, high
         # Note: Prices are in hundreds of thousands of dollars (e.g., 1.5 = $150,000)
         quartiles = np.percentile(prices, [25, 50, 75])
-        y = np.digitize(prices, quartiles).astype(int)  # Creates 0, 1, 2, 3, 4
-        y = np.clip(y - 1, 0, 3)  # Map to 0-3 (4 classes)
+        # np.digitize returns: 0 for <q1, 1 for q1-<q2, 2 for q2-<q3, 3 for >=q3
+        # This gives us 4 bins (0,1,2,3) which is what we want!
+        y = np.digitize(prices, quartiles).astype(int)  # Creates 0, 1, 2, 3 (4 classes)
+        # No need to subtract 1 - np.digitize already gives us 0-3
         
         feature_names = list(data.feature_names)
         class_names = ["very_low_price", "low_price", "medium_price", "high_price"]
         
         print(f"\nConverted housing prices to 4 classes:")
-        print(f"  Class 0 (very_low): < ${quartiles[0]*100:.0f}K")
-        print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K")
-        print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K")
-        print(f"  Class 3 (high): > ${quartiles[2]*100:.0f}K")
+        print(f"  Class 0 (very_low): < ${quartiles[0]*100:.0f}K (25th percentile)")
+        print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
+        print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
+        print(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
     else:
         raise ValueError(
             f"Unknown dataset '{dataset_name}'. "
@@ -302,10 +304,10 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 "n_envs": 3,
             },
             "housing": {
-                "episodes": 100,
-                "steps_per_episode": 500,
-                "classifier_epochs_per_round": 2,  # Larger dataset, 2 epochs per update
-                "classifier_update_every": 5,  # Update every 5 episodes
+                "episodes": 500,
+                "steps_per_episode": 100,
+                "classifier_epochs_per_round": 10,  # Larger dataset, 2 epochs per update
+                "classifier_update_every": 100,  # Update every 5 episodes
                 "n_envs": 4,
             },
             "default": {
@@ -362,7 +364,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             use_continuous_actions=use_continuous_actions,  # Enable continuous actions if requested
             continuous_algorithm=continuous_algorithm,  # "ddpg" or "td3"
             n_envs=n_envs if not use_continuous_actions else 1,  # DDPG doesn't use vectorized envs the same way
-            learning_rate=3e-4,
+            learning_rate=3e-4,  # For PPO (discrete actions)
+            continuous_learning_rate=5e-5,  # Lower LR for TD3/DDPG to reduce reward variance
             n_steps=steps_per_episode,
             batch_size=48,
             n_epochs=10,
@@ -371,11 +374,11 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             n_perturb=2048,
             step_fracs=(0.005, 0.01, 0.02),
             min_width=0.05,
-            precision_target=0.95,  # Match POC breast_cancer preset (easier than 0.98)
-            coverage_target=0.5,  # 50% coverage - very high threshold, requires large boxes
-            n_eval_instances_per_class=20,
+            precision_target=0.85,  # Reduced from 0.95 to allow earlier coverage optimization
+            coverage_target=0.3,  # Reduced from 0.5 to more realistic target (30% coverage)
+            n_eval_instances_per_class=50,
             max_features_in_rule=5,
-            output_dir=f"./output/{dataset_name}_joint/",
+            output_dir=f"./output/{dataset_name}_{continuous_algorithm}_joint/",
             save_checkpoints=True,
             checkpoint_freq=2000,
             verbose=1,
@@ -467,7 +470,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             n_eval_instances_per_class=20,
             max_features_in_rule=5,
             steps_per_episode=eval_steps_per_episode,
-            output_dir=f"./output/{dataset_name}_anchors/",
+            output_dir=f"./output/{dataset_name}_{continuous_algorithm}_anchors/",
             save_checkpoints=True,
             checkpoint_freq=2000,
             eval_freq=0,

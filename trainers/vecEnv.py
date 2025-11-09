@@ -106,6 +106,9 @@ class AnchorEnv:
         from trainers.device_utils import get_device
         self.device = get_device(device)
         self.target_class = int(target_class)
+        # Validate step_fracs is not empty to prevent division by zero in _apply_action
+        if step_fracs is None or len(step_fracs) == 0:
+            raise ValueError("step_fracs cannot be empty. Provide at least one step fraction value.")
         self.step_fracs = step_fracs
         self.min_width = min_width
         self.alpha = alpha
@@ -137,6 +140,9 @@ class AnchorEnv:
         self.js_penalty_weight = float(js_penalty_weight)
         self.x_star_unit = x_star_unit.astype(np.float32) if x_star_unit is not None else None
         self.initial_window = float(initial_window)
+        # Fixed instance sampling support: store fixed instances per class
+        # Format: {class: array of instance indices}
+        self.fixed_instances_per_class = None  # Will be set if using fixed instance sampling
         
         # Track coverage floor hits (reset per episode)
         self.coverage_floor_hits = 0
@@ -440,11 +446,32 @@ class AnchorEnv:
         precision_gain = precision - prev_precision
         coverage_gain = coverage - prev_coverage
         
-        # Validate gains
+        # Validate gains BEFORE scaling to prevent invalid scaling
+        # Note: prev_precision and prev_coverage are already validated above (lines 414-417)
         if not np.isfinite(precision_gain):
             precision_gain = 0.0
         if not np.isfinite(coverage_gain):
             coverage_gain = 0.0
+        
+        # Normalize coverage gain to match precision gain scale
+        # Coverage gains are typically 10-100x smaller than precision gains
+        # Use relative scaling with minimum denominator to avoid discontinuity
+        min_denominator = max(prev_coverage, 1e-6)  # Smooth transition, no discontinuity
+        coverage_gain_normalized = coverage_gain / min_denominator
+        # Scale to similar magnitude as precision gains (typically 0.01-0.1)
+        # If coverage increases by 10%, that's similar to precision increasing by 0.1
+        coverage_gain_scaled = coverage_gain_normalized * 0.1
+        
+        # Cap scaled coverage gain to prevent extreme values that could destabilize training
+        # This prevents very large negative penalties or rewards from coverage changes
+        coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.1, 0.1)
+        
+        # Use scaled coverage gain for reward calculation
+        coverage_gain_for_reward = coverage_gain_scaled
+        
+        # Final validation of scaled gain
+        if not np.isfinite(coverage_gain_for_reward):
+            coverage_gain_for_reward = 0.0
 
         widths = self.upper - self.lower
         overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
@@ -478,19 +505,19 @@ class AnchorEnv:
         # Compute reward weights and penalties
         precision_threshold = self.precision_target * 0.8  # Require 80% of target precision
         precision_weight, coverage_weight, js_penalty = self._compute_reward_weights_and_penalties(
-            precision, precision_gain, coverage_gain, js_proxy, eps
+            precision, precision_gain, coverage_gain_for_reward, js_proxy, precision_threshold, eps
         )
         
-        # Compute bonuses
+        # Compute bonuses (use scaled coverage gain for bonus calculation too)
         coverage_bonus = self._compute_coverage_bonus(
-            precision, coverage, coverage_gain, precision_threshold, eps
+            precision, coverage, coverage_gain_for_reward, precision_threshold, eps
         )
         target_class_bonus = self._compute_target_class_bonus(
             details, precision, precision_threshold, eps
         )
 
         reward = (self.alpha * precision_weight * precision_gain + 
-                 coverage_weight * coverage_gain + 
+                 coverage_weight * coverage_gain_for_reward + 
                  coverage_bonus +
                  target_class_bonus -
                  overlap_penalty - 
@@ -510,7 +537,7 @@ class AnchorEnv:
         
         # Calculate individual reward components for debugging
         precision_gain_component = self.alpha * precision_weight * precision_gain
-        coverage_gain_component = coverage_weight * coverage_gain
+        coverage_gain_component = coverage_weight * coverage_gain_for_reward
         
         info = {
             "precision": precision, 
@@ -525,7 +552,8 @@ class AnchorEnv:
             "coverage_after_revert": coverage_after_revert,   # Coverage after revert (if revert occurred)
             # Reward components for debugging
             "precision_gain": precision_gain,
-            "coverage_gain": coverage_gain,
+            "coverage_gain": coverage_gain,  # Original (unscaled) for logging
+            "coverage_gain_scaled": coverage_gain_for_reward,  # Scaled version used in reward
             "precision_gain_component": precision_gain_component,
             "coverage_gain_component": coverage_gain_component,
             "coverage_bonus": coverage_bonus,
@@ -554,7 +582,7 @@ class AnchorEnv:
     
     def _compute_reward_weights_and_penalties(
         self, precision: float, precision_gain: float, coverage_gain: float, 
-        js_proxy: float, eps: float
+        js_proxy: float, precision_threshold: float, eps: float
     ) -> tuple:
         """
         Compute reward weights and volume/overlap proxy penalty based on precision threshold.
@@ -562,30 +590,34 @@ class AnchorEnv:
         Args:
             js_proxy: Volume/overlap proxy value (0.0 = no change, 1.0 = large change)
                      This is NOT actual JS divergence, but a simple volume-based proxy.
+            precision_threshold: Precision threshold (typically 0.8 * precision_target)
         
         Returns:
             Tuple of (precision_weight, coverage_weight, js_penalty)
         """
-        precision_threshold = self.precision_target * 0.8  # Require 80% of target precision
         
         if precision >= precision_threshold:
             # Precision is high enough, now we can optimize coverage
+            # Ensure precision_weight doesn't decrease when crossing threshold (fix inconsistency)
             # Scale coverage gain by how much we exceed precision threshold
-            precision_weight = 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps)
+            precision_weight = max(2.0, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
             coverage_weight = self.beta * min(1.0, precision / (precision_threshold + eps))
             
             # If precision is at target and we're increasing coverage, reduce JS penalty
             # This encourages expanding coverage when precision is already high
+            # Note: coverage_gain here is the scaled version (coverage_gain_for_reward)
             if precision >= self.precision_target * 0.95 and coverage_gain > 0:
                 # Reduce JS penalty when expanding coverage with high precision
                 js_penalty = self.js_penalty_weight * js_proxy * 0.3  # 70% reduction
             else:
                 js_penalty = self.js_penalty_weight * js_proxy
         else:
-            # Precision is low, focus only on precision
-            # Penalize coverage gain if precision is not high enough
+            # Precision is low, focus primarily on precision but still allow coverage learning
+            # Penalize coverage gain if precision is not high enough, but less aggressively
             precision_weight = 2.0  # Higher weight for precision when it's low
-            coverage_weight = self.beta * 0.1 * (precision / (precision_threshold + eps))  # Very low coverage weight
+            # Less aggressive suppression: use 0.3 base + 0.7 * precision ratio (was 0.1 * ratio)
+            # This allows coverage to learn even when precision is low
+            coverage_weight = self.beta * (0.3 + 0.7 * (precision / (precision_threshold + eps)))
             js_penalty = self.js_penalty_weight * js_proxy
         
         return precision_weight, coverage_weight, js_penalty
@@ -605,15 +637,17 @@ class AnchorEnv:
             # The closer we get to target, the larger the bonus becomes
             # This creates a gradient that encourages reaching the target
             progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            # Bonus increases as we approach target (from 0.01 to 0.05)
-            coverage_bonus = (0.01 + 0.04 * progress_to_target) * coverage_gain / (self.coverage_target + eps)
+            # Increased multipliers and removed division by target to make bonus more meaningful
+            # Bonus increases as we approach target (from 0.1 to 0.4) - significantly increased
+            coverage_bonus = (0.1 + 0.3 * progress_to_target) * coverage_gain
             
             # Extra incentive when below target but precision is high
-            if coverage < self.coverage_target:
-                # Additional bonus proportional to how far we are from target
-                # This makes reaching the target more rewarding
-                distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
-                coverage_bonus += 0.03 * coverage_gain * (1.0 - distance_to_target) / (self.coverage_target + eps)
+            # Note: We're already in the elif block where coverage < self.coverage_target
+            # (otherwise we'd be in the first if block), so this check is redundant but kept for clarity
+            # Additional bonus proportional to how far we are from target
+            # This makes reaching the target more rewarding
+            distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
+            coverage_bonus += 0.05 * coverage_gain * (1.0 - distance_to_target)
         
         return coverage_bonus
     
@@ -628,9 +662,12 @@ class AnchorEnv:
             # Box contains target class samples but precision is low (classifier bias issue)
             # Give bonus proportional to fraction of target class samples
             # This helps RL agent find good regions even when classifier is biased
-            target_class_bonus = 0.2 * target_class_fraction * (1.0 - precision / (precision_threshold + eps))
+            # Compute precision ratio once (quadratic decay: bonus decreases faster as precision improves)
+            precision_ratio = 1.0 - precision / (precision_threshold + eps)
+            target_class_bonus = 0.2 * target_class_fraction * precision_ratio
             # Scale down as precision improves (less needed when classifier is working)
-            target_class_bonus *= max(0.1, 1.0 - precision / (precision_threshold + eps))
+            # Quadratic decay: bonus decreases faster as precision improves
+            target_class_bonus *= max(0.1, precision_ratio)
         
         return target_class_bonus
 
@@ -680,20 +717,47 @@ class DynamicAnchorEnv(gym.Env):
         # IMPORTANT: If x_star_unit is already set (e.g., for evaluation), use it instead of sampling
         # This allows final evaluation to use specific instances while training can still sample randomly
         if self.anchor_env.x_star_unit is None:
-            # Sample an instance from the training data matching the target class
-            # This ensures each episode starts with a small box around a relevant instance
             target_class = self.anchor_env.target_class
-            mask_target = (self.anchor_env.y == target_class)
-            indices_target = np.where(mask_target)[0]
             
-            if len(indices_target) > 0:
-                # Sample a random instance of the target class
-                instance_idx = self.anchor_env.rng.choice(indices_target)
-                sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+            # Check if fixed instance sampling is enabled
+            if (self.anchor_env.fixed_instances_per_class is not None and 
+                target_class in self.anchor_env.fixed_instances_per_class and
+                len(self.anchor_env.fixed_instances_per_class[target_class]) > 0):
+                # FIXED INSTANCE SAMPLING: Cycle through pre-selected instances
+                # Use seed to determine which instance to use (episode number encoded in seed)
+                fixed_instances = self.anchor_env.fixed_instances_per_class[target_class]
                 
-                # Set x_star_unit to the sampled instance location
+                # Extract episode number from seed if provided (seed = 42 + cls + ep)
+                # For cycling, extract episode number: ep = seed - 42 - cls
+                # This ensures each class cycles independently starting from instance 0
+                if seed is not None:
+                    # Seed format: 42 + cls + ep
+                    # Extract episode: ep = seed - 42 - cls
+                    base_seed = 42
+                    episode_num = seed - base_seed - target_class
+                    instance_idx_in_pool = episode_num % len(fixed_instances)
+                else:
+                    # Fallback: use random selection from fixed pool (shouldn't happen in training)
+                    instance_idx_in_pool = self.anchor_env.rng.integers(0, len(fixed_instances))
+                
+                instance_idx = fixed_instances[instance_idx_in_pool]
+                sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
                 self.anchor_env.x_star_unit = sampled_instance_unit
-            # If no instances found, x_star_unit remains None (will use full range)
+            else:
+                # RANDOM SAMPLING (fallback or when fixed instances not set)
+                # Sample an instance from the training data matching the target class
+                # This ensures each episode starts with a small box around a relevant instance
+                mask_target = (self.anchor_env.y == target_class)
+                indices_target = np.where(mask_target)[0]
+                
+                if len(indices_target) > 0:
+                    # Sample a random instance of the target class
+                    instance_idx = self.anchor_env.rng.choice(indices_target)
+                    sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+                    
+                    # Set x_star_unit to the sampled instance location
+                    self.anchor_env.x_star_unit = sampled_instance_unit
+                # If no instances found, x_star_unit remains None (will use full range)
         
         # Use a smaller initial_window for training (0.15) - starts with small box
         # IMPORTANT: Only override if it's still at default (0.1) to allow evaluation to use larger window (0.3)
@@ -731,19 +795,19 @@ class DynamicAnchorEnv(gym.Env):
         terminated = done
         truncated = False
         
-        step_info = {
-            "precision": info.get("precision", 0.0),
-            "coverage": info.get("coverage", 0.0),
-            "hard_precision": info.get("hard_precision", 0.0),
-            "drift": info.get("drift", 0.0),
-            "js_penalty": info.get("js_penalty", 0.0),
-            "coverage_clipped": info.get("coverage_clipped", False),
-            "coverage_floor_hits": info.get("coverage_floor_hits", 0),
-            "coverage_before_revert": info.get("coverage_before_revert"),
-            "coverage_after_revert": info.get("coverage_after_revert"),
-            "sampler": info.get("sampler", "unknown"),
-            "n_points": info.get("n_points", 0),
-        }
+        # Copy all info keys to step_info, including reward components
+        # This ensures reward breakdown logging works correctly
+        step_info = dict(info)  # Copy all keys from info
+        # Ensure required keys exist with defaults if missing
+        step_info.setdefault("precision", 0.0)
+        step_info.setdefault("coverage", 0.0)
+        step_info.setdefault("hard_precision", info.get("hard_precision", info.get("precision", 0.0)))
+        step_info.setdefault("drift", 0.0)
+        step_info.setdefault("js_penalty", 0.0)
+        step_info.setdefault("coverage_clipped", False)
+        step_info.setdefault("coverage_floor_hits", 0)
+        step_info.setdefault("sampler", "unknown")
+        step_info.setdefault("n_points", 0)
         
         return obs, float(reward), bool(terminated), bool(truncated), step_info
     
@@ -877,16 +941,43 @@ class ContinuousAnchorEnv(gym.Env):
         # IMPORTANT: If x_star_unit is already set (e.g., for evaluation), use it instead of sampling
         # This allows final evaluation to use specific instances while training can still sample randomly
         if self.anchor_env.x_star_unit is None:
-            # Sample an instance from the training data matching the target class
             target_class = self.anchor_env.target_class
-            mask_target = (self.anchor_env.y == target_class)
-            indices_target = np.where(mask_target)[0]
             
-            if len(indices_target) > 0:
-                instance_idx = self.anchor_env.rng.choice(indices_target)
+            # Check if fixed instance sampling is enabled
+            if (self.anchor_env.fixed_instances_per_class is not None and 
+                target_class in self.anchor_env.fixed_instances_per_class and
+                len(self.anchor_env.fixed_instances_per_class[target_class]) > 0):
+                # FIXED INSTANCE SAMPLING: Cycle through pre-selected instances
+                # Use seed to determine which instance to use (episode number encoded in seed)
+                fixed_instances = self.anchor_env.fixed_instances_per_class[target_class]
+                
+                # Extract episode number from seed if provided (seed = 42 + cls + ep)
+                # For cycling, extract episode number: ep = seed - 42 - cls
+                # This ensures each class cycles independently starting from instance 0
+                if seed is not None:
+                    # Seed format: 42 + cls + ep
+                    # Extract episode: ep = seed - 42 - cls
+                    base_seed = 42
+                    episode_num = seed - base_seed - target_class
+                    instance_idx_in_pool = episode_num % len(fixed_instances)
+                else:
+                    # Fallback: use random selection from fixed pool (shouldn't happen in training)
+                    instance_idx_in_pool = self.anchor_env.rng.integers(0, len(fixed_instances))
+                
+                instance_idx = fixed_instances[instance_idx_in_pool]
                 sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
                 self.anchor_env.x_star_unit = sampled_instance_unit
-            # If no instances found, x_star_unit remains None (will use full range)
+            else:
+                # RANDOM SAMPLING (fallback or when fixed instances not set)
+                # Sample an instance from the training data matching the target class
+                mask_target = (self.anchor_env.y == target_class)
+                indices_target = np.where(mask_target)[0]
+                
+                if len(indices_target) > 0:
+                    instance_idx = self.anchor_env.rng.choice(indices_target)
+                    sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
+                    self.anchor_env.x_star_unit = sampled_instance_unit
+                # If no instances found, x_star_unit remains None (will use full range)
         
         # Use smaller initial_window for training (0.15) unless already set (e.g., 0.3 for evaluation)
         if self.anchor_env.initial_window == 0.1:  # Only override default
@@ -912,19 +1003,19 @@ class ContinuousAnchorEnv(gym.Env):
         next_state, reward, done, info = self.anchor_env.step(action)
         obs = np.array(next_state, dtype=np.float32)
         
-        step_info = {
-            "precision": info.get("precision", 0.0),
-            "coverage": info.get("coverage", 0.0),
-            "hard_precision": info.get("hard_precision", 0.0),
-            "drift": info.get("drift", 0.0),
-            "js_penalty": info.get("js_penalty", 0.0),
-            "coverage_clipped": info.get("coverage_clipped", False),
-            "coverage_floor_hits": info.get("coverage_floor_hits", 0),
-            "coverage_before_revert": info.get("coverage_before_revert"),
-            "coverage_after_revert": info.get("coverage_after_revert"),
-            "sampler": info.get("sampler", "unknown"),
-            "n_points": info.get("n_points", 0),
-        }
+        # Copy all info keys to step_info, including reward components
+        # This ensures reward breakdown logging works correctly
+        step_info = dict(info)  # Copy all keys from info
+        # Ensure required keys exist with defaults if missing
+        step_info.setdefault("precision", 0.0)
+        step_info.setdefault("coverage", 0.0)
+        step_info.setdefault("hard_precision", info.get("hard_precision", info.get("precision", 0.0)))
+        step_info.setdefault("drift", 0.0)
+        step_info.setdefault("js_penalty", 0.0)
+        step_info.setdefault("coverage_clipped", False)
+        step_info.setdefault("coverage_floor_hits", 0)
+        step_info.setdefault("sampler", "unknown")
+        step_info.setdefault("n_points", 0)
         
         terminated = done
         truncated = False

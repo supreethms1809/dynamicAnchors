@@ -319,7 +319,8 @@ def train_and_evaluate_joint(
     use_continuous_actions: bool = False,  # Use continuous actions (DDPG/TD3) instead of PPO (discrete)
     continuous_algorithm: str = "ddpg",  # "ddpg" or "td3" (only used if use_continuous_actions=True)
     n_envs: int = 4,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 3e-4,  # Default for PPO (discrete actions)
+    continuous_learning_rate: float = 5e-5,  # Lower LR for TD3/DDPG (continuous actions) for stability
     n_steps: int = None,  # Will default to steps_per_episode
     batch_size: int = 64,
     n_epochs: int = 10,
@@ -694,8 +695,8 @@ def train_and_evaluate_joint(
             target_class=target_cls,
             step_fracs=step_fracs,
             min_width=min_width,
-            alpha=0.7,
-            beta=0.6,
+            alpha=0.5,  # Reduced from 0.7 to balance with coverage
+            beta=1.0,   # Increased from 0.6 to boost coverage learning
             gamma=0.1,
             precision_target=precision_target,
             coverage_target=coverage_target,
@@ -713,6 +714,29 @@ def train_and_evaluate_joint(
     # Create default factory (for evaluation)
     def make_anchor_env():
         return create_anchor_env()
+    
+    # ======================================================================
+    # FIXED INSTANCE SAMPLING: Pre-select instances per class for training
+    # This reduces variance by using consistent starting points
+    # ======================================================================
+    n_fixed_instances_per_class = 10  # Number of fixed instances per class
+    rng_fixed = np.random.default_rng(seed=42)  # Fixed seed for reproducibility
+    fixed_instances_per_class = {}
+    
+    print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class...")
+    for cls in target_classes:
+        cls_indices = np.where(y_train == cls)[0]
+        if len(cls_indices) > 0:
+            n_sample = min(n_fixed_instances_per_class, len(cls_indices))
+            fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
+            fixed_instances_per_class[cls] = fixed_indices
+            print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
+        else:
+            fixed_instances_per_class[cls] = np.array([], dtype=int)
+            print(f"  Class {cls}: No instances available")
+    
+    # Store fixed instances in a way accessible to environments
+    # We'll pass episode number through seed parameter to cycle through instances
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -739,6 +763,8 @@ def train_and_evaluate_joint(
         continuous_trainers = {}
         for cls in target_classes:
             anchor_env = create_anchor_env(target_cls=cls)
+            # Set fixed instances for this class (for fixed instance sampling)
+            anchor_env.fixed_instances_per_class = fixed_instances_per_class
             # Enable continuous actions in AnchorEnv
             anchor_env.n_actions = 2 * anchor_env.n_features
             anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
@@ -752,7 +778,7 @@ def train_and_evaluate_joint(
                 trainer = create_td3_trainer(
                     env=gym_env,
                     policy_type="MlpPolicy",
-                    learning_rate=1e-4,  # Smaller LR for stability
+                    learning_rate=continuous_learning_rate,  # Use parameter (default: 5e-5 for stability)
                     buffer_size=100000,
                     learning_starts=0,
                     batch_size=64,
@@ -771,7 +797,7 @@ def train_and_evaluate_joint(
                 trainer = create_ddpg_trainer(
                     env=gym_env,
                     policy_type="MlpPolicy",
-                    learning_rate=1e-4,  # Smaller LR for stability
+                    learning_rate=continuous_learning_rate,  # Use parameter (default: 5e-5 for stability)
                     buffer_size=100000,
                     learning_starts=0,
                     batch_size=64,
@@ -942,9 +968,13 @@ def train_and_evaluate_joint(
             for cls in target_classes:
                 # Update environment with current classifier
                 anchor_env = create_anchor_env(target_cls=cls)
+                # Set fixed instances for this class (for fixed instance sampling)
+                anchor_env.fixed_instances_per_class = fixed_instances_per_class
                 anchor_env.n_actions = 2 * anchor_env.n_features
                 anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
                 anchor_env.min_absolute_step = max(0.05, min_width * 0.5)
+                # Pass episode number in seed to cycle through fixed instances
+                # Seed format: 42 + cls + ep (episode number allows cycling)
                 gym_env = ContinuousAnchorEnv(anchor_env, seed=42 + cls + ep)
                 ddpg_trainer = ddpg_trainers[cls]
                 ddpg_trainer.env = gym_env  # Update environment
@@ -1069,7 +1099,9 @@ def train_and_evaluate_joint(
                         avg_js_per_step = reward_components['js_penalty'] / max(1, n_steps_actual)
                         avg_drift_per_step = reward_components['drift_penalty'] / max(1, n_steps_actual)
                         
-                        print(f"    [DDPG cls={cls}] Reward breakdown:")
+                        # Use correct algorithm name for logging
+                        algo_name = continuous_algorithm.upper() if use_continuous_actions else "PPO"
+                        print(f"    [{algo_name} cls={cls}] Reward breakdown:")
                         print(f"      Total reward: {episode_reward:.6f} (over {n_steps_actual} steps)")
                         print(f"      Final precision: {reward_components['final_precision']:.6f} | "
                               f"Final coverage: {reward_components['final_coverage']:.6f} | "
@@ -1099,7 +1131,9 @@ def train_and_evaluate_joint(
             avg_reward = np.mean(list(episode_rewards_per_class.values()))
             episode_rewards_history.append(avg_reward)
             if verbose >= 1:
-                print(f"  [DDPG] Episode rewards: {episode_rewards_per_class}, avg={avg_reward:.6f}")
+                # Use correct algorithm name for logging
+                algo_name = continuous_algorithm.upper() if use_continuous_actions else "PPO"
+                print(f"  [{algo_name}] Episode rewards: {episode_rewards_per_class}, avg={avg_reward:.6f}")
         else:
             # PPO: Use vectorized environment and SB3's learn() method
             # Update environment with current classifier (classifier may have changed)
