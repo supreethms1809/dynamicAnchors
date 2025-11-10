@@ -207,9 +207,10 @@ marimo/_lsp/
 __marimo__/
 
 #Custom 
-housing_joint_output/*
-wine_joint_output/*
-breast_cancer_joint_output/*
-covtype_joint_output/*
+output/housing_*_joint/*
+output/wine_*_joint/*
+output/breast_cancer_*_joint/*
+output/covtype_*_joint/*
+proof_of_concept/*.json
 
 *.pth
