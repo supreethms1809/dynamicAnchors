@@ -16,6 +16,17 @@ def analyze_metrics(json_path):
     with open(json_path, 'r') as f:
         data = json.load(f)
     
+    # Helper function to get the appropriate per_class_results structure
+    def get_results_structure():
+        """Returns (instance_results, class_results, is_new_structure)"""
+        per_class_results = data.get('per_class_results', {})
+        if 'instance_level' in per_class_results:
+            return per_class_results['instance_level'], per_class_results.get('class_level', {}), True
+        else:
+            return per_class_results, {}, False
+    
+    instance_results, class_results, is_new_structure = get_results_structure()
+    
     print("="*80)
     print("TRAINING SUMMARY")
     print("="*80)
@@ -30,34 +41,45 @@ def analyze_metrics(json_path):
     print("OVERALL STATISTICS")
     print("="*80)
     overall = data['overall_statistics']
-    print(f"Overall Precision: {overall['overall_precision']:.4f}")
-    print(f"Overall Coverage: {overall['overall_coverage']:.4f}")
     
-    print("\n" + "="*80)
-    print("PER-CLASS RESULTS (Final Evaluation)")
-    print("="*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        cls_data = data['per_class_results'][cls_key]
-        print(f"\n{cls_key}:")
-        print(f"  Hard Precision: {cls_data['hard_precision']:.4f}")
-        print(f"  Coverage: {cls_data['coverage']:.4f}")
-        print(f"  Best Rule Precision: {cls_data['best_precision']:.4f}")
-        print(f"  Number of rules: {len(cls_data['rules'])}")
-        print(f"  Unique rules: {len(set(cls_data['rules']))}")
+    # Handle both new structure (instance_level/class_level) and old structure (backward compatibility)
+    if 'instance_level' in overall:
+        # New structure: separate instance-level and class-level
+        print("\n[Instance-Level Evaluation] (One anchor per test instance, like static anchors):")
+        instance_overall = overall['instance_level']
+        print(f"  Overall Precision: {instance_overall.get('overall_precision', 0.0):.4f}")
+        print(f"  Overall Coverage: {instance_overall.get('overall_coverage', 0.0):.4f}")
+        if 'overall_n_points' in instance_overall:
+            print(f"  Overall N Points: {instance_overall.get('overall_n_points', 0)}")
         
-        # Analyze rule quality
-        rules_data = cls_data.get('rules_with_instances', [])
-        if rules_data:
-            precisions = [r['hard_precision'] for r in rules_data if r.get('hard_precision', 0) > 0]
-            coverages = [r['coverage'] for r in rules_data if r.get('coverage', 0) > 0]
-            if precisions:
-                print(f"  Rule Precision - Mean: {np.mean(precisions):.3f}, "
-                      f"Std: {np.std(precisions):.3f}, "
-                      f"Min: {np.min(precisions):.3f}, "
-                      f"Max: {np.max(precisions):.3f}")
-            if coverages:
-                print(f"  Rule Coverage - Mean: {np.mean(coverages):.3f}, "
-                      f"Std: {np.std(coverages):.3f}")
+        print("\n[Class-Level Evaluation] (One anchor per class, dynamic anchors advantage):")
+        class_overall = overall['class_level']
+        print(f"  Overall Precision: {class_overall.get('overall_precision', 0.0):.4f}")
+        print(f"  Overall Coverage: {class_overall.get('overall_coverage', 0.0):.4f}")
+        
+        # Show comparison
+        print("\n[Comparison]:")
+        cov_improvement = class_overall.get('overall_coverage', 0.0) - instance_overall.get('overall_coverage', 0.0)
+        if cov_improvement > 0:
+            improvement_pct = (cov_improvement / instance_overall.get('overall_coverage', 1e-10)) * 100 if instance_overall.get('overall_coverage', 0) > 0 else 0
+            print(f"  Coverage Improvement: {cov_improvement:+.4f} ({improvement_pct:+.1f}% increase)")
+            print(f"    → Dynamic anchors (class-level) achieve higher coverage!")
+        else:
+            print(f"  Coverage Difference: {cov_improvement:.4f}")
+    else:
+        # Old structure: backward compatibility
+        print(f"Overall Precision: {overall.get('overall_precision', 0.0):.4f}")
+        print(f"Overall Coverage: {overall.get('overall_coverage', 0.0):.4f}")
+        if 'overall_n_points' in overall:
+            print(f"Overall N Points: {overall.get('overall_n_points', 0)}")
+    
+    # Handle both new structure (instance_level/class_level) and old structure
+    per_class_results = data.get('per_class_results', {})
+    
+    if 'instance_level' in per_class_results:
+        # New structure: separate instance-level and class-level
+        instance_results = per_class_results['instance_level']
+        class_results = per_class_results['class_level']
     
     print("\n" + "="*80)
     print("TRAINING PROGRESS")
@@ -201,8 +223,14 @@ def analyze_metrics(json_path):
     print("\n" + "="*80)
     print("FEATURE FREQUENCY ANALYSIS")
     print("="*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules = data['per_class_results'][cls_key]['rules']
+    
+    # Get the appropriate per_class_results structure for analysis
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    
+    for cls_key in sorted(results_to_analyze.keys()):
+        cls_data = results_to_analyze[cls_key]
+        rules = cls_data.get('rules', [])
         features = []
         for rule in rules:
             matches = re.findall(r'(\w+) ∈', rule)
@@ -224,8 +252,10 @@ def analyze_metrics(json_path):
     print("\n" + "-"*80)
     print("1. RULE COMPLEXITY ANALYSIS")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules = data['per_class_results'][cls_key]['rules']
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules = results_to_analyze[cls_key].get('rules', [])
         rule_complexities = []
         for rule in rules:
             if rule and rule != "any values (no tightened features)":
@@ -247,8 +277,10 @@ def analyze_metrics(json_path):
     print("\n" + "-"*80)
     print("2. PRECISION-COVERAGE TRADEOFF ANALYSIS")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             precisions = [r['hard_precision'] for r in rules_data if r.get('hard_precision', 0) > 0]
             coverages = [r['coverage'] for r in rules_data if r.get('coverage', 0) > 0]
@@ -291,8 +323,10 @@ def analyze_metrics(json_path):
     })
     global_scores = []  # Initialize for later use in plotting
     
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             feature_importance = defaultdict(lambda: {
                 'count': 0, 
@@ -433,8 +467,10 @@ def analyze_metrics(json_path):
     print("\n" + "-"*80)
     print("4. FEATURE CO-OCCURRENCE ANALYSIS")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules = data['per_class_results'][cls_key]['rules']
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules = results_to_analyze[cls_key].get('rules', [])
         feature_pairs = defaultdict(int)
         
         for rule in rules:
@@ -454,8 +490,10 @@ def analyze_metrics(json_path):
     print("\n" + "-"*80)
     print("5. RULE OVERLAP ANALYSIS")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules = data['per_class_results'][cls_key]['rules']
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules = results_to_analyze[cls_key].get('rules', [])
         rule_counts = Counter(rules)
         
         if rules:
@@ -481,8 +519,10 @@ def analyze_metrics(json_path):
     print("\n" + "-"*80)
     print("6. RULE EFFICIENCY ANALYSIS (Precision per Feature)")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             efficiencies = []
             for rule_data in rules_data:
@@ -588,8 +628,10 @@ def analyze_metrics(json_path):
     print("9. CLASS COMPARISON SUMMARY")
     print("-"*80)
     class_summaries = []
-    for cls_key in sorted(data['per_class_results'].keys()):
-        cls_data = data['per_class_results'][cls_key]
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        cls_data = results_to_analyze[cls_key]
         rules_data = cls_data.get('rules_with_instances', [])
         
         summary = {
@@ -608,20 +650,32 @@ def analyze_metrics(json_path):
             summary['mean_rule_coverage'] = np.mean(coverages) if coverages else 0
         
         class_summaries.append(summary)
+        
+        # Add class-level comparison if available
+        if is_new_structure and cls_key in class_results:
+            cls_class_data = class_results[cls_key]
+            summary['class_level_precision'] = cls_class_data.get('hard_precision', 0.0)
+            summary['class_level_coverage'] = cls_class_data.get('coverage', 0.0)
+            summary['coverage_improvement'] = summary['class_level_coverage'] - summary['coverage']
     
     # Sort by precision
     class_summaries.sort(key=lambda x: x['precision'], reverse=True)
-    print("\nClasses ranked by precision:")
+    print("\nClasses ranked by precision (Instance-Level):")
     for i, summary in enumerate(class_summaries, 1):
         print(f"  {i}. {summary['class']}: precision={summary['precision']:.3f}, coverage={summary['coverage']:.4f}, "
               f"best={summary['best_precision']:.3f}, rules={summary['n_rules']}/{summary['unique_rules']} unique")
+        if 'class_level_coverage' in summary:
+            print(f"      → Class-Level Coverage: {summary['class_level_coverage']:.4f} "
+                  f"(improvement: {summary.get('coverage_improvement', 0):+.4f})")
     
     # 10. Feature Range Analysis (if bounds available)
     print("\n" + "-"*80)
     print("10. FEATURE RANGE ANALYSIS")
     print("-"*80)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        anchors = data['per_class_results'][cls_key].get('anchors', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for anchor analysis
+    for cls_key in sorted(results_to_analyze.keys()):
+        anchors = results_to_analyze[cls_key].get('anchors', [])
         if anchors and len(anchors) > 0:
             # Check if we have bounds
             first_anchor = anchors[0]
@@ -656,8 +710,10 @@ def analyze_metrics(json_path):
     
     # Plot 1: Precision-Coverage scatter
     ax1 = plt.subplot(3, 4, 1)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             precisions = [r['hard_precision'] for r in rules_data]
             coverages = [r['coverage'] for r in rules_data]
@@ -671,8 +727,10 @@ def analyze_metrics(json_path):
     # Plot 2: Rule complexity distribution
     ax2 = plt.subplot(3, 4, 2)
     all_complexities = []
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules = data['per_class_results'][cls_key]['rules']
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules = results_to_analyze[cls_key].get('rules', [])
         for rule in rules:
             if rule and rule != "any values (no tightened features)":
                 matches = re.findall(r'(\w+) ∈', rule)
@@ -686,8 +744,10 @@ def analyze_metrics(json_path):
     
     # Plot 3: Precision distribution
     ax3 = plt.subplot(3, 4, 3)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             precisions = [r['hard_precision'] for r in rules_data if r.get('hard_precision', 0) > 0]
             if precisions:
@@ -700,8 +760,10 @@ def analyze_metrics(json_path):
     
     # Plot 4: Coverage distribution
     ax4 = plt.subplot(3, 4, 4)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             coverages = [r['coverage'] for r in rules_data if r.get('coverage', 0) > 0]
             if coverages:
@@ -728,8 +790,10 @@ def analyze_metrics(json_path):
     
     # Plot 6: Rule efficiency (precision per feature)
     ax6 = plt.subplot(3, 4, 6)
-    for cls_key in sorted(data['per_class_results'].keys()):
-        rules_data = data['per_class_results'][cls_key].get('rules_with_instances', [])
+    instance_results, class_results, is_new_structure = get_results_structure()
+    results_to_analyze = instance_results  # Use instance-level for rule-based analyses
+    for cls_key in sorted(results_to_analyze.keys()):
+        rules_data = results_to_analyze[cls_key].get('rules_with_instances', [])
         if rules_data:
             complexities = []
             precisions = []
@@ -856,41 +920,78 @@ def analyze_metrics(json_path):
                          (frequencies[idx], avg_precs[idx]),
                          xytext=(5, 5), textcoords='offset points', fontsize=8)
     
-    # Plot 12: Feature Importance Comparison (Multiple Metrics)
+    # Plot 12: Instance-Level vs Class-Level Coverage Comparison
     ax12 = plt.subplot(3, 4, 12)
-    if global_scores:
-        top_10_features = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:10]
-        features = [f['feature'] for f in top_10_features]
-        
-        # Calculate scores from available data
-        prec_weighted_scores = [f['count'] * f['avg_precision'] for f in top_10_features]
-        combined_scores = [f['count'] * f['avg_precision'] * f['avg_coverage'] for f in top_10_features]
-        freq_scores = [f['count'] for f in top_10_features]
-        
-        # Normalize scores for comparison
-        max_freq = max(freq_scores) if freq_scores else 1
-        max_prec_weighted = max(prec_weighted_scores) if prec_weighted_scores else 1
-        max_combined = max(combined_scores) if combined_scores else 1
-        
-        x_pos = np.arange(len(features))
-        width_bar = 0.25
-        
-        # Normalize and plot
-        freq_norm = [f / max_freq for f in freq_scores]
-        prec_norm = [f / max_prec_weighted if max_prec_weighted > 0 else 0 for f in prec_weighted_scores]
-        comb_norm = [f / max_combined if max_combined > 0 else 0 for f in combined_scores]
-        
-        ax12.bar(x_pos - width_bar, freq_norm, width_bar, label='Frequency (norm)', alpha=0.7)
-        ax12.bar(x_pos, prec_norm, width_bar, label='Precision-Weighted (norm)', alpha=0.7)
-        ax12.bar(x_pos + width_bar, comb_norm, width_bar, label='Combined Score (norm)', alpha=0.7)
-        
-        ax12.set_xlabel('Feature')
-        ax12.set_ylabel('Normalized Score')
-        ax12.set_title('Top 10 Features: Multiple Metrics')
-        ax12.set_xticks(x_pos)
-        ax12.set_xticklabels(features, rotation=45, ha='right', fontsize=8)
-        ax12.legend(fontsize=7)
-        ax12.grid(True, alpha=0.3, axis='y')
+    instance_results, class_results, is_new_structure = get_results_structure()
+    if is_new_structure and class_results:
+        classes = sorted(set(instance_results.keys()) & set(class_results.keys()))
+        if classes:
+            instance_covs = [instance_results[cls].get('coverage', 0.0) for cls in classes]
+            class_covs = [class_results[cls].get('coverage', 0.0) for cls in classes]
+            
+            x = np.arange(len(classes))
+            width = 0.35
+            ax12.bar(x - width/2, instance_covs, width, label='Instance-Level', alpha=0.8, color='skyblue')
+            ax12.bar(x + width/2, class_covs, width, label='Class-Level', alpha=0.8, color='coral')
+            ax12.set_xlabel('Class')
+            ax12.set_ylabel('Coverage')
+            ax12.set_title('Coverage: Instance vs Class Level\n(Dynamic Anchors Advantage)')
+            ax12.set_xticks(x)
+            ax12.set_xticklabels(classes, rotation=45, ha='right')
+            ax12.legend()
+            ax12.grid(True, alpha=0.3, axis='y')
+            
+            # Add improvement annotations
+            for i, cls in enumerate(classes):
+                improvement = class_covs[i] - instance_covs[i]
+                if improvement > 0:
+                    ax12.annotate(f'+{improvement:.3f}', 
+                                xy=(i + width/2, class_covs[i]),
+                                xytext=(0, 5), textcoords='offset points',
+                                ha='center', fontsize=8, color='green', weight='bold')
+        else:
+            ax12.text(0.5, 0.5, 'No class-level data\navailable', 
+                     ha='center', va='center', transform=ax12.transAxes)
+            ax12.set_title('Coverage Comparison (N/A)')
+    else:
+        # Fallback: Feature Importance Comparison (if no class-level data)
+        if global_scores:
+            top_10_features = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:10]
+            features = [f['feature'] for f in top_10_features]
+            
+            # Calculate scores from available data
+            prec_weighted_scores = [f['count'] * f['avg_precision'] for f in top_10_features]
+            combined_scores = [f['count'] * f['avg_precision'] * f['avg_coverage'] for f in top_10_features]
+            freq_scores = [f['count'] for f in top_10_features]
+            
+            # Normalize scores for comparison
+            max_freq = max(freq_scores) if freq_scores else 1
+            max_prec_weighted = max(prec_weighted_scores) if prec_weighted_scores else 1
+            max_combined = max(combined_scores) if combined_scores else 1
+            
+            x_pos = np.arange(len(features))
+            width_bar = 0.25
+            
+            # Normalize and plot
+            freq_norm = [f / max_freq for f in freq_scores]
+            prec_norm = [f / max_prec_weighted if max_prec_weighted > 0 else 0 for f in prec_weighted_scores]
+            comb_norm = [f / max_combined if max_combined > 0 else 0 for f in combined_scores]
+            
+            ax12.bar(x_pos - width_bar, freq_norm, width_bar, label='Frequency (norm)', alpha=0.7)
+            ax12.bar(x_pos, prec_norm, width_bar, label='Precision-Weighted (norm)', alpha=0.7)
+            ax12.bar(x_pos + width_bar, comb_norm, width_bar, label='Combined Score (norm)', alpha=0.7)
+            
+            ax12.set_xlabel('Feature')
+            ax12.set_ylabel('Normalized Score')
+            ax12.set_title('Top 10 Features: Multiple Metrics')
+            ax12.set_xticks(x_pos)
+            ax12.set_xticklabels(features, rotation=45, ha='right', fontsize=8)
+            ax12.legend(fontsize=7)
+            ax12.grid(True, alpha=0.3, axis='y')
+        else:
+            ax12.text(0.5, 0.5, 'No data available', 
+                     ha='center', va='center', transform=ax12.transAxes)
+            ax12.set_title('Plot 12 (N/A)')
     
     plt.tight_layout()
     

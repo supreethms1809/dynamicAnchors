@@ -40,6 +40,7 @@ class DynamicAnchorDDPGTrainer:
         policy_kwargs: Optional[dict] = None,
         verbose: int = 0,
         device: str = "auto",
+        tensorboard_log: Optional[str] = None,
     ):
         """
         Initialize the DDPG trainer with Stable-Baselines3.
@@ -59,6 +60,7 @@ class DynamicAnchorDDPGTrainer:
             policy_kwargs: Additional policy network arguments
             verbose: Verbosity level (0, 1, 2)
             device: Device for training ("auto", "cpu", "cuda")
+            tensorboard_log: Directory for TensorBoard logs (None = no logging)
         """
         self.env = env
         
@@ -95,6 +97,7 @@ class DynamicAnchorDDPGTrainer:
             policy_kwargs=policy_kwargs,
             verbose=verbose,
             device=device_str,
+            tensorboard_log=tensorboard_log,
         )
         
         # Initialize logger if not already initialized (needed for train() method)
@@ -246,13 +249,42 @@ class DynamicAnchorDDPGTrainer:
     
     def evaluate(self, n_eval_episodes: int = 10, deterministic: bool = True):
         """Evaluate the policy on the environment."""
+        print(f"[DEBUG DDPG.evaluate] Starting evaluation with n_eval_episodes={n_eval_episodes}, deterministic={deterministic}")
+        
+        # Ensure classifier is in eval mode before evaluation
+        # This is critical to prevent hanging during forward pass
+        print(f"[DEBUG DDPG.evaluate] Checking for classifier in environment...")
+        if hasattr(self.env, 'anchor_env') and hasattr(self.env.anchor_env, 'classifier'):
+            classifier = self.env.anchor_env.classifier
+            print(f"[DEBUG DDPG.evaluate] Found classifier: {type(classifier).__name__}")
+            if hasattr(classifier, 'eval'):
+                print(f"[DEBUG DDPG.evaluate] Setting classifier to eval mode...")
+                classifier.eval()
+                # Also ensure underlying model is in eval mode (for UnifiedClassifier wrapper)
+                if hasattr(classifier, 'model') and hasattr(classifier.model, 'eval'):
+                    classifier.model.eval()
+                print(f"[DEBUG DDPG.evaluate] Classifier set to eval mode")
+            else:
+                print(f"[DEBUG DDPG.evaluate] Classifier does not have eval() method")
+        else:
+            print(f"[DEBUG DDPG.evaluate] No classifier found in environment (env.anchor_env.classifier)")
+        
+        print(f"[DEBUG DDPG.evaluate] Calling evaluate_policy from stable_baselines3...")
         from stable_baselines3.common.evaluation import evaluate_policy
-        return evaluate_policy(
-            self.model,
-            self.env,
-            n_eval_episodes=n_eval_episodes,
-            deterministic=deterministic
-        )
+        try:
+            result = evaluate_policy(
+                self.model,
+                self.env,
+                n_eval_episodes=n_eval_episodes,
+                deterministic=deterministic
+            )
+            print(f"[DEBUG DDPG.evaluate] evaluate_policy completed successfully, result={result}")
+            return result
+        except Exception as e:
+            print(f"[DEBUG DDPG.evaluate] Exception in evaluate_policy: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
 
 def create_ddpg_trainer(
@@ -260,6 +292,7 @@ def create_ddpg_trainer(
     policy_type: str = "MlpPolicy",
     learning_rate: float = 1e-4,
     action_noise_sigma: float = 0.3,
+    tensorboard_log: Optional[str] = None,
     **kwargs
 ):
     """
@@ -287,6 +320,7 @@ def create_ddpg_trainer(
         policy_type=policy_type,
         learning_rate=learning_rate,
         action_noise=action_noise,
+        tensorboard_log=tensorboard_log,
         **kwargs
     )
 

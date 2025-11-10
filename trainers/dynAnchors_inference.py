@@ -659,6 +659,123 @@ def evaluate_class(
     }
 
 
+def evaluate_class_level(
+    trained_model: Union[PPO, DDPG, TD3, Dict[int, Any]],
+    make_env_fn,
+    feature_names: List[str],
+    target_class: int,
+    steps_per_episode: int = 100,
+    max_features_in_rule: int = 5,
+    random_seed: int = 42,
+    eval_on_test_data: bool = False,
+    X_test_unit: Optional[np.ndarray] = None,
+    X_test_std: Optional[np.ndarray] = None,
+    y_test: Optional[np.ndarray] = None,
+    initial_window: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate and generate ONE anchor per class (class-level evaluation).
+    
+    This creates a single anchor optimized for the entire class, not per-instance.
+    This matches how the RL agent was trained (class-level optimization).
+    
+    Args:
+        trained_model: Trained PPO model, DDPG model, or dict of DDPG trainers per class
+        make_env_fn: Function that creates AnchorEnv instance
+        feature_names: List of feature names
+        target_class: Target class to evaluate
+        steps_per_episode: Maximum rollout steps
+        max_features_in_rule: Maximum features in rule
+        random_seed: Random seed for consistency
+        eval_on_test_data: If True, compute metrics on test data instead of training data
+        X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
+        X_test_std: Test data in standardized space (required if eval_on_test_data=True)
+        y_test: Test labels (required if eval_on_test_data=True)
+        initial_window: Initial window size for anchor box (default: matches training)
+    
+    Returns:
+        Dictionary with class-level anchor metrics (one anchor per class).
+        Coverage is global coverage (fraction of all training/test data covered).
+    """
+    # Create environment for this class (no x_star_unit - class-level, not instance-level)
+    anchor_env = make_env_fn()
+    
+    # Set initial_window if provided
+    if initial_window is not None:
+        anchor_env.initial_window = initial_window
+    
+    # For class-level evaluation, don't set x_star_unit (let it be None)
+    # This allows the anchor to optimize for the entire class, not a specific instance
+    anchor_env.x_star_unit = None
+    
+    # Handle different model types
+    if isinstance(trained_model, dict):
+        # DDPG/TD3: Use per-class trainer
+        if target_class not in trained_model:
+            return {
+                "precision": 0.0,
+                "hard_precision": 0.0,
+                "coverage": 0.0,
+                "rule": "no model",
+                "lower_bounds": None,
+                "upper_bounds": None,
+                "data_source": "training",
+                "evaluation_type": "class_level"
+            }
+        continuous_trainer = trained_model[target_class]
+        continuous_model = continuous_trainer.model if hasattr(continuous_trainer, 'model') else continuous_trainer
+        
+        # Enable continuous actions
+        anchor_env.n_actions = 2 * anchor_env.n_features
+        anchor_env.max_action_scale = 0.02  # Default step size
+        anchor_env.min_absolute_step = 0.05
+        
+        # Wrap with ContinuousAnchorEnv
+        from trainers.vecEnv import ContinuousAnchorEnv
+        gym_env = ContinuousAnchorEnv(anchor_env, seed=random_seed)
+        
+        # Use greedy rollout
+        info, rule, lower, upper = greedy_rollout(
+            gym_env,
+            continuous_model,
+            steps_per_episode=steps_per_episode,
+            max_features_in_rule=max_features_in_rule
+        )
+    else:
+        # PPO: Use PPO model
+        from trainers.vecEnv import DynamicAnchorEnv
+        wrapped_env = DynamicAnchorEnv(anchor_env, seed=random_seed)
+        
+        info, rule, lower, upper = greedy_rollout(
+            wrapped_env,
+            trained_model,
+            steps_per_episode=steps_per_episode,
+            max_features_in_rule=max_features_in_rule
+        )
+    
+    # Get metrics from the final anchor
+    # Coverage is already global (computed on all training/test data)
+    local_coverage = info.get("coverage", 0.0)
+    
+    # Compute global coverage on test data if available
+    global_coverage = None
+    if eval_on_test_data and X_test_unit is not None:
+        global_coverage = compute_coverage_on_data(lower, upper, X_test_unit)
+    
+    return {
+        "rule": rule,
+        "precision": info.get("precision", 0.0),
+        "hard_precision": info.get("hard_precision", 0.0),
+        "coverage": local_coverage,  # This is already global coverage (on training/test data)
+        "local_coverage": local_coverage,  # For consistency with instance-level API
+        "global_coverage": global_coverage if global_coverage is not None else local_coverage,
+        "lower_bounds": lower.tolist(),
+        "upper_bounds": upper.tolist(),
+        "data_source": info.get("data_source", "training"),
+        "evaluation_type": "class_level"
+    }
+
+
 def evaluate_all_classes(
     X_test: np.ndarray,
     y_test: np.ndarray,
@@ -840,6 +957,156 @@ def evaluate_all_classes(
         "overall_union_coverage": float(overall_union_coverage) if overall_union_coverage is not None else None,
         "n_classes": n_classes,
         "data_source": data_source,
+        "evaluation_type": "instance_level",  # Mark as instance-level evaluation
+    }
+
+
+def evaluate_all_classes_class_level(
+    trained_model: Union[PPO, DDPG, TD3, Dict[int, Any]],
+    make_env_fn,
+    feature_names: List[str],
+    target_classes: Optional[List[int]] = None,
+    steps_per_episode: int = 100,
+    max_features_in_rule: int = 5,
+    random_seed: int = 42,
+    eval_on_test_data: bool = False,
+    X_test_unit: Optional[np.ndarray] = None,
+    X_test_std: Optional[np.ndarray] = None,
+    y_test: Optional[np.ndarray] = None,
+    initial_window: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate and generate ONE anchor per class (class-level evaluation for all classes).
+    
+    This creates a single anchor per class optimized for the entire class, not per-instance.
+    This matches how the RL agent was trained (class-level optimization).
+    
+    Args:
+        trained_model: Trained PPO model, DDPG model, or dict of DDPG trainers per class
+        make_env_fn: Function that creates AnchorEnv instance (should accept target_class parameter)
+        feature_names: List of feature names
+        target_classes: List of classes to evaluate (if None, inferred from model)
+        steps_per_episode: Maximum rollout steps
+        max_features_in_rule: Maximum features in rule
+        random_seed: Random seed for consistency
+        eval_on_test_data: If True, compute metrics on test data instead of training data
+        X_test_unit: Test data in unit space [0,1] (required if eval_on_test_data=True)
+        X_test_std: Test data in standardized space (required if eval_on_test_data=True)
+        y_test: Test labels (required if eval_on_test_data=True)
+        initial_window: Initial window size for anchor box (default: matches training)
+    
+    Returns:
+        Dictionary with per-class class-level results and overall statistics.
+        Coverage is global coverage (fraction of all training/test data covered).
+    """
+    # Determine target classes
+    if target_classes is None:
+        if isinstance(trained_model, dict):
+            target_classes = list(trained_model.keys())
+        else:
+            # For PPO, we need to infer from make_env_fn or use default
+            # Try to get from a temporary environment
+            temp_env = make_env_fn()
+            if hasattr(temp_env, 'target_class'):
+                target_classes = [temp_env.target_class]
+            else:
+                # Default: assume binary classification (0, 1)
+                target_classes = [0, 1]
+    
+    n_classes = len(target_classes)
+    
+    # Evaluate each class
+    per_class_results = {}
+    for cls in target_classes:
+        cls_int = int(cls)
+        print(f"\nEvaluating class {cls_int} (class-level, one anchor per class)...")
+        
+        # Create make_env_fn for this specific class
+        # Handle both cases: make_env_fn that accepts target_class, or create_anchor_env pattern
+        if callable(make_env_fn):
+            # Try calling with target_class parameter first
+            try:
+                # Check if make_env_fn accepts target_class parameter
+                import inspect
+                sig = inspect.signature(make_env_fn)
+                if 'target_class' in sig.parameters or 'target_cls' in sig.parameters:
+                    # It accepts target_class/target_cls parameter
+                    if 'target_class' in sig.parameters:
+                        temp_env = make_env_fn(target_class=cls_int)
+                    else:
+                        temp_env = make_env_fn(target_cls=cls_int)
+                else:
+                    # It's a factory that creates envs - try calling it
+                    temp_env = make_env_fn()
+                    # If it doesn't have target_class set, we need to recreate with target_class
+                    if not hasattr(temp_env, 'target_class') or temp_env.target_class != cls_int:
+                        # Recreate with target_class if possible
+                        if hasattr(make_env_fn, '__name__') and 'create_anchor_env' in str(make_env_fn):
+                            # It's create_anchor_env pattern - call with target_cls
+                            temp_env = make_env_fn(target_cls=cls_int)
+                        else:
+                            # Use as-is, but this might not work correctly
+                            temp_env = make_env_fn()
+            except Exception as e:
+                # Fallback: try calling without parameters
+                temp_env = make_env_fn()
+        else:
+            temp_env = make_env_fn
+        
+        # Create a proper make_env_fn for this class (use closure to capture cls_int)
+        def make_env_for_class():
+            # Try to call with target_class/target_cls if the function supports it
+            try:
+                import inspect
+                sig = inspect.signature(make_env_fn)
+                if 'target_class' in sig.parameters:
+                    return make_env_fn(target_class=cls_int)
+                elif 'target_cls' in sig.parameters:
+                    return make_env_fn(target_cls=cls_int)
+                else:
+                    # Fallback: call and hope it uses the right class
+                    return make_env_fn()
+            except:
+                # Final fallback
+                return make_env_fn()
+        
+        result = evaluate_class_level(
+            trained_model=trained_model,
+            make_env_fn=make_env_for_class,
+            feature_names=feature_names,
+            target_class=cls_int,
+            steps_per_episode=steps_per_episode,
+            max_features_in_rule=max_features_in_rule,
+            random_seed=random_seed,
+            eval_on_test_data=eval_on_test_data,
+            X_test_unit=X_test_unit,
+            X_test_std=X_test_std,
+            y_test=y_test,
+            initial_window=initial_window,
+        )
+        per_class_results[cls_int] = result
+        
+        print(f"  Class-level precision: {result['hard_precision']:.3f}")
+        print(f"  Class-level coverage: {result['coverage']:.3f}")
+        print(f"  Rule: {result['rule']}")
+    
+    # Compute overall statistics
+    if len(per_class_results) > 0:
+        overall_precision = np.mean([r["hard_precision"] for r in per_class_results.values()])
+        overall_coverage = np.mean([r["coverage"] for r in per_class_results.values()])
+        data_source = list(per_class_results.values())[0].get("data_source", "training")
+    else:
+        overall_precision = 0.0
+        overall_coverage = 0.0
+        data_source = "training"
+    
+    return {
+        "per_class_results": per_class_results,
+        "overall_precision": float(overall_precision),
+        "overall_coverage": float(overall_coverage),
+        "n_classes": n_classes,
+        "data_source": data_source,
+        "evaluation_type": "class_level",  # Mark as class-level evaluation
     }
 
 

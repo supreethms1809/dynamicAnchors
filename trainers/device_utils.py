@@ -123,3 +123,11 @@ def get_device_pair(device: Union[str, torch.device, None] = None) -> tuple[torc
     device_str = str(device_obj)
     return device_obj, device_str
 
+def set_device(device: Union[str, torch.device, None] = None) -> None:
+    """
+    Set the device for the current process.
+    
+    Args:
+        device: Device specification (same as get_device)
+    """
+    torch.cuda.set_device(device)

@@ -266,6 +266,15 @@ class AnchorEnv:
             else:
                 raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap' or 'uniform'.")
 
+        # Ensure classifier is in eval mode before forward pass
+        # This prevents hanging during evaluation (critical for stable_baselines3 evaluate_policy)
+        if hasattr(self.classifier, 'eval'):
+            self.classifier.eval()
+        # Also ensure underlying model is in eval mode (for UnifiedClassifier wrapper)
+        import torch
+        if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+            self.classifier.model.eval()
+        
         with torch.no_grad():
             inputs = torch.from_numpy(X_eval).float().to(self.device)
             logits = self.classifier(inputs)
@@ -314,6 +323,10 @@ class AnchorEnv:
         }
 
     def reset(self):
+        # Ensure classifier is in eval mode before reset (critical for preventing hangs)
+        if hasattr(self.classifier, 'eval'):
+            self.classifier.eval()
+        
         if self.x_star_unit is None:
             self.lower[:] = 0.0
             self.upper[:] = 1.0
@@ -458,13 +471,13 @@ class AnchorEnv:
         # Use relative scaling with minimum denominator to avoid discontinuity
         min_denominator = max(prev_coverage, 1e-6)  # Smooth transition, no discontinuity
         coverage_gain_normalized = coverage_gain / min_denominator
-        # Scale to similar magnitude as precision gains (typically 0.01-0.1)
-        # If coverage increases by 10%, that's similar to precision increasing by 0.1
-        coverage_gain_scaled = coverage_gain_normalized * 0.1
+        # INCREASED scaling to boost coverage learning (was 0.1, now 0.5)
+        # This makes coverage gains 5x more impactful in the reward
+        coverage_gain_scaled = coverage_gain_normalized * 0.5
         
-        # Cap scaled coverage gain to prevent extreme values that could destabilize training
-        # This prevents very large negative penalties or rewards from coverage changes
-        coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.1, 0.1)
+        # Increased cap to allow larger coverage rewards (was [-0.1, 0.1], now [-0.5, 0.5])
+        # This allows coverage improvements to have stronger signal
+        coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.5, 0.5)
         
         # Use scaled coverage gain for reward calculation
         coverage_gain_for_reward = coverage_gain_scaled
@@ -533,7 +546,41 @@ class AnchorEnv:
         self.prev_lower = prev_lower
         self.prev_upper = prev_upper
         state = np.concatenate([self.lower, self.upper, np.array([precision, coverage], dtype=np.float32)])
-        done = bool(precision >= self.precision_target and coverage >= self.coverage_target)
+        
+        # Flexible termination conditions:
+        # 1. Both targets met (ideal case)
+        # 2. Very high precision (>= 95% of target) with reasonable coverage (>= 50% of target)
+        # 3. Both metrics reasonably close (>= 90% of each target)
+        # 4. Precision exceeds target with any positive coverage (excellent precision compensates for low coverage)
+        eps = 1e-12
+        both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
+        high_precision_with_reasonable_coverage = (
+            precision >= 0.95 * self.precision_target and 
+            coverage >= 0.5 * self.coverage_target
+        )
+        both_reasonably_close = (
+            precision >= 0.90 * self.precision_target and 
+            coverage >= 0.90 * self.coverage_target
+        )
+        # If precision exceeds target, allow termination even with lower coverage
+        # This rewards excellent precision performance
+        excellent_precision = (
+            precision >= self.precision_target and 
+            coverage >= 0.3 * self.coverage_target  # At least 30% of coverage target
+        )
+        done = bool(both_targets_met or high_precision_with_reasonable_coverage or both_reasonably_close or excellent_precision)
+        
+        # Track termination reason for debugging
+        termination_reason = None
+        if done:
+            if both_targets_met:
+                termination_reason = "both_targets_met"
+            elif excellent_precision:
+                termination_reason = "excellent_precision"
+            elif high_precision_with_reasonable_coverage:
+                termination_reason = "high_precision_reasonable_coverage"
+            elif both_reasonably_close:
+                termination_reason = "both_reasonably_close"
         
         # Calculate individual reward components for debugging
         precision_gain_component = self.alpha * precision_weight * precision_gain
@@ -546,6 +593,8 @@ class AnchorEnv:
             "anchor_drift": anchor_drift_penalty,
             "js_penalty": js_penalty, 
             "coverage_clipped": coverage_clipped,
+            # Termination reason (for debugging)
+            "termination_reason": termination_reason,
             # Coverage floor tracking (for debugging learning stalls)
             "coverage_floor_hits": self.coverage_floor_hits,  # Total hits this episode
             "coverage_before_revert": coverage_before_revert,  # Coverage before revert (if revert occurred)
@@ -615,10 +664,15 @@ class AnchorEnv:
             # Precision is low, focus primarily on precision but still allow coverage learning
             # Penalize coverage gain if precision is not high enough, but less aggressively
             precision_weight = 2.0  # Higher weight for precision when it's low
-            # Less aggressive suppression: use 0.3 base + 0.7 * precision ratio (was 0.1 * ratio)
-            # This allows coverage to learn even when precision is low
-            coverage_weight = self.beta * (0.3 + 0.7 * (precision / (precision_threshold + eps)))
-            js_penalty = self.js_penalty_weight * js_proxy
+            # MORE AGGRESSIVE coverage weight: use 0.5 base + 0.5 * precision ratio (was 0.3 + 0.7)
+            # This gives coverage 50% weight even when precision is very low, encouraging expansion
+            coverage_weight = self.beta * (0.5 + 0.5 * (precision / (precision_threshold + eps)))
+            # Reduce JS penalty when expanding coverage (even if precision is low)
+            # This encourages exploration and coverage expansion
+            if coverage_gain > 0:
+                js_penalty = self.js_penalty_weight * js_proxy * 0.5  # 50% reduction when expanding
+            else:
+                js_penalty = self.js_penalty_weight * js_proxy
         
         return precision_weight, coverage_weight, js_penalty
     
@@ -637,17 +691,24 @@ class AnchorEnv:
             # The closer we get to target, the larger the bonus becomes
             # This creates a gradient that encourages reaching the target
             progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            # Increased multipliers and removed division by target to make bonus more meaningful
-            # Bonus increases as we approach target (from 0.1 to 0.4) - significantly increased
-            coverage_bonus = (0.1 + 0.3 * progress_to_target) * coverage_gain
+            # SIGNIFICANTLY INCREASED multipliers (was 0.1-0.4, now 0.3-1.0)
+            # Bonus increases as we approach target (from 0.3 to 1.0) - much stronger signal
+            coverage_bonus = (0.3 + 0.7 * progress_to_target) * coverage_gain
             
             # Extra incentive when below target but precision is high
             # Note: We're already in the elif block where coverage < self.coverage_target
             # (otherwise we'd be in the first if block), so this check is redundant but kept for clarity
             # Additional bonus proportional to how far we are from target
-            # This makes reaching the target more rewarding
+            # INCREASED from 0.05 to 0.2 for stronger coverage incentive
             distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
-            coverage_bonus += 0.05 * coverage_gain * (1.0 - distance_to_target)
+            coverage_bonus += 0.2 * coverage_gain * (1.0 - distance_to_target)
+        
+        # NEW: Also give coverage bonus even when precision is below threshold (but not too low)
+        # This encourages coverage expansion throughout training, not just when precision is high
+        elif precision >= precision_threshold * 0.8 and coverage_gain > 0:  # 80% of precision threshold
+            # Smaller bonus but still encourages coverage when precision is reasonable
+            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
+            coverage_bonus = (0.1 + 0.2 * progress_to_target) * coverage_gain
         
         return coverage_bonus
     
@@ -935,6 +996,10 @@ class ContinuousAnchorEnv(gym.Env):
     
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[np.ndarray, Dict]:
         """Reset the environment and return initial observation."""
+        # Ensure classifier is in eval mode before reset (critical for preventing hangs)
+        if hasattr(self.anchor_env.classifier, 'eval'):
+            self.anchor_env.classifier.eval()
+        
         if seed is not None:
             self.seed(seed)
         

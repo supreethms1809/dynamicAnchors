@@ -114,7 +114,7 @@ def train_and_evaluate_dynamic_anchors(
     from sklearn.preprocessing import StandardScaler
     from trainers.vecEnv import AnchorEnv, make_dummy_vec_env
     from trainers.PPO_trainer import train_ppo_model
-    from trainers.dynAnchors_inference import evaluate_all_classes
+    from trainers.dynAnchors_inference import evaluate_all_classes, evaluate_all_classes_class_level
     from trainers.device_utils import get_device_pair
     
     # Create output directory
@@ -224,11 +224,14 @@ def train_and_evaluate_dynamic_anchors(
     print(f"      This explains the classifier's behavior on training data.")
     print(f"      To evaluate on test data, set eval_on_test_data=True in evaluate_all_classes.")
     
-    eval_results = evaluate_all_classes(
+    # Instance-level evaluation (one anchor per test instance, like static anchors)
+    print(f"\n[Instance-Level Evaluation] Creating one anchor per test instance...")
+    
+    eval_results_instance = evaluate_all_classes(
         X_test=X_test_scaled,
         y_test=y_test,
         trained_model=trainer.model,
-        make_env_fn=make_anchor_env,
+        make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
         feature_names=feature_names,
         n_instances_per_class=n_eval_instances_per_class,
         max_features_in_rule=max_features_in_rule,
@@ -238,16 +241,44 @@ def train_and_evaluate_dynamic_anchors(
         eval_on_test_data=False,  # Default: use training data (backward compatible)
     )
     
+    # Class-level evaluation (one anchor per class)
+    print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+    eval_results_class = evaluate_all_classes_class_level(
+        trained_model=trainer.model,
+        make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
+        feature_names=feature_names,
+        target_classes=list(target_classes),
+        steps_per_episode=steps_per_episode,
+        max_features_in_rule=max_features_in_rule,
+        random_seed=42,
+        eval_on_test_data=False,
+        X_test_unit=None,
+        X_test_std=None,
+        y_test=None,
+    )
+    
+    # Combine both evaluation results
+    eval_results = {
+        "instance_level": eval_results_instance,
+        "class_level": eval_results_class,
+    }
+    
     vec_env.close()
     
     # Prepare results
     results = {
         "trained_model": trainer.model,
         "trainer": trainer,
-        "eval_results": eval_results,
+        "eval_results": eval_results,  # Contains both instance_level and class_level
         "overall_stats": {
-            "avg_precision": eval_results["overall_precision"],
-            "avg_coverage": eval_results["overall_coverage"],
+            "instance_level": {
+                "avg_precision": eval_results_instance.get("overall_precision", 0.0),
+                "avg_coverage": eval_results_instance.get("overall_coverage", 0.0),
+            },
+            "class_level": {
+                "avg_precision": eval_results_class.get("overall_precision", 0.0),
+                "avg_coverage": eval_results_class.get("overall_coverage", 0.0),
+            },
         },
         "metadata": {
             "n_classes": len(target_classes),
@@ -259,8 +290,15 @@ def train_and_evaluate_dynamic_anchors(
     }
     
     print(f"\nTraining and evaluation complete!")
-    print(f"Overall precision: {eval_results['overall_precision']:.3f}")
-    print(f"Overall coverage: {eval_results['overall_coverage']:.3f}")
+    print(f"\n{'='*80}")
+    print("FINAL EVALUATION RESULTS")
+    print(f"{'='*80}")
+    print(f"\n[Instance-Level Evaluation] (One anchor per test instance, like static anchors):")
+    print(f"  Overall Precision: {eval_results_instance.get('overall_precision', 0.0):.3f}")
+    print(f"  Overall Coverage: {eval_results_instance.get('overall_coverage', 0.0):.3f}")
+    print(f"\n[Class-Level Evaluation] (One anchor per class, dynamic anchors advantage):")
+    print(f"  Overall Precision: {eval_results_class.get('overall_precision', 0.0):.3f}")
+    print(f"  Overall Coverage: {eval_results_class.get('overall_coverage', 0.0):.3f}")
     
     return results
 

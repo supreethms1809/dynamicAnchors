@@ -38,7 +38,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 from typing import List, Tuple, Optional, Dict, Any
 from functools import partial
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CallbackList
 
 
 def compute_bootstrapped_return(
@@ -341,6 +341,9 @@ def train_and_evaluate_joint(
     output_dir: str = "./output/joint/",
     save_checkpoints: bool = True,
     checkpoint_freq: int = 10000,
+    save_best_model: bool = True,  # Save best model based on evaluation
+    best_model_eval_freq: int = 1,  # Evaluate every N episodes for best model (1 = every episode)
+    best_model_n_eval_episodes: int = 5,  # Number of episodes per evaluation
     verbose: int = 1,
 ) -> Dict[str, Any]:
     """
@@ -683,9 +686,11 @@ def train_and_evaluate_joint(
     # Create environment factory function
     def create_anchor_env(target_cls=None):
         """Helper to create AnchorEnv with a specific target class and current classifier."""
+        print(f"[DEBUG] create_anchor_env called with target_cls={target_cls}")
         if target_cls is None:
             target_cls = target_classes[0]
-        return AnchorEnv(
+        print(f"[DEBUG] create_anchor_env: Creating AnchorEnv for target_cls={target_cls}")
+        env = AnchorEnv(
             X_unit=X_unit_train,
             X_std=X_train_scaled,
             y=y_train,
@@ -710,6 +715,8 @@ def train_and_evaluate_joint(
             min_coverage_floor=0.005,
             js_penalty_weight=0.01,  # Reduced from 0.05 to 0.01 to prevent penalty from dominating rewards
         )
+        print(f"[DEBUG] create_anchor_env: AnchorEnv created successfully for target_cls={target_cls}")
+        return env
     
     # Create default factory (for evaluation)
     def make_anchor_env():
@@ -744,6 +751,17 @@ def train_and_evaluate_joint(
     # Setup single tensorboard log directory for all episodes (for unified logging)
     tensorboard_log_dir = os.path.join(output_dir, "tensorboard")
     os.makedirs(tensorboard_log_dir, exist_ok=True)
+    
+    # Setup best model directory if enabled
+    best_model_dir = None
+    best_reward_per_class = {}  # Track best reward per class for TD3/DDPG
+    if save_best_model:
+        best_model_dir = os.path.join(output_dir, "best_model")
+        os.makedirs(best_model_dir, exist_ok=True)
+        for cls in target_classes:
+            best_reward_per_class[cls] = float('-inf')
+        if verbose >= 1:
+            print(f"\n[Best Model Saving] Enabled - Best models will be saved to: {best_model_dir}")
     
     # Set n_steps default to steps_per_episode if not provided
     if n_steps is None:
@@ -791,6 +809,7 @@ def train_and_evaluate_joint(
                     policy_kwargs=dict(net_arch=[256, 256]),
                     verbose=0,
                     device=device_str,
+                    tensorboard_log=tensorboard_log_dir,  # Add TensorBoard logging
                 )
             else:
                 # Create DDPG trainer (default)
@@ -809,6 +828,7 @@ def train_and_evaluate_joint(
                     policy_kwargs=dict(net_arch=[256, 256]),
                     verbose=0,
                     device=device_str,
+                    tensorboard_log=tensorboard_log_dir,  # Add TensorBoard logging
                 )
             continuous_trainers[cls] = trainer
         
@@ -851,8 +871,11 @@ def train_and_evaluate_joint(
     # Training history
     test_acc_history = []
     episode_rewards_history = []  # Track rewards per episode
-    per_class_precision_history = {cls: [] for cls in target_classes}  # Track precision per class per episode
-    per_class_coverage_history = {cls: [] for cls in target_classes}  # Track coverage per class per episode
+    per_class_precision_history = {cls: [] for cls in target_classes}  # Track precision per class per episode (class-level)
+    per_class_coverage_history = {cls: [] for cls in target_classes}  # Track coverage per class per episode (class-level)
+    # Also track instance-level metrics (from evaluation during training)
+    per_class_instance_precision_history = {cls: [] for cls in target_classes}  # Instance-level precision
+    per_class_instance_coverage_history = {cls: [] for cls in target_classes}  # Instance-level coverage
     
     # Initialize classifier metrics to preserve across episodes
     last_loss = 0.0
@@ -956,18 +979,56 @@ def train_and_evaluate_joint(
         # STEP 2: Train RL Policy (every episode, matching dyn_anchor_PPO.py)
         # ======================================================================
         print(f"\n[Episode {ep + 1}] Training RL Policy...")
+        print(f"[DEBUG] Entering RL training block, use_continuous_actions={use_continuous_actions}")
         
         if use_continuous_actions:
+            print(f"[DEBUG] Starting continuous actions training")
             # Continuous actions (DDPG/TD3): Manual training loop (collect experiences, add to replay buffer, train)
             # Calculate timesteps for this episode: steps_per_episode * number of classes
             # (Continuous action algorithms run one episode per class, not using vectorized envs)
             timesteps_per_episode = steps_per_episode * len(target_classes)
+            print(f"[DEBUG] timesteps_per_episode={timesteps_per_episode}, steps_per_episode={steps_per_episode}, len(target_classes)={len(target_classes)}")
             
             episode_rewards_per_class = {}
             training_metrics_per_class = {}  # Store training metrics for each class
+            
+            # CRITICAL: Ensure classifier is in eval mode before RL training
+            # This prevents hanging during environment reset/step operations
+            print(f"[DEBUG] Setting classifier to eval mode")
+            if hasattr(classifier, 'eval'):
+                classifier.eval()
+            print(f"[DEBUG] Classifier set to eval mode")
+            
+            # CRITICAL: Disable PyTorch threading to prevent hangs on CPU
+            # This is especially important when using stable_baselines3 with vectorized environments
+            if device_str == "cpu":
+                print(f"[DEBUG] Setting CPU threading limits")
+                torch.set_num_threads(1)  # Use single thread to prevent deadlocks
+                # Also set environment variable as backup
+                os.environ['OMP_NUM_THREADS'] = '1'
+                os.environ['MKL_NUM_THREADS'] = '1'
+                os.environ['NUMEXPR_NUM_THREADS'] = '1'
+                if verbose >= 2:
+                    print(f"  [Device] Set PyTorch to single-threaded mode for CPU (prevents hangs)")
+                    print(f"  [Device] Set OMP_NUM_THREADS=MKL_NUM_THREADS=NUMEXPR_NUM_THREADS=1")
+            print(f"[DEBUG] Starting loop over target_classes: {target_classes}")
+            
             for cls in target_classes:
+                print(f"[DEBUG] Processing class {cls}")
+                # CRITICAL: Ensure classifier is in eval mode before creating environment
+                # This must be done for each class to prevent hangs
+                print(f"[DEBUG] Class {cls}: Setting classifier to eval mode before creating environment")
+                if hasattr(classifier, 'eval'):
+                    classifier.eval()
+                # Also ensure underlying model is in eval mode (for UnifiedClassifier wrapper)
+                if hasattr(classifier, 'model') and hasattr(classifier.model, 'eval'):
+                    classifier.model.eval()
+                print(f"[DEBUG] Class {cls}: Classifier set to eval mode")
+                
                 # Update environment with current classifier
+                print(f"[DEBUG] Class {cls}: Creating anchor_env...")
                 anchor_env = create_anchor_env(target_cls=cls)
+                print(f"[DEBUG] Class {cls}: anchor_env created successfully")
                 # Set fixed instances for this class (for fixed instance sampling)
                 anchor_env.fixed_instances_per_class = fixed_instances_per_class
                 anchor_env.n_actions = 2 * anchor_env.n_features
@@ -975,9 +1036,13 @@ def train_and_evaluate_joint(
                 anchor_env.min_absolute_step = max(0.05, min_width * 0.5)
                 # Pass episode number in seed to cycle through fixed instances
                 # Seed format: 42 + cls + ep (episode number allows cycling)
+                print(f"[DEBUG] Class {cls}: Creating ContinuousAnchorEnv with seed={42 + cls + ep}")
                 gym_env = ContinuousAnchorEnv(anchor_env, seed=42 + cls + ep)
+                print(f"[DEBUG] Class {cls}: ContinuousAnchorEnv created successfully")
                 ddpg_trainer = ddpg_trainers[cls]
+                print(f"[DEBUG] Class {cls}: Updating trainer environment")
                 ddpg_trainer.env = gym_env  # Update environment
+                print(f"[DEBUG] Class {cls}: Trainer environment updated")
                 
                 # Run episode: collect experiences and train
                 try:
@@ -991,10 +1056,27 @@ def train_and_evaluate_joint(
                         GYM_VERSION = "gym"
                 
                 try:
+                    # CRITICAL: Ensure classifier is in eval mode right before reset
+                    # This is the last chance before the forward pass that might hang
+                    print(f"[DEBUG] Class {cls}: Ensuring classifier is in eval mode before reset")
+                    if hasattr(anchor_env.classifier, 'eval'):
+                        anchor_env.classifier.eval()
+                    if hasattr(anchor_env.classifier, 'model') and hasattr(anchor_env.classifier.model, 'eval'):
+                        anchor_env.classifier.model.eval()
+                    print(f"[DEBUG] Class {cls}: Classifier confirmed in eval mode")
+                    
+                    if verbose >= 2:
+                        print(f"    [DEBUG] About to reset environment for class {cls}...")
+                    
+                    print(f"[DEBUG] Class {cls}: Calling gym_env.reset()...")
                     if GYM_VERSION == "gymnasium":
                         obs, _ = gym_env.reset(seed=42 + cls + ep)
                     else:
                         obs = gym_env.reset()
+                    print(f"[DEBUG] Class {cls}: gym_env.reset() completed successfully, obs shape={obs.shape if hasattr(obs, 'shape') else type(obs)}")
+                    
+                    if verbose >= 2:
+                        print(f"    [DEBUG] Environment reset complete for class {cls}")
                     
                     episode_reward = 0.0
                     # Track reward components for debugging
@@ -1014,11 +1096,21 @@ def train_and_evaluate_joint(
                         "n_steps": 0,  # Track actual number of steps
                     }
                     
+                    # Log episode targets
+                    prec_target = anchor_env.precision_target if hasattr(anchor_env, 'precision_target') else precision_target
+                    cov_target = anchor_env.coverage_target if hasattr(anchor_env, 'coverage_target') else coverage_target
+                    print(f"[DEBUG] Class {cls}: Starting episode loop, steps_per_episode={steps_per_episode}, precision_target={prec_target:.4f}, coverage_target={cov_target:.4f}")
                     for t in range(steps_per_episode):
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Getting action from trainer...")
                         # Get action from DDPG trainer
                         action, _ = ddpg_trainer.predict(obs, deterministic=False)
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Action obtained, shape={action.shape if hasattr(action, 'shape') else type(action)}")
                         
                         # Step environment
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Calling gym_env.step()...")
                         if GYM_VERSION == "gymnasium":
                             next_obs, reward, terminated, truncated, step_info = gym_env.step(action)
                             done = terminated or truncated
@@ -1029,6 +1121,13 @@ def train_and_evaluate_joint(
                                 done = terminated or truncated
                             else:
                                 next_obs, reward, done, step_info = step_result
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: gym_env.step() completed, reward={reward}, done={done}")
+                        if t < 3 or t % 50 == 0:
+                            # Extract precision and coverage from step_info for logging
+                            prec = step_info.get("precision", 0.0) if isinstance(step_info, dict) else 0.0
+                            cov = step_info.get("coverage", 0.0) if isinstance(step_info, dict) else 0.0
+                            print(f"[DEBUG] Class {cls}: Step {t}/{steps_per_episode}: reward={reward:.4f}, done={done}, precision={prec:.4f}, coverage={cov:.4f}")
                         
                         episode_reward += reward
                         
@@ -1063,6 +1162,8 @@ def train_and_evaluate_joint(
                                 reward_components["js_penalty"] += abs(step_info["js_penalty"])
                         
                         # Add to replay buffer and train
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Adding to replay buffer...")
                         ddpg_trainer.add_to_replay_buffer(
                             obs=obs,
                             next_obs=next_obs,
@@ -1071,29 +1172,125 @@ def train_and_evaluate_joint(
                             done=done,
                             info=step_info
                         )
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Added to replay buffer")
                         
                         # Train DDPG if enough samples
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: Calling train_step...")
                         trained = ddpg_trainer.train_step(gradient_steps=1)
+                        if t == 0:
+                            print(f"[DEBUG] Class {cls}: Step {t}: train_step completed, trained={trained}")
                         
                         obs = next_obs
                         reward_components["n_steps"] += 1
                         if done:
+                            # Extract final precision and coverage
+                            final_prec = step_info.get("precision", 0.0) if isinstance(step_info, dict) else 0.0
+                            final_cov = step_info.get("coverage", 0.0) if isinstance(step_info, dict) else 0.0
+                            termination_reason = step_info.get("termination_reason", "unknown") if isinstance(step_info, dict) else "unknown"
+                            prec_target = anchor_env.precision_target if hasattr(anchor_env, 'precision_target') else precision_target
+                            cov_target = anchor_env.coverage_target if hasattr(anchor_env, 'coverage_target') else coverage_target
+                            print(f"[DEBUG] Class {cls}: Episode TERMINATED EARLY at step {t}/{steps_per_episode}")
+                            print(f"[DEBUG] Class {cls}: Final precision={final_prec:.4f} (target={prec_target:.4f}), coverage={final_cov:.4f} (target={cov_target:.4f})")
+                            print(f"[DEBUG] Class {cls}: Termination reason: {termination_reason}")
                             break
                     
+                    # Log final metrics even if episode didn't terminate early
+                    final_prec = reward_components.get('final_precision', 0.0)
+                    final_cov = reward_components.get('final_coverage', 0.0)
+                    prec_target = anchor_env.precision_target if hasattr(anchor_env, 'precision_target') else precision_target
+                    cov_target = anchor_env.coverage_target if hasattr(anchor_env, 'coverage_target') else coverage_target
+                    print(f"[DEBUG] Class {cls}: Episode loop completed, total steps={reward_components['n_steps']}/{steps_per_episode}, total_reward={episode_reward:.4f}")
+                    print(f"[DEBUG] Class {cls}: Final precision={final_prec:.4f} (target={prec_target:.4f}), coverage={final_cov:.4f} (target={cov_target:.4f})")
                     reward_components["total_reward"] = episode_reward
                     episode_rewards_per_class[cls] = episode_reward
+                    print(f"[DEBUG] Class {cls}: Stored episode reward")
                     
                     # Store training metrics for this class (to use when evaluation doesn't run)
                     # These are the final metrics from the training episode
+                    print(f"[DEBUG] Class {cls}: Storing training metrics...")
                     training_metrics_per_class[cls] = {
                         "precision": reward_components['final_precision'],
                         "hard_precision": reward_components['final_precision'],  # Use final precision as hard_precision
                         "coverage": reward_components['final_coverage'],
                         "n_points": reward_components['final_n_points'],
                     }
+                    print(f"[DEBUG] Class {cls}: Training metrics stored")
+                    
+                    # Save best model for TD3/DDPG if enabled
+                    print(f"[DEBUG] Class {cls}: Checking best model save conditions: save_best_model={save_best_model}, best_model_eval_freq={best_model_eval_freq}, (ep + 1) % best_model_eval_freq={(ep + 1) % best_model_eval_freq}")
+                    if save_best_model and best_model_eval_freq > 0 and (ep + 1) % best_model_eval_freq == 0:
+                        # For continuous actions, skip evaluation during training (it can hang)
+                        # Instead, use training episode reward as proxy and save model periodically
+                        print(f"[DEBUG] Class {cls}: Best model save enabled, but skipping evaluation (can hang with continuous actions)")
+                        print(f"[DEBUG] Class {cls}: Using training episode reward ({episode_reward:.6f}) as proxy for model quality")
+                        
+                        # Use training episode reward instead of evaluation reward
+                        # Save model if this is the best training reward so far
+                        current_best = best_reward_per_class.get(cls, -float('inf'))
+                        if episode_reward > current_best:
+                            print(f"[DEBUG] Class {cls}: New best training reward! Saving model...")
+                            best_reward_per_class[cls] = episode_reward
+                            best_model_path = os.path.join(best_model_dir, f"best_model_class_{cls}.zip")
+                            ddpg_trainer.save(best_model_path)
+                            print(f"[DEBUG] Class {cls}: Model saved to {best_model_path}")
+                            if verbose >= 1:
+                                print(f"  [Best Model] Saved class {cls} model! Training reward: {episode_reward:.6f}")
+                        else:
+                            print(f"[DEBUG] Class {cls}: Not a new best training reward (current: {episode_reward:.6f}, best: {current_best:.6f}), skipping save")
+                        
+                        # Alternative: Try evaluation with timeout (commented out for now due to hanging)
+                        # Uncomment this if you want to try evaluation with a fresh environment reset
+                        """
+                        try:
+                            # Reset environment before evaluation to ensure clean state
+                            print(f"[DEBUG] Class {cls}: Resetting environment before evaluation...")
+                            if GYM_VERSION == "gymnasium":
+                                gym_env.reset(seed=42 + cls + ep + 1000)  # Use different seed for eval
+                            else:
+                                gym_env.reset()
+                            print(f"[DEBUG] Class {cls}: Environment reset complete")
+                            
+                            # Ensure classifier is in eval mode
+                            if hasattr(gym_env, 'anchor_env') and hasattr(gym_env.anchor_env, 'classifier'):
+                                classifier = gym_env.anchor_env.classifier
+                                if hasattr(classifier, 'eval'):
+                                    classifier.eval()
+                            
+                            print(f"[DEBUG] Class {cls}: Calling evaluate() with n_eval_episodes={best_model_n_eval_episodes}...")
+                            mean_reward, std_reward = ddpg_trainer.evaluate(
+                                n_eval_episodes=best_model_n_eval_episodes,
+                                deterministic=True
+                            )
+                            print(f"[DEBUG] Class {cls}: evaluate() completed, mean_reward={mean_reward:.6f}, std_reward={std_reward:.6f}")
+                            
+                            # Save if this is the best reward for this class
+                            current_best = best_reward_per_class.get(cls, -float('inf'))
+                            if mean_reward > current_best:
+                                print(f"[DEBUG] Class {cls}: New best reward! Saving model...")
+                                best_reward_per_class[cls] = mean_reward
+                                best_model_path = os.path.join(best_model_dir, f"best_model_class_{cls}.zip")
+                                ddpg_trainer.save(best_model_path)
+                                print(f"[DEBUG] Class {cls}: Model saved to {best_model_path}")
+                                if verbose >= 1:
+                                    print(f"  [Best Model] Saved class {cls} model! Mean reward: {mean_reward:.6f} ± {std_reward:.6f}")
+                            else:
+                                print(f"[DEBUG] Class {cls}: Not a new best reward, skipping save")
+                        except Exception as e:
+                            print(f"[DEBUG] Class {cls}: Exception during best model evaluation: {type(e).__name__}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            if verbose >= 2:
+                                print(f"  [Best Model] Evaluation failed for class {cls}: {e}")
+                        """
+                    else:
+                        print(f"[DEBUG] Class {cls}: Best model save skipped (conditions not met)")
                     
                     # Print detailed reward breakdown for debugging (every 10 episodes or when verbose >= 2)
+                    print(f"[DEBUG] Class {cls}: Checking reward breakdown print conditions: verbose={verbose}, ep % 10={ep % 10}")
                     if verbose >= 2 or (ep % 10 == 0 and verbose >= 1):
+                        print(f"[DEBUG] Class {cls}: Printing reward breakdown...")
                         # Calculate average per-step values
                         n_steps_actual = reward_components["n_steps"]
                         avg_js_per_step = reward_components['js_penalty'] / max(1, n_steps_actual)
@@ -1120,16 +1317,28 @@ def train_and_evaluate_joint(
                             print(f"      ⚠ WARNING: JS penalty per step is high ({avg_js_per_step:.6f}) - box is changing too much!")
                         if reward_components['precision_gain'] == 0.0 and reward_components['coverage_gain'] == 0.0:
                             print(f"      ⚠ WARNING: No precision/coverage gains - agent isn't improving the box!")
+                        print(f"[DEBUG] Class {cls}: Reward breakdown printed")
+                    else:
+                        print(f"[DEBUG] Class {cls}: Reward breakdown skipped (conditions not met)")
+                    
+                    print(f"[DEBUG] Class {cls}: Finished all post-episode processing, about to enter finally block")
                 finally:
                     # Cleanup: close environment
+                    print(f"[DEBUG] Class {cls}: Entering finally block for cleanup")
                     try:
                         gym_env.close()
-                    except:
+                        print(f"[DEBUG] Class {cls}: Environment closed successfully")
+                    except Exception as e:
+                        print(f"[DEBUG] Class {cls}: Error closing environment: {e}")
                         pass
+                
+                print(f"[DEBUG] Class {cls}: Completed processing")
             
+            print(f"[DEBUG] Completed loop over all classes")
             # Average reward across classes
             avg_reward = np.mean(list(episode_rewards_per_class.values()))
             episode_rewards_history.append(avg_reward)
+            print(f"[DEBUG] Average reward across classes: {avg_reward:.6f}")
             if verbose >= 1:
                 # Use correct algorithm name for logging
                 algo_name = continuous_algorithm.upper() if use_continuous_actions else "PPO"
@@ -1164,6 +1373,41 @@ def train_and_evaluate_joint(
                 # Create callback to track rewards
                 reward_callback = RewardCallback(verbose=0)
                 
+                # Setup callbacks list
+                callbacks_list = [reward_callback]
+                
+                # Add EvalCallback for best model saving if enabled
+                if save_best_model and best_model_eval_freq > 0 and (ep + 1) % best_model_eval_freq == 0:
+                    # Create separate evaluation environment (same as training env)
+                    if use_dynamic_env:
+                        eval_env_fns = []
+                        for i in range(n_envs):
+                            cls_idx = i % len(target_classes)
+                            target_cls = target_classes[cls_idx]
+                            factory_fn = lambda c=target_cls: create_anchor_env(target_cls=c)
+                            eval_env_fns.append(lambda f=factory_fn, s=42+i+10000: make_dynamic_anchor_env(f, seed=s))
+                        eval_vec_env = DummyVecEnv(eval_env_fns)
+                    else:
+                        from trainers.vecEnv import make_dummy_vec_env
+                        eval_vec_env = make_dummy_vec_env(make_anchor_env, n_envs=n_envs, seed=42+10000)
+                    
+                    eval_callback = EvalCallback(
+                        eval_vec_env,
+                        best_model_save_path=best_model_dir,
+                        log_path=os.path.join(best_model_dir, "eval_logs"),
+                        eval_freq=timesteps_per_episode,  # Evaluate after this episode's training
+                        n_eval_episodes=best_model_n_eval_episodes,
+                        deterministic=True,
+                        verbose=1 if verbose >= 2 else 0,
+                    )
+                    callbacks_list.append(eval_callback)
+                
+                # Combine callbacks
+                if len(callbacks_list) > 1:
+                    final_callback = CallbackList(callbacks_list)
+                else:
+                    final_callback = reward_callback
+                
                 if rl_trainer is None:
                     # First episode: create new trainer
                     episode_output_dir = f"{output_dir}/episode_{ep+1}/"
@@ -1184,12 +1428,12 @@ def train_and_evaluate_joint(
                     # Train with callback
                     rl_trainer.learn(
                         total_timesteps=timesteps_per_episode,
-                        callback=reward_callback,
+                        callback=final_callback,
                         progress_bar=False,
                         log_interval=10,
                         save_checkpoints=save_checkpoints and (ep % 10 == 0),
                         checkpoint_freq=checkpoint_freq,
-                        eval_freq=0,
+                        eval_freq=0,  # We handle evaluation via EvalCallback
                     )
                     # Save model
                     final_model_path = f"{episode_output_dir}/ppo_model_final"
@@ -1200,16 +1444,51 @@ def train_and_evaluate_joint(
                     # Continue training existing model - update environment and continue learning
                     rl_trainer.model.set_env(vec_env)
                     rl_trainer.vec_env = vec_env  # Update trainer's vec_env reference
-                    # Reset callback for this episode
+                    
+                    # Setup callbacks for this episode
                     reward_callback = RewardCallback(verbose=0)
+                    callbacks_list = [reward_callback]
+                    
+                    # Add EvalCallback for best model saving if enabled
+                    if save_best_model and best_model_eval_freq > 0 and (ep + 1) % best_model_eval_freq == 0:
+                        # Create separate evaluation environment
+                        if use_dynamic_env:
+                            eval_env_fns = []
+                            for i in range(n_envs):
+                                cls_idx = i % len(target_classes)
+                                target_cls = target_classes[cls_idx]
+                                factory_fn = lambda c=target_cls: create_anchor_env(target_cls=c)
+                                eval_env_fns.append(lambda f=factory_fn, s=42+i+10000: make_dynamic_anchor_env(f, seed=s))
+                            eval_vec_env = DummyVecEnv(eval_env_fns)
+                        else:
+                            from trainers.vecEnv import make_dummy_vec_env
+                            eval_vec_env = make_dummy_vec_env(make_anchor_env, n_envs=n_envs, seed=42+10000)
+                        
+                        eval_callback = EvalCallback(
+                            eval_vec_env,
+                            best_model_save_path=best_model_dir,
+                            log_path=os.path.join(best_model_dir, "eval_logs"),
+                            eval_freq=timesteps_per_episode,
+                            n_eval_episodes=best_model_n_eval_episodes,
+                            deterministic=True,
+                            verbose=1 if verbose >= 2 else 0,
+                        )
+                        callbacks_list.append(eval_callback)
+                    
+                    # Combine callbacks
+                    if len(callbacks_list) > 1:
+                        final_callback = CallbackList(callbacks_list)
+                    else:
+                        final_callback = reward_callback
+                    
                     rl_trainer.learn(
                         total_timesteps=timesteps_per_episode,
-                        callback=reward_callback,  # Track rewards
+                        callback=final_callback,  # Track rewards and save best model
                         progress_bar=False,  # Less verbose for per-episode updates
                         log_interval=10,
                         save_checkpoints=save_checkpoints and (ep % 10 == 0),
                         checkpoint_freq=checkpoint_freq,
-                        eval_freq=0,  # No evaluation during joint training
+                        eval_freq=0,  # We handle evaluation via EvalCallback
                     )
                 
                 # Extract episode rewards from callback
@@ -1342,9 +1621,10 @@ def train_and_evaluate_joint(
                 
                 # Run greedy rollout based on action type
                 if use_continuous_actions:
-                    # Continuous actions (DDPG/TD3): Use trainer for this class
+                    # Continuous actions (DDPG/TD3): Use current trainer for this class
+                    # During training, we use the current model (not best model) for evaluation
+                    # Best models are only used after training completes
                     continuous_trainer_eval = ddpg_trainers[cls]
-                    # Get the model from the trainer
                     continuous_model = continuous_trainer_eval.model if hasattr(continuous_trainer_eval, 'model') else continuous_trainer_eval
                     
                     # Enable continuous actions in AnchorEnv
@@ -1448,7 +1728,11 @@ def train_and_evaluate_joint(
                         lower = anchor_env.lower.copy()
                         upper = anchor_env.upper.copy()
                 else:
-                    # PPO: Use PPO trainer
+                    # PPO: Use current trainer's model
+                    # During training, we use the current model (not best model) for evaluation
+                    # Best models are only used after training completes
+                    ppo_model = rl_trainer.model
+                    
                     # IMPORTANT: Capture initial bounds BEFORE greedy_rollout (which resets internally)
                     # Reset first to get initial state and bounds
                     reset_result = wrapped_env.reset(seed=42 + cls + ep)
@@ -1467,7 +1751,7 @@ def train_and_evaluate_joint(
                     try:
                         info, rule, lower, upper = greedy_rollout(
                             env=wrapped_env,
-                            trained_model=rl_trainer.model,
+                            trained_model=ppo_model,  # Use best model if available
                             steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
                             max_features_in_rule=max_features_in_rule,
                             device=device_str
@@ -1481,7 +1765,7 @@ def train_and_evaluate_joint(
                         
                         # Run greedy rollout
                         for t in range(eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode):
-                            action, _ = rl_trainer.model.predict(state, deterministic=True)
+                            action, _ = ppo_model.predict(state, deterministic=True)  # Use best model if available
                             step_result = wrapped_env.step(int(action))
                             if len(step_result) == 5:
                                 state, _, done, _, info = step_result
@@ -1605,9 +1889,12 @@ def train_and_evaluate_joint(
                           f"rule: {rule_str}")
                 
                 # Store per-class metrics for plotting (every episode)
-                # Always store, even if 0.0, to maintain consistent episode tracking
-                per_class_precision_history[cls].append(per_class_stats[cls]['hard_precision'])
-                per_class_coverage_history[cls].append(per_class_stats[cls]['coverage'])
+                # Instance-level metrics (from evaluation during training - one anchor per instance)
+                per_class_instance_precision_history[cls].append(per_class_stats[cls]['hard_precision'])
+                per_class_instance_coverage_history[cls].append(per_class_stats[cls]['coverage'])
+                
+                # Class-level metrics (from training episode - one anchor per class)
+                # These are stored separately below from training_metrics_per_class
             
             # Calculate average statistics
             # Use per_class_stats if evaluation ran, otherwise use training_metrics_per_class
@@ -1649,8 +1936,10 @@ def train_and_evaluate_joint(
                         "rule": "evaluation failed",
                     }
                 # Store 0.0 values to maintain episode count consistency
-                per_class_precision_history[cls].append(0.0)
-                per_class_coverage_history[cls].append(0.0)
+                per_class_precision_history[cls].append(0.0)  # Class-level
+                per_class_coverage_history[cls].append(0.0)  # Class-level
+                per_class_instance_precision_history[cls].append(0.0)  # Instance-level
+                per_class_instance_coverage_history[cls].append(0.0)  # Instance-level
             
             # Set averages to 0.0 if computation failed
             avg_precision = 0.0
@@ -1675,11 +1964,27 @@ def train_and_evaluate_joint(
                     precision_val = per_class_stats.get(cls, {}).get("hard_precision", 0.0)
                     coverage_val = per_class_stats.get(cls, {}).get("coverage", 0.0)
                 
-                per_class_precision_history[cls].append(precision_val)
-                per_class_coverage_history[cls].append(coverage_val)
-                if verbose >= 2:
-                    print(f"  [DEBUG] Stored metrics for episode {ep + 1}, class {cls}: "
-                          f"prec={precision_val:.6f}, cov={coverage_val:.6f}")
+                # Store class-level metrics (from training episode - these are the RL training metrics)
+                # Class-level: one anchor per class, optimized for entire class
+                if use_continuous_actions and cls in training_metrics_per_class:
+                    # Use training metrics (class-level from RL episode)
+                    class_level_prec = training_metrics_per_class[cls].get("hard_precision", training_metrics_per_class[cls].get("precision", 0.0))
+                    class_level_cov = training_metrics_per_class[cls].get("coverage", 0.0)
+                else:
+                    # Fallback: use evaluation metrics (but these are instance-level)
+                    class_level_prec = precision_val
+                    class_level_cov = coverage_val
+                
+                per_class_precision_history[cls].append(class_level_prec)  # Class-level
+                per_class_coverage_history[cls].append(class_level_cov)  # Class-level
+                
+                # Store instance-level metrics (from evaluation during training - one anchor per instance)
+                if len(per_class_instance_precision_history[cls]) < expected_length:
+                    # Use instance-level from evaluation if available
+                    instance_prec = per_class_stats.get(cls, {}).get('hard_precision', 0.0) if cls in per_class_stats else precision_val
+                    instance_cov = per_class_stats.get(cls, {}).get('coverage', 0.0) if cls in per_class_stats else coverage_val
+                    per_class_instance_precision_history[cls].append(instance_prec)
+                    per_class_instance_coverage_history[cls].append(instance_cov)
             
             # Verify we have the right number of entries
             if verbose >= 2 and len(per_class_precision_history[cls]) != expected_length:
@@ -1724,50 +2029,173 @@ def train_and_evaluate_joint(
     print(f"      This explains the classifier's behavior on training data.")
     print(f"      To evaluate on test data, set eval_on_test_data=True in evaluate_all_classes.")
     
+    # ======================================================================
+    # Load Best Models for Evaluation (if available)
+    # ======================================================================
+    # Store original trainers for saving (before replacing with best models for evaluation)
+    original_ddpg_trainers = None
+    original_rl_trainer = None
+    original_ppo_model = None
+    if use_continuous_actions and ddpg_trainers:
+        original_ddpg_trainers = ddpg_trainers.copy()
+    elif not use_continuous_actions and rl_trainer is not None:
+        original_rl_trainer = rl_trainer
+        # Store original model separately since we'll replace rl_trainer.model
+        original_ppo_model = rl_trainer.model
+    
+    if save_best_model and best_model_dir and os.path.exists(best_model_dir):
+        print(f"\n[Best Model] Loading best models from {best_model_dir} for evaluation...")
+        
+        if use_continuous_actions:
+            # TD3/DDPG: Load best model per class
+            best_models_loaded = {}
+            for cls in target_classes:
+                best_model_path = os.path.join(best_model_dir, f"best_model_class_{cls}.zip")
+                if os.path.exists(best_model_path):
+                    try:
+                        if continuous_algorithm_lower == "td3":
+                            from stable_baselines3 import TD3
+                            best_model = TD3.load(best_model_path)
+                        else:
+                            from stable_baselines3 import DDPG
+                            best_model = DDPG.load(best_model_path)
+                        
+                        # Create a temporary trainer wrapper for the best model
+                        # We need to wrap it in a trainer-like object for evaluate_all_classes
+                        class BestModelWrapper:
+                            def __init__(self, model):
+                                self.model = model
+                                self.env = None  # Will be set by evaluate_all_classes
+                        
+                        best_models_loaded[cls] = BestModelWrapper(best_model)
+                        if verbose >= 1:
+                            print(f"  [Best Model] Loaded best model for class {cls}")
+                    except Exception as e:
+                        if verbose >= 1:
+                            print(f"  [Best Model] Failed to load best model for class {cls}: {e}")
+                            print(f"  [Best Model] Falling back to final model for class {cls}")
+                        best_models_loaded[cls] = ddpg_trainers[cls]
+                else:
+                    if verbose >= 1:
+                        print(f"  [Best Model] Best model not found for class {cls}, using final model")
+                    best_models_loaded[cls] = ddpg_trainers[cls]
+            
+            # Use best models if any were loaded, otherwise use final models
+            if len(best_models_loaded) > 0:
+                ddpg_trainers = best_models_loaded
+                print(f"  [Best Model] Using best models for evaluation")
+        else:
+            # PPO: Load best model
+            best_model_path = os.path.join(best_model_dir, "best_model.zip")
+            if os.path.exists(best_model_path):
+                try:
+                    from stable_baselines3 import PPO
+                    best_model = PPO.load(best_model_path)
+                    rl_trainer.model = best_model
+                    if verbose >= 1:
+                        print(f"  [Best Model] Loaded best PPO model for evaluation")
+                except Exception as e:
+                    if verbose >= 1:
+                        print(f"  [Best Model] Failed to load best PPO model: {e}")
+                        print(f"  [Best Model] Falling back to final model")
+            else:
+                if verbose >= 1:
+                    print(f"  [Best Model] Best model not found, using final model")
+    else:
+        if verbose >= 1:
+            print(f"\n[Best Model] Best model saving was disabled or directory not found, using final models")
+    
     # Prepare test data in unit space for optional test-set evaluation
     X_test_unit = (X_test_scaled - X_min) / X_range
     
+    # ======================================================================
+    # FINAL EVALUATION: Both Instance-Level and Class-Level
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("FINAL EVALUATION")
+    print(f"{'='*80}")
+    
+    # Instance-level evaluation (one anchor per test instance, like static anchors)
+    print(f"\n[Instance-Level Evaluation] Creating one anchor per test instance...")
+    from trainers.dynAnchors_inference import evaluate_all_classes, evaluate_all_classes_class_level
+    
     if use_continuous_actions:
         # Continuous actions (DDPG/TD3): Use trainers for evaluation
-        # Continuous action algorithms have separate trainers per class, so pass the dict of trainers
         if ddpg_trainers and len(ddpg_trainers) > 0:
-            # Pass the dict of continuous action trainers (evaluate_all_classes will handle per-class trainers)
-            eval_results = evaluate_all_classes(
+            # Instance-level evaluation
+            eval_results_instance = evaluate_all_classes(
                 X_test=X_test_scaled,
                 y_test=y_test,
-                trained_model=ddpg_trainers,  # Pass dict of trainers per class
-                make_env_fn=make_anchor_env,
+                trained_model=ddpg_trainers,
+                make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
                 feature_names=feature_names,
                 n_instances_per_class=n_eval_instances_per_class,
                 max_features_in_rule=max_features_in_rule,
                 steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
                 random_seed=42,
-                # Optional: Set eval_on_test_data=True to compute metrics on test data
-                eval_on_test_data=False,  # Default: use training data (backward compatible)
-                X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
+                eval_on_test_data=False,
+                X_test_unit=X_test_unit if False else None,
                 X_test_std=X_test_scaled if False else None,
                 num_rollouts_per_instance=num_rollouts_per_instance,
+            )
+            
+            # Class-level evaluation (one anchor per class)
+            print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+            eval_results_class = evaluate_all_classes_class_level(
+                trained_model=ddpg_trainers,
+                make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
+                feature_names=feature_names,
+                target_classes=list(target_classes),
+                steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
+                max_features_in_rule=max_features_in_rule,
+                random_seed=42,
+                eval_on_test_data=False,
+                X_test_unit=X_test_unit if False else None,
+                X_test_std=X_test_scaled if False else None,
+                y_test=y_test if False else None,
             )
         else:
             raise ValueError("No DDPG trainers available for evaluation")
     else:
         # PPO: Use PPO trainer's model
-        eval_results = evaluate_all_classes(
+        # Instance-level evaluation
+        eval_results_instance = evaluate_all_classes(
             X_test=X_test_scaled,
             y_test=y_test,
             trained_model=rl_trainer.model,
-            make_env_fn=make_anchor_env,
+            make_env_fn=create_anchor_env,
             feature_names=feature_names,
             n_instances_per_class=n_eval_instances_per_class,
             max_features_in_rule=max_features_in_rule,
             steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
             random_seed=42,
-            # Optional: Set eval_on_test_data=True to compute metrics on test data
-            eval_on_test_data=False,  # Default: use training data (backward compatible)
-            X_test_unit=X_test_unit if False else None,  # Prepare but don't use unless eval_on_test_data=True
+            eval_on_test_data=False,
+            X_test_unit=X_test_unit if False else None,
             X_test_std=X_test_scaled if False else None,
             num_rollouts_per_instance=num_rollouts_per_instance,
         )
+        
+        # Class-level evaluation
+        print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+        eval_results_class = evaluate_all_classes_class_level(
+            trained_model=rl_trainer.model,
+            make_env_fn=create_anchor_env,
+            feature_names=feature_names,
+            target_classes=list(target_classes),
+            steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
+            max_features_in_rule=max_features_in_rule,
+            random_seed=42,
+            eval_on_test_data=False,
+            X_test_unit=X_test_unit if False else None,
+            X_test_std=X_test_scaled if False else None,
+            y_test=y_test if False else None,
+        )
+    
+    # Combine both evaluation results
+    eval_results = {
+        "instance_level": eval_results_instance,
+        "class_level": eval_results_class,
+    }
     
     # Close environments
     if not use_continuous_actions and rl_trainer is not None and hasattr(rl_trainer, 'vec_env'):
@@ -1798,9 +2226,11 @@ def train_and_evaluate_joint(
     
     if use_continuous_actions:
         # Continuous actions (DDPG/TD3): Save each class's model (actor and critic networks)
+        # Use original trainers for saving (they have the save method), not BestModelWrapper
+        trainers_to_save = original_ddpg_trainers if original_ddpg_trainers else ddpg_trainers
         algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
         print(f"\nSaving {algorithm_name} models (actor and critic networks)...")
-        for cls, continuous_trainer in ddpg_trainers.items():
+        for cls, continuous_trainer in trainers_to_save.items():
             model_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_final"
             continuous_trainer.save(model_path)
             print(f"  Saved {algorithm_name} model for class {cls}: {model_path}")
@@ -1821,24 +2251,37 @@ def train_and_evaluate_joint(
                     print(f"    [WARNING] Could not save actor/critic separately: {e}")
     else:
         # PPO: Save PPO model (policy and value networks)
+        # Use original model for saving (restore temporarily if best model was loaded)
         print(f"\nSaving PPO model (policy and value networks)...")
         model_path = f"{models_dir}/ppo_final"
-        rl_trainer.save(model_path)
-        print(f"  Saved PPO model: {model_path}")
         
-        # Also save policy and value networks separately for easier inspection
-        policy_path = f"{models_dir}/ppo_policy"
-        value_path = f"{models_dir}/ppo_value"
+        # Temporarily restore original model if best model was loaded
+        temp_model = None
+        if original_ppo_model is not None and rl_trainer.model is not original_ppo_model:
+            temp_model = rl_trainer.model
+            rl_trainer.model = original_ppo_model
+        
         try:
-            # Save policy network
-            torch.save(rl_trainer.model.policy.state_dict(), f"{policy_path}.pth")
-            print(f"    Saved policy network: {policy_path}.pth")
-            # Save value network (value function)
-            torch.save(rl_trainer.model.policy.value_net.state_dict(), f"{value_path}.pth")
-            print(f"    Saved value network: {value_path}.pth")
-        except Exception as e:
-            if verbose >= 1:
-                print(f"    [WARNING] Could not save policy/value separately: {e}")
+            rl_trainer.save(model_path)
+            print(f"  Saved PPO model: {model_path}")
+            
+            # Also save policy and value networks separately for easier inspection
+            policy_path = f"{models_dir}/ppo_policy"
+            value_path = f"{models_dir}/ppo_value"
+            try:
+                # Save policy network
+                torch.save(rl_trainer.model.policy.state_dict(), f"{policy_path}.pth")
+                print(f"    Saved policy network: {policy_path}.pth")
+                # Save value network (value function)
+                torch.save(rl_trainer.model.policy.value_net.state_dict(), f"{value_path}.pth")
+                print(f"    Saved value network: {value_path}.pth")
+            except Exception as e:
+                if verbose >= 1:
+                    print(f"    [WARNING] Could not save policy/value separately: {e}")
+        finally:
+            # Restore best model if it was temporarily replaced
+            if temp_model is not None:
+                rl_trainer.model = temp_model
     
     # Save classifier model
     clf_type_lower = classifier_type.lower()
@@ -1874,6 +2317,10 @@ def train_and_evaluate_joint(
     print(f"{'='*80}")
     
     # Prepare comprehensive metrics and rules data
+    # Handle both instance-level and class-level evaluation results
+    eval_results_instance = eval_results.get("instance_level", {})
+    eval_results_class = eval_results.get("class_level", {})
+    
     metrics_data = {
         "training_summary": {
             "episodes": episodes,
@@ -1884,19 +2331,30 @@ def train_and_evaluate_joint(
             "algorithm": continuous_algorithm.upper() if use_continuous_actions else "PPO",
         },
         "overall_statistics": {
-            "overall_precision": float(eval_results["overall_precision"]),
-            "overall_coverage": float(eval_results["overall_coverage"]),
-            "overall_n_points": int(eval_results.get("overall_n_points", 0)),
+            # Instance-level (one anchor per instance, like static anchors)
+            "instance_level": {
+                "overall_precision": float(eval_results_instance.get("overall_precision", 0.0)),
+                "overall_coverage": float(eval_results_instance.get("overall_coverage", 0.0)),
+                "overall_n_points": int(eval_results_instance.get("overall_n_points", 0)),
+            },
+            # Class-level (one anchor per class, dynamic anchors advantage)
+            "class_level": {
+                "overall_precision": float(eval_results_class.get("overall_precision", 0.0)),
+                "overall_coverage": float(eval_results_class.get("overall_coverage", 0.0)),
+            },
         },
-        "per_class_results": {},
+        "per_class_results": {
+            "instance_level": {},
+            "class_level": {},
+        },
         "training_history": [],
         "evaluation_results": {}
     }
     
-    # Add per-class results from evaluation
+    # Add per-class results from instance-level evaluation
     for cls_int in target_classes:
-        if cls_int in eval_results.get("per_class_results", {}):
-            cls_result = eval_results["per_class_results"][cls_int]
+        if cls_int in eval_results_instance.get("per_class_results", {}):
+            cls_result = eval_results_instance["per_class_results"][cls_int]
             
             # Extract rules and instance information from individual_results
             rules_list = []  # Simple list of rule strings
@@ -1942,7 +2400,7 @@ def train_and_evaluate_joint(
             unique_rules = list(set([r for r in rules_list if r]))  # Only non-empty rules
             unique_rules_count = len(unique_rules)
             
-            metrics_data["per_class_results"][f"class_{cls_int}"] = {
+            metrics_data["per_class_results"]["instance_level"][f"class_{cls_int}"] = {
                 "precision": float(cls_result.get("precision", cls_result.get("avg_precision", 0.0))),
                 "hard_precision": float(cls_result.get("hard_precision", cls_result.get("avg_hard_precision", cls_result.get("precision", 0.0)))),
                 "coverage": float(cls_result.get("coverage", cls_result.get("avg_coverage", 0.0))),
@@ -1959,6 +2417,22 @@ def train_and_evaluate_joint(
                 "instance_indices_used": instance_indices_used,  # Which test instances were evaluated
                 # Full anchor details
                 "anchors": anchors_list  # Complete anchor details for each instance (includes bounds, metrics, rule)
+            }
+    
+    # Add per-class results from class-level evaluation
+    for cls_int in target_classes:
+        if cls_int in eval_results_class.get("per_class_results", {}):
+            cls_result = eval_results_class["per_class_results"][cls_int]
+            
+            metrics_data["per_class_results"]["class_level"][f"class_{cls_int}"] = {
+                "precision": float(cls_result.get("precision", 0.0)),
+                "hard_precision": float(cls_result.get("hard_precision", cls_result.get("precision", 0.0))),
+                "coverage": float(cls_result.get("coverage", 0.0)),  # This is global coverage (one anchor per class)
+                "global_coverage": float(cls_result.get("global_coverage", cls_result.get("coverage", 0.0))),
+                "rule": cls_result.get("rule", ""),
+                "lower_bounds": cls_result.get("lower_bounds", []),
+                "upper_bounds": cls_result.get("upper_bounds", []),
+                "evaluation_type": cls_result.get("evaluation_type", "class_level"),
             }
     
     # Add training history (per episode)
@@ -1987,13 +2461,21 @@ def train_and_evaluate_joint(
         
         metrics_data["training_history"].append(episode_data)
     
-    # Add full evaluation results
+    # Add full evaluation results (both instance-level and class-level)
     metrics_data["evaluation_results"] = {
-        "overall_precision": float(eval_results.get("overall_precision", 0.0)),
-        "overall_coverage": float(eval_results.get("overall_coverage", 0.0)),
-        "overall_n_points": int(eval_results.get("overall_n_points", 0)),
-        "per_class_precision": {f"class_{k}": float(v) for k, v in eval_results.get("per_class_precision", {}).items()},
-        "per_class_coverage": {f"class_{k}": float(v) for k, v in eval_results.get("per_class_coverage", {}).items()},
+        "instance_level": {
+            "overall_precision": float(eval_results_instance.get("overall_precision", 0.0)),
+            "overall_coverage": float(eval_results_instance.get("overall_coverage", 0.0)),
+            "overall_n_points": int(eval_results_instance.get("overall_n_points", 0)),
+            "per_class_precision": {f"class_{k}": float(v) for k, v in eval_results_instance.get("per_class_precision", {}).items()},
+            "per_class_coverage": {f"class_{k}": float(v) for k, v in eval_results_instance.get("per_class_coverage", {}).items()},
+        },
+        "class_level": {
+            "overall_precision": float(eval_results_class.get("overall_precision", 0.0)),
+            "overall_coverage": float(eval_results_class.get("overall_coverage", 0.0)),
+            "per_class_precision": {f"class_{k}": float(v.get("hard_precision", v.get("precision", 0.0))) for k, v in eval_results_class.get("per_class_results", {}).items()},
+            "per_class_coverage": {f"class_{k}": float(v.get("coverage", 0.0)) for k, v in eval_results_class.get("per_class_results", {}).items()},
+        },
     }
     
     # Convert numpy arrays to lists for JSON serialization
@@ -2039,14 +2521,16 @@ def train_and_evaluate_joint(
         # For plotting, we need them to convert bounds from unit space to standardized space
         
         # eval_results should already have the correct structure from evaluate_all_classes
-        # It has per_class_results with integer keys (class indices)
-        # Verify structure before plotting
-        if "per_class_results" not in eval_results:
+        # But now it has instance_level and class_level, so we need to handle both
+        # For visualization, we'll use instance_level results (one anchor per instance)
+        eval_results_for_viz = eval_results.get("instance_level", eval_results)
+        
+        if "per_class_results" not in eval_results_for_viz:
             raise ValueError("eval_results missing 'per_class_results'")
         
         # IMPORTANT: evaluate_all_classes returns individual_results, but plot_rules_2d expects anchors
         # Extract anchors from individual_results before plotting
-        per_class_results = eval_results.get("per_class_results", {}).copy()
+        per_class_results = eval_results_for_viz.get("per_class_results", {}).copy()
         for cls_key, cls_result in per_class_results.items():
             # If anchors don't exist, extract them from individual_results
             if "anchors" not in cls_result and "individual_results" in cls_result:
@@ -2147,11 +2631,17 @@ def train_and_evaluate_joint(
             "trained_model": ddpg_trainers,  # Dictionary of continuous action trainers per class
             "classifier": classifier,
             "trainer": ddpg_trainers,  # Dictionary of continuous action trainers
-            "eval_results": eval_results,
-        "overall_stats": {
-            "avg_precision": eval_results["overall_precision"],
-            "avg_coverage": eval_results["overall_coverage"],
-        },
+            "eval_results": eval_results,  # Contains both instance_level and class_level
+            "overall_stats": {
+                "instance_level": {
+                    "avg_precision": eval_results_instance.get("overall_precision", 0.0),
+                    "avg_coverage": eval_results_instance.get("overall_coverage", 0.0),
+                },
+                "class_level": {
+                    "avg_precision": eval_results_class.get("overall_precision", 0.0),
+                    "avg_coverage": eval_results_class.get("overall_coverage", 0.0),
+                },
+            },
         "joint_training_history": joint_training_history,
         "complexity_analysis": complexity_analysis,  # Store complexity analysis for reference
         "metadata": {
@@ -2192,10 +2682,16 @@ def train_and_evaluate_joint(
             "trained_model": rl_trainer.model,
             "classifier": classifier,
             "trainer": rl_trainer,
-            "eval_results": eval_results,
+            "eval_results": eval_results,  # Contains both instance_level and class_level
             "overall_stats": {
-                "avg_precision": eval_results["overall_precision"],
-                "avg_coverage": eval_results["overall_coverage"],
+                "instance_level": {
+                    "avg_precision": eval_results_instance.get("overall_precision", 0.0),
+                    "avg_coverage": eval_results_instance.get("overall_coverage", 0.0),
+                },
+                "class_level": {
+                    "avg_precision": eval_results_class.get("overall_precision", 0.0),
+                    "avg_coverage": eval_results_class.get("overall_coverage", 0.0),
+                },
             },
             "joint_training_history": joint_training_history,
             "complexity_analysis": complexity_analysis,
@@ -2233,8 +2729,15 @@ def train_and_evaluate_joint(
     }
     
     print(f"\nJoint training and evaluation complete!")
-    print(f"Overall precision: {eval_results['overall_precision']:.3f}")
-    print(f"Overall coverage: {eval_results['overall_coverage']:.3f}")
+    print(f"\n{'='*80}")
+    print("FINAL EVALUATION RESULTS")
+    print(f"{'='*80}")
+    print(f"\n[Instance-Level Evaluation] (One anchor per test instance, like static anchors):")
+    print(f"  Overall Precision: {eval_results_instance.get('overall_precision', 0.0):.3f}")
+    print(f"  Overall Coverage: {eval_results_instance.get('overall_coverage', 0.0):.3f}")
+    print(f"\n[Class-Level Evaluation] (One anchor per class, dynamic anchors advantage):")
+    print(f"  Overall Precision: {eval_results_class.get('overall_precision', 0.0):.3f}")
+    print(f"  Overall Coverage: {eval_results_class.get('overall_coverage', 0.0):.3f}")
     print(f"\nModels saved to: {models_dir}")
     print(f"Metrics and rules saved to: {json_path}")
     
