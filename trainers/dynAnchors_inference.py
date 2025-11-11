@@ -708,6 +708,24 @@ def evaluate_class_level(
     # This allows the anchor to optimize for the entire class, not a specific instance
     anchor_env.x_star_unit = None
     
+    # CRITICAL: For class-level evaluation, use uniform perturbation if available
+    # This allows metrics to be computed even if the box doesn't contain training data points
+    # (which can happen when the policy moves the box to a region with no data)
+    if hasattr(anchor_env, 'use_perturbation') and hasattr(anchor_env, 'perturbation_mode'):
+        # Ensure perturbation is enabled for class-level evaluation
+        if not anchor_env.use_perturbation:
+            anchor_env.use_perturbation = True
+            print(f"  [DEBUG] Enabled perturbation for class-level evaluation")
+        # Switch to uniform perturbation (works even when box has no training data)
+        if anchor_env.perturbation_mode == "bootstrap":
+            anchor_env.perturbation_mode = "uniform"
+            print(f"  [DEBUG] Switched to uniform perturbation for class-level evaluation")
+    
+    # CRITICAL: Reset the environment after setting x_star_unit = None
+    # This ensures the box is initialized correctly (full box [0.0, 1.0] for all features)
+    # The greedy_rollout will call reset() again, but we need to ensure x_star_unit is None first
+    anchor_env.reset()
+    
     # Handle different model types
     if isinstance(trained_model, dict):
         # DDPG/TD3: Use per-class trainer
@@ -756,6 +774,27 @@ def evaluate_class_level(
     # Get metrics from the final anchor
     # Coverage is already global (computed on all training/test data)
     local_coverage = info.get("coverage", 0.0)
+    
+    # DEBUG: If coverage/precision are 0, check what's in the info dict and recompute metrics
+    if local_coverage == 0.0 or info.get("precision", 0.0) == 0.0:
+        # Recompute metrics directly from anchor_env to debug
+        prec_debug, cov_debug, det_debug = anchor_env._current_metrics()
+        print(f"  [DEBUG] Class-level evaluation for class {target_class}:")
+        print(f"    Info dict keys: {list(info.keys())}")
+        print(f"    Info precision: {info.get('precision', 'NOT FOUND')}")
+        print(f"    Info coverage: {info.get('coverage', 'NOT FOUND')}")
+        print(f"    Direct recompute - precision: {prec_debug:.6f}, coverage: {cov_debug:.6f}")
+        print(f"    Direct recompute - hard_precision: {det_debug.get('hard_precision', 'NOT FOUND')}")
+        print(f"    Direct recompute - n_points: {det_debug.get('n_points', 'NOT FOUND')}")
+        print(f"    Direct recompute - sampler: {det_debug.get('sampler', 'NOT FOUND')}")
+        print(f"    Box bounds - lower: {lower[:3]}..., upper: {upper[:3]}...")
+        print(f"    Box width: {(upper - lower)[:3]}...")
+        # Use recomputed values if info values are 0
+        if local_coverage == 0.0:
+            local_coverage = cov_debug
+        if info.get("precision", 0.0) == 0.0:
+            info["precision"] = prec_debug
+            info["hard_precision"] = det_debug.get("hard_precision", prec_debug)
     
     # Compute global coverage on test data if available
     global_coverage = None

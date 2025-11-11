@@ -172,20 +172,34 @@ class DynamicAnchorTD3Trainer:
         """
         if hasattr(self.model, 'replay_buffer') and self.model.replay_buffer is not None:
             # Validate input shapes and values
-            obs_array = np.array(obs, dtype=np.float32)
-            next_obs_array = np.array(next_obs, dtype=np.float32)
-            action_array = np.array(action, dtype=np.float32)
+            # CRITICAL: Ensure we have proper numpy arrays and make explicit copies
+            # Flatten to 1D first to ensure consistent shape handling
+            obs_flat = np.asarray(obs, dtype=np.float32).flatten()
+            next_obs_flat = np.asarray(next_obs, dtype=np.float32).flatten()
             
-            # Validate shapes match
-            if obs_array.ndim == 1:
-                obs_array = obs_array.reshape(1, -1)
-            if next_obs_array.ndim == 1:
-                next_obs_array = next_obs_array.reshape(1, -1)
+            # Validate lengths match before proceeding
+            if len(obs_flat) != len(next_obs_flat):
+                print(f"ERROR: Observation length mismatch in add_to_replay_buffer!")
+                print(f"  obs type: {type(obs)}, shape: {np.asarray(obs).shape}, flattened len: {len(obs_flat)}")
+                print(f"  next_obs type: {type(next_obs)}, shape: {np.asarray(next_obs).shape}, flattened len: {len(next_obs_flat)}")
+                print(f"  obs content (first 20): {obs_flat[:20]}")
+                print(f"  next_obs content (first 20): {next_obs_flat[:20]}")
+                raise ValueError(
+                    f"Observation length mismatch: obs has {len(obs_flat)} features, "
+                    f"next_obs has {len(next_obs_flat)} features"
+                )
+            
+            # Create proper copies as 2D arrays for replay buffer
+            obs_array = obs_flat.copy().reshape(1, -1)
+            next_obs_array = next_obs_flat.copy().reshape(1, -1)
+            action_array = np.asarray(action, dtype=np.float32)
             if action_array.ndim == 1:
                 action_array = action_array.reshape(1, -1)
             
-            # Validate observation dimensions match
+            # Final validation that shapes match
             if obs_array.shape[1] != next_obs_array.shape[1]:
+                print(f"ERROR: Observation shape mismatch after reshaping in add_to_replay_buffer!")
+                print(f"  obs_array.shape: {obs_array.shape}, next_obs_array.shape: {next_obs_array.shape}")
                 raise ValueError(
                     f"Observation shape mismatch: obs has {obs_array.shape[1]} features, "
                     f"next_obs has {next_obs_array.shape[1]} features"

@@ -14,23 +14,45 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 class SimpleClassifier(nn.Module):
     """Simple neural network classifier for tabular data."""
     
-    def __init__(self, input_dim: int, num_classes: int):
+    def __init__(self, input_dim: int, num_classes: int, dropout_rate: float = 0.3, use_batch_norm: bool = True):
         """
         Initialize the classifier.
         
         Args:
             input_dim: Number of input features
             num_classes: Number of output classes
+            dropout_rate: Dropout rate for regularization (default: 0.3)
+            use_batch_norm: Whether to use batch normalization (default: True)
         """
         super().__init__()
         self.num_classes = num_classes
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes),
-        )
+        
+        layers = []
+        # First layer
+        layers.append(nn.Linear(input_dim, 256))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(256))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate))
+        
+        # Second layer
+        layers.append(nn.Linear(256, 256))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(256))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate))
+        
+        # Third layer (optional, for deeper network)
+        layers.append(nn.Linear(256, 128))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(128))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate * 0.5))  # Less dropout in later layers
+        
+        # Output layer
+        layers.append(nn.Linear(128, num_classes))
+        
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

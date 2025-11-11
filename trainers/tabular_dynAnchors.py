@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from typing import List, Tuple, Optional, Dict, Any
 import os
+import json
 from functools import partial
 
 
@@ -43,6 +44,10 @@ def train_and_evaluate_dynamic_anchors(
     n_steps: int = 2048,
     batch_size: int = 64,
     n_epochs: int = 10,
+    # Continuous action parameters
+    use_continuous_actions: bool = False,
+    continuous_algorithm: str = "ddpg",
+    continuous_learning_rate: float = 5e-5,
     # Environment parameters
     use_perturbation: bool = True,
     perturbation_mode: str = "bootstrap",
@@ -55,6 +60,8 @@ def train_and_evaluate_dynamic_anchors(
     n_eval_instances_per_class: int = 20,
     max_features_in_rule: int = 5,
     steps_per_episode: int = 100,
+    eval_steps_per_episode: int = None,  # Defaults to steps_per_episode if None
+    num_rollouts_per_instance: int = 1,  # Number of greedy rollouts per instance (default: 1)
     # Output parameters
     output_dir: str = "./output/anchors/",
     save_checkpoints: bool = True,
@@ -67,7 +74,7 @@ def train_and_evaluate_dynamic_anchors(
     
     This function:
     1. Prepares data and creates environments
-    2. Trains PPO policy to generate anchors
+    2. Trains RL policy (PPO for discrete actions, TD3/DDPG for continuous actions) to generate anchors
     3. Evaluates on test instances to compute precision/coverage
     4. Returns results and trained models
     
@@ -79,13 +86,16 @@ def train_and_evaluate_dynamic_anchors(
         feature_names: Names of features
         classifier: Trained PyTorch classifier
         target_classes: Classes to generate anchors for (None = all classes)
-        device: Device to use ("cpu")
-        n_envs: Number of parallel training environments
+        device: Device to use ("cpu", "cuda", "auto")
+        n_envs: Number of parallel training environments (only used for PPO/discrete actions)
         total_timesteps: Total training timesteps
-        learning_rate: Learning rate for PPO
-        n_steps: Steps per environment before update
-        batch_size: Batch size for PPO updates
-        n_epochs: PPO epochs per update
+        learning_rate: Learning rate for PPO (discrete actions)
+        n_steps: Steps per environment before update (PPO only)
+        batch_size: Batch size for PPO updates (PPO only)
+        n_epochs: PPO epochs per update (PPO only)
+        use_continuous_actions: If True, use continuous actions (TD3/DDPG) instead of discrete (PPO)
+        continuous_algorithm: "ddpg" or "td3" (only used if use_continuous_actions=True)
+        continuous_learning_rate: Learning rate for TD3/DDPG (continuous actions)
         use_perturbation: Enable perturbation sampling in environment
         perturbation_mode: "bootstrap" or "uniform" sampling
         n_perturb: Number of perturbation samples
@@ -104,7 +114,7 @@ def train_and_evaluate_dynamic_anchors(
     
     Returns:
         Dictionary with:
-            - trained_model: PPO model
+            - trained_model: RL model (PPO model or dict of TD3/DDPG trainers per class)
             - trainer: Trainer instance
             - eval_results: Per-class evaluation results
             - overall_stats: Overall precision/coverage
@@ -112,7 +122,7 @@ def train_and_evaluate_dynamic_anchors(
     """
     import torch.nn as nn
     from sklearn.preprocessing import StandardScaler
-    from trainers.vecEnv import AnchorEnv, make_dummy_vec_env
+    from trainers.vecEnv import AnchorEnv, make_dummy_vec_env, ContinuousAnchorEnv
     from trainers.PPO_trainer import train_ppo_model
     from trainers.dynAnchors_inference import evaluate_all_classes, evaluate_all_classes_class_level
     from trainers.device_utils import get_device_pair
@@ -136,6 +146,9 @@ def train_and_evaluate_dynamic_anchors(
     X_unit_train = (X_train_scaled - X_min) / X_range
     X_unit_test = (X_test_scaled - X_min) / X_range
     
+    # Prepare test data in unit space for optional test-set evaluation (consistent with joint training)
+    X_test_unit = (X_test_scaled - X_min) / X_range
+    
     # Determine target classes
     unique_classes = np.unique(y_train)
     if target_classes is None:
@@ -151,7 +164,7 @@ def train_and_evaluate_dynamic_anchors(
         """Helper to create AnchorEnv with a specific target class."""
         if target_cls is None:
             target_cls = target_classes[0]  # Default to first class
-        return AnchorEnv(
+        env = AnchorEnv(
             X_unit=X_unit_train,
             X_std=X_train_scaled,
             y=y_train,
@@ -176,6 +189,11 @@ def train_and_evaluate_dynamic_anchors(
             min_coverage_floor=0.005,
             js_penalty_weight=0.05,
         )
+        # Enable continuous actions if requested
+        if use_continuous_actions:
+            env.max_action_scale = max(step_fracs) if step_fracs else 0.02
+            env.min_absolute_step = max(0.05, min_width * 0.5)
+        return env
     
     # Create default factory (for evaluation and single-class training)
     def make_anchor_env():
@@ -200,23 +218,294 @@ def train_and_evaluate_dynamic_anchors(
         # Single class or single env - use standard approach
         vec_env = make_dummy_vec_env(make_anchor_env, n_envs=n_envs, seed=42)
     
-    # Train PPO model
-    print(f"\nTraining PPO for {total_timesteps} timesteps...")
-    # Note: PPO will use the same device as the classifier
-    trainer = train_ppo_model(
-        vec_env=vec_env,
-        total_timesteps=total_timesteps,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        output_dir=output_dir,
-        save_checkpoints=save_checkpoints,
-        checkpoint_freq=checkpoint_freq,
-        eval_freq=eval_freq,
-        verbose=verbose,
-        device=device_str,  # Pass device to PPO trainer
-    )
+    # Train model (PPO for discrete actions, TD3/DDPG for continuous actions)
+    continuous_trainers = None  # Initialize for use in evaluation
+    if use_continuous_actions:
+        continuous_algorithm_lower = continuous_algorithm.lower()
+        if continuous_algorithm_lower == "td3":
+            algorithm_name = "TD3"
+            from trainers.TD3_trainer import DynamicAnchorTD3Trainer, create_td3_trainer
+            print(f"\nTraining TD3 for {total_timesteps} timesteps...")
+        else:
+            algorithm_name = "DDPG"
+            from trainers.DDPG_trainer import DynamicAnchorDDPGTrainer, create_ddpg_trainer
+            print(f"\nTraining DDPG for {total_timesteps} timesteps...")
+        
+        # For continuous actions, we need to train per class (DDPG/TD3 don't use vectorized envs the same way)
+        # Create trainers for each target class
+        continuous_trainers = {}
+        gym_envs = {}  # Store gym_envs separately to use directly (not through trainer.env which is wrapped)
+        for cls in target_classes:
+            # Create AnchorEnv for this class
+            anchor_env = create_anchor_env(target_cls=cls)
+            
+            # Wrap with ContinuousAnchorEnv for TD3/DDPG (provides action_space attribute)
+            gym_env = ContinuousAnchorEnv(anchor_env, seed=42 + cls)
+            gym_envs[cls] = gym_env  # Store for direct use
+            
+            if continuous_algorithm_lower == "td3":
+                cls_trainer = create_td3_trainer(
+                    env=gym_env,
+                    learning_rate=continuous_learning_rate,
+                    device=device_str,
+                    verbose=verbose,
+                )
+            else:
+                cls_trainer = create_ddpg_trainer(
+                    env=gym_env,
+                    learning_rate=continuous_learning_rate,
+                    device=device_str,
+                    verbose=verbose,
+                )
+            continuous_trainers[cls] = cls_trainer
+        
+        # Manual training loop for continuous actions (similar to joint training)
+        # Calculate steps per class
+        steps_per_class = total_timesteps // len(target_classes)
+        
+        for cls in target_classes:
+            print(f"\nTraining {algorithm_name} for class {cls} ({steps_per_class} timesteps)...")
+            cls_trainer = continuous_trainers[cls]
+            gym_env = gym_envs[cls]  # Use the unwrapped ContinuousAnchorEnv directly
+            
+            # Handle gymnasium vs gym reset() return format
+            try:
+                import gymnasium as gym
+                GYM_VERSION = "gymnasium"
+            except ImportError:
+                try:
+                    import gym
+                    GYM_VERSION = "gym"
+                except ImportError:
+                    GYM_VERSION = "gym"
+            
+            # Manual training loop
+            # Reset environment - reset() returns observation that already includes [lower, upper, precision, coverage]
+            if GYM_VERSION == "gymnasium":
+                reset_result, reset_info = gym_env.reset(seed=42 + cls)
+            else:
+                reset_result = gym_env.reset(seed=42 + cls)
+                if isinstance(reset_result, tuple):
+                    reset_result, reset_info = reset_result
+                else:
+                    reset_info = {}
+            
+            # Use reset_result directly - it already has the correct shape: (2 * n_features + 2,)
+            # This matches how we use anchor_state from step()
+            obs = np.array(reset_result, dtype=np.float32).flatten()
+            
+            # Calculate expected observation dimensions once
+            expected_shape = (2 * gym_env.n_features + 2,)
+            expected_len = 2 * gym_env.n_features + 2
+            
+            # Validate initial observation shape
+            if obs.shape != expected_shape or len(obs) != expected_len:
+                raise ValueError(
+                    f"Initial observation shape mismatch: obs shape={obs.shape}, len={len(obs)}, "
+                    f"expected shape={expected_shape}, len={expected_len}"
+                )
+            
+            # Ensure classifier is in eval mode
+            if hasattr(gym_env.anchor_env.classifier, 'eval'):
+                gym_env.anchor_env.classifier.eval()
+            
+            for step in range(steps_per_class):
+                # Ensure obs is the right shape before predict
+                obs = np.array(obs, dtype=np.float32).flatten()
+                
+                # Validate obs length before predict
+                if len(obs) != expected_len:
+                    print(f"ERROR: obs has wrong length before predict at step {step}!")
+                    print(f"  obs length: {len(obs)}, expected: {expected_len}")
+                    print(f"  obs shape: {obs.shape}")
+                    raise ValueError(
+                        f"Observation length mismatch before predict at step {step}: "
+                        f"obs len={len(obs)}, expected len={expected_len}"
+                    )
+                
+                # Reshape to expected shape
+                obs = obs.reshape(expected_shape)
+                
+                # Get action - ensure we pass flattened obs to predict
+                obs_for_predict = np.array(obs, dtype=np.float32).flatten()
+                action, _ = cls_trainer.predict(obs_for_predict, deterministic=False)
+                
+                # Step environment using the wrapper's step() method (same as joint training)
+                # This ensures observations are properly formatted with correct shape
+                if GYM_VERSION == "gymnasium":
+                    next_obs, reward, terminated, truncated, step_info = gym_env.step(action)
+                    done = terminated or truncated
+                else:
+                    step_result = gym_env.step(action)
+                    if len(step_result) == 5:
+                        next_obs, reward, terminated, truncated, step_info = step_result
+                        done = terminated or truncated
+                    else:
+                        next_obs, reward, done, step_info = step_result
+                
+                # next_obs from gym_env.step() should already have correct shape (2 * n_features + 2,)
+                # because ContinuousAnchorEnv.step() calls anchor_env.step() and returns the state
+                # which includes [lower, upper, precision, coverage]
+                next_obs = np.array(next_obs, dtype=np.float32).flatten()
+                
+                # CRITICAL: Validate observation length immediately after step()
+                if len(next_obs) != expected_len:
+                    print(f"ERROR: next_obs from gym_env.step() has wrong length at step {step}!")
+                    print(f"  Expected length: {expected_len}")
+                    print(f"  Actual length: {len(next_obs)}")
+                    print(f"  next_obs shape: {next_obs.shape if hasattr(next_obs, 'shape') else 'no shape'}")
+                    print(f"  n_features: {gym_env.n_features}")
+                    print(f"  next_obs content (first 20): {next_obs[:20]}")
+                    # Fallback: construct manually from bounds if wrapper returns wrong shape
+                    precision = step_info.get('precision', 0.0) if isinstance(step_info, dict) else 0.0
+                    coverage = step_info.get('coverage', 0.0) if isinstance(step_info, dict) else 0.0
+                    lower = np.array(gym_env.anchor_env.lower.copy(), dtype=np.float32).flatten()
+                    upper = np.array(gym_env.anchor_env.upper.copy(), dtype=np.float32).flatten()
+                    next_obs = np.concatenate([
+                        lower,
+                        upper,
+                        np.array([precision, coverage], dtype=np.float32)
+                    ]).astype(np.float32).flatten()
+                    print(f"  Fallback construction: len={len(next_obs)}")
+                    if len(next_obs) != expected_len:
+                        raise ValueError(
+                            f"Failed to construct next_obs with correct shape at step {step}: "
+                            f"expected {expected_len}, got {len(next_obs)}"
+                        )
+                
+                # Ensure next_obs has the correct shape tuple
+                next_obs = next_obs.reshape(expected_shape)
+                
+                # Validate observation shapes match before adding to replay buffer
+                if obs.shape != next_obs.shape or len(obs.flatten()) != len(next_obs.flatten()):
+                    print(f"ERROR: Observation shape mismatch at step {step}!")
+                    print(f"  obs shape: {obs.shape}, len: {len(obs.flatten())}")
+                    print(f"  next_obs shape: {next_obs.shape}, len: {len(next_obs.flatten())}")
+                    print(f"  Expected shape: {expected_shape}, len: {expected_len}")
+                    raise ValueError(
+                        f"Observation shape mismatch at step {step}: "
+                        f"obs shape={obs.shape} len={len(obs.flatten())}, "
+                        f"next_obs shape={next_obs.shape} len={len(next_obs.flatten())}. "
+                        f"Expected shape: {expected_shape} len: {expected_len}"
+                    )
+                
+                # Final validation right before adding to replay buffer
+                # Ensure both are 1D arrays with correct length
+                obs_final = np.array(obs, dtype=np.float32).flatten()
+                next_obs_final = np.array(next_obs, dtype=np.float32).flatten()
+                
+                # CRITICAL: Double-check lengths match before calling add_to_replay_buffer
+                if len(obs_final) != expected_len:
+                    raise ValueError(
+                        f"obs_final has wrong length: {len(obs_final)}, expected {expected_len}"
+                    )
+                if len(next_obs_final) != expected_len:
+                    raise ValueError(
+                        f"next_obs_final has wrong length: {len(next_obs_final)}, expected {expected_len}"
+                    )
+                if len(obs_final) != len(next_obs_final):
+                    raise ValueError(
+                        f"Length mismatch: obs_final len={len(obs_final)}, "
+                        f"next_obs_final len={len(next_obs_final)}"
+                    )
+                
+                # DEBUG: Print shapes right before add_to_replay_buffer (only first few steps)
+                if step < 3:
+                    print(f"DEBUG step {step}: obs_final.shape={obs_final.shape}, len={len(obs_final)}, "
+                          f"next_obs_final.shape={next_obs_final.shape}, len={len(next_obs_final)}, "
+                          f"expected_len={expected_len}")
+                
+                # Add to replay buffer - ensure arrays are fresh copies with explicit copy()
+                # CRITICAL: Use .copy() to ensure we have independent arrays that won't be modified
+                obs_final_copy = np.array(obs_final.copy(), dtype=np.float32).flatten()
+                next_obs_final_copy = np.array(next_obs_final.copy(), dtype=np.float32).flatten()
+                
+                # Final check on copies - validate lengths match
+                if len(obs_final_copy) != expected_len:
+                    raise ValueError(
+                        f"Copy validation failed: obs_final_copy len={len(obs_final_copy)}, expected={expected_len}"
+                    )
+                if len(next_obs_final_copy) != expected_len:
+                    raise ValueError(
+                        f"Copy validation failed: next_obs_final_copy len={len(next_obs_final_copy)}, expected={expected_len}"
+                    )
+                if len(obs_final_copy) != len(next_obs_final_copy):
+                    raise ValueError(
+                        f"Copy validation failed: obs_final_copy len={len(obs_final_copy)} != "
+                        f"next_obs_final_copy len={len(next_obs_final_copy)}"
+                    )
+                
+                # Ensure arrays are contiguous and have correct dtype before passing
+                obs_final_copy = np.ascontiguousarray(obs_final_copy, dtype=np.float32)
+                next_obs_final_copy = np.ascontiguousarray(next_obs_final_copy, dtype=np.float32)
+                
+                cls_trainer.add_to_replay_buffer(
+                    obs=obs_final_copy,
+                    next_obs=next_obs_final_copy,
+                    action=action,
+                    reward=reward,
+                    done=done,
+                    info=step_info
+                )
+                
+                # Train if enough samples
+                if cls_trainer.model.replay_buffer.size() > cls_trainer.model.learning_starts:
+                    cls_trainer.train_step(gradient_steps=1)
+                
+                if done:
+                    # Reset environment - reset() returns observation that already includes [lower, upper, precision, coverage]
+                    if GYM_VERSION == "gymnasium":
+                        reset_result, reset_info = gym_env.reset(seed=42 + cls + step)
+                    else:
+                        reset_result = gym_env.reset(seed=42 + cls + step)
+                        if isinstance(reset_result, tuple):
+                            reset_result, reset_info = reset_result
+                        else:
+                            reset_info = {}
+                    
+                    # Use reset_result directly - it already has the correct shape: (2 * n_features + 2,)
+                    obs = np.array(reset_result, dtype=np.float32).flatten()
+                    
+                    # Validate shape
+                    if len(obs) != expected_len:
+                        raise ValueError(
+                            f"Reset observation length mismatch: obs len={len(obs)}, "
+                            f"expected len={expected_len}"
+                        )
+                    obs = obs.reshape(expected_shape)
+                else:
+                    # Use next_obs as-is, but ensure it has correct shape
+                    obs = np.array(next_obs, dtype=np.float32).flatten()
+                    if len(obs) != expected_len:
+                        raise ValueError(
+                            f"obs from next_obs has wrong length: {len(obs)}, expected {expected_len}"
+                        )
+                    obs = obs.reshape(expected_shape)
+                
+                if (step + 1) % (steps_per_class // 10) == 0:
+                    print(f"  Progress: {step + 1}/{steps_per_class} steps")
+        
+        # For evaluation, we'll use the continuous_trainers dict
+        trainer = type('TrainerWrapper', (), {
+            'model': continuous_trainers,  # Dict of trainers per class
+        })()
+    else:
+        print(f"\nTraining PPO for {total_timesteps} timesteps...")
+        # Note: PPO will use the same device as the classifier
+        trainer = train_ppo_model(
+            vec_env=vec_env,
+            total_timesteps=total_timesteps,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            output_dir=output_dir,
+            save_checkpoints=save_checkpoints,
+            checkpoint_freq=checkpoint_freq,
+            eval_freq=eval_freq,
+            verbose=verbose,
+            device=device_str,  # Pass device to PPO trainer
+        )
     
     # Evaluate on test set
     print(f"\nEvaluating on test set...")
@@ -227,34 +516,42 @@ def train_and_evaluate_dynamic_anchors(
     # Instance-level evaluation (one anchor per test instance, like static anchors)
     print(f"\n[Instance-Level Evaluation] Creating one anchor per test instance...")
     
+    # For continuous actions, pass the dict of trainers; for PPO, pass the model
+    trained_model_for_eval = continuous_trainers if use_continuous_actions else trainer.model
+    
+    # Use eval_steps_per_episode if provided, otherwise use steps_per_episode (consistent with joint training)
+    eval_steps = eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode
+    
     eval_results_instance = evaluate_all_classes(
         X_test=X_test_scaled,
         y_test=y_test,
-        trained_model=trainer.model,
+        trained_model=trained_model_for_eval,
         make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
         feature_names=feature_names,
         n_instances_per_class=n_eval_instances_per_class,
         max_features_in_rule=max_features_in_rule,
-        steps_per_episode=steps_per_episode,
+        steps_per_episode=eval_steps,
         random_seed=42,
-        # Optional: Set eval_on_test_data=True to compute metrics on test data
-        eval_on_test_data=False,  # Default: use training data (backward compatible)
+        eval_on_test_data=False,  # Default: use training data (consistent with joint training)
+        X_test_unit=X_test_unit if False else None,  # Consistent with joint training pattern
+        X_test_std=X_test_scaled if False else None,  # Consistent with joint training pattern
+        num_rollouts_per_instance=num_rollouts_per_instance,  # Consistent with joint training
     )
     
     # Class-level evaluation (one anchor per class)
     print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
     eval_results_class = evaluate_all_classes_class_level(
-        trained_model=trainer.model,
+        trained_model=trained_model_for_eval,
         make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
         feature_names=feature_names,
         target_classes=list(target_classes),
-        steps_per_episode=steps_per_episode,
+        steps_per_episode=eval_steps,
         max_features_in_rule=max_features_in_rule,
         random_seed=42,
-        eval_on_test_data=False,
-        X_test_unit=None,
-        X_test_std=None,
-        y_test=None,
+        eval_on_test_data=False,  # Default: use training data (consistent with joint training)
+        X_test_unit=X_test_unit if False else None,  # Consistent with joint training pattern
+        X_test_std=X_test_scaled if False else None,  # Consistent with joint training pattern
+        y_test=y_test if False else None,  # Consistent with joint training pattern
     )
     
     # Combine both evaluation results
@@ -263,7 +560,9 @@ def train_and_evaluate_dynamic_anchors(
         "class_level": eval_results_class,
     }
     
-    vec_env.close()
+    # Close vectorized environment only for PPO (discrete actions)
+    if not use_continuous_actions:
+        vec_env.close()
     
     # Prepare results
     results = {
@@ -299,6 +598,149 @@ def train_and_evaluate_dynamic_anchors(
     print(f"\n[Class-Level Evaluation] (One anchor per class, dynamic anchors advantage):")
     print(f"  Overall Precision: {eval_results_class.get('overall_precision', 0.0):.3f}")
     print(f"  Overall Coverage: {eval_results_class.get('overall_coverage', 0.0):.3f}")
+    
+    # ======================================================================
+    # Save metrics and rules to JSON (for non-joint training)
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("SAVING METRICS AND RULES TO JSON")
+    print(f"{'='*80}")
+    
+    # Prepare comprehensive metrics and rules data (without training_history for non-joint)
+    metrics_data = {
+        "overall_statistics": {
+            # Instance-level (one anchor per instance, like static anchors)
+            "instance_level": {
+                "overall_precision": float(eval_results_instance.get("overall_precision", 0.0)),
+                "overall_coverage": float(eval_results_instance.get("overall_coverage", 0.0)),
+                "overall_n_points": int(eval_results_instance.get("overall_n_points", 0)),
+            },
+            # Class-level (one anchor per class, dynamic anchors advantage)
+            "class_level": {
+                "overall_precision": float(eval_results_class.get("overall_precision", 0.0)),
+                "overall_coverage": float(eval_results_class.get("overall_coverage", 0.0)),
+            },
+        },
+        "per_class_results": {
+            "instance_level": {},
+            "class_level": {},
+        },
+        "metadata": {
+            "n_classes": len(target_classes),
+            "n_features": len(feature_names),
+            "target_classes": target_classes,
+            "feature_names": feature_names,
+            "output_dir": output_dir,
+            "total_timesteps": total_timesteps,
+            "use_continuous_actions": use_continuous_actions,
+            "algorithm": continuous_algorithm.upper() if use_continuous_actions else "PPO",
+        },
+    }
+    
+    # Add per-class results from instance-level evaluation
+    for cls_int in target_classes:
+        if cls_int in eval_results_instance.get("per_class_results", {}):
+            cls_result = eval_results_instance["per_class_results"][cls_int]
+            
+            # Extract rules and instance information from individual_results
+            rules_list = []
+            rules_with_instances = []
+            anchors_list = []
+            instance_indices_used = []
+            
+            if "individual_results" in cls_result:
+                for individual_result in cls_result["individual_results"]:
+                    instance_idx = int(individual_result.get("instance_idx", -1))
+                    rule = individual_result.get("rule", "")
+                    
+                    if instance_idx >= 0:
+                        instance_indices_used.append(instance_idx)
+                    
+                    rules_list.append(rule)
+                    
+                    rules_with_instances.append({
+                        "instance_idx": instance_idx,
+                        "rule": rule,
+                        "precision": float(individual_result.get("precision", 0.0)),
+                        "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                        "coverage": float(individual_result.get("coverage", 0.0)),
+                        "n_points": int(individual_result.get("n_points", 0)),
+                    })
+                    
+                    anchors_list.append({
+                        "instance_idx": instance_idx,
+                        "lower_bounds": individual_result.get("lower_bounds", []),
+                        "upper_bounds": individual_result.get("upper_bounds", []),
+                        "precision": float(individual_result.get("precision", 0.0)),
+                        "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                        "coverage": float(individual_result.get("coverage", 0.0)),
+                        "n_points": int(individual_result.get("n_points", 0)),
+                        "rule": rule,
+                    })
+            
+            unique_rules = list(set([r for r in rules_list if r]))
+            unique_rules_count = len(unique_rules)
+            
+            metrics_data["per_class_results"]["instance_level"][f"class_{cls_int}"] = {
+                "precision": float(cls_result.get("precision", cls_result.get("avg_precision", 0.0))),
+                "hard_precision": float(cls_result.get("hard_precision", cls_result.get("avg_hard_precision", cls_result.get("precision", 0.0)))),
+                "coverage": float(cls_result.get("coverage", cls_result.get("avg_coverage", 0.0))),
+                "n_points": int(cls_result.get("n_points", 0)),
+                "n_instances_evaluated": int(cls_result.get("n_instances", len(anchors_list))),
+                "best_rule": cls_result.get("best_rule", ""),
+                "best_precision": float(cls_result.get("best_precision", 0.0)),
+                "rules": rules_list,
+                "rules_with_instances": rules_with_instances,
+                "unique_rules": unique_rules,
+                "unique_rules_count": unique_rules_count,
+                "instance_indices_used": instance_indices_used,
+                "anchors": anchors_list,
+            }
+    
+    # Add per-class results from class-level evaluation
+    for cls_int in target_classes:
+        if cls_int in eval_results_class.get("per_class_results", {}):
+            cls_result = eval_results_class["per_class_results"][cls_int]
+            
+            metrics_data["per_class_results"]["class_level"][f"class_{cls_int}"] = {
+                "precision": float(cls_result.get("precision", 0.0)),
+                "hard_precision": float(cls_result.get("hard_precision", cls_result.get("precision", 0.0))),
+                "coverage": float(cls_result.get("coverage", 0.0)),
+                "global_coverage": float(cls_result.get("global_coverage", cls_result.get("coverage", 0.0))),
+                "rule": cls_result.get("rule", ""),
+                "lower_bounds": cls_result.get("lower_bounds", []),
+                "upper_bounds": cls_result.get("upper_bounds", []),
+                "evaluation_type": cls_result.get("evaluation_type", "class_level"),
+            }
+    
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_to_serializable(obj):
+        """Recursively convert numpy arrays and other non-serializable types to JSON-compatible types."""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj) if isinstance(obj, np.floating) else int(obj)
+        elif isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        else:
+            return obj
+    
+    # Convert all data to JSON-serializable format
+    metrics_data = convert_to_serializable(metrics_data)
+    
+    # Save to JSON file
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = f"{output_dir}/metrics_and_rules.json"
+    with open(json_path, 'w') as f:
+        json.dump(metrics_data, f, indent=2, ensure_ascii=False)
+    print(f"\nSaved metrics and rules to: {json_path}")
+    
+    # Update results to include JSON path
+    results["metrics_json_path"] = json_path
     
     return results
 

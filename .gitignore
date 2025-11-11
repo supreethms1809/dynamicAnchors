@@ -212,5 +212,6 @@ output/wine_*_joint/*
 output/breast_cancer_*_joint/*
 output/covtype_*_joint/*
 proof_of_concept/*.json
+output/*
 
 *.pth

@@ -9,6 +9,63 @@ import re
 import sys
 from itertools import combinations
 
+def extract_feature_names_from_rule(rule):
+    """
+    Extract feature names from a rule string.
+    Handles multi-word feature names and different operator formats:
+    - "feature_name ∈ [...]"
+    - "feature_name <= value"
+    - "feature_name >= value"
+    - "feature_name > value"
+    - "feature_name < value"
+    
+    Returns a list of feature names (strings).
+    """
+    if not rule or rule == "any values (no tightened features)":
+        return []
+    
+    features = []
+    # Split rule by " and " to handle multiple conditions
+    # Each condition has format: "feature_name operator value"
+    conditions = [c.strip() for c in rule.split(' and ')]
+    
+    for condition in conditions:
+        if not condition:
+            continue
+            
+        # Try to match different operator patterns
+        # Pattern 1: feature_name ∈ [...]
+        match = re.match(r'^([^∈]+?)\s*∈', condition)
+        if match:
+            features.append(match.group(1).strip())
+            continue
+        
+        # Pattern 2: feature_name <= value
+        match = re.match(r'^([^<]+?)\s*<=', condition)
+        if match:
+            features.append(match.group(1).strip())
+            continue
+        
+        # Pattern 3: feature_name >= value
+        match = re.match(r'^([^>]+?)\s*>=', condition)
+        if match:
+            features.append(match.group(1).strip())
+            continue
+        
+        # Pattern 4: feature_name > value (but not >=)
+        match = re.match(r'^([^>]+?)\s*>(?!\s*=)', condition)
+        if match:
+            features.append(match.group(1).strip())
+            continue
+        
+        # Pattern 5: feature_name < value (but not <=)
+        match = re.match(r'^([^<]+?)\s*<(?![=\s])', condition)
+        if match:
+            features.append(match.group(1).strip())
+            continue
+    
+    return features
+
 def analyze_metrics(json_path):
     """Analyze metrics_and_rules.json file and generate plots."""
     
@@ -27,15 +84,29 @@ def analyze_metrics(json_path):
     
     instance_results, class_results, is_new_structure = get_results_structure()
     
+    # Check if this is joint training or non-joint training
+    is_joint_training = 'training_summary' in data and 'training_history' in data
+    
     print("="*80)
     print("TRAINING SUMMARY")
     print("="*80)
-    summary = data['training_summary']
-    print(f"Algorithm: {summary['algorithm']}")
-    print(f"Episodes: {summary['episodes']}")
-    print(f"Steps per episode: {summary['steps_per_episode']}")
-    print(f"Classifier update every: {summary['classifier_update_every']} episodes")
-    print(f"Classifier epochs per round: {summary['classifier_epochs_per_round']}")
+    if is_joint_training:
+        summary = data['training_summary']
+        print(f"Training Mode: JOINT (Classifier + RL)")
+        print(f"Algorithm: {summary.get('algorithm', 'N/A')}")
+        print(f"Episodes: {summary.get('episodes', 'N/A')}")
+        print(f"Steps per episode: {summary.get('steps_per_episode', 'N/A')}")
+        print(f"Classifier update every: {summary.get('classifier_update_every', 'N/A')} episodes")
+        print(f"Classifier epochs per round: {summary.get('classifier_epochs_per_round', 'N/A')}")
+    else:
+        print("Training Mode: NON-JOINT (RL only, classifier pre-trained)")
+        # Try to infer from other fields if available
+        if 'metadata' in data:
+            metadata = data['metadata']
+            print(f"Algorithm: {metadata.get('algorithm', 'N/A')}")
+            print(f"Total timesteps: {metadata.get('total_timesteps', 'N/A')}")
+        else:
+            print("(Training configuration details not available)")
     
     print("\n" + "="*80)
     print("OVERALL STATISTICS")
@@ -81,136 +152,183 @@ def analyze_metrics(json_path):
         instance_results = per_class_results['instance_level']
         class_results = per_class_results['class_level']
     
-    print("\n" + "="*80)
-    print("TRAINING PROGRESS")
-    print("="*80)
-    history = data['training_history']
-    episodes = [e['episode'] for e in history]
-    classifier_acc = [e['classifier_test_acc'] for e in history]
-    classifier_loss = [e['classifier_loss'] for e in history]
-    rl_precision = [e['rl_avg_precision'] for e in history]
-    rl_coverage = [e['rl_avg_coverage'] for e in history]
+    # Training progress section (only available for joint training)
+    history = data.get('training_history', [])
+    has_training_history = len(history) > 0
     
-    # Check if history is empty to prevent IndexError
-    if len(classifier_acc) == 0 or len(rl_precision) == 0 or len(rl_coverage) == 0:
-        print("⚠ WARNING: No history data found in metrics file. Cannot compute statistics.")
-        return
-    
-    print(f"Initial classifier accuracy: {classifier_acc[0]:.4f}")
-    print(f"Final classifier accuracy: {classifier_acc[-1]:.4f}")
-    print(f"Classifier improvement: {classifier_acc[-1] - classifier_acc[0]:+.4f}")
-    
-    print(f"\nInitial RL precision: {rl_precision[0]:.4f}")
-    print(f"Final RL precision: {rl_precision[-1]:.4f}")
-    print(f"RL improvement: {rl_precision[-1] - rl_precision[0]:+.4f}")
-    
-    print(f"\nInitial RL coverage: {rl_coverage[0]:.4f}")
-    print(f"Final RL coverage: {rl_coverage[-1]:.4f}")
-    print(f"RL coverage change: {rl_coverage[-1] - rl_coverage[0]:+.4f}")
-    
-    # Check for issues
-    print("\n" + "="*80)
-    print("ISSUE DETECTION")
-    print("="*80)
-    zero_prec_episodes = [e['episode'] for e in history if e['rl_avg_precision'] == 0]
-    zero_cov_episodes = [e['episode'] for e in history if e['rl_avg_coverage'] == 0]
-    
-    if zero_prec_episodes:
-        print(f"⚠ Warning: {len(zero_prec_episodes)} episodes with zero precision")
-        if len(zero_prec_episodes) <= 10:
-            print(f"  Episodes: {zero_prec_episodes}")
-    
-    if zero_cov_episodes:
-        print(f"⚠ Warning: {len(zero_cov_episodes)} episodes with zero coverage")
-        if len(zero_cov_episodes) <= 10:
-            print(f"  Episodes: {zero_cov_episodes[:10]}")
-    
-    # Per-class analysis over time
-    classes = sorted(set([k for e in history for k in e['per_class_rl_stats'].keys()]))
-    if classes:
+    if has_training_history:
         print("\n" + "="*80)
-        print("PER-CLASS TRAINING ANALYSIS")
+        print("TRAINING PROGRESS")
         print("="*80)
-        for cls in classes:
-            cls_precisions = []
-            cls_coverages = []
-            for e in history:
-                cls_stats = e['per_class_rl_stats'].get(cls, {})
-                cls_precisions.append(cls_stats.get('hard_precision', 0.0))
-                cls_coverages.append(cls_stats.get('coverage', 0.0))
+        episodes = [e.get('episode', i) for i, e in enumerate(history)]
+        classifier_acc = [e.get('classifier_test_acc', 0.0) for e in history]
+        classifier_loss = [e.get('classifier_loss', 0.0) for e in history]
+        rl_precision = [e.get('rl_avg_precision', 0.0) for e in history]
+        rl_coverage = [e.get('rl_avg_coverage', 0.0) for e in history]
+        
+        # Check if history has valid data
+        if len(rl_precision) == 0 or len(rl_coverage) == 0:
+            print("⚠ WARNING: No RL history data found in metrics file.")
+            has_training_history = False
+        else:
+            # Classifier metrics (only for joint training)
+            if any(acc > 0 for acc in classifier_acc):
+                print(f"Initial classifier accuracy: {classifier_acc[0]:.4f}")
+                print(f"Final classifier accuracy: {classifier_acc[-1]:.4f}")
+                print(f"Classifier improvement: {classifier_acc[-1] - classifier_acc[0]:+.4f}")
             
-            print(f"\n{cls}:")
-            if len(cls_precisions) > 0 and len(cls_coverages) > 0:
-                print(f"  Initial precision: {cls_precisions[0]:.4f} → Final: {cls_precisions[-1]:.4f}")
-                print(f"  Initial coverage: {cls_coverages[0]:.4f} → Final: {cls_coverages[-1]:.4f}")
-                print(f"  Max precision: {max(cls_precisions):.4f} (episode {episodes[cls_precisions.index(max(cls_precisions))]})")
-                print(f"  Max coverage: {max(cls_coverages):.4f} (episode {episodes[cls_coverages.index(max(cls_coverages))]})")
-            else:
-                print(f"  No precision/coverage history for this class")
+            print(f"\nInitial RL precision: {rl_precision[0]:.4f}")
+            print(f"Final RL precision: {rl_precision[-1]:.4f}")
+            print(f"RL improvement: {rl_precision[-1] - rl_precision[0]:+.4f}")
+            
+            print(f"\nInitial RL coverage: {rl_coverage[0]:.4f}")
+            print(f"Final RL coverage: {rl_coverage[-1]:.4f}")
+            print(f"RL coverage change: {rl_coverage[-1] - rl_coverage[0]:+.4f}")
+            
+            # Check for issues
+            print("\n" + "="*80)
+            print("ISSUE DETECTION")
+            print("="*80)
+            zero_prec_episodes = [e.get('episode', i) for i, e in enumerate(history) if e.get('rl_avg_precision', 0) == 0]
+            zero_cov_episodes = [e.get('episode', i) for i, e in enumerate(history) if e.get('rl_avg_coverage', 0) == 0]
+            
+            if zero_prec_episodes:
+                print(f"⚠ Warning: {len(zero_prec_episodes)} episodes with zero precision")
+                if len(zero_prec_episodes) <= 10:
+                    print(f"  Episodes: {zero_prec_episodes}")
+            
+            if zero_cov_episodes:
+                print(f"⚠ Warning: {len(zero_cov_episodes)} episodes with zero coverage")
+                if len(zero_cov_episodes) <= 10:
+                    print(f"  Episodes: {zero_cov_episodes[:10]}")
+            
+            # Per-class analysis over time
+            classes = sorted(set([k for e in history for k in e.get('per_class_rl_stats', {}).keys()]))
+            if classes:
+                print("\n" + "="*80)
+                print("PER-CLASS TRAINING ANALYSIS")
+                print("="*80)
+                for cls in classes:
+                    cls_precisions = []
+                    cls_coverages = []
+                    for e in history:
+                        cls_stats = e.get('per_class_rl_stats', {}).get(cls, {})
+                        cls_precisions.append(cls_stats.get('hard_precision', 0.0))
+                        cls_coverages.append(cls_stats.get('coverage', 0.0))
+                    
+                    print(f"\n{cls}:")
+                    if len(cls_precisions) > 0 and len(cls_coverages) > 0:
+                        print(f"  Initial precision: {cls_precisions[0]:.4f} → Final: {cls_precisions[-1]:.4f}")
+                        print(f"  Initial coverage: {cls_coverages[0]:.4f} → Final: {cls_coverages[-1]:.4f}")
+                        print(f"  Max precision: {max(cls_precisions):.4f} (episode {episodes[cls_precisions.index(max(cls_precisions))]})")
+                        print(f"  Max coverage: {max(cls_coverages):.4f} (episode {episodes[cls_coverages.index(max(cls_coverages))]})")
+                    else:
+                        print(f"  No precision/coverage history for this class")
+    else:
+        print("\n" + "="*80)
+        print("TRAINING PROGRESS")
+        print("="*80)
+        print("(Training history not available for non-joint training)")
+        episodes = []
+        classifier_acc = []
+        classifier_loss = []
+        rl_precision = []
+        rl_coverage = []
+        classes = []
     
     # Create plots
     print("\n" + "="*80)
     print("GENERATING PLOTS")
     print("="*80)
     
-    fig = plt.figure(figsize=(18, 10))
+    # Determine number of plots based on available data
+    if has_training_history:
+        fig = plt.figure(figsize=(18, 10))
+        n_rows, n_cols = 2, 3
+    else:
+        # For non-joint training, skip training history plots
+        fig = plt.figure(figsize=(18, 6))
+        n_rows, n_cols = 1, 3
     
-    # Plot 1: Classifier performance
-    ax1 = plt.subplot(2, 3, 1)
-    ax1.plot(episodes, classifier_acc, 'b-', label='Test Accuracy', linewidth=2)
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Accuracy')
-    ax1.set_title('Classifier Test Accuracy')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
+    plot_idx = 1
     
-    # Plot 2: Classifier loss
-    ax2 = plt.subplot(2, 3, 2)
-    ax2.plot(episodes, classifier_loss, 'r-', linewidth=2)
-    ax2.set_xlabel('Episode')
-    ax2.set_ylabel('Loss')
-    ax2.set_title('Classifier Loss')
-    ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: RL Precision
-    ax3 = plt.subplot(2, 3, 3)
-    ax3.plot(episodes, rl_precision, 'g-', linewidth=2)
-    ax3.set_xlabel('Episode')
-    ax3.set_ylabel('Precision')
-    ax3.set_title('RL Average Precision')
-    ax3.grid(True, alpha=0.3)
-    
-    # Plot 4: RL Coverage
-    ax4 = plt.subplot(2, 3, 4)
-    ax4.plot(episodes, rl_coverage, 'm-', linewidth=2)
-    ax4.set_xlabel('Episode')
-    ax4.set_ylabel('Coverage')
-    ax4.set_title('RL Average Coverage')
-    ax4.grid(True, alpha=0.3)
-    
-    # Plot 5: Per-class precision
-    ax5 = plt.subplot(2, 3, 5)
-    for cls in classes:
-        cls_precisions = [e['per_class_rl_stats'].get(cls, {}).get('hard_precision', 0.0) 
-                          for e in history]
-        ax5.plot(episodes, cls_precisions, label=cls, linewidth=1.5, alpha=0.7)
-    ax5.set_xlabel('Episode')
-    ax5.set_ylabel('Hard Precision')
-    ax5.set_title('Per-Class Precision Over Time')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
-    
-    # Plot 6: Per-class coverage
-    ax6 = plt.subplot(2, 3, 6)
-    for cls in classes:
-        cls_coverages = [e['per_class_rl_stats'].get(cls, {}).get('coverage', 0.0) 
-                         for e in history]
-        ax6.plot(episodes, cls_coverages, label=cls, linewidth=1.5, alpha=0.7)
-    ax6.set_xlabel('Episode')
-    ax6.set_ylabel('Coverage')
-    ax6.set_title('Per-Class Coverage Over Time')
-    ax6.legend()
-    ax6.grid(True, alpha=0.3)
+    if has_training_history:
+        # Plot 1: Classifier performance (only for joint training)
+        if any(acc > 0 for acc in classifier_acc):
+            ax1 = plt.subplot(n_rows, n_cols, plot_idx)
+            ax1.plot(episodes, classifier_acc, 'b-', label='Test Accuracy', linewidth=2)
+            ax1.set_xlabel('Episode')
+            ax1.set_ylabel('Accuracy')
+            ax1.set_title('Classifier Test Accuracy')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            plot_idx += 1
+        
+        # Plot 2: Classifier loss (only for joint training)
+        if any(loss > 0 for loss in classifier_loss):
+            ax2 = plt.subplot(n_rows, n_cols, plot_idx)
+            ax2.plot(episodes, classifier_loss, 'r-', linewidth=2)
+            ax2.set_xlabel('Episode')
+            ax2.set_ylabel('Loss')
+            ax2.set_title('Classifier Loss')
+            ax2.grid(True, alpha=0.3)
+            plot_idx += 1
+        
+        # Plot 3: RL Precision
+        ax3 = plt.subplot(n_rows, n_cols, plot_idx)
+        ax3.plot(episodes, rl_precision, 'g-', linewidth=2)
+        ax3.set_xlabel('Episode')
+        ax3.set_ylabel('Precision')
+        ax3.set_title('RL Average Precision')
+        ax3.grid(True, alpha=0.3)
+        plot_idx += 1
+        
+        # Plot 4: RL Coverage
+        ax4 = plt.subplot(n_rows, n_cols, plot_idx)
+        ax4.plot(episodes, rl_coverage, 'm-', linewidth=2)
+        ax4.set_xlabel('Episode')
+        ax4.set_ylabel('Coverage')
+        ax4.set_title('RL Average Coverage')
+        ax4.grid(True, alpha=0.3)
+        plot_idx += 1
+        
+        # Plot 5: Per-class precision
+        if classes:
+            ax5 = plt.subplot(n_rows, n_cols, plot_idx)
+            for cls in classes:
+                cls_precisions = [e.get('per_class_rl_stats', {}).get(cls, {}).get('hard_precision', 0.0) 
+                                  for e in history]
+                ax5.plot(episodes, cls_precisions, label=cls, linewidth=1.5, alpha=0.7)
+            ax5.set_xlabel('Episode')
+            ax5.set_ylabel('Hard Precision')
+            ax5.set_title('Per-Class Precision Over Time')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+            plot_idx += 1
+        
+        # Plot 6: Per-class coverage
+        if classes:
+            ax6 = plt.subplot(n_rows, n_cols, plot_idx)
+            for cls in classes:
+                cls_coverages = [e.get('per_class_rl_stats', {}).get(cls, {}).get('coverage', 0.0) 
+                                 for e in history]
+                ax6.plot(episodes, cls_coverages, label=cls, linewidth=1.5, alpha=0.7)
+            ax6.set_xlabel('Episode')
+            ax6.set_ylabel('Coverage')
+            ax6.set_title('Per-Class Coverage Over Time')
+            ax6.legend()
+            ax6.grid(True, alpha=0.3)
+            plot_idx += 1
+    else:
+        # For non-joint training, show summary plots instead
+        # Plot 1: Precision-Coverage scatter (will be created later in detailed plots)
+        # For now, just show a message
+        ax1 = plt.subplot(n_rows, n_cols, plot_idx)
+        ax1.text(0.5, 0.5, 'Training history plots\nnot available for\nnon-joint training', 
+                ha='center', va='center', transform=ax1.transAxes, fontsize=12)
+        ax1.set_title('Training Progress (N/A)')
+        ax1.axis('off')
+        plot_idx += 1
     
     plt.tight_layout()
     
@@ -233,7 +351,7 @@ def analyze_metrics(json_path):
         rules = cls_data.get('rules', [])
         features = []
         for rule in rules:
-            matches = re.findall(r'(\w+) ∈', rule)
+            matches = extract_feature_names_from_rule(rule)
             features.extend(matches)
         
         if features:
@@ -259,7 +377,7 @@ def analyze_metrics(json_path):
         rule_complexities = []
         for rule in rules:
             if rule and rule != "any values (no tightened features)":
-                matches = re.findall(r'(\w+) ∈', rule)
+                matches = extract_feature_names_from_rule(rule)
                 rule_complexities.append(len(matches))
             else:
                 rule_complexities.append(0)
@@ -342,7 +460,7 @@ def analyze_metrics(json_path):
                 coverage = rule_data.get('coverage', 0.0)
                 
                 if rule and rule != "any values (no tightened features)":
-                    matches = re.findall(r'(\w+) ∈', rule)
+                    matches = extract_feature_names_from_rule(rule)
                     for feat in matches:
                         feature_importance[feat]['count'] += 1
                         feature_importance[feat]['total_precision'] += precision
@@ -475,7 +593,7 @@ def analyze_metrics(json_path):
         
         for rule in rules:
             if rule and rule != "any values (no tightened features)":
-                matches = re.findall(r'(\w+) ∈', rule)
+                matches = extract_feature_names_from_rule(rule)
                 # Count pairs
                 for pair in combinations(sorted(matches), 2):
                     feature_pairs[pair] += 1
@@ -530,7 +648,7 @@ def analyze_metrics(json_path):
                 precision = rule_data.get('hard_precision', 0.0)
                 
                 if rule and rule != "any values (no tightened features)":
-                    matches = re.findall(r'(\w+) ∈', rule)
+                    matches = extract_feature_names_from_rule(rule)
                     n_features = len(matches)
                     if n_features > 0:
                         efficiency = precision / n_features
@@ -548,12 +666,11 @@ def analyze_metrics(json_path):
                     if effs_for_n:
                         print(f"  {n_feat}-feature rules: mean efficiency={np.mean(effs_for_n):.4f} (n={len(effs_for_n)})")
     
-    # 7. Convergence Analysis
+    # 7. Convergence Analysis (only for joint training)
     print("\n" + "-"*80)
     print("7. CONVERGENCE ANALYSIS")
     print("-"*80)
-    history = data['training_history']
-    if len(history) >= 10:
+    if has_training_history and len(history) >= 10:
         # Last 25% of episodes
         last_quarter = max(1, len(history) // 4)
         last_episodes = history[-last_quarter:]
@@ -592,36 +709,42 @@ def analyze_metrics(json_path):
             print(f"  → Converged (low variance in final quarter)")
         else:
             print(f"  → Still varying (std={last_cov_std:.4f})")
+    else:
+        print("(Convergence analysis not available - requires training history)")
     
-    # 8. Classifier-RL Correlation Analysis
+    # 8. Classifier-RL Correlation Analysis (only for joint training)
     print("\n" + "-"*80)
     print("8. CLASSIFIER-RL CORRELATION ANALYSIS")
     print("-"*80)
-    history = data['training_history']
-    classifier_acc = [e['classifier_test_acc'] for e in history]
-    rl_precision = [e['rl_avg_precision'] for e in history]
-    rl_coverage = [e['rl_avg_coverage'] for e in history]
-    
-    if len(classifier_acc) > 1:
-        corr_prec = np.corrcoef(classifier_acc, rl_precision)[0, 1]
-        corr_cov = np.corrcoef(classifier_acc, rl_coverage)[0, 1]
+    if has_training_history and len(history) > 0:
+        classifier_acc_corr = [e.get('classifier_test_acc', 0.0) for e in history]
+        rl_precision_corr = [e.get('rl_avg_precision', 0.0) for e in history]
+        rl_coverage_corr = [e.get('rl_avg_coverage', 0.0) for e in history]
         
-        print(f"\nCorrelation between classifier accuracy and RL metrics:")
-        print(f"  Classifier vs RL Precision: {corr_prec:.3f}")
-        if abs(corr_prec) > 0.5:
-            print(f"    → Strong correlation ({'positive' if corr_prec > 0 else 'negative'})")
-        elif abs(corr_prec) > 0.3:
-            print(f"    → Moderate correlation")
+        if len(classifier_acc_corr) > 1 and any(acc > 0 for acc in classifier_acc_corr):
+            corr_prec = np.corrcoef(classifier_acc_corr, rl_precision_corr)[0, 1]
+            corr_cov = np.corrcoef(classifier_acc_corr, rl_coverage_corr)[0, 1]
+            
+            print(f"\nCorrelation between classifier accuracy and RL metrics:")
+            print(f"  Classifier vs RL Precision: {corr_prec:.3f}")
+            if abs(corr_prec) > 0.5:
+                print(f"    → Strong correlation ({'positive' if corr_prec > 0 else 'negative'})")
+            elif abs(corr_prec) > 0.3:
+                print(f"    → Moderate correlation")
+            else:
+                print(f"    → Weak correlation")
+            
+            print(f"  Classifier vs RL Coverage: {corr_cov:.3f}")
+            if abs(corr_cov) > 0.5:
+                print(f"    → Strong correlation ({'positive' if corr_cov > 0 else 'negative'})")
+            elif abs(corr_cov) > 0.3:
+                print(f"    → Moderate correlation")
+            else:
+                print(f"    → Weak correlation")
         else:
-            print(f"    → Weak correlation")
-        
-        print(f"  Classifier vs RL Coverage: {corr_cov:.3f}")
-        if abs(corr_cov) > 0.5:
-            print(f"    → Strong correlation ({'positive' if corr_cov > 0 else 'negative'})")
-        elif abs(corr_cov) > 0.3:
-            print(f"    → Moderate correlation")
-        else:
-            print(f"    → Weak correlation")
+            print("(Correlation analysis not available - requires classifier training history)")
+    else:
+        print("(Correlation analysis not available - requires training history)")
     
     # 9. Class Comparison Summary
     print("\n" + "-"*80)
@@ -733,7 +856,7 @@ def analyze_metrics(json_path):
         rules = results_to_analyze[cls_key].get('rules', [])
         for rule in rules:
             if rule and rule != "any values (no tightened features)":
-                matches = re.findall(r'(\w+) ∈', rule)
+                matches = extract_feature_names_from_rule(rule)
                 all_complexities.append(len(matches))
     if all_complexities:
         ax2.hist(all_complexities, bins=range(max(all_complexities)+2), edgecolor='black', alpha=0.7)
@@ -774,19 +897,25 @@ def analyze_metrics(json_path):
     ax4.legend()
     ax4.grid(True, alpha=0.3, axis='y')
     
-    # Plot 5: Classifier vs RL Precision over time
+    # Plot 5: Classifier vs RL Precision over time (only for joint training)
     ax5 = plt.subplot(3, 4, 5)
-    ax5_twin = ax5.twinx()
-    episodes = [e['episode'] for e in history]
-    ax5.plot(episodes, classifier_acc, 'b-', label='Classifier Acc', linewidth=2)
-    ax5_twin.plot(episodes, rl_precision, 'g-', label='RL Precision', linewidth=2)
-    ax5.set_xlabel('Episode')
-    ax5.set_ylabel('Classifier Accuracy', color='b')
-    ax5_twin.set_ylabel('RL Precision', color='g')
-    ax5.set_title('Classifier vs RL Precision')
-    ax5.tick_params(axis='y', labelcolor='b')
-    ax5_twin.tick_params(axis='y', labelcolor='g')
-    ax5.grid(True, alpha=0.3)
+    if has_training_history and len(episodes) > 0:
+        ax5_twin = ax5.twinx()
+        if any(acc > 0 for acc in classifier_acc):
+            ax5.plot(episodes, classifier_acc, 'b-', label='Classifier Acc', linewidth=2)
+            ax5.set_ylabel('Classifier Accuracy', color='b')
+            ax5.tick_params(axis='y', labelcolor='b')
+        ax5_twin.plot(episodes, rl_precision, 'g-', label='RL Precision', linewidth=2)
+        ax5.set_xlabel('Episode')
+        ax5_twin.set_ylabel('RL Precision', color='g')
+        ax5.set_title('Classifier vs RL Precision')
+        ax5_twin.tick_params(axis='y', labelcolor='g')
+        ax5.grid(True, alpha=0.3)
+    else:
+        ax5.text(0.5, 0.5, 'Training history\nnot available', 
+                ha='center', va='center', transform=ax5.transAxes)
+        ax5.set_title('Classifier vs RL Precision (N/A)')
+        ax5.axis('off')
     
     # Plot 6: Rule efficiency (precision per feature)
     ax6 = plt.subplot(3, 4, 6)
@@ -801,7 +930,7 @@ def analyze_metrics(json_path):
                 rule = rule_data.get('rule', '')
                 precision = rule_data.get('hard_precision', 0.0)
                 if rule and rule != "any values (no tightened features)":
-                    matches = re.findall(r'(\w+) ∈', rule)
+                    matches = extract_feature_names_from_rule(rule)
                     n_features = len(matches)
                     if n_features > 0:
                         complexities.append(n_features)
@@ -814,14 +943,14 @@ def analyze_metrics(json_path):
     ax6.legend()
     ax6.grid(True, alpha=0.3)
     
-    # Plot 7: Convergence analysis (last quarter)
+    # Plot 7: Convergence analysis (last quarter) - only for joint training
     ax7 = plt.subplot(3, 4, 7)
-    if len(history) >= 10:
+    if has_training_history and len(history) >= 10:
         last_quarter = max(1, len(history) // 4)
         last_episodes_data = history[-last_quarter:]
-        last_episodes = [e['episode'] for e in last_episodes_data]
-        last_precisions = [e['rl_avg_precision'] for e in last_episodes_data]
-        last_coverages = [e['rl_avg_coverage'] for e in last_episodes_data]
+        last_episodes = [e.get('episode', i) for i, e in enumerate(last_episodes_data)]
+        last_precisions = [e.get('rl_avg_precision', 0.0) for e in last_episodes_data]
+        last_coverages = [e.get('rl_avg_coverage', 0.0) for e in last_episodes_data]
         
         ax7_twin = ax7.twinx()
         ax7.plot(last_episodes, last_precisions, 'g-', label='Precision', linewidth=2)
@@ -833,6 +962,11 @@ def analyze_metrics(json_path):
         ax7.tick_params(axis='y', labelcolor='g')
         ax7_twin.tick_params(axis='y', labelcolor='m')
         ax7.grid(True, alpha=0.3)
+    else:
+        ax7.text(0.5, 0.5, 'Convergence analysis\nnot available\n(requires training history)', 
+                ha='center', va='center', transform=ax7.transAxes)
+        ax7.set_title('Convergence Analysis (N/A)')
+        ax7.axis('off')
     
     # Plot 8: Class comparison bar chart
     ax8 = plt.subplot(3, 4, 8)

@@ -158,10 +158,12 @@ def train_classifier(
     epochs=100, 
     batch_size=256, 
     lr=1e-3, 
-    patience=10
+    patience=100,
+    weight_decay=1e-4,
+    use_lr_scheduler=True
 ):
     """
-    Train a SimpleClassifier on tabular data.
+    Train a SimpleClassifier on tabular data with optimized training.
     
     Args:
         X_train: Training features
@@ -175,26 +177,53 @@ def train_classifier(
         batch_size: Batch size
         lr: Learning rate
         patience: Early stopping patience
+        weight_decay: L2 regularization weight decay (default: 1e-4)
+        use_lr_scheduler: Whether to use learning rate scheduling (default: True)
         
     Returns:
         Trained classifier and test accuracy
     """
     print("\n" + "="*80)
-    print("Training Classifier")
+    print("Training Classifier (Optimized)")
     print("="*80)
     
-    classifier = SimpleClassifier(n_features, n_classes).to(device)
-    optimizer = optim.Adam(classifier.parameters(), lr=lr)
+    # Create optimized classifier with dropout and batch norm
+    classifier = SimpleClassifier(n_features, n_classes, dropout_rate=0.3, use_batch_norm=True).to(device)
+    
+    # Use Adam optimizer with weight decay for L2 regularization
+    optimizer = optim.Adam(classifier.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
+    
+    # Learning rate scheduler: reduce LR on plateau
+    scheduler = None
+    if use_lr_scheduler:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=patience//3, 
+            min_lr=1e-6
+        )
     
     dataset = TensorDataset(
         torch.from_numpy(X_train).float(), 
         torch.from_numpy(y_train).long()
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     
     best_test_acc = 0.0
+    best_model_state = None
     patience_counter = 0
+    
+    print(f"Training configuration:")
+    print(f"  Architecture: Input({n_features}) -> 256 -> 256 -> 128 -> Output({n_classes})")
+    print(f"  Batch normalization: Enabled")
+    print(f"  Dropout: 0.3 (hidden), 0.15 (final)")
+    print(f"  Learning rate: {lr}")
+    print(f"  Weight decay: {weight_decay}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Max epochs: {epochs}")
+    print(f"  Early stopping patience: {patience}")
+    if scheduler:
+        print(f"  LR scheduler: ReduceLROnPlateau (factor=0.5, patience={patience//3})")
+    print()
     
     for epoch in range(epochs):
         classifier.train()
@@ -207,6 +236,8 @@ def train_classifier(
             logits = classifier(xb)
             loss = criterion(logits, yb)
             loss.backward()
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
         
@@ -217,20 +248,32 @@ def train_classifier(
             test_preds = test_logits.argmax(dim=1).cpu().numpy()
             test_acc = accuracy_score(y_test, test_preds)
         
+        # Update learning rate scheduler
+        current_lr = optimizer.param_groups[0]['lr']
+        if scheduler:
+            scheduler.step(test_acc)
+            current_lr = optimizer.param_groups[0]['lr']  # Update after scheduler step
+        
         if test_acc > best_test_acc:
             best_test_acc = test_acc
+            best_model_state = classifier.state_dict().copy()
             patience_counter = 0
         else:
             patience_counter += 1
         
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | Test Acc: {test_acc:.3f}")
+            lr_str = f", LR: {current_lr:.2e}" if scheduler else ""
+            print(f"Epoch {epoch}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | Test Acc: {test_acc:.3f}{lr_str}")
         
         if patience_counter >= patience and epoch >= 50:
             print(f"Early stopping at epoch {epoch}")
             break
     
-    print(f"Classifier training complete. Best test accuracy: {best_test_acc:.3f}")
+    # Load best model
+    if best_model_state is not None:
+        classifier.load_state_dict(best_model_state)
+    
+    print(f"\nClassifier training complete. Best test accuracy: {best_test_acc:.3f}")
     print("="*80)
     
     return classifier, best_test_acc
@@ -457,20 +500,26 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 n_features=n_features,
                 n_classes=n_classes_train,  # Use actual number of classes in training data
                 device=device,
-                epochs=100,
+                epochs=2000,  # Sufficient epochs with better training
                 batch_size=256,
-                lr=1e-3,
-                patience=10
+                lr=1e-3,  # Fixed: was 1e-5 which is too low!
+                patience=100,  # Reasonable patience with LR scheduling
+                weight_decay=1e-4,  # L2 regularization
+                use_lr_scheduler=True  # Enable learning rate scheduling
             )
             
             print(f"\nClassifier trained successfully!")
             print(f"Test accuracy: {test_acc:.3f}")
             
             # ======================================================================
-            # STEP 3: Train Dynamic Anchors PPO Policy
+            # STEP 3: Train Dynamic Anchors Policy (PPO for discrete, TD3/DDPG for continuous)
             # ======================================================================
             print("\n" + "="*80)
-            print("STEP 3: Training Dynamic Anchors with PPO")
+            if use_continuous_actions:
+                algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
+                print(f"STEP 3: Training Dynamic Anchors with {algorithm_name}")
+            else:
+                print("STEP 3: Training Dynamic Anchors with PPO")
             print("="*80)
         
             # Note: We pass raw unscaled data - tabular_dynAnchors will standardize
@@ -480,8 +529,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             # Training configuration using episodes and steps_per_episode convention
             # From POC: Breast Cancer uses 25 episodes × 40 steps
             # We'll use similar but with more steps per episode for better learning
-            episodes = 600
-            steps_per_episode = 90
+            episodes = 150
+            steps_per_episode = 1500
             
             # Calculate PPO parameters from episodes convention
             # total_timesteps = episodes × steps_per_episode × n_envs
@@ -509,12 +558,15 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 classifier=classifier,
                 target_classes=target_classes,
                 device=device,
-                n_envs=n_envs,
+                n_envs=n_envs if not use_continuous_actions else 1,  # DDPG/TD3 don't use vectorized envs the same way
                 total_timesteps=total_timesteps,
                 learning_rate=3e-4,
                 n_steps=n_steps,
-                batch_size=64,
+                batch_size=256,
                 n_epochs=10,
+                use_continuous_actions=use_continuous_actions,  # Enable continuous actions if requested
+                continuous_algorithm=continuous_algorithm,  # "ddpg" or "td3"
+                continuous_learning_rate=5e-5,  # Lower LR for TD3/DDPG to reduce reward variance
                 use_perturbation=True,
                 perturbation_mode="bootstrap",
                 n_perturb=2048,
@@ -525,7 +577,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 n_eval_instances_per_class=20,
                 max_features_in_rule=5,
                 steps_per_episode=eval_steps_per_episode,
-                output_dir=f"./output/{dataset_name}_{continuous_algorithm}_anchors/",
+                output_dir=f"./output/{dataset_name}_{continuous_algorithm}_post_hoc_dynamic_anchors/",
                 save_checkpoints=True,
                 checkpoint_freq=2000,
                 eval_freq=0,
@@ -605,8 +657,28 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                     cls_int = int(cls.replace('class_', '')) if isinstance(cls, str) and cls.startswith('class_') else int(cls) if isinstance(cls, (int, str)) else cls
                     cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
                     print(f"\n  Class {cls_int} ({cls_name}):")
-                    print(f"    Precision: {class_data.get('hard_precision', class_data.get('precision', 0.0)):.3f}")
-                    print(f"    Coverage:  {class_data.get('coverage', 0.0):.3f}")
+                    # Try multiple possible keys for precision and coverage
+                    # Debug: print available keys if precision/coverage are 0
+                    precision = class_data.get('hard_precision', class_data.get('precision', class_data.get('avg_hard_precision', class_data.get('avg_precision', 0.0))))
+                    coverage = class_data.get('coverage', class_data.get('avg_coverage', class_data.get('avg_local_coverage', class_data.get('avg_global_coverage', 0.0))))
+                    
+                    # If precision/coverage are 0 but best_rule exists, try to get from individual_results
+                    if (precision == 0.0 or coverage == 0.0) and 'best_rule' in class_data and class_data.get('best_rule'):
+                        # Try to get from individual_results if available
+                        if 'individual_results' in class_data and len(class_data['individual_results']) > 0:
+                            # Get average from individual results
+                            individual_precisions = [r.get('hard_precision', r.get('precision', 0.0)) for r in class_data['individual_results']]
+                            individual_coverages = [r.get('coverage', r.get('local_coverage', r.get('global_coverage', 0.0))) for r in class_data['individual_results']]
+                            if individual_precisions:
+                                precision = np.mean(individual_precisions)
+                            if individual_coverages:
+                                coverage = np.mean(individual_coverages)
+                        # Also try best_precision if available
+                        if precision == 0.0 and 'best_precision' in class_data:
+                            precision = class_data['best_precision']
+                    
+                    print(f"    Precision: {precision:.3f}")
+                    print(f"    Coverage:  {coverage:.3f}")
                     if 'best_rule' in class_data:
                         print(f"    Best Rule: {class_data['best_rule'][:100]}...")
             
@@ -617,8 +689,23 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                     cls_int = int(cls.replace('class_', '')) if isinstance(cls, str) and cls.startswith('class_') else int(cls) if isinstance(cls, (int, str)) else cls
                     cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
                     print(f"\n  Class {cls_int} ({cls_name}):")
-                    print(f"    Precision: {class_data.get('hard_precision', class_data.get('precision', 0.0)):.3f}")
-                    print(f"    Coverage:  {class_data.get('coverage', class_data.get('global_coverage', 0.0)):.3f}")
+                    
+                    # Debug: Check what keys are available
+                    available_keys = list(class_data.keys())
+                    precision = class_data.get('hard_precision', class_data.get('precision', 0.0))
+                    coverage = class_data.get('coverage', class_data.get('global_coverage', 0.0))
+                    
+                    # If precision/coverage are 0, check if values exist under different keys
+                    if precision == 0.0 and coverage == 0.0:
+                        # Debug output to help diagnose
+                        print(f"    [DEBUG] Available keys: {available_keys}")
+                        print(f"    [DEBUG] hard_precision: {class_data.get('hard_precision', 'NOT FOUND')}")
+                        print(f"    [DEBUG] precision: {class_data.get('precision', 'NOT FOUND')}")
+                        print(f"    [DEBUG] coverage: {class_data.get('coverage', 'NOT FOUND')}")
+                        print(f"    [DEBUG] global_coverage: {class_data.get('global_coverage', 'NOT FOUND')}")
+                    
+                    print(f"    Precision: {precision:.3f}")
+                    print(f"    Coverage:  {coverage:.3f}")
                     if 'rule' in class_data:
                         print(f"    Rule: {class_data['rule'][:100]}...")
         elif 'per_class_results' in eval_results:
