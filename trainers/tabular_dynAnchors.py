@@ -50,7 +50,7 @@ def train_and_evaluate_dynamic_anchors(
     continuous_learning_rate: float = 5e-5,
     # Environment parameters
     use_perturbation: bool = True,
-    perturbation_mode: str = "bootstrap",
+    perturbation_mode: str = "bootstrap",  # "bootstrap", "uniform", or "adaptive"
     n_perturb: int = 1024,
     step_fracs: Tuple[float, ...] = (0.005, 0.01, 0.02),
     min_width: float = 0.05,
@@ -97,7 +97,10 @@ def train_and_evaluate_dynamic_anchors(
         continuous_algorithm: "ddpg" or "td3" (only used if use_continuous_actions=True)
         continuous_learning_rate: Learning rate for TD3/DDPG (continuous actions)
         use_perturbation: Enable perturbation sampling in environment
-        perturbation_mode: "bootstrap" or "uniform" sampling
+        perturbation_mode: "bootstrap", "uniform", or "adaptive" sampling.
+            - "bootstrap": Resample empirical points with replacement (requires points in box)
+            - "uniform": Generate uniform samples within box bounds (works even with 0 points)
+            - "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
         n_perturb: Number of perturbation samples
         step_fracs: Action step sizes
         min_width: Minimum box width
@@ -158,6 +161,54 @@ def train_and_evaluate_dynamic_anchors(
     
     print(f"Classes: {unique_classes}, Target classes: {target_classes}")
     
+    # ======================================================================
+    # CLUSTER-BASED SAMPLING: Compute cluster centroids per class
+    # This identifies dense regions and uses their centroids as starting points
+    # This can improve training by starting from more representative examples
+    # ======================================================================
+    from trainers.vecEnv import compute_cluster_centroids_per_class
+    
+    n_clusters_per_class = 10  # Number of cluster centroids per class
+    print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
+    try:
+        cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=X_unit_train,
+            y=y_train,
+            n_clusters_per_class=n_clusters_per_class,
+            random_state=42
+        )
+        print(f"  Cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in cluster_centroids_per_class:
+                n_centroids = len(cluster_centroids_per_class[cls])
+                print(f"  Class {cls}: {n_centroids} cluster centroids")
+            else:
+                print(f"  Class {cls}: No centroids available")
+    except ImportError as e:
+        print(f"  WARNING: Could not compute cluster centroids: {e}")
+        print(f"  Falling back to random sampling. Install sklearn: pip install scikit-learn")
+        cluster_centroids_per_class = None
+    
+    # ======================================================================
+    # FIXED INSTANCE SAMPLING: Pre-select instances per class for training
+    # This reduces variance by using consistent starting points (fallback)
+    # ======================================================================
+    n_fixed_instances_per_class = 10  # Number of fixed instances per class
+    rng_fixed = np.random.default_rng(seed=42)  # Fixed seed for reproducibility
+    fixed_instances_per_class = {}
+    
+    print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class (fallback)...")
+    for cls in target_classes:
+        cls_indices = np.where(y_train == cls)[0]
+        if len(cls_indices) > 0:
+            n_sample = min(n_fixed_instances_per_class, len(cls_indices))
+            fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
+            fixed_instances_per_class[cls] = fixed_indices
+            print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
+        else:
+            fixed_instances_per_class[cls] = np.array([], dtype=int)
+            print(f"  Class {cls}: No instances available")
+    
     # Create environment factory function
     # For multi-class training, distribute classes across environments
     def create_anchor_env(target_cls=None):
@@ -189,6 +240,11 @@ def train_and_evaluate_dynamic_anchors(
             min_coverage_floor=0.005,
             js_penalty_weight=0.05,
         )
+        # Set cluster centroids for this class (priority: cluster centroids > fixed instances > random)
+        # Note: cluster_centroids_per_class and fixed_instances_per_class are set in outer scope
+        if cluster_centroids_per_class is not None:
+            env.cluster_centroids_per_class = cluster_centroids_per_class
+        env.fixed_instances_per_class = fixed_instances_per_class
         # Enable continuous actions if requested
         if use_continuous_actions:
             env.max_action_scale = max(step_fracs) if step_fracs else 0.02
@@ -238,6 +294,11 @@ def train_and_evaluate_dynamic_anchors(
         for cls in target_classes:
             # Create AnchorEnv for this class
             anchor_env = create_anchor_env(target_cls=cls)
+            # Set cluster centroids for this class (priority: cluster centroids > fixed instances > random)
+            if cluster_centroids_per_class is not None:
+                anchor_env.cluster_centroids_per_class = cluster_centroids_per_class
+            # Set fixed instances for this class (for fixed instance sampling fallback)
+            anchor_env.fixed_instances_per_class = fixed_instances_per_class
             
             # Wrap with ContinuousAnchorEnv for TD3/DDPG (provides action_space attribute)
             gym_env = ContinuousAnchorEnv(anchor_env, seed=42 + cls)

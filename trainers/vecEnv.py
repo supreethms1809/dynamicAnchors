@@ -19,6 +19,13 @@ try:
 except ImportError:
     from trainers.networks import SimpleClassifier
 
+# Try to import sklearn for clustering (optional dependency)
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 try:
     import gymnasium as gym
     from gymnasium import spaces
@@ -37,6 +44,83 @@ except ImportError:
     # Create dummy classes for type hints when SB3 is not available
     DummyVecEnv = None
     SubprocVecEnv = None
+
+
+# ============================================================================
+# Helper Functions: Clustering
+# ============================================================================
+
+def compute_cluster_centroids_per_class(
+    X_unit: np.ndarray,
+    y: np.ndarray,
+    n_clusters_per_class: int = 10,
+    random_state: int = 42,
+    min_samples_per_cluster: int = 1
+) -> Dict[int, np.ndarray]:
+    """
+    Compute cluster centroids for each class using KMeans clustering.
+    
+    This identifies dense regions (clusters) in the data and returns their centroids.
+    Starting episodes from cluster centroids can improve training by:
+    - Starting from more representative/typical examples
+    - Reducing variance by focusing on dense regions
+    - Potentially finding better anchors that cover more points
+    
+    IMPORTANT: This is ONLY for class-based training. For instance-based training,
+    set x_star_unit explicitly on the AnchorEnv before calling reset().
+    
+    Args:
+        X_unit: Data in unit space [0, 1], shape (n_samples, n_features)
+        y: Class labels, shape (n_samples,)
+        n_clusters_per_class: Number of clusters to find per class
+        random_state: Random seed for reproducibility
+        min_samples_per_cluster: Minimum samples required to form a cluster
+        
+    Returns:
+        Dictionary mapping class -> array of cluster centroids (n_clusters, n_features)
+        
+    Note:
+        Cluster centroids are used when x_star_unit is None (class-based training).
+        For instance-based training, set x_star_unit directly on AnchorEnv.
+    """
+    if not SKLEARN_AVAILABLE:
+        raise ImportError(
+            "sklearn is required for cluster-based sampling. "
+            "Install it with: pip install scikit-learn"
+        )
+    
+    centroids_per_class = {}
+    unique_classes = np.unique(y)
+    
+    for cls in unique_classes:
+        cls_mask = (y == cls)
+        cls_indices = np.where(cls_mask)[0]
+        X_cls = X_unit[cls_indices]
+        
+        if len(X_cls) == 0:
+            centroids_per_class[cls] = np.array([]).reshape(0, X_unit.shape[1])
+            continue
+        
+        # Determine number of clusters (can't have more clusters than samples)
+        n_clusters = min(n_clusters_per_class, len(X_cls))
+        
+        if n_clusters < min_samples_per_cluster:
+            # Not enough samples for clustering, use mean as single centroid
+            centroid = X_cls.mean(axis=0, keepdims=True)
+            centroids_per_class[cls] = centroid.astype(np.float32)
+        else:
+            # Perform KMeans clustering
+            kmeans = KMeans(
+                n_clusters=n_clusters,
+                random_state=random_state,
+                n_init=10,
+                max_iter=300
+            )
+            kmeans.fit(X_cls)
+            centroids = kmeans.cluster_centers_.astype(np.float32)
+            centroids_per_class[cls] = centroids
+    
+    return centroids_per_class
 
 
 # ============================================================================
@@ -81,7 +165,7 @@ class AnchorEnv:
         precision_blend_lambda: float = 0.5,
         drift_penalty_weight: float = 0.05,
         use_perturbation: bool = False,
-        perturbation_mode: str = "bootstrap",
+        perturbation_mode: str = "bootstrap",  # "bootstrap", "uniform", or "adaptive"
         n_perturb: int = 1024,
         X_min: np.ndarray | None = None,
         X_range: np.ndarray | None = None,
@@ -143,6 +227,9 @@ class AnchorEnv:
         # Fixed instance sampling support: store fixed instances per class
         # Format: {class: array of instance indices}
         self.fixed_instances_per_class = None  # Will be set if using fixed instance sampling
+        # Cluster centroids support: store cluster centroids per class
+        # Format: {class: array of cluster centroids (n_clusters, n_features)}
+        self.cluster_centroids_per_class = None  # Will be set if using cluster-based sampling
         
         # Track coverage floor hits (reset per episode)
         self.coverage_floor_hits = 0
@@ -202,8 +289,8 @@ class AnchorEnv:
         covered = np.where(mask)[0]
         coverage = float(mask.mean())
         
-        # If no empirical points covered and not using uniform perturbation, return early
-        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode == "uniform"):
+        # If no empirical points covered and not using uniform/adaptive perturbation, return early
+        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
             data_source = "test" if self.eval_on_test_data else "training"
             return 0.0, coverage, {
                 "hard_precision": 0.0, 
@@ -263,8 +350,37 @@ class AnchorEnv:
                 y_eval = None  # No ground truth labels for synthetic samples
                 n_points = int(n_samp)
                 sampler_note = f"uniform_{data_source}"
+            elif self.perturbation_mode == "adaptive":
+                # Adaptive/hybrid mode: use bootstrap when plenty of points, uniform when sparse
+                # Threshold: use bootstrap if we have at least 10% of n_perturb empirical points
+                min_points_for_bootstrap = max(1, int(0.1 * self.n_perturb))
+                
+                if covered.size >= min_points_for_bootstrap:
+                    # Plenty of points: use bootstrap (keeps ground truth labels)
+                    n_samp = min(self.n_perturb, covered.size)
+                    idx = self.rng.choice(covered, size=n_samp, replace=True)
+                    X_eval = X_data_std[idx]
+                    y_eval = y_data[idx]
+                    n_points = int(n_samp)
+                    sampler_note = f"adaptive_bootstrap_{data_source}"
+                else:
+                    # Sparse region: use uniform (synthetic samples)
+                    n_samp = self.n_perturb
+                    U = np.zeros((n_samp, self.n_features), dtype=np.float32)
+                    for j in range(self.n_features):
+                        low, up = float(self.lower[j]), float(self.upper[j])
+                        # Ensure valid bounds (width >= min_width)
+                        width = max(up - low, self.min_width)
+                        mid = 0.5 * (low + up)
+                        low = max(0.0, mid - width / 2.0)
+                        up = min(1.0, mid + width / 2.0)
+                        U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                    X_eval = self._unit_to_std(U)
+                    y_eval = None  # No ground truth labels for synthetic samples
+                    n_points = int(n_samp)
+                    sampler_note = f"adaptive_uniform_{data_source}"
             else:
-                raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap' or 'uniform'.")
+                raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap', 'uniform', or 'adaptive'.")
 
         # Ensure classifier is in eval mode before forward pass
         # This prevents hanging during evaluation (critical for stable_baselines3 evaluate_policy)
@@ -1003,13 +1119,41 @@ class ContinuousAnchorEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
         
-        # IMPORTANT: If x_star_unit is already set (e.g., for evaluation), use it instead of sampling
-        # This allows final evaluation to use specific instances while training can still sample randomly
+        # IMPORTANT: If x_star_unit is already set (e.g., for instance-based evaluation), 
+        # use it directly and skip all sampling (cluster centroids, fixed instances, random).
+        # Cluster centroids are ONLY used for class-based training, not instance-based training.
+        # This allows final evaluation to use specific instances while training can use cluster centroids.
         if self.anchor_env.x_star_unit is None:
             target_class = self.anchor_env.target_class
             
+            # Priority order: 1) Cluster centroids, 2) Fixed instances, 3) Random sampling
+            # NOTE: Cluster centroids are ONLY for class-based training (when x_star_unit is None).
+            # For instance-based training, x_star_unit should be set explicitly before reset().
+            # CLUSTER-BASED SAMPLING: Use cluster centroids (dense regions) for better starting points
+            if (self.anchor_env.cluster_centroids_per_class is not None and 
+                target_class in self.anchor_env.cluster_centroids_per_class and
+                len(self.anchor_env.cluster_centroids_per_class[target_class]) > 0):
+                # Sample a cluster centroid for this episode
+                centroids = self.anchor_env.cluster_centroids_per_class[target_class]
+                
+                # Extract episode number from seed if provided (seed = 42 + cls + ep)
+                # For cycling, extract episode number: ep = seed - 42 - cls
+                # This ensures each class cycles independently starting from centroid 0
+                if seed is not None:
+                    # Seed format: 42 + cls + ep
+                    # Extract episode: ep = seed - 42 - cls
+                    base_seed = 42
+                    episode_num = seed - base_seed - target_class
+                    centroid_idx = episode_num % len(centroids)
+                else:
+                    # Fallback: use random selection from centroids (shouldn't happen in training)
+                    centroid_idx = self.anchor_env.rng.integers(0, len(centroids))
+                
+                # Use the selected cluster centroid as the starting point
+                sampled_instance_unit = centroids[centroid_idx].astype(np.float32)
+                self.anchor_env.x_star_unit = sampled_instance_unit
             # Check if fixed instance sampling is enabled
-            if (self.anchor_env.fixed_instances_per_class is not None and 
+            elif (self.anchor_env.fixed_instances_per_class is not None and 
                 target_class in self.anchor_env.fixed_instances_per_class and
                 len(self.anchor_env.fixed_instances_per_class[target_class]) > 0):
                 # FIXED INSTANCE SAMPLING: Cycle through pre-selected instances
@@ -1033,7 +1177,7 @@ class ContinuousAnchorEnv(gym.Env):
                 sampled_instance_unit = self.anchor_env.X_unit[instance_idx].astype(np.float32)
                 self.anchor_env.x_star_unit = sampled_instance_unit
             else:
-                # RANDOM SAMPLING (fallback or when fixed instances not set)
+                # RANDOM SAMPLING (fallback or when fixed instances/clusters not set)
                 # Sample an instance from the training data matching the target class
                 mask_target = (self.anchor_env.y == target_class)
                 indices_target = np.where(mask_target)[0]

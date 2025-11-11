@@ -326,7 +326,7 @@ def train_and_evaluate_joint(
     n_epochs: int = 10,
     # Environment parameters
     use_perturbation: bool = True,
-    perturbation_mode: str = "bootstrap",
+    perturbation_mode: str = "bootstrap",  # "bootstrap", "uniform", or "adaptive"
     n_perturb: int = 1024,
     step_fracs: Tuple[float, ...] = (0.005, 0.01, 0.02),
     min_width: float = 0.05,
@@ -381,7 +381,10 @@ def train_and_evaluate_joint(
         batch_size: RL batch size for updates
         n_epochs: RL epochs per update
         use_perturbation: Enable perturbation sampling
-        perturbation_mode: "bootstrap" or "uniform" sampling
+        perturbation_mode: "bootstrap", "uniform", or "adaptive" sampling.
+            - "bootstrap": Resample empirical points with replacement (requires points in box)
+            - "uniform": Generate uniform samples within box bounds (works even with 0 points)
+            - "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
         n_perturb: Number of perturbation samples
         step_fracs: Action step sizes
         min_width: Minimum box width
@@ -723,6 +726,34 @@ def train_and_evaluate_joint(
         return create_anchor_env()
     
     # ======================================================================
+    # CLUSTER-BASED SAMPLING: Compute cluster centroids per class
+    # This identifies dense regions and uses their centroids as starting points
+    # This can improve training by starting from more representative examples
+    # ======================================================================
+    from trainers.vecEnv import compute_cluster_centroids_per_class
+    
+    n_clusters_per_class = 10  # Number of cluster centroids per class
+    print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
+    try:
+        cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=X_unit_train,
+            y=y_train,
+            n_clusters_per_class=n_clusters_per_class,
+            random_state=42
+        )
+        print(f"  Cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in cluster_centroids_per_class:
+                n_centroids = len(cluster_centroids_per_class[cls])
+                print(f"  Class {cls}: {n_centroids} cluster centroids")
+            else:
+                print(f"  Class {cls}: No centroids available")
+    except ImportError as e:
+        print(f"  WARNING: Could not compute cluster centroids: {e}")
+        print(f"  Falling back to fixed instance sampling. Install sklearn: pip install scikit-learn")
+        cluster_centroids_per_class = None
+    
+    # ======================================================================
     # FIXED INSTANCE SAMPLING: Pre-select instances per class for training
     # This reduces variance by using consistent starting points
     # ======================================================================
@@ -781,7 +812,10 @@ def train_and_evaluate_joint(
         continuous_trainers = {}
         for cls in target_classes:
             anchor_env = create_anchor_env(target_cls=cls)
-            # Set fixed instances for this class (for fixed instance sampling)
+            # Set cluster centroids for this class (priority: cluster centroids > fixed instances > random)
+            if cluster_centroids_per_class is not None:
+                anchor_env.cluster_centroids_per_class = cluster_centroids_per_class
+            # Set fixed instances for this class (for fixed instance sampling fallback)
             anchor_env.fixed_instances_per_class = fixed_instances_per_class
             # Enable continuous actions in AnchorEnv
             anchor_env.n_actions = 2 * anchor_env.n_features
@@ -1029,7 +1063,10 @@ def train_and_evaluate_joint(
                 print(f"[DEBUG] Class {cls}: Creating anchor_env...")
                 anchor_env = create_anchor_env(target_cls=cls)
                 print(f"[DEBUG] Class {cls}: anchor_env created successfully")
-                # Set fixed instances for this class (for fixed instance sampling)
+                # Set cluster centroids for this class (priority: cluster centroids > fixed instances > random)
+                if cluster_centroids_per_class is not None:
+                    anchor_env.cluster_centroids_per_class = cluster_centroids_per_class
+                # Set fixed instances for this class (for fixed instance sampling fallback)
                 anchor_env.fixed_instances_per_class = fixed_instances_per_class
                 anchor_env.n_actions = 2 * anchor_env.n_features
                 anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
@@ -2304,10 +2341,54 @@ def train_and_evaluate_joint(
         except ImportError:
             print(f"  [WARNING] joblib not available, skipping Gradient Boosting save")
     else:  # DNN
-        # Save DNN using PyTorch
+        # Save DNN using PyTorch with architecture metadata
         classifier_path = f"{models_dir}/classifier_final.pth"
-        torch.save(classifier.state_dict(), classifier_path)
+        
+        # Extract architecture information from the classifier
+        architecture_info = None
+        if hasattr(classifier, 'model') and hasattr(classifier.model, 'net'):
+            # Extract layer information from Sequential model
+            layers_info = []
+            for layer in classifier.model.net:
+                if isinstance(layer, nn.Linear):
+                    layers_info.append({
+                        "type": "Linear",
+                        "in_features": layer.in_features,
+                        "out_features": layer.out_features
+                    })
+                elif isinstance(layer, nn.ReLU):
+                    layers_info.append({"type": "ReLU"})
+                elif isinstance(layer, nn.BatchNorm1d):
+                    layers_info.append({
+                        "type": "BatchNorm1d",
+                        "num_features": layer.num_features
+                    })
+                elif isinstance(layer, nn.Dropout):
+                    layers_info.append({
+                        "type": "Dropout",
+                        "p": layer.p
+                    })
+            
+            architecture_info = {
+                "classifier_type": "dnn",
+                "input_dim": n_features,
+                "num_classes": n_classes,
+                "layers": layers_info
+            }
+        
+        # Save both state dict and architecture info
+        save_dict = {
+            "state_dict": classifier.state_dict(),
+            "architecture": architecture_info
+        }
+        torch.save(save_dict, classifier_path)
         print(f"  Saved DNN classifier: {classifier_path}")
+        if architecture_info:
+            # Print architecture summary
+            linear_layers = [l for l in architecture_info["layers"] if l["type"] == "Linear"]
+            if linear_layers:
+                arch_str = " -> ".join([str(l["out_features"]) for l in linear_layers])
+                print(f"    Architecture: {n_features} -> {arch_str}")
     
     # ======================================================================
     # STEP 5: Save Full Metrics and Rules to JSON

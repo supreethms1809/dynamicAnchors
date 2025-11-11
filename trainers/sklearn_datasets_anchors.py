@@ -2,15 +2,22 @@
 Complete example: sklearn Datasets with Dynamic Anchors
 
 This script demonstrates the full pipeline:
-1. Load dataset (Breast Cancer or Covtype)
+1. Load dataset (Breast Cancer, Covtype, Wine, or Housing)
 2. Train a classifier
-3. Train PPO policy to find anchors
+3. Train RL policy (PPO for discrete actions, DDPG/TD3 for continuous actions) to find anchors
 4. Evaluate anchors on test instances
+
+Perturbation Modes:
+- "bootstrap": Resample empirical points with replacement (requires points in box)
+- "uniform": Generate uniform samples within box bounds (works even with 0 points)
+- "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
 
 Usage:
     python -m trainers.sklearn_datasets_anchors --dataset breast_cancer
-    python -m trainers.sklearn_datasets_anchors --dataset covtype
+    python -m trainers.sklearn_datasets_anchors --dataset covtype --sample_size 10000
     python -m trainers.sklearn_datasets_anchors --dataset breast_cancer --continuous-actions
+    python -m trainers.sklearn_datasets_anchors --dataset wine
+    python -m trainers.sklearn_datasets_anchors --dataset housing --sample_size 10000
 """
 
 import numpy as np
@@ -284,10 +291,18 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
     Main function: Complete pipeline for sklearn datasets.
     
     Args:
-        dataset_name: Dataset to use ("breast_cancer" or "covtype")
-        sample_size: Optional size to sample (for covtype, use 10000-50000)
+        dataset_name: Dataset to use ("breast_cancer", "covtype", "wine", or "housing")
+        sample_size: Optional size to sample (for large datasets like covtype or housing)
         joint: If True, use joint training (alternating classifier and RL)
-        use_continuous_actions: If True, use continuous actions version (from POC)
+        use_continuous_actions: If True, use continuous actions (DDPG/TD3) instead of discrete (PPO)
+        continuous_algorithm: "ddpg" or "td3" (only used if use_continuous_actions=True)
+        classifier_type: "dnn", "random_forest", or "gradient_boosting"
+    
+    Note:
+        Perturbation modes (set in training functions):
+        - "bootstrap": Resample empirical points with replacement (requires points in box)
+        - "uniform": Generate uniform samples within box bounds (works even with 0 points)
+        - "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
     """
     # Setup logging to file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -468,7 +483,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 batch_size=48,
                 n_epochs=10,
                 use_perturbation=True,
-                perturbation_mode="bootstrap",
+                perturbation_mode="adaptive",  # "bootstrap", "uniform", or "adaptive" (recommended: "adaptive")
                 n_perturb=2048,
                 step_fracs=(0.005, 0.01, 0.02),
                 min_width=0.05,
@@ -568,7 +583,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 continuous_algorithm=continuous_algorithm,  # "ddpg" or "td3"
                 continuous_learning_rate=5e-5,  # Lower LR for TD3/DDPG to reduce reward variance
                 use_perturbation=True,
-                perturbation_mode="bootstrap",
+                perturbation_mode="adaptive",  # "bootstrap", "uniform", or "adaptive" (recommended: "adaptive")
                 n_perturb=2048,
                 step_fracs=(0.005, 0.01, 0.02),
                 min_width=0.05,
