@@ -1,0 +1,887 @@
+import functools
+from copy import copy
+import numpy as np
+import torch
+from typing import Dict, Optional, Tuple, Any, List
+from pettingzoo.utils import ParallelEnv
+from gymnasium import spaces
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from trainers.device_utils import get_device
+
+
+class AnchorEnv(ParallelEnv):
+    metadata = {
+        "name": "AnchorEnv",
+        "description": "AnchorEnv is a multi-agent environment for finding anchors",
+        "keywords": ["multi-agent", "anchor", "environment"],
+        "render_modes": None,
+    }
+
+    def __init__(
+        self,
+        X_unit: Optional[np.ndarray] = None,
+        X_std: Optional[np.ndarray] = None,
+        y: np.ndarray = None,
+        feature_names: list = None,
+        classifier = None,
+        device: str = "cpu",
+        target_class: Optional[int] = None,
+        target_classes: Optional[List[int]] = None,
+        env_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+        
+        if env_config is None:
+            env_config = {}
+        
+        normalize_data = env_config.get("normalize_data", False)
+        
+        if normalize_data:
+            if X_std is None:
+                raise ValueError("X_std must be provided when normalize_data=True")
+            X_unit_normalized, X_min, X_range = self._normalize_data(X_std, env_config)
+            X_unit = X_unit_normalized
+            if env_config.get("X_min") is None:
+                env_config["X_min"] = X_min
+            if env_config.get("X_range") is None:
+                env_config["X_range"] = X_range
+        else:
+            if X_unit is None or X_std is None:
+                raise ValueError("Both X_unit and X_std must be provided when normalize_data=False")
+        
+        self.X_unit = X_unit
+        self.X_std = X_std
+        self.y = y.astype(int)
+        self.feature_names = feature_names
+        self.n_features = X_unit.shape[1]
+        self.classifier = classifier
+        self.device = get_device(device)
+        
+        if target_classes is None:
+            if target_class is not None:
+                target_classes = [target_class]
+            else:
+                target_classes = sorted(np.unique(y).tolist())
+        
+        self.target_classes = target_classes
+        self.possible_agents = [f"agent_{cls}" for cls in target_classes]
+        self.agent_to_class = {f"agent_{cls}": cls for cls in target_classes}
+        
+        step_fracs = env_config.get("step_fracs", (0.005, 0.01, 0.02))
+        if step_fracs is None or len(step_fracs) == 0:
+            raise ValueError("step_fracs cannot be empty. Provide at least one step fraction value.")
+        self.step_fracs = step_fracs
+        self.min_width = env_config.get("min_width", 0.05)
+        self.alpha = env_config.get("alpha", 0.7)
+        self.beta = env_config.get("beta", 0.6)
+        self.gamma = env_config.get("gamma", 0.1)
+
+        self.directions = ("shrink_lower", "expand_lower", "shrink_upper", "expand_upper")
+        self.precision_target = env_config.get("precision_target", 0.8)
+        self.coverage_target = env_config.get("coverage_target", 0.02)
+        self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
+        self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
+
+        self.use_perturbation = env_config.get("use_perturbation", False)
+        self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
+        self.n_perturb = env_config.get("n_perturb", 1024)
+        self.X_min = env_config.get("X_min", None)
+        self.X_range = env_config.get("X_range", None)
+        self.rng = env_config.get("rng", None)
+        if self.rng is None:
+            self.rng = np.random.default_rng(42)
+        self.min_coverage_floor = env_config.get("min_coverage_floor", 0.005)
+        self.js_penalty_weight = env_config.get("js_penalty_weight", 0.05)
+        self.initial_window = env_config.get("initial_window", 0.1)
+        self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
+        self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
+        self.use_random_sampling = env_config.get("use_random_sampling", False)
+        
+        self.eval_on_test_data = env_config.get("eval_on_test_data", False)
+        if self.eval_on_test_data:
+            X_test_unit = env_config.get("X_test_unit", None)
+            X_test_std = env_config.get("X_test_std", None)
+            y_test = env_config.get("y_test", None)
+            if X_test_unit is None or X_test_std is None or y_test is None:
+                raise ValueError("eval_on_test_data=True requires X_test_unit, X_test_std, and y_test")
+            self.X_test_unit = X_test_unit
+            self.X_test_std = X_test_std
+            self.y_test = y_test.astype(int)
+        else:
+            self.X_test_unit = None
+            self.X_test_std = None
+            self.y_test = None
+
+        self.max_action_scale = env_config.get("max_action_scale", 0.1)
+        self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
+        self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
+        
+        x_star_unit_config = env_config.get("x_star_unit", None)
+        if isinstance(x_star_unit_config, dict):
+            self.x_star_unit = x_star_unit_config
+        else:
+            self.x_star_unit = {}
+
+        self.lower = {}
+        self.upper = {}
+        self.prev_lower = {}
+        self.prev_upper = {}
+        self.box_history = {}
+        self.coverage_floor_hits = {}
+        self.timestep = None
+
+    @staticmethod
+    def _normalize_data(X_std: np.ndarray, env_config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        X_min = env_config.get("X_min", None)
+        X_range = env_config.get("X_range", None)
+        
+        if X_min is None or X_range is None:
+            X_min = X_std.min(axis=0)
+            X_max = X_std.max(axis=0)
+            X_range = np.where((X_max - X_min) == 0, 1.0, (X_max - X_min))
+        
+        X_unit = (X_std - X_min) / X_range
+        X_unit = np.clip(X_unit, 0.0, 1.0).astype(np.float32)
+        
+        return X_unit, X_min, X_range
+
+    def _mask_in_box(self, agent: str) -> np.ndarray:
+        if self.eval_on_test_data:
+            X_eval_unit = self.X_test_unit
+        else:
+            X_eval_unit = self.X_unit
+        
+        conds = []
+        for j in range(self.n_features):
+            conds.append((X_eval_unit[:, j] >= self.lower[agent][j]) & (X_eval_unit[:, j] <= self.upper[agent][j]))
+        mask = np.logical_and.reduce(conds) if conds else np.ones(X_eval_unit.shape[0], dtype=bool)
+        return mask
+
+    def _unit_to_std(self, X_unit_samples: np.ndarray) -> np.ndarray:
+        if self.X_min is None or self.X_range is None:
+            raise ValueError("X_min/X_range must be set for uniform perturbation sampling.")
+        return (X_unit_samples * self.X_range) + self.X_min
+
+    def _current_metrics(self, agent: str) -> tuple:
+        target_class = self.agent_to_class[agent]
+        mask = self._mask_in_box(agent)
+        covered = np.where(mask)[0]
+        coverage = float(mask.mean())
+        
+        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
+            data_source = "test" if self.eval_on_test_data else "training"
+            return 0.0, coverage, {
+                "hard_precision": 0.0, 
+                "avg_prob": 0.0, 
+                "n_points": 0, 
+                "sampler": "none",
+                "data_source": data_source
+            }
+
+        if self.eval_on_test_data:
+            X_data_std = self.X_test_std
+            y_data = self.y_test
+            data_source = "test"
+        else:
+            X_data_std = self.X_std
+            y_data = self.y
+            data_source = "training"
+
+        if not self.use_perturbation:
+            X_eval = X_data_std[covered]
+            y_eval = y_data[covered]
+            n_points = int(X_eval.shape[0])
+            sampler_note = f"empirical_{data_source}"
+        else:
+            if self.perturbation_mode == "bootstrap":
+                if covered.size == 0:
+                    data_source = "test" if self.eval_on_test_data else "training"
+                    return 0.0, coverage, {
+                        "hard_precision": 0.0, 
+                        "avg_prob": 0.0, 
+                        "n_points": 0, 
+                        "sampler": "none",
+                        "data_source": data_source
+                    }
+                n_samp = min(self.n_perturb, max(1, covered.size))
+                idx = self.rng.choice(covered, size=n_samp, replace=True)
+                X_eval = X_data_std[idx]
+                y_eval = y_data[idx]
+                n_points = int(n_samp)
+                sampler_note = f"bootstrap_{data_source}"
+            elif self.perturbation_mode == "uniform":
+                n_samp = self.n_perturb
+                U = np.zeros((n_samp, self.n_features), dtype=np.float32)
+                for j in range(self.n_features):
+                    low, up = float(self.lower[agent][j]), float(self.upper[agent][j])
+                    width = max(up - low, self.min_width)
+                    mid = 0.5 * (low + up)
+                    low = max(0.0, mid - width / 2.0)
+                    up = min(1.0, mid + width / 2.0)
+                    U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                X_eval = self._unit_to_std(U)
+                y_eval = None
+                n_points = int(n_samp)
+                sampler_note = f"uniform_{data_source}"
+            elif self.perturbation_mode == "adaptive":
+                min_points_for_bootstrap = max(1, int(0.1 * self.n_perturb))
+                
+                if covered.size >= min_points_for_bootstrap:
+                    n_samp = min(self.n_perturb, covered.size)
+                    idx = self.rng.choice(covered, size=n_samp, replace=True)
+                    X_eval = X_data_std[idx]
+                    y_eval = y_data[idx]
+                    n_points = int(n_samp)
+                    sampler_note = f"adaptive_bootstrap_{data_source}"
+                else:
+                    n_samp = self.n_perturb
+                    U = np.zeros((n_samp, self.n_features), dtype=np.float32)
+                    for j in range(self.n_features):
+                        low, up = float(self.lower[agent][j]), float(self.upper[agent][j])
+                        width = max(up - low, self.min_width)
+                        mid = 0.5 * (low + up)
+                        low = max(0.0, mid - width / 2.0)
+                        up = min(1.0, mid + width / 2.0)
+                        U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                    X_eval = self._unit_to_std(U)
+                    y_eval = None
+                    n_points = int(n_samp)
+                    sampler_note = f"adaptive_uniform_{data_source}"
+            else:
+                raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap', 'uniform', or 'adaptive'.")
+
+        if hasattr(self.classifier, 'eval'):
+            self.classifier.eval()
+        if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+            self.classifier.model.eval()
+        
+        with torch.no_grad():
+            inputs = torch.from_numpy(X_eval).float().to(self.device)
+            logits = self.classifier(inputs)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+
+        preds = probs.argmax(axis=1)
+        positive_idx = (preds == target_class)
+        if y_eval is None:
+            hard_precision = float(positive_idx.mean())
+        else:
+            if positive_idx.sum() == 0:
+                target_in_box = (y_eval == target_class)
+                if target_in_box.sum() == 0:
+                    hard_precision = 0.0
+                else:
+                    hard_precision = 0.01
+            else:
+                hard_precision = float((y_eval[positive_idx] == target_class).mean())
+
+        avg_prob = float(probs[:, target_class].mean())
+        precision_proxy = (
+            self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
+        )
+        target_class_fraction = 0.0
+        if y_eval is not None:
+            target_class_fraction = float((y_eval == target_class).mean())
+        
+        return precision_proxy, coverage, {
+            "hard_precision": hard_precision,
+            "avg_prob": avg_prob,
+            "n_points": int(n_points),
+            "sampler": sampler_note,
+            "target_class_fraction": target_class_fraction,
+            "data_source": data_source,
+        }
+
+    def reset(
+        self, 
+        seed: Optional[int] = None, 
+        options: Optional[Dict] = None
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
+        if hasattr(self.classifier, 'eval'):
+            self.classifier.eval()
+        
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        
+        self.agents = copy(self.possible_agents)
+        self.timestep = 0
+        
+        observations = {}
+        infos = {}
+        
+        for agent in self.agents:
+            if self.x_star_unit.get(agent) is None:
+                self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
+                self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
+            else:
+                w = self.initial_window
+                self.lower[agent] = np.clip(self.x_star_unit[agent] - w, 0.0, 1.0)
+                self.upper[agent] = np.clip(self.x_star_unit[agent] + w, 0.0, 1.0)
+            
+            self.prev_lower[agent] = self.lower[agent].copy()
+            self.prev_upper[agent] = self.upper[agent].copy()
+            self.box_history[agent] = [(self.lower[agent].copy(), self.upper[agent].copy())]
+            self.coverage_floor_hits[agent] = 0
+            
+            precision, coverage, _ = self._current_metrics(agent)
+            state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
+            
+            observations[agent] = np.array(state, dtype=np.float32)
+            infos[agent] = {}
+        
+        return observations, infos
+
+    def _apply_action(self, agent: str, action: int):
+        f = action // (len(self.directions) * len(self.step_fracs))
+        rem = action % (len(self.directions) * len(self.step_fracs))
+        d = rem // len(self.step_fracs)
+        m = rem % len(self.step_fracs)
+
+        direction = self.directions[d]
+        step = float(self.step_fracs[m])
+        cur_width = max(1e-6, self.upper[agent][f] - self.lower[agent][f])
+        rel_step = step * cur_width
+
+        if direction == "shrink_lower":
+            self.lower[agent][f] = min(self.lower[agent][f] + rel_step, self.upper[agent][f] - self.min_width)
+        elif direction == "expand_lower":
+            self.lower[agent][f] = max(self.lower[agent][f] - rel_step, 0.0)
+        elif direction == "shrink_upper":
+            self.upper[agent][f] = max(self.upper[agent][f] - rel_step, self.lower[agent][f] + self.min_width)
+        elif direction == "expand_upper":
+            self.upper[agent][f] = min(self.upper[agent][f] + rel_step, 1.0)
+
+        if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
+            mid = 0.5 * (self.upper[agent][f] + self.lower[agent][f])
+            self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
+            self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
+
+    def _apply_continuous_action(self, agent: str, action: np.ndarray):
+        action = np.clip(action, -1.0, 1.0)
+        
+        lower_deltas = action[:self.n_features]
+        upper_deltas = action[self.n_features:]
+        
+        widths = np.maximum(self.upper[agent] - self.lower[agent], 1e-6)
+        max_delta_proportional = self.max_action_scale * widths
+        max_delta = np.maximum(max_delta_proportional, self.min_absolute_step)
+        
+        lower_changes = lower_deltas * max_delta
+        self.lower[agent] = np.clip(self.lower[agent] + lower_changes, 0.0, self.upper[agent] - self.min_width)
+        
+        upper_changes = upper_deltas * max_delta
+        self.upper[agent] = np.clip(self.upper[agent] + upper_changes, self.lower[agent] + self.min_width, 1.0)
+        
+        for f in range(self.n_features):
+            if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
+                mid = 0.5 * (self.upper[agent][f] + self.lower[agent][f])
+                self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
+                self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
+    
+    def step(
+        self, 
+        actions: Dict[str, np.ndarray]
+    ) -> Tuple[
+        Dict[str, np.ndarray],
+        Dict[str, float],
+        Dict[str, bool],
+        Dict[str, bool],
+        Dict[str, Dict]
+    ]:
+        observations = {}
+        rewards = {}
+        terminations = {}
+        truncations = {}
+        infos = {}
+        
+        for agent in self.agents:
+            if agent not in actions:
+                precision, coverage, _ = self._current_metrics(agent)
+                state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
+                observations[agent] = np.array(state, dtype=np.float32)
+                rewards[agent] = 0.0
+                terminations[agent] = False
+                truncations[agent] = False
+                infos[agent] = {
+                    "precision": precision,
+                    "coverage": coverage,
+                    "drift": 0.0,
+                    "anchor_drift": 0.0,
+                    "js_penalty": 0.0,
+                    "coverage_clipped": False,
+                    "termination_reason": None,
+                    "coverage_floor_hits": self.coverage_floor_hits[agent],
+                    "coverage_before_revert": None,
+                    "coverage_after_revert": None,
+                    "precision_gain": 0.0,
+                    "coverage_gain": 0.0,
+                    "coverage_gain_scaled": 0.0,
+                    "precision_gain_component": 0.0,
+                    "coverage_gain_component": 0.0,
+                    "coverage_bonus": 0.0,
+                    "target_class_bonus": 0.0,
+                    "overlap_penalty": 0.0,
+                    "drift_penalty": 0.0,
+                    "anchor_drift_penalty": 0.0,
+                    "total_reward": 0.0,
+                }
+                continue
+            
+            action = actions[agent]
+            
+            if isinstance(action, torch.Tensor):
+                action = action.cpu().numpy()
+            action = np.array(action, dtype=np.float32)
+            
+            prev_precision, prev_coverage, _ = self._current_metrics(agent)
+            prev_lower = self.lower[agent].copy()
+            prev_upper = self.upper[agent].copy()
+            prev_widths = np.maximum(prev_upper - prev_lower, 1e-9)
+            prev_vol = float(np.prod(prev_widths))
+            
+            if isinstance(action, np.ndarray) and action.shape[0] == 2 * self.n_features:
+                self._apply_continuous_action(agent, action)
+            else:
+                self._apply_action(agent, int(action))
+            
+            precision, coverage, details = self._current_metrics(agent)
+
+            if not np.isfinite(precision):
+                precision = 0.0
+            if not np.isfinite(coverage):
+                coverage = 0.0
+            if not np.isfinite(prev_precision):
+                prev_precision = 0.0
+            if not np.isfinite(prev_coverage):
+                prev_coverage = 0.0
+
+            coverage_clipped = False
+            coverage_before_revert = None
+            coverage_after_revert = None
+            if coverage < self.min_coverage_floor:
+                coverage_before_revert = float(coverage)
+                self.lower[agent] = prev_lower
+                self.upper[agent] = prev_upper
+                precision, coverage, details = self._current_metrics(agent)
+                if not np.isfinite(precision):
+                    precision = 0.0
+                if not np.isfinite(coverage):
+                    coverage = 0.0
+                coverage_after_revert = float(coverage)
+                self.coverage_floor_hits[agent] += 1
+                coverage_clipped = True
+
+            precision_gain = precision - prev_precision
+            coverage_gain = coverage - prev_coverage
+            
+            if not np.isfinite(precision_gain):
+                precision_gain = 0.0
+            if not np.isfinite(coverage_gain):
+                coverage_gain = 0.0
+            
+            min_denominator = max(prev_coverage, 1e-6)
+            coverage_gain_normalized = coverage_gain / min_denominator
+            coverage_gain_scaled = coverage_gain_normalized * 0.5
+            coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.5, 0.5)
+            coverage_gain_for_reward = coverage_gain_scaled
+            
+            if not np.isfinite(coverage_gain_for_reward):
+                coverage_gain_for_reward = 0.0
+
+            widths = self.upper[agent] - self.lower[agent]
+            overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
+
+            drift = float(np.linalg.norm(self.upper[agent] - prev_upper) + np.linalg.norm(self.lower[agent] - prev_lower))
+            drift_penalty = self.drift_penalty_weight * drift
+
+            anchor_drift_penalty = self._compute_anchor_drift_penalty(agent, prev_lower, prev_upper)
+            
+            inter_class_overlap_penalty = self._compute_inter_class_overlap_penalty(agent)
+
+            inter_lower = np.maximum(self.lower[agent], prev_lower)
+            inter_upper = np.minimum(self.upper[agent], prev_upper)
+            inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
+            inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
+            curr_widths = np.maximum(self.upper[agent] - self.lower[agent], 1e-9)
+            curr_vol = float(np.prod(curr_widths))
+            eps = 1e-12
+            if inter_vol <= eps:
+                js_proxy = 1.0
+            else:
+                js_proxy = 1.0 - float(inter_vol / (0.5 * (prev_vol + curr_vol) + eps))
+                js_proxy = float(np.clip(js_proxy, 0.0, 1.0))
+            
+            precision_threshold = self.precision_target * 0.8
+            precision_weight, coverage_weight, js_penalty = self._compute_reward_weights_and_penalties(
+                precision, precision_gain, coverage_gain_for_reward, js_proxy, precision_threshold, eps
+            )
+            
+            coverage_bonus = self._compute_coverage_bonus(
+                precision, coverage, coverage_gain_for_reward, precision_threshold, eps
+            )
+            target_class_bonus = self._compute_target_class_bonus(
+                details, precision, precision_threshold, eps
+            )
+
+            reward = (self.alpha * precision_weight * precision_gain + 
+                     coverage_weight * coverage_gain_for_reward + 
+                     coverage_bonus +
+                     target_class_bonus -
+                     overlap_penalty - 
+                     drift_penalty - 
+                     anchor_drift_penalty - 
+                     js_penalty -
+                     inter_class_overlap_penalty)
+            
+            if not np.isfinite(reward):
+                reward = 0.0
+
+            self.box_history[agent].append((self.lower[agent].copy(), self.upper[agent].copy()))
+            self.prev_lower[agent] = prev_lower
+            self.prev_upper[agent] = prev_upper
+            state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
+            
+            eps = 1e-12
+            both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
+            high_precision_with_reasonable_coverage = (
+                precision >= 0.95 * self.precision_target and 
+                coverage >= 0.5 * self.coverage_target
+            )
+            both_reasonably_close = (
+                precision >= 0.90 * self.precision_target and 
+                coverage >= 0.90 * self.coverage_target
+            )
+            excellent_precision = (
+                precision >= self.precision_target and 
+                coverage >= 0.3 * self.coverage_target
+            )
+            done = bool(both_targets_met or high_precision_with_reasonable_coverage or both_reasonably_close or excellent_precision)
+            
+            termination_reason = None
+            if done:
+                if both_targets_met:
+                    termination_reason = "both_targets_met"
+                elif excellent_precision:
+                    termination_reason = "excellent_precision"
+                elif high_precision_with_reasonable_coverage:
+                    termination_reason = "high_precision_reasonable_coverage"
+                elif both_reasonably_close:
+                    termination_reason = "both_reasonably_close"
+            
+            precision_gain_component = self.alpha * precision_weight * precision_gain
+            coverage_gain_component = coverage_weight * coverage_gain_for_reward
+            
+            termination_reason_code = 0.0
+            if termination_reason == "both_targets_met":
+                termination_reason_code = 1.0
+            elif termination_reason == "excellent_precision":
+                termination_reason_code = 2.0
+            elif termination_reason == "high_precision_reasonable_coverage":
+                termination_reason_code = 3.0
+            elif termination_reason == "both_reasonably_close":
+                termination_reason_code = 4.0
+            
+            info = {
+                "precision": float(precision),
+                "coverage": float(coverage),
+                "drift": float(drift),
+                "anchor_drift": float(anchor_drift_penalty),
+                "js_penalty": float(js_penalty),
+                "coverage_clipped": float(1.0 if coverage_clipped else 0.0),
+                "termination_reason": termination_reason_code,
+                "coverage_floor_hits": float(self.coverage_floor_hits[agent]),
+                "coverage_before_revert": float(coverage_before_revert) if coverage_before_revert is not None else 0.0,
+                "coverage_after_revert": float(coverage_after_revert) if coverage_after_revert is not None else 0.0,
+                "precision_gain": float(precision_gain),
+                "coverage_gain": float(coverage_gain),
+                "coverage_gain_scaled": float(coverage_gain_for_reward),
+                "precision_gain_component": float(precision_gain_component),
+                "coverage_gain_component": float(coverage_gain_component),
+                "coverage_bonus": float(coverage_bonus),
+                "target_class_bonus": float(target_class_bonus),
+                "overlap_penalty": float(overlap_penalty),
+                "drift_penalty": float(drift_penalty),
+                "anchor_drift_penalty": float(anchor_drift_penalty),
+                "inter_class_overlap_penalty": float(inter_class_overlap_penalty),
+                "total_reward": float(reward),
+            }
+            
+            for key, value in details.items():
+                if value is not None:
+                    if isinstance(value, (int, float, np.number)):
+                        info[key] = float(value)
+                    elif isinstance(value, bool):
+                        info[key] = float(1.0 if value else 0.0)
+                    elif isinstance(value, np.ndarray):
+                        info[key] = float(value.item()) if value.size == 1 else value.tolist()
+                    elif isinstance(value, str):
+                        continue
+            
+            observations[agent] = np.array(state, dtype=np.float32)
+            rewards[agent] = float(reward)
+            terminations[agent] = bool(done)
+            truncations[agent] = False
+            infos[agent] = info
+        
+        self.timestep += 1
+        
+        if any(terminations.values()) or all(truncations.values()):
+            self.agents = []
+        
+        return observations, rewards, terminations, truncations, infos
+    
+    def _compute_inter_class_overlap_penalty(self, agent: str) -> float:
+        if len(self.agents) <= 1:
+            return 0.0
+        
+        agent_lower = self.lower[agent]
+        agent_upper = self.upper[agent]
+        agent_vol = float(np.prod(np.maximum(agent_upper - agent_lower, 1e-9)))
+        
+        if agent_vol <= 1e-12:
+            return 0.0
+        
+        total_overlap_vol = 0.0
+        
+        for other_agent in self.agents:
+            if other_agent == agent:
+                continue
+            
+            other_lower = self.lower[other_agent]
+            other_upper = self.upper[other_agent]
+            
+            inter_lower = np.maximum(agent_lower, other_lower)
+            inter_upper = np.minimum(agent_upper, other_upper)
+            inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
+            inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
+            
+            if inter_vol > 1e-12:
+                overlap_ratio = inter_vol / (agent_vol + 1e-12)
+                total_overlap_vol += overlap_ratio
+        
+        inter_class_overlap_weight = getattr(self, 'inter_class_overlap_weight', 0.1)
+        penalty = inter_class_overlap_weight * total_overlap_vol
+        
+        return float(np.clip(penalty, 0.0, 1.0))
+    
+    def _compute_anchor_drift_penalty(self, agent: str, prev_lower: np.ndarray, prev_upper: np.ndarray) -> float:
+        anchor_drift_penalty = 0.0
+        if self.x_star_unit.get(agent) is not None:
+            box_center = 0.5 * (self.lower[agent] + self.upper[agent])
+            anchor_distance = float(np.linalg.norm(box_center - self.x_star_unit[agent]))
+            max_allowed_distance = self.initial_window * 2.0
+            if anchor_distance > max_allowed_distance:
+                excess = anchor_distance - max_allowed_distance
+                anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5
+        return anchor_drift_penalty
+    
+    def _compute_reward_weights_and_penalties(
+        self, precision: float, precision_gain: float, coverage_gain: float, 
+        js_proxy: float, precision_threshold: float, eps: float
+    ) -> tuple:
+        if precision >= precision_threshold:
+            precision_weight = max(2.0, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
+            coverage_weight = self.beta * min(1.0, precision / (precision_threshold + eps))
+            
+            if precision >= self.precision_target * 0.95 and coverage_gain > 0:
+                js_penalty = self.js_penalty_weight * js_proxy * 0.3
+            else:
+                js_penalty = self.js_penalty_weight * js_proxy
+        else:
+            precision_weight = 2.0
+            coverage_weight = self.beta * (0.5 + 0.5 * (precision / (precision_threshold + eps)))
+            if coverage_gain > 0:
+                js_penalty = self.js_penalty_weight * js_proxy * 0.5
+            else:
+                js_penalty = self.js_penalty_weight * js_proxy
+        
+        return precision_weight, coverage_weight, js_penalty
+    
+    def _compute_coverage_bonus(
+        self, precision: float, coverage: float, coverage_gain: float, 
+        precision_threshold: float, eps: float
+    ) -> float:
+        coverage_bonus = 0.0
+        
+        if precision >= precision_threshold and coverage >= self.coverage_target:
+            coverage_bonus = 0.1 * (coverage / self.coverage_target)
+        elif precision >= precision_threshold and coverage_gain > 0:
+            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
+            coverage_bonus = (0.3 + 0.7 * progress_to_target) * coverage_gain
+            distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
+            coverage_bonus += 0.2 * coverage_gain * (1.0 - distance_to_target)
+        elif precision >= precision_threshold * 0.8 and coverage_gain > 0:
+            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
+            coverage_bonus = (0.1 + 0.2 * progress_to_target) * coverage_gain
+        
+        return coverage_bonus
+    
+    def _compute_target_class_bonus(
+        self, details: dict, precision: float, precision_threshold: float, eps: float
+    ) -> float:
+        target_class_bonus = 0.0
+        target_class_fraction = details.get("target_class_fraction", 0.0)
+        
+        if target_class_fraction > 0.0 and precision < precision_threshold:
+            precision_ratio = 1.0 - precision / (precision_threshold + eps)
+            target_class_bonus = 0.2 * target_class_fraction * precision_ratio
+            target_class_bonus *= max(0.1, precision_ratio)
+        
+        return target_class_bonus
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent: str) -> spaces.Box:
+        return spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(2 * self.n_features + 2,),
+            dtype=np.float32
+        )
+    
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent: str) -> spaces.Box:
+        return spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(2 * self.n_features,),
+            dtype=np.float32
+        )
+
+    def get_anchor_bounds(self, agent: str) -> Tuple[np.ndarray, np.ndarray]:
+        return self.lower[agent].copy(), self.upper[agent].copy()
+    
+    def extract_rule(
+        self, 
+        agent: str, 
+        max_features_in_rule: Optional[int] = 5,
+        initial_lower: Optional[np.ndarray] = None,
+        initial_upper: Optional[np.ndarray] = None
+    ) -> str:
+        lower = self.lower[agent].copy()
+        upper = self.upper[agent].copy()
+        
+        if initial_lower is None or initial_upper is None:
+            initial_width = np.ones(self.n_features, dtype=np.float32)
+        else:
+            initial_width = initial_upper - initial_lower
+        
+        current_width = upper - lower
+        
+        if np.any(initial_width <= 0) or np.any(np.isnan(initial_width)) or np.any(np.isinf(initial_width)):
+            initial_width_ref = np.ones_like(initial_width)
+        else:
+            initial_width_ref = initial_width.copy()
+        
+        if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
+            tightened = np.array([], dtype=int)
+        else:
+            tightened = np.where(current_width < initial_width_ref * 0.98)[0]
+            if tightened.size == 0:
+                tightened = np.where(current_width < initial_width_ref * 0.99)[0]
+            if tightened.size == 0:
+                tightened = np.where(current_width < 0.95)[0]
+            if tightened.size == 0:
+                if np.all(initial_width_ref >= 0.9):
+                    tightened = np.where(current_width < 0.9)[0]
+            if tightened.size == 0:
+                tightened = np.where(current_width < initial_width_ref)[0]
+        
+        if tightened.size == 0:
+            return "any values (no tightened features)"
+        
+        tightened_sorted = np.argsort(current_width[tightened])
+        if max_features_in_rule is None or max_features_in_rule == -1 or max_features_in_rule == 0:
+            to_show_idx = tightened
+        else:
+            to_show_idx = tightened[tightened_sorted[:max_features_in_rule]]
+        
+        if to_show_idx.size == 0:
+            return "any values (no tightened features)"
+        
+        cond_parts = []
+        for i in to_show_idx:
+            cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.4f}, {upper[i]:.4f}]")
+        
+        return " and ".join(cond_parts)
+    
+    def render(self):
+        raise NotImplementedError("Render not implemented for AnchorEnv")
+    
+    def close(self):
+        pass
+
+
+def main():
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    n_samples = 1000
+    n_features = 5
+    n_classes = 2
+    
+    X_raw = np.random.randn(n_samples, n_features).astype(np.float32)
+    y = np.random.randint(0, n_classes, size=n_samples).astype(int)
+    feature_names = [f"feature_{i}" for i in range(n_features)]
+    
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_std = scaler.fit_transform(X_raw).astype(np.float32)
+    
+    X_min = X_std.min(axis=0)
+    X_max = X_std.max(axis=0)
+    X_range = np.where((X_max - X_min) == 0, 1.0, (X_max - X_min))
+    X_unit = (X_std - X_min) / X_range
+    X_unit = np.clip(X_unit, 0.0, 1.0).astype(np.float32)
+    
+    try:
+        from trainers.networks import SimpleClassifier
+        classifier = SimpleClassifier(input_dim=n_features, num_classes=n_classes, dropout_rate=0.3, use_batch_norm=True)
+    except (ImportError, TypeError):
+        try:
+            from trainers.multiagent_networks import SimpleClassifier
+            classifier = SimpleClassifier(input_size=n_features, hidden_size=128, output_size=n_classes)
+        except ImportError:
+            class TestClassifier(torch.nn.Module):
+                def __init__(self, input_dim, num_classes):
+                    super().__init__()
+                    self.fc1 = torch.nn.Linear(input_dim, 64)
+                    self.fc2 = torch.nn.Linear(64, 64)
+                    self.fc3 = torch.nn.Linear(64, num_classes)
+                    self.relu = torch.nn.ReLU()
+                
+                def forward(self, x):
+                    x = self.relu(self.fc1(x))
+                    x = self.relu(self.fc2(x))
+                    x = self.fc3(x)
+                    return x
+            
+            classifier = TestClassifier(input_dim=n_features, num_classes=n_classes)
+    
+    classifier.eval()
+    
+    env_config = {
+        "precision_target": 0.8,
+        "coverage_target": 0.02,
+        "use_perturbation": False,
+        "X_min": X_min,
+        "X_range": X_range,
+    }
+    
+    test_env = AnchorEnv(
+        X_unit=X_unit,
+        X_std=X_std,
+        y=y,
+        feature_names=feature_names,
+        classifier=classifier,
+        device="cpu",
+        target_classes=[0, 1],
+        env_config=env_config
+    )
+    
+    from pettingzoo.test import parallel_api_test
+    parallel_api_test(test_env, num_cycles=10)
+
+
+if __name__ == "__main__":
+    main()

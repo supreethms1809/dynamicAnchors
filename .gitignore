@@ -215,3 +215,7 @@ proof_of_concept/*.json
 output/*
 
 *.pth
+BenchMARL/docs/*
+BenchMARL/maddpg*
+BenchMARL/output/*
+BenchMARL/masac*
