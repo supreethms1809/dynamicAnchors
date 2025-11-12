@@ -131,6 +131,7 @@ class AnchorEnv(ParallelEnv):
         self.box_history = {}
         self.coverage_floor_hits = {}
         self.timestep = None
+        self.max_cycles = env_config.get("max_cycles", 100)
 
     @staticmethod
     def _normalize_data(X_std: np.ndarray, env_config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -626,7 +627,14 @@ class AnchorEnv(ParallelEnv):
         
         self.timestep += 1
         
-        if any(terminations.values()) or all(truncations.values()):
+        max_steps_reached = (self.timestep >= self.max_cycles)
+        
+        if max_steps_reached:
+            for agent in self.agents:
+                if not terminations[agent]:
+                    truncations[agent] = True
+        
+        if any(terminations.values()) or max_steps_reached:
             self.agents = []
         
         return observations, rewards, terminations, truncations, infos

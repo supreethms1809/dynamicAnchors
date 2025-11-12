@@ -11,7 +11,7 @@ from benchmarl.models.mlp import MlpConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmarl_wrappers import AnchorTask, AnchorMetricsCallback
-from Environment import AnchorEnv
+from environment import AnchorEnv
 
 
 def _get_algorithm_configs():
