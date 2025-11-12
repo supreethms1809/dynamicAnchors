@@ -58,10 +58,14 @@ def train_and_evaluate_dynamic_anchors(
     coverage_target: float = 0.02,
     # Evaluation parameters
     n_eval_instances_per_class: int = 20,
-    max_features_in_rule: int = 5,
+    max_features_in_rule: Optional[int] = 5,
     steps_per_episode: int = 100,
     eval_steps_per_episode: int = None,  # Defaults to steps_per_episode if None
     num_rollouts_per_instance: int = 1,  # Number of greedy rollouts per instance (default: 1)
+    # Training sampling parameters
+    n_clusters_per_class: Optional[int] = None,  # Number of cluster centroids per class. None = use all training instances (recommended for lower variance)
+    n_fixed_instances_per_class: Optional[int] = None,  # Number of fixed instances per class for fallback. None = use all training instances
+    use_random_sampling: bool = False,  # If True, randomly sample from pool each episode instead of deterministic cycling (reduces variance)
     # Output parameters
     output_dir: str = "./output/anchors/",
     save_checkpoints: bool = True,
@@ -107,8 +111,19 @@ def train_and_evaluate_dynamic_anchors(
         precision_target: Target precision threshold
         coverage_target: Target coverage threshold
         n_eval_instances_per_class: Instances per class for evaluation
-        max_features_in_rule: Max features to show in rules
+        max_features_in_rule: Max features to show in rules.
+            Use -1 or None to include all tightened features (useful for feature importance).
+            Default: 5
         steps_per_episode: Max steps for greedy rollouts
+        n_clusters_per_class: Number of cluster centroids per class for training sampling.
+            None = use all training instances (recommended for lower variance).
+            Higher values provide more diverse starting points. Default: None (use all instances)
+        n_fixed_instances_per_class: Number of fixed instances per class for training fallback sampling.
+            None = use all training instances. Used when cluster centroids are unavailable.
+            Default: None (use all instances)
+        use_random_sampling: If True, randomly sample from instance pool each episode instead of
+            deterministic cycling. This reduces variance by avoiding repeated patterns.
+            Default: False (deterministic cycling)
         output_dir: Directory for outputs
         save_checkpoints: Save checkpoints during training
         checkpoint_freq: Checkpoint frequency
@@ -165,54 +180,86 @@ def train_and_evaluate_dynamic_anchors(
     # CLUSTER-BASED SAMPLING: Compute cluster centroids per class
     # This identifies dense regions and uses their centroids as starting points
     # This can improve training by starting from more representative examples
+    # If n_clusters_per_class is None, we'll use all training instances instead
     # ======================================================================
     from trainers.vecEnv import compute_cluster_centroids_per_class
     
-    n_clusters_per_class = 10  # Number of cluster centroids per class
-    print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
-    try:
-        cluster_centroids_per_class = compute_cluster_centroids_per_class(
-            X_unit=X_unit_train,
-            y=y_train,
-            n_clusters_per_class=n_clusters_per_class,
-            random_state=42
-        )
-        print(f"  Cluster centroids computed successfully!")
-        for cls in target_classes:
-            if cls in cluster_centroids_per_class:
-                n_centroids = len(cluster_centroids_per_class[cls])
-                print(f"  Class {cls}: {n_centroids} cluster centroids")
-            else:
-                print(f"  Class {cls}: No centroids available")
-    except ImportError as e:
-        print(f"  WARNING: Could not compute cluster centroids: {e}")
-        print(f"  Falling back to random sampling. Install sklearn: pip install scikit-learn")
-        cluster_centroids_per_class = None
+    # Determine number of clusters: None means use all training instances
+    if n_clusters_per_class is None:
+        # Use all training instances - compute centroids for all instances per class
+        # This effectively uses all training data, reducing variance
+        print(f"\n[Cluster-Based Sampling] Using all training instances per class (n_clusters_per_class=None)...")
+        # For cluster centroids, if None, we'll use all instances directly
+        # Set to a large number to effectively use all instances
+        n_clusters_per_class_actual = None  # Will use all instances
+    else:
+        n_clusters_per_class_actual = n_clusters_per_class
+        print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
+    
+    cluster_centroids_per_class = None
+    if n_clusters_per_class_actual is not None:
+        try:
+            cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                X_unit=X_unit_train,
+                y=y_train,
+                n_clusters_per_class=n_clusters_per_class_actual,
+                random_state=42
+            )
+            print(f"  Cluster centroids computed successfully!")
+            for cls in target_classes:
+                if cls in cluster_centroids_per_class:
+                    n_centroids = len(cluster_centroids_per_class[cls])
+                    print(f"  Class {cls}: {n_centroids} cluster centroids")
+                else:
+                    print(f"  Class {cls}: No centroids available")
+        except ImportError as e:
+            print(f"  WARNING: Could not compute cluster centroids: {e}")
+            print(f"  Falling back to fixed instance sampling. Install sklearn: pip install scikit-learn")
+            cluster_centroids_per_class = None
+    else:
+        print(f"  Using all training instances (no clustering)")
+        # When None, we'll use all training instances directly in fixed_instances_per_class
     
     # ======================================================================
     # FIXED INSTANCE SAMPLING: Pre-select instances per class for training
     # This reduces variance by using consistent starting points (fallback)
+    # If n_fixed_instances_per_class is None, use ALL training instances
     # ======================================================================
-    n_fixed_instances_per_class = 10  # Number of fixed instances per class
     rng_fixed = np.random.default_rng(seed=42)  # Fixed seed for reproducibility
     fixed_instances_per_class = {}
     
-    print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class (fallback)...")
-    for cls in target_classes:
-        cls_indices = np.where(y_train == cls)[0]
-        if len(cls_indices) > 0:
-            n_sample = min(n_fixed_instances_per_class, len(cls_indices))
-            fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
-            fixed_instances_per_class[cls] = fixed_indices
-            print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
-        else:
-            fixed_instances_per_class[cls] = np.array([], dtype=int)
-            print(f"  Class {cls}: No instances available")
+    if n_fixed_instances_per_class is None:
+        print(f"\n[Fixed Instance Sampling] Using ALL training instances per class (n_fixed_instances_per_class=None)...")
+        # Use all training instances - this maximizes diversity and reduces variance
+        for cls in target_classes:
+            cls_indices = np.where(y_train == cls)[0]
+            fixed_instances_per_class[cls] = cls_indices
+            print(f"  Class {cls}: Using all {len(cls_indices)} training instances")
+    else:
+        print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class (fallback)...")
+        for cls in target_classes:
+            cls_indices = np.where(y_train == cls)[0]
+            if len(cls_indices) > 0:
+                n_sample = min(n_fixed_instances_per_class, len(cls_indices))
+                fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
+                fixed_instances_per_class[cls] = fixed_indices
+                print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
+            else:
+                fixed_instances_per_class[cls] = np.array([], dtype=int)
+                print(f"  Class {cls}: No instances available")
+    
+    # Initialize test centroids variable (will be computed later for evaluation)
+    test_cluster_centroids_per_class = None
     
     # Create environment factory function
     # For multi-class training, distribute classes across environments
-    def create_anchor_env(target_cls=None):
-        """Helper to create AnchorEnv with a specific target class."""
+    def create_anchor_env(target_cls=None, use_test_centroids=False):
+        """Helper to create AnchorEnv with a specific target class.
+        
+        Args:
+            target_cls: Target class for the environment
+            use_test_centroids: If True, use test centroids for class-level evaluation
+        """
         if target_cls is None:
             target_cls = target_classes[0]  # Default to first class
         env = AnchorEnv(
@@ -240,11 +287,13 @@ def train_and_evaluate_dynamic_anchors(
             min_coverage_floor=0.005,
             js_penalty_weight=0.05,
         )
-        # Set cluster centroids for this class (priority: cluster centroids > fixed instances > random)
-        # Note: cluster_centroids_per_class and fixed_instances_per_class are set in outer scope
-        if cluster_centroids_per_class is not None:
+        # Set cluster centroids: use test centroids for evaluation, training centroids for training
+        if use_test_centroids and test_cluster_centroids_per_class is not None:
+            env.cluster_centroids_per_class = test_cluster_centroids_per_class
+        elif cluster_centroids_per_class is not None:
             env.cluster_centroids_per_class = cluster_centroids_per_class
         env.fixed_instances_per_class = fixed_instances_per_class
+        env.use_random_sampling = use_random_sampling  # Enable random sampling if requested
         # Enable continuous actions if requested
         if use_continuous_actions:
             env.max_action_scale = max(step_fracs) if step_fracs else 0.02
@@ -324,10 +373,23 @@ def train_and_evaluate_dynamic_anchors(
         # Calculate steps per class
         steps_per_class = total_timesteps // len(target_classes)
         
+        # Track training history for plots
+        training_history = []  # List of episode metrics
+        episode_rewards_history = []  # For plotting
+        per_class_precision_history = {cls: [] for cls in target_classes}
+        per_class_coverage_history = {cls: [] for cls in target_classes}
+        
         for cls in target_classes:
             print(f"\nTraining {algorithm_name} for class {cls} ({steps_per_class} timesteps)...")
             cls_trainer = continuous_trainers[cls]
             gym_env = gym_envs[cls]  # Use the unwrapped ContinuousAnchorEnv directly
+            
+            # Track episodes for this class
+            episode_num = 0
+            episode_reward = 0.0
+            episode_steps = 0
+            episode_precision = 0.0
+            episode_coverage = 0.0
             
             # Handle gymnasium vs gym reset() return format
             try:
@@ -509,16 +571,48 @@ def train_and_evaluate_dynamic_anchors(
                     info=step_info
                 )
                 
+                # Track episode metrics
+                episode_reward += reward
+                episode_steps += 1
+                if isinstance(step_info, dict):
+                    if "precision" in step_info:
+                        episode_precision = step_info["precision"]
+                    if "coverage" in step_info:
+                        episode_coverage = step_info["coverage"]
+                
                 # Train if enough samples
                 if cls_trainer.model.replay_buffer.size() > cls_trainer.model.learning_starts:
                     cls_trainer.train_step(gradient_steps=1)
                 
-                if done:
+                # Episode ends if: 1) done=True (targets met), or 2) max episode length reached
+                # This ensures we track multiple episodes even if targets are hard to reach
+                episode_max_length_reached = (episode_steps >= steps_per_episode)
+                if done or episode_max_length_reached:
+                    # Episode completed (either naturally or by max length) - record metrics
+                    episode_num += 1
+                    training_history.append({
+                        "class": cls,
+                        "episode": episode_num,
+                        "timestep": step + 1,
+                        "reward": float(episode_reward),
+                        "precision": float(episode_precision),
+                        "coverage": float(episode_coverage),
+                        "steps": episode_steps,
+                    })
+                    per_class_precision_history[cls].append(float(episode_precision))
+                    per_class_coverage_history[cls].append(float(episode_coverage))
+                    
+                    # Reset episode tracking
+                    episode_reward = 0.0
+                    episode_steps = 0
+                    episode_precision = 0.0
+                    episode_coverage = 0.0
                     # Reset environment - reset() returns observation that already includes [lower, upper, precision, coverage]
+                    # Use episode_num in seed to ensure different starting points for each episode
                     if GYM_VERSION == "gymnasium":
-                        reset_result, reset_info = gym_env.reset(seed=42 + cls + step)
+                        reset_result, reset_info = gym_env.reset(seed=42 + cls + episode_num)
                     else:
-                        reset_result = gym_env.reset(seed=42 + cls + step)
+                        reset_result = gym_env.reset(seed=42 + cls + episode_num)
                         if isinstance(reset_result, tuple):
                             reset_result, reset_info = reset_result
                         else:
@@ -545,14 +639,104 @@ def train_and_evaluate_dynamic_anchors(
                 
                 if (step + 1) % (steps_per_class // 10) == 0:
                     print(f"  Progress: {step + 1}/{steps_per_class} steps")
+            
+            # Record final episode if training ended without done=True
+            if episode_steps > 0:
+                episode_num += 1
+                training_history.append({
+                    "class": cls,
+                    "episode": episode_num,
+                    "timestep": steps_per_class,
+                    "reward": float(episode_reward),
+                    "precision": float(episode_precision),
+                    "coverage": float(episode_coverage),
+                    "steps": episode_steps,
+                })
+                per_class_precision_history[cls].append(float(episode_precision))
+                per_class_coverage_history[cls].append(float(episode_coverage))
         
         # For evaluation, we'll use the continuous_trainers dict
         trainer = type('TrainerWrapper', (), {
             'model': continuous_trainers,  # Dict of trainers per class
         })()
+        
+        # Calculate average rewards per episode (across all classes)
+        if training_history:
+            # Group by episode number (episodes can overlap across classes)
+            episodes_by_num = {}
+            for entry in training_history:
+                ep_num = entry["episode"]
+                if ep_num not in episodes_by_num:
+                    episodes_by_num[ep_num] = []
+                episodes_by_num[ep_num].append(entry)
+            
+            # Average rewards across classes for each episode
+            for ep_num in sorted(episodes_by_num.keys()):
+                ep_entries = episodes_by_num[ep_num]
+                avg_reward = np.mean([e["reward"] for e in ep_entries])
+                episode_rewards_history.append(avg_reward)
     else:
         print(f"\nTraining PPO for {total_timesteps} timesteps...")
         # Note: PPO will use the same device as the classifier
+        
+        # Track training history for PPO
+        training_history = []
+        episode_rewards_history = []
+        per_class_precision_history = {cls: [] for cls in target_classes}
+        per_class_coverage_history = {cls: [] for cls in target_classes}
+        
+        # Create callback to track episodes
+        from stable_baselines3.common.callbacks import BaseCallback
+        
+        class EpisodeTrackingCallback(BaseCallback):
+            def __init__(self, verbose=0):
+                super().__init__(verbose)
+                self.episode_rewards = []
+                self.episode_lengths = []
+                self.current_episode_reward = 0.0
+                self.current_episode_length = 0
+                self.episode_num = 0
+                
+            def _on_step(self) -> bool:
+                # Get reward from infos
+                if 'infos' in self.locals and len(self.locals['infos']) > 0:
+                    info = self.locals['infos'][0]
+                    reward = self.locals.get('rewards', [0.0])[0] if 'rewards' in self.locals else 0.0
+                    self.current_episode_reward += reward
+                    self.current_episode_length += 1
+                    
+                    # Check if episode is done
+                    if info.get('episode', {}).get('r', None) is not None:
+                        # Episode completed
+                        self.episode_num += 1
+                        ep_reward = info['episode']['r']
+                        ep_length = info['episode']['l']
+                        self.episode_rewards.append(ep_reward)
+                        self.episode_lengths.append(ep_length)
+                        self.current_episode_reward = 0.0
+                        self.current_episode_length = 0
+                        
+                        # Try to extract precision/coverage from info if available
+                        precision = info.get('precision', 0.0)
+                        coverage = info.get('coverage', 0.0)
+                        
+                        # Determine class from environment (if available)
+                        # For multi-class, we'll need to track per environment
+                        training_history.append({
+                            "episode": self.episode_num,
+                            "timestep": self.num_timesteps,
+                            "reward": float(ep_reward),
+                            "precision": float(precision),
+                            "coverage": float(coverage),
+                            "steps": int(ep_length),
+                        })
+                        
+                        episode_rewards_history.append(float(ep_reward))
+                
+                return True
+        
+        episode_callback = EpisodeTrackingCallback(verbose=verbose)
+        
         trainer = train_ppo_model(
             vec_env=vec_env,
             total_timesteps=total_timesteps,
@@ -566,13 +750,46 @@ def train_and_evaluate_dynamic_anchors(
             eval_freq=eval_freq,
             verbose=verbose,
             device=device_str,  # Pass device to PPO trainer
+            callback=episode_callback,  # Add episode tracking callback
         )
+        
+        # Extract episode data from callback
+        if hasattr(episode_callback, 'episode_rewards') and len(episode_callback.episode_rewards) > 0:
+            episode_rewards_history = episode_callback.episode_rewards
     
     # Evaluate on test set
     print(f"\nEvaluating on test set...")
     print(f"Note: By default, coverage and precision are computed on training data.")
     print(f"      This explains the classifier's behavior on training data.")
     print(f"      To evaluate on test data, set eval_on_test_data=True in evaluate_all_classes.")
+    
+    # ======================================================================
+    # COMPUTE CLUSTER CENTROIDS FROM TEST DATA FOR CLASS-LEVEL EVALUATION
+    # ======================================================================
+    # For class-level evaluation, use centroids from test data to ensure
+    # systematic coverage and consistency with training methodology
+    print(f"\n[Class-Level Evaluation] Computing cluster centroids from test data...")
+    from trainers.vecEnv import compute_cluster_centroids_per_class
+    
+    n_clusters_per_class_eval = 10  # Same as training
+    try:
+        test_cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=X_test_unit,
+            y=y_test,
+            n_clusters_per_class=n_clusters_per_class_eval,
+            random_state=42
+        )
+        print(f"  Test cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in test_cluster_centroids_per_class:
+                n_centroids = len(test_cluster_centroids_per_class[cls])
+                print(f"  Class {cls}: {n_centroids} test centroids")
+            else:
+                print(f"  Class {cls}: No test centroids available")
+    except ImportError as e:
+        print(f"  WARNING: Could not compute test cluster centroids: {e}")
+        print(f"  Falling back to random sampling for class-level evaluation.")
+        test_cluster_centroids_per_class = None
     
     # Instance-level evaluation (one anchor per test instance, like static anchors)
     print(f"\n[Instance-Level Evaluation] Creating one anchor per test instance...")
@@ -600,10 +817,14 @@ def train_and_evaluate_dynamic_anchors(
     )
     
     # Class-level evaluation (one anchor per class)
-    print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+    # Use test centroids for systematic coverage of test distribution
+    print(f"\n[Class-Level Evaluation] Creating one anchor per class (using test centroids)...")
+    def create_anchor_env_for_class_eval(target_cls=None):
+        return create_anchor_env(target_cls=target_cls, use_test_centroids=True)
+    
     eval_results_class = evaluate_all_classes_class_level(
         trained_model=trained_model_for_eval,
-        make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
+        make_env_fn=create_anchor_env_for_class_eval,  # Use wrapper that sets test centroids
         feature_names=feature_names,
         target_classes=list(target_classes),
         steps_per_episode=eval_steps,
@@ -686,6 +907,7 @@ def train_and_evaluate_dynamic_anchors(
             "instance_level": {},
             "class_level": {},
         },
+        "training_history": [],  # Will be populated with episode data
         "metadata": {
             "n_classes": len(target_classes),
             "n_features": len(feature_names),
@@ -774,6 +996,22 @@ def train_and_evaluate_dynamic_anchors(
                 "evaluation_type": cls_result.get("evaluation_type", "class_level"),
             }
     
+    # Add training history to metrics_data (if available)
+    if training_history:
+        # Convert training history to JSON-serializable format
+        for hist_entry in training_history:
+            episode_data = {
+                "episode": int(hist_entry.get("episode", 0)),
+                "timestep": int(hist_entry.get("timestep", 0)),
+                "reward": float(hist_entry.get("reward", 0.0)),
+                "precision": float(hist_entry.get("precision", 0.0)),
+                "coverage": float(hist_entry.get("coverage", 0.0)),
+                "steps": int(hist_entry.get("steps", 0)),
+            }
+            if "class" in hist_entry:
+                episode_data["class"] = int(hist_entry["class"])
+            metrics_data["training_history"].append(episode_data)
+    
     # Convert numpy arrays to lists for JSON serialization
     def convert_to_serializable(obj):
         """Recursively convert numpy arrays and other non-serializable types to JSON-compatible types."""
@@ -803,6 +1041,270 @@ def train_and_evaluate_dynamic_anchors(
     # Update results to include JSON path
     results["metrics_json_path"] = json_path
     
+    # ======================================================================
+    # Save RL Models (Policy and Value Networks)
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("SAVING RL MODELS")
+    print(f"{'='*80}")
+    
+    models_dir = f"{output_dir}/models/"
+    os.makedirs(models_dir, exist_ok=True)
+    
+    if use_continuous_actions:
+        # Continuous actions (DDPG/TD3): Save each class's model
+        algorithm_name = continuous_algorithm.upper() if continuous_algorithm.lower() == "td3" else "DDPG"
+        print(f"\nSaving {algorithm_name} models (actor and critic networks)...")
+        for cls, continuous_trainer in continuous_trainers.items():
+            model_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_final"
+            continuous_trainer.save(model_path)
+            print(f"  Saved {algorithm_name} model for class {cls}: {model_path}")
+            
+            # Also save actor and critic separately for easier inspection
+            actor_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_actor"
+            critic_path = f"{models_dir}/{continuous_algorithm.lower()}_class_{cls}_critic"
+            try:
+                torch.save(continuous_trainer.model.actor.state_dict(), f"{actor_path}.pth")
+                print(f"    Saved actor network: {actor_path}.pth")
+                torch.save(continuous_trainer.model.critic.state_dict(), f"{critic_path}.pth")
+                print(f"    Saved critic network: {critic_path}.pth")
+            except Exception as e:
+                if verbose >= 1:
+                    print(f"    [WARNING] Could not save actor/critic separately: {e}")
+    else:
+        # PPO: Save PPO model (policy and value networks)
+        print(f"\nSaving PPO model (policy and value networks)...")
+        model_path = f"{models_dir}/ppo_final"
+        trainer.save(model_path)
+        print(f"  Saved PPO model: {model_path}")
+        
+        # Also save policy and value networks separately for easier inspection
+        policy_path = f"{models_dir}/ppo_policy"
+        value_path = f"{models_dir}/ppo_value"
+        try:
+            torch.save(trainer.model.policy.state_dict(), f"{policy_path}.pth")
+            print(f"    Saved policy network: {policy_path}.pth")
+            torch.save(trainer.model.policy.value_net.state_dict(), f"{value_path}.pth")
+            print(f"    Saved value network: {value_path}.pth")
+        except Exception as e:
+            if verbose >= 1:
+                print(f"    [WARNING] Could not save policy/value separately: {e}")
+    
+    print(f"\nModels saved to: {models_dir}")
+    
+    # ======================================================================
+    # Create 2D Visualization of Rules
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("CREATING 2D VISUALIZATION OF RULES")
+    print(f"{'='*80}")
+    
+    try:
+        from trainers.dynAnchors_inference import plot_rules_2d
+        
+        plot_path = f"{output_dir}/plots/rules_2d_visualization.png"
+        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        
+        # Extract anchors from eval_results for visualization
+        eval_results_for_viz = eval_results.get("instance_level", eval_results)
+        
+        if "per_class_results" not in eval_results_for_viz:
+            print(f"  [WARNING] eval_results missing 'per_class_results', skipping 2D visualization")
+            if verbose >= 1:
+                print(f"    eval_results keys: {list(eval_results.keys())}")
+        else:
+            per_class_results = eval_results_for_viz.get("per_class_results", {}).copy()
+            
+            # IMPORTANT: evaluate_all_classes returns individual_results, but plot_rules_2d expects anchors
+            # Extract anchors from individual_results before plotting
+            for cls_key, cls_result in per_class_results.items():
+                # If anchors don't exist, extract them from individual_results
+                if "anchors" not in cls_result and "individual_results" in cls_result:
+                    anchors_list = []
+                    instance_indices_used = []
+                    for individual_result in cls_result["individual_results"]:
+                        instance_idx = int(individual_result.get("instance_idx", -1))
+                        if instance_idx >= 0:
+                            instance_indices_used.append(instance_idx)
+                        anchors_list.append({
+                            "instance_idx": instance_idx,
+                            "lower_bounds": individual_result.get("lower_bounds", []),
+                            "upper_bounds": individual_result.get("upper_bounds", []),
+                            "precision": float(individual_result.get("precision", 0.0)),
+                            "hard_precision": float(individual_result.get("hard_precision", individual_result.get("precision", 0.0))),
+                            "coverage": float(individual_result.get("coverage", 0.0)),
+                            "n_points": int(individual_result.get("n_points", 0)),
+                            "rule": individual_result.get("rule", ""),
+                        })
+                    cls_result["anchors"] = anchors_list
+                    cls_result["instance_indices_used"] = instance_indices_used
+            
+            # Create a copy of eval_results with anchors added
+            eval_results_with_anchors = eval_results.copy()
+            eval_results_with_anchors["per_class_results"] = per_class_results
+            
+            if len(per_class_results) == 0:
+                print(f"  [WARNING] No per_class_results found in eval_results, skipping 2D visualization")
+                if verbose >= 1:
+                    print(f"    eval_results keys: {list(eval_results.keys())}")
+            else:
+                # Debug: Check structure
+                if verbose >= 2:
+                    print(f"  [DEBUG] per_class_results keys: {list(per_class_results.keys())[:5]}")
+                    sample_key = list(per_class_results.keys())[0]
+                    sample_result = per_class_results[sample_key]
+                    print(f"  [DEBUG] Sample class result keys: {list(sample_result.keys())}")
+                
+                # Check if anchors are present
+                has_anchors = False
+                anchor_count = 0
+                for cls_key, cls_result in per_class_results.items():
+                    if "anchors" in cls_result:
+                        anchors = cls_result.get("anchors", [])
+                        if len(anchors) > 0:
+                            has_anchors = True
+                            anchor_count += len(anchors)
+                            if verbose >= 2:
+                                print(f"  [DEBUG] Class {cls_key} has {len(anchors)} anchors")
+                
+                if not has_anchors:
+                    print(f"  [WARNING] No anchors found in eval_results, skipping 2D visualization")
+                    print(f"    Hint: This might happen if all rules are 'any values (no tightened features)'")
+                    if verbose >= 1:
+                        print(f"    Total classes checked: {len(per_class_results)}")
+                        print(f"    Sample class keys: {list(per_class_results.keys())[:3]}")
+                else:
+                    if verbose >= 1:
+                        print(f"  Found {anchor_count} anchors across {len(per_class_results)} classes")
+                    # Create 2D plot of rules
+                    try:
+                        # Compute X_min and X_range from training data (for unit space conversion)
+                        X_min = X_train_scaled.min(axis=0)
+                        X_range = X_train_scaled.max(axis=0) - X_train_scaled.min(axis=0)
+                        
+                        plot_path = plot_rules_2d(
+                            eval_results=eval_results_with_anchors,  # Use eval_results with anchors added
+                            X_test=X_test_scaled,  # Use standardized test data
+                            y_test=y_test,
+                            feature_names=feature_names,
+                            class_names=None,  # Can be passed if available, but not required
+                            output_path=plot_path,
+                            X_min=X_min,  # For unit space conversion
+                            X_range=X_range,  # For unit space conversion
+                        )
+                        print(f"  ✓ Saved 2D rules visualization: {plot_path}")
+                    except Exception as plot_error:
+                        print(f"  [ERROR] Failed to create 2D visualization: {plot_error}")
+                        import traceback
+                        traceback.print_exc()  # Always print traceback for debugging
+                        # Try to provide helpful error message
+                        print(f"    Check that:")
+                        print(f"    - eval_results contains per_class_results with anchors")
+                        print(f"    - anchors have lower_bounds and upper_bounds")
+                        print(f"    - X_test_scaled, X_min, X_range are valid")
+                        print(f"    - X_test_scaled shape: {X_test_scaled.shape if hasattr(X_test_scaled, 'shape') else 'N/A'}")
+                        print(f"    - y_test shape: {y_test.shape if hasattr(y_test, 'shape') else 'N/A'}")
+                        print(f"    - feature_names length: {len(feature_names) if feature_names else 'N/A'}")
+    except Exception as e:
+        if verbose >= 1:
+            print(f"  [WARNING] Could not create 2D visualization: {e}")
+        import traceback
+        if verbose >= 2:
+            traceback.print_exc()
+        elif verbose >= 1:
+            # Print a bit more detail even at verbose=1
+            print(f"    Error type: {type(e).__name__}")
+    
+    # ======================================================================
+    # Save Training Plots (if training history available)
+    # ======================================================================
+    print(f"\n{'='*80}")
+    print("SAVING TRAINING PLOTS")
+    print(f"{'='*80}")
+    
+    plot_dir = f"{output_dir}/plots/"
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    # Import matplotlib
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    
+    # Plot 1: Rewards per episode (if available)
+    if len(episode_rewards_history) > 0:
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(episode_rewards_history) + 1), episode_rewards_history, 'b-', linewidth=2, marker='o', markersize=4)
+        plt.xlabel('Episode', fontsize=12)
+        plt.ylabel('Average Reward', fontsize=12)
+        plt.title('RL Training: Rewards per Episode', fontsize=14, fontweight='bold')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        reward_plot_path = f"{plot_dir}/rewards_per_episode.png"
+        plt.savefig(reward_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: {reward_plot_path}")
+    
+    # Plot 2: Precision per class per episode (for continuous actions)
+    if use_continuous_actions and len(per_class_precision_history) > 0:
+        has_data = any(len(per_class_precision_history[cls]) > 0 for cls in target_classes)
+        if has_data:
+            plt.figure(figsize=(12, 6))
+            for cls in target_classes:
+                if len(per_class_precision_history[cls]) > 0:
+                    plt.plot(range(1, len(per_class_precision_history[cls]) + 1), 
+                            per_class_precision_history[cls], 
+                            linewidth=2, marker='o', markersize=3, 
+                            label=f'Class {cls}')
+            plt.xlabel('Episode', fontsize=12)
+            plt.ylabel('Precision', fontsize=12)
+            plt.title('RL Training: Precision per Class per Episode', fontsize=14, fontweight='bold')
+            plt.legend(loc='best', fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            precision_plot_path = f"{plot_dir}/precision_per_class_per_episode.png"
+            plt.savefig(precision_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {precision_plot_path}")
+    
+    # Plot 3: Coverage per class per episode (for continuous actions)
+    if use_continuous_actions and len(per_class_coverage_history) > 0:
+        has_data = any(len(per_class_coverage_history[cls]) > 0 for cls in target_classes)
+        if has_data:
+            plt.figure(figsize=(12, 6))
+            for cls in target_classes:
+                if len(per_class_coverage_history[cls]) > 0:
+                    plt.plot(range(1, len(per_class_coverage_history[cls]) + 1), 
+                            per_class_coverage_history[cls], 
+                            linewidth=2, marker='o', markersize=3, 
+                            label=f'Class {cls}')
+            plt.xlabel('Episode', fontsize=12)
+            plt.ylabel('Coverage', fontsize=12)
+            plt.title('RL Training: Coverage per Class per Episode', fontsize=14, fontweight='bold')
+            plt.legend(loc='best', fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            coverage_plot_path = f"{plot_dir}/coverage_per_class_per_episode.png"
+            plt.savefig(coverage_plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved: {coverage_plot_path}")
+    
+    # Add training history to results
+    if training_history:
+        results["training_history"] = training_history
+        results["plotting_data"] = {
+            "episode_rewards": episode_rewards_history,
+            "per_class_precision": per_class_precision_history,
+            "per_class_coverage": per_class_coverage_history,
+        }
+    
+    print(f"\n{'='*80}")
+    print("SAVING COMPLETE")
+    print(f"{'='*80}")
+    print(f"  Models: {models_dir}")
+    print(f"  Metrics: {json_path}")
+    print(f"  Plots: {output_dir}/plots/")
+    print(f"{'='*80}\n")
+    
     return results
 
 
@@ -820,7 +1322,7 @@ def explain_individual_instance(
     X_min: np.ndarray,
     X_range: np.ndarray,
     steps_per_episode: int = 100,
-    max_features_in_rule: int = 5
+    max_features_in_rule: Optional[int] = 5
 ) -> Dict[str, Any]:
     """
     Explain a single instance using trained dynamic anchor policy.
@@ -839,7 +1341,9 @@ def explain_individual_instance(
         X_min: Min values for normalization
         X_range: Range values for normalization
         steps_per_episode: Max rollout steps
-        max_features_in_rule: Max features in rule
+        max_features_in_rule: Max features in rule.
+            Use -1 or None to include all tightened features (useful for feature importance).
+            Default: 5
     
     Returns:
         Dictionary with anchor explanation

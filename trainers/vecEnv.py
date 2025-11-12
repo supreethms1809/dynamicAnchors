@@ -230,6 +230,8 @@ class AnchorEnv:
         # Cluster centroids support: store cluster centroids per class
         # Format: {class: array of cluster centroids (n_clusters, n_features)}
         self.cluster_centroids_per_class = None  # Will be set if using cluster-based sampling
+        # Random sampling flag: if True, randomly sample from pool instead of deterministic cycling
+        self.use_random_sampling = False  # Will be set if using random sampling
         
         # Track coverage floor hits (reset per episode)
         self.coverage_floor_hits = 0
@@ -907,14 +909,14 @@ class DynamicAnchorEnv(gym.Env):
                 # Extract episode number from seed if provided (seed = 42 + cls + ep)
                 # For cycling, extract episode number: ep = seed - 42 - cls
                 # This ensures each class cycles independently starting from instance 0
-                if seed is not None:
+                if seed is not None and not getattr(self.anchor_env, 'use_random_sampling', False):
                     # Seed format: 42 + cls + ep
                     # Extract episode: ep = seed - 42 - cls
                     base_seed = 42
                     episode_num = seed - base_seed - target_class
                     instance_idx_in_pool = episode_num % len(fixed_instances)
                 else:
-                    # Fallback: use random selection from fixed pool (shouldn't happen in training)
+                    # Random selection from fixed pool (reduces variance by avoiding deterministic patterns)
                     instance_idx_in_pool = self.anchor_env.rng.integers(0, len(fixed_instances))
                 
                 instance_idx = fixed_instances[instance_idx_in_pool]
@@ -1139,14 +1141,14 @@ class ContinuousAnchorEnv(gym.Env):
                 # Extract episode number from seed if provided (seed = 42 + cls + ep)
                 # For cycling, extract episode number: ep = seed - 42 - cls
                 # This ensures each class cycles independently starting from centroid 0
-                if seed is not None:
+                if seed is not None and not getattr(self.anchor_env, 'use_random_sampling', False):
                     # Seed format: 42 + cls + ep
                     # Extract episode: ep = seed - 42 - cls
                     base_seed = 42
                     episode_num = seed - base_seed - target_class
                     centroid_idx = episode_num % len(centroids)
                 else:
-                    # Fallback: use random selection from centroids (shouldn't happen in training)
+                    # Random selection from centroids (reduces variance by avoiding deterministic patterns)
                     centroid_idx = self.anchor_env.rng.integers(0, len(centroids))
                 
                 # Use the selected cluster centroid as the starting point
@@ -1163,14 +1165,14 @@ class ContinuousAnchorEnv(gym.Env):
                 # Extract episode number from seed if provided (seed = 42 + cls + ep)
                 # For cycling, extract episode number: ep = seed - 42 - cls
                 # This ensures each class cycles independently starting from instance 0
-                if seed is not None:
+                if seed is not None and not getattr(self.anchor_env, 'use_random_sampling', False):
                     # Seed format: 42 + cls + ep
                     # Extract episode: ep = seed - 42 - cls
                     base_seed = 42
                     episode_num = seed - base_seed - target_class
                     instance_idx_in_pool = episode_num % len(fixed_instances)
                 else:
-                    # Fallback: use random selection from fixed pool (shouldn't happen in training)
+                    # Random selection from fixed pool (reduces variance by avoiding deterministic patterns)
                     instance_idx_in_pool = self.anchor_env.rng.integers(0, len(fixed_instances))
                 
                 instance_idx = fixed_instances[instance_idx_in_pool]

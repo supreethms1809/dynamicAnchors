@@ -334,9 +334,13 @@ def train_and_evaluate_joint(
     coverage_target: float = 0.02,
     # Evaluation parameters
     n_eval_instances_per_class: int = 20,
-    max_features_in_rule: int = 5,
+    max_features_in_rule: Optional[int] = 5,
     eval_steps_per_episode: int = None,  # Defaults to steps_per_episode if None
     num_rollouts_per_instance: int = 1,  # Number of greedy rollouts per instance (default: 1)
+    # Training sampling parameters
+    n_clusters_per_class: Optional[int] = None,  # Number of cluster centroids per class. None = use all training instances (recommended for lower variance)
+    n_fixed_instances_per_class: Optional[int] = None,  # Number of fixed instances per class for fallback. None = use all training instances
+    use_random_sampling: bool = False,  # If True, randomly sample from pool each episode instead of deterministic cycling (reduces variance)
     # Output parameters
     output_dir: str = "./output/joint/",
     save_checkpoints: bool = True,
@@ -686,10 +690,18 @@ def train_and_evaluate_joint(
     # Training history
     joint_training_history = []
     
+    # Initialize test centroids variable (will be computed later for evaluation)
+    test_cluster_centroids_per_class = None
+    
     # Create environment factory function
-    def create_anchor_env(target_cls=None):
-        """Helper to create AnchorEnv with a specific target class and current classifier."""
-        print(f"[DEBUG] create_anchor_env called with target_cls={target_cls}")
+    def create_anchor_env(target_cls=None, use_test_centroids=False):
+        """Helper to create AnchorEnv with a specific target class and current classifier.
+        
+        Args:
+            target_cls: Target class for the environment
+            use_test_centroids: If True, use test centroids for class-level evaluation
+        """
+        print(f"[DEBUG] create_anchor_env called with target_cls={target_cls}, use_test_centroids={use_test_centroids}")
         if target_cls is None:
             target_cls = target_classes[0]
         print(f"[DEBUG] create_anchor_env: Creating AnchorEnv for target_cls={target_cls}")
@@ -718,6 +730,17 @@ def train_and_evaluate_joint(
             min_coverage_floor=0.005,
             js_penalty_weight=0.01,  # Reduced from 0.05 to 0.01 to prevent penalty from dominating rewards
         )
+        
+        # Set cluster centroids: use test centroids for evaluation, training centroids for training
+        if use_test_centroids and test_cluster_centroids_per_class is not None:
+            env.cluster_centroids_per_class = test_cluster_centroids_per_class
+            print(f"[DEBUG] create_anchor_env: Using test centroids for class-level evaluation")
+        elif cluster_centroids_per_class is not None:
+            env.cluster_centroids_per_class = cluster_centroids_per_class
+            print(f"[DEBUG] create_anchor_env: Using training centroids")
+        
+        env.fixed_instances_per_class = fixed_instances_per_class
+        env.use_random_sampling = use_random_sampling  # Enable random sampling if requested
         print(f"[DEBUG] create_anchor_env: AnchorEnv created successfully for target_cls={target_cls}")
         return env
     
@@ -729,49 +752,73 @@ def train_and_evaluate_joint(
     # CLUSTER-BASED SAMPLING: Compute cluster centroids per class
     # This identifies dense regions and uses their centroids as starting points
     # This can improve training by starting from more representative examples
+    # If n_clusters_per_class is None, we'll use all training instances instead
     # ======================================================================
     from trainers.vecEnv import compute_cluster_centroids_per_class
     
-    n_clusters_per_class = 10  # Number of cluster centroids per class
-    print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
-    try:
-        cluster_centroids_per_class = compute_cluster_centroids_per_class(
-            X_unit=X_unit_train,
-            y=y_train,
-            n_clusters_per_class=n_clusters_per_class,
-            random_state=42
-        )
-        print(f"  Cluster centroids computed successfully!")
-        for cls in target_classes:
-            if cls in cluster_centroids_per_class:
-                n_centroids = len(cluster_centroids_per_class[cls])
-                print(f"  Class {cls}: {n_centroids} cluster centroids")
-            else:
-                print(f"  Class {cls}: No centroids available")
-    except ImportError as e:
-        print(f"  WARNING: Could not compute cluster centroids: {e}")
-        print(f"  Falling back to fixed instance sampling. Install sklearn: pip install scikit-learn")
-        cluster_centroids_per_class = None
+    # Determine number of clusters: None means use all training instances
+    if n_clusters_per_class is None:
+        # Use all training instances - compute centroids for all instances per class
+        # This effectively uses all training data, reducing variance
+        print(f"\n[Cluster-Based Sampling] Using all training instances per class (n_clusters_per_class=None)...")
+        # For cluster centroids, if None, we'll use all instances directly
+        # Set to a large number to effectively use all instances
+        n_clusters_per_class_actual = None  # Will use all instances
+    else:
+        n_clusters_per_class_actual = n_clusters_per_class
+        print(f"\n[Cluster-Based Sampling] Computing {n_clusters_per_class} cluster centroids per class...")
+    
+    cluster_centroids_per_class = None
+    if n_clusters_per_class_actual is not None:
+        try:
+            cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                X_unit=X_unit_train,
+                y=y_train,
+                n_clusters_per_class=n_clusters_per_class_actual,
+                random_state=42
+            )
+            print(f"  Cluster centroids computed successfully!")
+            for cls in target_classes:
+                if cls in cluster_centroids_per_class:
+                    n_centroids = len(cluster_centroids_per_class[cls])
+                    print(f"  Class {cls}: {n_centroids} cluster centroids")
+                else:
+                    print(f"  Class {cls}: No centroids available")
+        except ImportError as e:
+            print(f"  WARNING: Could not compute cluster centroids: {e}")
+            print(f"  Falling back to fixed instance sampling. Install sklearn: pip install scikit-learn")
+            cluster_centroids_per_class = None
+    else:
+        print(f"  Using all training instances (no clustering)")
+        # When None, we'll use all training instances directly in fixed_instances_per_class
     
     # ======================================================================
     # FIXED INSTANCE SAMPLING: Pre-select instances per class for training
     # This reduces variance by using consistent starting points
+    # If n_fixed_instances_per_class is None, use ALL training instances
     # ======================================================================
-    n_fixed_instances_per_class = 10  # Number of fixed instances per class
     rng_fixed = np.random.default_rng(seed=42)  # Fixed seed for reproducibility
     fixed_instances_per_class = {}
     
-    print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class...")
-    for cls in target_classes:
-        cls_indices = np.where(y_train == cls)[0]
-        if len(cls_indices) > 0:
-            n_sample = min(n_fixed_instances_per_class, len(cls_indices))
-            fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
-            fixed_instances_per_class[cls] = fixed_indices
-            print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
-        else:
-            fixed_instances_per_class[cls] = np.array([], dtype=int)
-            print(f"  Class {cls}: No instances available")
+    if n_fixed_instances_per_class is None:
+        print(f"\n[Fixed Instance Sampling] Using ALL training instances per class (n_fixed_instances_per_class=None)...")
+        # Use all training instances - this maximizes diversity and reduces variance
+        for cls in target_classes:
+            cls_indices = np.where(y_train == cls)[0]
+            fixed_instances_per_class[cls] = cls_indices
+            print(f"  Class {cls}: Using all {len(cls_indices)} training instances")
+    else:
+        print(f"\n[Fixed Instance Sampling] Pre-selecting {n_fixed_instances_per_class} instances per class...")
+        for cls in target_classes:
+            cls_indices = np.where(y_train == cls)[0]
+            if len(cls_indices) > 0:
+                n_sample = min(n_fixed_instances_per_class, len(cls_indices))
+                fixed_indices = rng_fixed.choice(cls_indices, size=n_sample, replace=False)
+                fixed_instances_per_class[cls] = fixed_indices
+                print(f"  Class {cls}: Selected {len(fixed_indices)} instances (indices: {fixed_indices[:5].tolist()}...)")
+            else:
+                fixed_instances_per_class[cls] = np.array([], dtype=int)
+                print(f"  Class {cls}: No instances available")
     
     # Store fixed instances in a way accessible to environments
     # We'll pass episode number through seed parameter to cycle through instances
@@ -817,6 +864,7 @@ def train_and_evaluate_joint(
                 anchor_env.cluster_centroids_per_class = cluster_centroids_per_class
             # Set fixed instances for this class (for fixed instance sampling fallback)
             anchor_env.fixed_instances_per_class = fixed_instances_per_class
+            anchor_env.use_random_sampling = use_random_sampling  # Enable random sampling if requested
             # Enable continuous actions in AnchorEnv
             anchor_env.n_actions = 2 * anchor_env.n_features
             anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
@@ -1068,6 +1116,7 @@ def train_and_evaluate_joint(
                     anchor_env.cluster_centroids_per_class = cluster_centroids_per_class
                 # Set fixed instances for this class (for fixed instance sampling fallback)
                 anchor_env.fixed_instances_per_class = fixed_instances_per_class
+                anchor_env.use_random_sampling = use_random_sampling  # Enable random sampling if requested
                 anchor_env.n_actions = 2 * anchor_env.n_features
                 anchor_env.max_action_scale = max(step_fracs) if step_fracs else 0.02
                 anchor_env.min_absolute_step = max(0.05, min_width * 0.5)
@@ -1757,7 +1806,11 @@ def train_and_evaluate_joint(
                         tightened = np.where(lw < initial_width * 0.95)[0]
                         if tightened.size > 0:
                             tightened_sorted = np.argsort(lw[tightened])
-                            to_show = tightened[tightened_sorted[:max_features_in_rule]] if max_features_in_rule > 0 else tightened
+                            # Use all features if max_features_in_rule is -1, None, or 0
+                            if max_features_in_rule is None or max_features_in_rule == -1 or max_features_in_rule == 0:
+                                to_show = tightened
+                            else:
+                                to_show = tightened[tightened_sorted[:max_features_in_rule]]
                             cond_parts = [f"{feature_names[i]} ∈ [{anchor_env.lower[i]:.2f}, {anchor_env.upper[i]:.2f}]" for i in to_show]
                             rule = " and ".join(cond_parts) if cond_parts else "any values (no tightened features)"
                         else:
@@ -1849,7 +1902,11 @@ def train_and_evaluate_joint(
                             rule = "any values (no tightened features)"
                         else:
                             tightened_sorted = np.argsort(lw[tightened])
-                            to_show = tightened[tightened_sorted[:max_features_in_rule]] if max_features_in_rule > 0 else tightened
+                            # Use all features if max_features_in_rule is -1, None, or 0
+                            if max_features_in_rule is None or max_features_in_rule == -1 or max_features_in_rule == 0:
+                                to_show = tightened
+                            else:
+                                to_show = tightened[tightened_sorted[:max_features_in_rule]]
                             if to_show.size == 0:
                                 rule = "any values (no tightened features)"
                             else:
@@ -2146,6 +2203,35 @@ def train_and_evaluate_joint(
     X_test_unit = (X_test_scaled - X_min) / X_range
     
     # ======================================================================
+    # COMPUTE CLUSTER CENTROIDS FROM TEST DATA FOR CLASS-LEVEL EVALUATION
+    # ======================================================================
+    # For class-level evaluation, use centroids from test data to ensure
+    # systematic coverage and consistency with training methodology
+    print(f"\n[Class-Level Evaluation] Computing cluster centroids from test data...")
+    from trainers.vecEnv import compute_cluster_centroids_per_class
+    
+    n_clusters_per_class_eval = 10  # Same as training
+    test_cluster_centroids_per_class = None
+    try:
+        test_cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=X_test_unit,
+            y=y_test,
+            n_clusters_per_class=n_clusters_per_class_eval,
+            random_state=42
+        )
+        print(f"  Test cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in test_cluster_centroids_per_class:
+                n_centroids = len(test_cluster_centroids_per_class[cls])
+                print(f"  Class {cls}: {n_centroids} test centroids")
+            else:
+                print(f"  Class {cls}: No test centroids available")
+    except ImportError as e:
+        print(f"  WARNING: Could not compute test cluster centroids: {e}")
+        print(f"  Falling back to random sampling for class-level evaluation.")
+        test_cluster_centroids_per_class = None
+    
+    # ======================================================================
     # FINAL EVALUATION: Both Instance-Level and Class-Level
     # ======================================================================
     print(f"\n{'='*80}")
@@ -2177,10 +2263,14 @@ def train_and_evaluate_joint(
             )
             
             # Class-level evaluation (one anchor per class)
-            print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+            # Use test centroids for systematic coverage of test distribution
+            print(f"\n[Class-Level Evaluation] Creating one anchor per class (using test centroids)...")
+            def create_anchor_env_for_class_eval(target_cls=None):
+                return create_anchor_env(target_cls=target_cls, use_test_centroids=True)
+            
             eval_results_class = evaluate_all_classes_class_level(
                 trained_model=ddpg_trainers,
-                make_env_fn=create_anchor_env,  # Use create_anchor_env which accepts target_cls
+                make_env_fn=create_anchor_env_for_class_eval,  # Use wrapper that sets test centroids
                 feature_names=feature_names,
                 target_classes=list(target_classes),
                 steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,
@@ -2213,10 +2303,14 @@ def train_and_evaluate_joint(
         )
         
         # Class-level evaluation
-        print(f"\n[Class-Level Evaluation] Creating one anchor per class...")
+        # Use test centroids for systematic coverage of test distribution
+        print(f"\n[Class-Level Evaluation] Creating one anchor per class (using test centroids)...")
+        def create_anchor_env_for_class_eval(target_cls=None):
+            return create_anchor_env(target_cls=target_cls, use_test_centroids=True)
+        
         eval_results_class = evaluate_all_classes_class_level(
             trained_model=rl_trainer.model,
-            make_env_fn=create_anchor_env,
+            make_env_fn=create_anchor_env_for_class_eval,  # Use wrapper that sets test centroids
             feature_names=feature_names,
             target_classes=list(target_classes),
             steps_per_episode=eval_steps_per_episode if eval_steps_per_episode is not None else steps_per_episode,

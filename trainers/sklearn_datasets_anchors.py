@@ -286,6 +286,40 @@ def train_classifier(
     return classifier, best_test_acc
 
 
+def get_output_directory(
+    dataset_name: str,
+    continuous_algorithm: str,
+    joint: bool,
+    timestamp: str = None
+) -> str:
+    """
+    Generate consistent output directory name with timestamp.
+    
+    Args:
+        dataset_name: Name of the dataset
+        continuous_algorithm: "ddpg" or "td3" (or "ppo" for discrete)
+        joint: Whether using joint training
+        timestamp: Optional timestamp string (if None, generates one)
+    
+    Returns:
+        Output directory path with timestamp
+    """
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Determine algorithm name
+    if continuous_algorithm.lower() in ["ddpg", "td3"]:
+        algo_name = continuous_algorithm.lower()
+    else:
+        algo_name = "ppo"
+    
+    # Consistent naming: {dataset}_{algorithm}_{training_mode}_{timestamp}
+    training_mode = "joint" if joint else "post_hoc"
+    output_dir = f"./output/{dataset_name}_{algo_name}_{training_mode}_{timestamp}/"
+    
+    return output_dir
+
+
 def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, continuous_algorithm: str = "ddpg", classifier_type: str = "dnn"):
     """
     Main function: Complete pipeline for sklearn datasets.
@@ -304,13 +338,22 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         - "uniform": Generate uniform samples within box bounds (works even with 0 points)
         - "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
     """
-    # Setup logging to file
+    # Generate timestamp and output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"./output/{dataset_name}_{continuous_algorithm}_joint/logs"
+    output_dir = get_output_directory(
+        dataset_name=dataset_name,
+        continuous_algorithm=continuous_algorithm if use_continuous_actions else "ppo",
+        joint=joint,
+        timestamp=timestamp
+    )
+    
+    # Setup logging to file
+    log_dir = os.path.join(output_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_file_path = os.path.join(log_dir, f"training_log_{timestamp}.log")
     
     print(f"\n{'='*80}")
+    print(f"Output Directory: {output_dir}")
     print(f"Logging enabled: Output will be saved to {log_file_path}")
     print(f"{'='*80}\n")
     
@@ -490,8 +533,9 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 precision_target=0.95,  # High precision target
                 coverage_target=0.01,  # Realistic target (1% coverage) - can be increased as agent learns
                 n_eval_instances_per_class=50,
-                max_features_in_rule=5,
-                output_dir=f"./output/{dataset_name}_{continuous_algorithm}_joint/",
+                max_features_in_rule=-1,  # Use -1 or None to include all tightened features (for feature importance)
+                use_random_sampling=True,  # Enable random sampling to reduce variance (avoids deterministic cycling patterns)
+                output_dir=output_dir,
                 save_checkpoints=True,
                 checkpoint_freq=2000,
                 verbose=1,
@@ -590,9 +634,10 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 precision_target=0.98,
                 coverage_target=0.5,  # 50% coverage - very high threshold, requires large boxes
                 n_eval_instances_per_class=20,
-                max_features_in_rule=5,
+                max_features_in_rule=-1,  # Use -1 or None to include all tightened features (for feature importance)
                 steps_per_episode=eval_steps_per_episode,
-                output_dir=f"./output/{dataset_name}_{continuous_algorithm}_post_hoc_dynamic_anchors/",
+                use_random_sampling=True,  # Enable random sampling to reduce variance (avoids deterministic cycling patterns)
+                output_dir=output_dir,
                 save_checkpoints=True,
                 checkpoint_freq=2000,
                 eval_freq=0,
