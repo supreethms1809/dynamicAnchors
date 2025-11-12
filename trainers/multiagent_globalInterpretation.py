@@ -11,16 +11,14 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import torch
-from trainers.multiagent_utils import SimpleClassifier, train_classifier, \
-                                    globalBuffer, AnchorEnv, \
+from trainers.multiagent_utils import normalize_dataset
+from trainers.multiagent_networks import SimpleClassifier, train_classifier, \
                                     MultiAgentEnvironment, CentralizedCritic, \
-                                    MultiAgentPolicyNet, CentralizedTrainer, \
-                                    DecentralizedExecutor
+                                    MultiAgentPolicyNet, DecentralizedExecutor, \
+                                    CentralizedTrainer
 from trainers.sklearn_datasets_anchors import load_dataset
 import gymnasium as gym
-
-def get_number_of_classes(dataset_name: str, sample_size: int = None, seed: int = 42):
-    X, y, feature_names, class_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
+def get_number_of_classes(class_names: list, y: np.ndarray):
     n_classes = len(class_names)
     unique_classes = np.unique(y)
     n_classes_from_y = len(unique_classes)
@@ -39,7 +37,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, seed: int
     
     # Load dataset
     X, y, feature_names, class_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
-    n_classes = get_number_of_classes(dataset_name, sample_size=sample_size, seed=seed)
+    n_classes = get_number_of_classes(class_names, y)
     print(f"Number of classes: {n_classes}")
     
     # Set number of agents
@@ -47,7 +45,10 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, seed: int
     print(f"Number of agents: {n_agents}")
 
     # Check if classifier model exists and load it, otherwise train a new one
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else 
+                            "cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Using device: {device}")
     hidden_size = 512
     
     # Create model path based on dataset parameters
@@ -55,6 +56,9 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, seed: int
     os.makedirs(model_dir, exist_ok=True)
     sample_size_str = f"_{sample_size}" if sample_size is not None else ""
     model_path = os.path.join(model_dir, f"classifier_{dataset_name}{sample_size_str}_seed{seed}.pth")
+
+    # Normalize dataset
+    X, y = normalize_dataset(X, y)
     
     # Initialize classifier
     classifier = SimpleClassifier(X.shape[1], hidden_size, n_classes)
@@ -88,14 +92,16 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, seed: int
     
     # Multi-Agent Global Interpretation
     # Observation space: [lower_bounds, upper_bounds, precision, coverage]
-    obs_dim = X.shape[1] + 2  # Features + precision + coverage
-    action_dim = n_classes  # Action dimension
+    # 2 * Features because we have lower and upper bounds for each feature
+    obs_dim = 2 * X.shape[1] + 2
+    # 2 * Features because we have lower and upper bounds for each feature
+    action_dim = 2 * X.shape[1]
     
     # Initialize centralized critic
     # Critic input: concatenated observations from all agents
     centralized_critic = CentralizedCritic(obs_dim * n_agents, hidden_size, n_classes * n_agents, device)
-    # Initialize policy nets - each agent's policy takes its own observation
-    policy_nets = [MultiAgentPolicyNet(n_agents, obs_dim, hidden_size, action_dim, device) for agent_id in range(n_agents)]
+    # Initialize policy nets - single MultiAgentPolicyNet manages all agents internally
+    policy_nets = MultiAgentPolicyNet(n_agents, obs_dim, hidden_size, action_dim, device)
 
     # Initialize observation and action spaces
     run_config = {
@@ -123,7 +129,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, seed: int
     print("="*80)
 
     # Initialize centralized trainer and train
-    centralized_trainer = CentralizedTrainer(multiagent_env, centralized_critic, policy_nets, n_agents, obs_space, action_space, run_config)
+    centralized_trainer = CentralizedTrainer(multiagent_env, n_agents, obs_space, action_space, run_config)
     training_results = centralized_trainer.train()
     print(f"Centralized trainer trained successfully with results: {training_results}")
     print("="*80)
