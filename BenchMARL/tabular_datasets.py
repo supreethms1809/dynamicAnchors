@@ -15,7 +15,8 @@ from sklearn.metrics import accuracy_score
 from typing import Dict, Tuple, Optional, List
 import os
 import sys
-
+import logging
+logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trainers.networks import SimpleClassifier, UnifiedClassifier
 
@@ -105,11 +106,11 @@ class TabularDatasetLoader:
             feature_names = list(data.feature_names)
             class_names = ["very_low_price", "low_price", "medium_price", "high_price"]
             
-            print(f"\nConverted housing prices to 4 classes:")
-            print(f"  Class 0 (very_low): < ${quartiles[0]*100:.0f}K (25th percentile)")
-            print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
-            print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
-            print(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
+            logger.info(f"\nConverted housing prices to 4 classes:")
+            logger.info(f"  Class 0 (very_low): < ${quartiles[0]*100:.0f}K (25th percentile)")
+            logger.info(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
+            logger.info(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
+            logger.info(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
         else:
             raise ValueError(
                 f"Unknown dataset: {self.dataset_name}. "
@@ -122,7 +123,7 @@ class TabularDatasetLoader:
             )
             X = X[indices]
             y = y[indices]
-            print(f"Sampled {self.sample_size} instances from dataset")
+            logger.info(f"Sampled {self.sample_size} instances from dataset")
         
         stratify = y if len(np.unique(y)) < 20 else None
         X_train, X_test, y_train, y_test = train_test_split(
@@ -138,19 +139,19 @@ class TabularDatasetLoader:
         self.n_features = X_train.shape[1]
         self.n_classes = len(np.unique(y))
         
-        print(f"Dataset loaded:")
-        print(f"  Training samples: {len(X_train)}")
-        print(f"  Test samples: {len(X_test)}")
-        print(f"  Features: {self.n_features}")
-        print(f"  Classes: {self.n_classes}")
-        print(f"  Class distribution (train): {np.bincount(y_train)}")
-        print(f"  Class distribution (test): {np.bincount(y_test)}")
+        logger.info(f"Dataset loaded:")
+        logger.info(f"  Training samples: {len(X_train)}")
+        logger.info(f"  Test samples: {len(X_test)}")
+        logger.info(f"  Features: {self.n_features}")
+        logger.info(f"  Classes: {self.n_classes}")
+        logger.info(f"  Class distribution (train): {np.bincount(y_train)}")
+        logger.info(f"  Class distribution (test): {np.bincount(y_test)}")
         
         return self.X_train, self.X_test, self.y_train, self.y_test, feature_names, class_names
     
     def preprocess_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        print("\nPreprocessing data...")
-        print("="*80)
+        logger.info("\nPreprocessing data...")
+        logger.info("="*80)
         
         self.X_train_scaled = self.scaler.fit_transform(self.X_train).astype(np.float32)
         self.X_test_scaled = self.scaler.transform(self.X_test).astype(np.float32)
@@ -165,11 +166,11 @@ class TabularDatasetLoader:
         self.X_test_unit = (self.X_test_scaled - self.X_min) / self.X_range
         self.X_test_unit = np.clip(self.X_test_unit, 0.0, 1.0).astype(np.float32)
         
-        print("Data preprocessing complete:")
-        print(f"  Scaled train shape: {self.X_train_scaled.shape}")
-        print(f"  Scaled test shape: {self.X_test_scaled.shape}")
-        print(f"  Unit train range: [{self.X_train_unit.min():.3f}, {self.X_train_unit.max():.3f}]")
-        print(f"  Unit test range: [{self.X_test_unit.min():.3f}, {self.X_test_unit.max():.3f}]")
+        logger.info("Data preprocessing complete:")
+        logger.info(f"  Scaled train shape: {self.X_train_scaled.shape}")
+        logger.info(f"  Scaled test shape: {self.X_test_scaled.shape}")
+        logger.info(f"  Unit train range: [{self.X_train_unit.min():.3f}, {self.X_train_unit.max():.3f}]")
+        logger.info(f"  Unit test range: [{self.X_test_unit.min():.3f}, {self.X_test_unit.max():.3f}]")
         
         return (
             self.X_train_scaled, self.X_test_scaled,
@@ -185,8 +186,8 @@ class TabularDatasetLoader:
         use_batch_norm: bool = True,
         device: str = "cpu"
     ) -> torch.nn.Module:
-        print(f"\nCreating classifier: {classifier_type}")
-        print("="*80)
+        logger.info(f"\nCreating classifier: {classifier_type}")
+        logger.info("="*80)
         
         if classifier_type.lower() == "dnn":
             classifier = SimpleClassifier(
@@ -195,8 +196,8 @@ class TabularDatasetLoader:
                 dropout_rate=dropout_rate,
                 use_batch_norm=use_batch_norm
             ).to(device)
-            print(f"  Architecture: Input({self.n_features}) -> 256 -> 256 -> 128 -> Output({self.n_classes})")
-            print(f"  Dropout: {dropout_rate}, BatchNorm: {use_batch_norm}")
+            logger.info(f"  Architecture: Input({self.n_features}) -> 256 -> 256 -> 128 -> Output({self.n_classes})")
+            logger.info(f"  Dropout: {dropout_rate}, BatchNorm: {use_batch_norm}")
         elif classifier_type.lower() == "random_forest":
             classifier = UnifiedClassifier(
                 classifier_type="random_forest",
@@ -204,7 +205,7 @@ class TabularDatasetLoader:
                 num_classes=self.n_classes,
                 device=device
             )
-            print(f"  Type: Random Forest")
+            logger.info(f"  Type: Random Forest")
         elif classifier_type.lower() == "gradient_boosting":
             classifier = UnifiedClassifier(
                 classifier_type="gradient_boosting",
@@ -212,7 +213,7 @@ class TabularDatasetLoader:
                 num_classes=self.n_classes,
                 device=device
             )
-            print(f"  Type: Gradient Boosting")
+            logger.info(f"  Type: Gradient Boosting")
         else:
             raise ValueError(
                 f"Unknown classifier type: {classifier_type}. "
@@ -234,8 +235,8 @@ class TabularDatasetLoader:
         device: str = "cpu",
         verbose: bool = True
     ) -> Tuple[torch.nn.Module, float, Dict[str, List[float]]]:
-        print(f"\nTraining classifier")
-        print("="*80)
+        logger.info(f"\nTraining classifier")
+        logger.info("="*80)
         
         classifier_type = "dnn"
         if isinstance(classifier, UnifiedClassifier):
@@ -324,21 +325,21 @@ class TabularDatasetLoader:
             
             if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"Epoch {epoch:3d}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | "
+                logger.info(f"Epoch {epoch:3d}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | "
                       f"Test Acc: {test_acc:.4f} | LR: {current_lr:.2e} | "
                       f"Best: {best_test_acc:.4f}")
             
             if patience_counter >= patience and epoch >= 50:
                 if verbose:
-                    print(f"Early stopping at epoch {epoch}")
+                    logger.info(f"Early stopping at epoch {epoch}")
                 break
         
         if best_model_state is not None:
             classifier.load_state_dict(best_model_state)
         
         classifier.eval()
-        print(f"\nTraining complete. Best test accuracy: {best_test_acc:.4f}")
-        print("="*80)
+        logger.info(f"\nTraining complete. Best test accuracy: {best_test_acc:.4f}")
+        logger.info("="*80)
         
         return classifier, best_test_acc, history
     
@@ -349,7 +350,7 @@ class TabularDatasetLoader:
         verbose: bool
     ) -> Tuple[torch.nn.Module, float, Dict[str, List[float]]]:
         if verbose:
-            print(f"Training {classifier_type} classifier...")
+            logger.info(f"Training {classifier_type} classifier...")
         
         classifier.fit(self.X_train_scaled, self.y_train)
         
@@ -365,9 +366,9 @@ class TabularDatasetLoader:
         }
         
         if verbose:
-            print(f"Training accuracy: {train_acc:.4f}")
-            print(f"Test accuracy: {test_acc:.4f}")
-            print("="*80)
+            logger.info(f"Training accuracy: {train_acc:.4f}")
+            logger.info(f"Test accuracy: {test_acc:.4f}")
+            logger.info("="*80)
         
         return classifier, test_acc, history
     
@@ -394,7 +395,7 @@ class TabularDatasetLoader:
         else:
             torch.save(classifier.state_dict(), filepath)
         
-        print(f"Classifier saved to {filepath}")
+        logger.info(f"Classifier saved to {filepath}")
     
     def load_classifier(
         self,
@@ -412,7 +413,7 @@ class TabularDatasetLoader:
             classifier.load_state_dict(torch.load(filepath, map_location=device))
         
         classifier.eval()
-        print(f"Classifier loaded from {filepath}")
+        logger.info(f"Classifier loaded from {filepath}")
         return classifier
 
     def get_classifier(self) -> torch.nn.Module:
@@ -451,11 +452,11 @@ class TabularDatasetLoader:
         
         if eda_already_done and not force_rerun:
             if verbose:
-                print(f"\nEDA analysis already exists for dataset: {self.dataset_name}")
-                print("="*80)
-                print(f"Found existing EDA results in: {output_dir}")
-                print("  - Skipping EDA generation (use force_rerun=True to regenerate)")
-                print("="*80)
+                logger.info(f"\nEDA analysis already exists for dataset: {self.dataset_name}")
+                logger.info("="*80)
+                logger.info(f"Found existing EDA results in: {output_dir}")
+                logger.info("  - Skipping EDA generation (use force_rerun=True to regenerate)")
+                logger.info("="*80)
             
             # Load and return existing results
             eda_results = {}
@@ -475,14 +476,14 @@ class TabularDatasetLoader:
                         }
             except Exception as e:
                 if verbose:
-                    print(f"  ⚠ Warning: Could not load existing EDA results: {e}")
-                    print("  Continuing with fresh EDA generation...")
+                    logger.warning(f"  ⚠ Warning: Could not load existing EDA results: {e}")
+                    logger.warning("  Continuing with fresh EDA generation...")
                 eda_already_done = False
         
         if not eda_already_done or force_rerun:
             if verbose:
-                print(f"\nPerforming EDA analysis for dataset: {self.dataset_name}")
-                print("="*80)
+                logger.info(f"\nPerforming EDA analysis for dataset: {self.dataset_name}")
+                logger.info("="*80)
             
             eda_results = {}
             
@@ -494,8 +495,8 @@ class TabularDatasetLoader:
                     )
                 except ImportError:
                     if verbose:
-                        print("\n⚠ ydata-profiling not installed. Falling back to custom EDA.")
-                        print("  Install with: pip install ydata-profiling")
+                        logger.warning("\n⚠ ydata-profiling not installed. Falling back to custom EDA.")
+                        logger.warning("  Install with: pip install ydata-profiling")
                     use_ydata_profiling = False
             
             if not use_ydata_profiling:
@@ -507,10 +508,10 @@ class TabularDatasetLoader:
                 eda_results["data_quality"] = self._analyze_data_quality(verbose)
             
             if verbose:
-                print("\n" + "="*80)
-                print("EDA COMPLETE!")
-                print("="*80)
-                print(f"Results saved to: {output_dir}")
+                logger.info("\n" + "="*80)
+                logger.info("EDA COMPLETE!")
+                logger.info("="*80)
+                logger.info(f"Results saved to: {output_dir}")
         
         return eda_results
     
@@ -529,11 +530,11 @@ class TabularDatasetLoader:
             )
         
         if verbose:
-            print("\n" + "="*80)
-            print("YDATA PROFILING ANALYSIS")
-            print("="*80)
-            print("Generating comprehensive EDA report...")
-            print("  This may take a few minutes for large datasets...")
+            logger.info("\n" + "="*80)
+            logger.info("YDATA PROFILING ANALYSIS")
+            logger.info("="*80)
+            logger.info("Generating comprehensive EDA report...")
+            logger.info("  This may take a few minutes for large datasets...")
         
         df_train = pd.DataFrame(self.X_train, columns=self.feature_names)
         df_train['target'] = self.y_train
@@ -544,7 +545,7 @@ class TabularDatasetLoader:
         results = {}
         
         if verbose:
-            print("\n1. Generating training data profile...")
+            logger.info("\n1. Generating training data profile...")
         
         profile_train = ProfileReport(
             df_train,
@@ -574,10 +575,10 @@ class TabularDatasetLoader:
         results["training_report_path"] = train_report_path
         
         if verbose:
-            print(f"   ✓ Saved training data profile to {train_report_path}")
+            logger.info(f"   ✓ Saved training data profile to {train_report_path}")
         
         if verbose:
-            print("\n2. Generating test data profile...")
+            logger.info("\n2. Generating test data profile...")
         
         profile_test = ProfileReport(
             df_test,
@@ -607,10 +608,10 @@ class TabularDatasetLoader:
         results["test_report_path"] = test_report_path
         
         if verbose:
-            print(f"   ✓ Saved test data profile to {test_report_path}")
+            logger.info(f"   ✓ Saved test data profile to {test_report_path}")
         
         if verbose:
-            print("\n3. Extracting key metrics for XAI...")
+            logger.info("\n3. Extracting key metrics for XAI...")
         
         train_description = profile_train.get_description()
         test_description = profile_test.get_description()
@@ -696,21 +697,21 @@ class TabularDatasetLoader:
             pass
         
         if verbose:
-            print("\n4. Key Statistics:")
-            print(f"   Training samples: {results['training_summary']['n_observations']:,}")
-            print(f"   Test samples: {results['test_summary']['n_observations']:,}")
-            print(f"   Features: {results['training_summary']['n_variables'] - 1}")
-            print(f"   Missing values (train): {results['training_summary']['n_missing']} "
+            logger.info("\n4. Key Statistics:")
+            logger.info(f"   Training samples: {results['training_summary']['n_observations']:,}")
+            logger.info(f"   Test samples: {results['test_summary']['n_observations']:,}")
+            logger.info(f"   Features: {results['training_summary']['n_variables'] - 1}")
+            logger.info(f"   Missing values (train): {results['training_summary']['n_missing']} "
                   f"({results['training_summary']['p_missing']:.2f}%)")
-            print(f"   Missing values (test): {results['test_summary']['n_missing']} "
+            logger.info(f"   Missing values (test): {results['test_summary']['n_missing']} "
                   f"({results['test_summary']['p_missing']:.2f}%)")
-            print(f"   Duplicates (train): {results['training_summary']['n_duplicates']} "
+            logger.info(f"   Duplicates (train): {results['training_summary']['n_duplicates']} "
                   f"({results['training_summary']['p_duplicates']:.2f}%)")
-            print(f"   Duplicates (test): {results['test_summary']['n_duplicates']} "
+            logger.info(f"   Duplicates (test): {results['test_summary']['n_duplicates']} "
                   f"({results['test_summary']['p_duplicates']:.2f}%)")
         
         if verbose:
-            print("\n5. Saving JSON summary...")
+            logger.info("\n5. Saving JSON summary...")
         
         import json
         
@@ -774,7 +775,7 @@ class TabularDatasetLoader:
         results["summary_json_path"] = summary_path
         
         if verbose:
-            print(f"   ✓ Saved summary to {summary_path}")
+            logger.info(f"   ✓ Saved summary to {summary_path}")
         
         return results
     
@@ -790,16 +791,16 @@ class TabularDatasetLoader:
         }
         
         if verbose:
-            print("\n" + "="*80)
-            print("DATASET OVERVIEW")
-            print("="*80)
-            print(f"Dataset: {overview['dataset_name']}")
-            print(f"Training samples: {overview['n_train_samples']:,}")
-            print(f"Test samples: {overview['n_test_samples']:,}")
-            print(f"Features: {overview['n_features']}")
-            print(f"Classes: {overview['n_classes']}")
+            logger.info("\n" + "="*80)
+            logger.info("DATASET OVERVIEW")
+            logger.info("="*80)
+            logger.info(f"Dataset: {overview['dataset_name']}")
+            logger.info(f"Training samples: {overview['n_train_samples']:,}")
+            logger.info(f"Test samples: {overview['n_test_samples']:,}")
+            logger.info(f"Features: {overview['n_features']}")
+            logger.info(f"Classes: {overview['n_classes']}")
             if self.class_names:
-                print(f"Class names: {self.class_names}")
+                logger.info(f"Class names: {self.class_names}")
         
         return overview
     
@@ -824,17 +825,17 @@ class TabularDatasetLoader:
             }
         
         if verbose:
-            print("\n" + "="*80)
-            print("FEATURE STATISTICS")
-            print("="*80)
-            print(f"{'Feature':<20} {'Train Mean':<12} {'Train Std':<12} {'Test Mean':<12} {'Test Std':<12}")
-            print("-" * 80)
+            logger.info("\n" + "="*80)
+            logger.info("FEATURE STATISTICS")
+            logger.info("="*80)
+            logger.info(f"{'Feature':<20} {'Train Mean':<12} {'Train Std':<12} {'Test Mean':<12} {'Test Std':<12}")
+            logger.info("-" * 80)
             for feat_name, feat_stats in list(stats.items())[:10]:
-                print(f"{feat_name:<20} {feat_stats['train_mean']:>11.4f} "
+                logger.info(f"{feat_name:<20} {feat_stats['train_mean']:>11.4f} "
                       f"{feat_stats['train_std']:>11.4f} {feat_stats['test_mean']:>11.4f} "
                       f"{feat_stats['test_std']:>11.4f}")
             if len(stats) > 10:
-                print(f"... and {len(stats) - 10} more features")
+                logger.info(f"... and {len(stats) - 10} more features")
         
         return stats
     
@@ -870,16 +871,16 @@ class TabularDatasetLoader:
         }
         
         if verbose:
-            print("\n" + "="*80)
-            print("CLASS DISTRIBUTION")
-            print("="*80)
-            print("Training set:")
+            logger.info("\n" + "="*80)
+            logger.info("CLASS DISTRIBUTION")
+            logger.info("="*80)
+            logger.info("Training set:")
             for cls, info in train_dist.items():
-                print(f"  {info['name']}: {info['count']:,} ({info['percentage']:.1f}%)")
-            print("\nTest set:")
+                logger.info(f"  {info['name']}: {info['count']:,} ({info['percentage']:.1f}%)")
+            logger.info("\nTest set:")
             for cls, info in test_dist.items():
-                print(f"  {info['name']}: {info['count']:,} ({info['percentage']:.1f}%)")
-            print(f"\nClass balance: {'Balanced' if distribution['is_balanced'] else 'Imbalanced'}")
+                logger.info(f"  {info['name']}: {info['count']:,} ({info['percentage']:.1f}%)")
+            logger.info(f"\nClass balance: {'Balanced' if distribution['is_balanced'] else 'Imbalanced'}")
         
         return distribution
     
@@ -902,10 +903,10 @@ class TabularDatasetLoader:
             import seaborn as sns
         except ImportError:
             if verbose:
-                print("\n" + "="*80)
-                print("FEATURE CORRELATIONS")
-                print("="*80)
-                print("Skipping correlation analysis (pandas/matplotlib/seaborn not available)")
+                logger.info("\n" + "="*80)
+                logger.info("FEATURE CORRELATIONS")
+                logger.info("="*80)
+                logger.info("Skipping correlation analysis (pandas/matplotlib/seaborn not available)")
             return {}
         
         df_train = pd.DataFrame(self.X_train, columns=self.feature_names)
@@ -927,16 +928,16 @@ class TabularDatasetLoader:
                     })
         
         if verbose:
-            print("\n" + "="*80)
-            print("FEATURE CORRELATIONS")
-            print("="*80)
-            print(f"High correlations (|r| > 0.7): {len(correlations['high_correlations'])}")
+            logger.info("\n" + "="*80)
+            logger.info("FEATURE CORRELATIONS")
+            logger.info("="*80)
+            logger.info(f"High correlations (|r| > 0.7): {len(correlations['high_correlations'])}")
             if correlations["high_correlations"]:
-                print("\nTop high correlations:")
+                logger.info("\nTop high correlations:")
                 for corr_info in sorted(correlations["high_correlations"], 
                                        key=lambda x: abs(x["correlation"]), 
                                        reverse=True)[:10]:
-                    print(f"  {corr_info['feature1']} <-> {corr_info['feature2']}: "
+                    logger.info(f"  {corr_info['feature1']} <-> {corr_info['feature2']}: "
                           f"{corr_info['correlation']:.3f}")
         
         try:
@@ -952,10 +953,10 @@ class TabularDatasetLoader:
             plt.savefig(f'{output_dir}correlation_heatmap.png', dpi=150, bbox_inches='tight')
             plt.close()
             if verbose:
-                print(f"  ✓ Saved correlation heatmap to {output_dir}correlation_heatmap.png")
+                logger.info(f"  ✓ Saved correlation heatmap to {output_dir}correlation_heatmap.png")
         except Exception as e:
             if verbose:
-                print(f"  ⚠ Could not save correlation heatmap: {e}")
+                logger.warning(f"  ⚠ Could not save correlation heatmap: {e}")
         
         return correlations
     
@@ -1016,12 +1017,12 @@ class TabularDatasetLoader:
                 }
         
         if verbose:
-            print("\n" + "="*80)
-            print("CLASS SEPARABILITY")
-            print("="*80)
-            print("Top 10 features by separability score:")
+            logger.info("\n" + "="*80)
+            logger.info("CLASS SEPARABILITY")
+            logger.info("="*80)
+            logger.info("Top 10 features by separability score:")
             for feat, score in sorted_features[:10]:
-                print(f"  {feat}: {score:.4f}")
+                logger.info(f"  {feat}: {score:.4f}")
         
         return separability
     
@@ -1057,13 +1058,13 @@ class TabularDatasetLoader:
         quality["has_infinite"] = quality["infinite_values_train"] > 0 or quality["infinite_values_test"] > 0
         
         if verbose:
-            print("\n" + "="*80)
-            print("DATA QUALITY")
-            print("="*80)
-            print(f"Missing values (train): {quality['missing_values_train']}")
-            print(f"Missing values (test): {quality['missing_values_test']}")
-            print(f"Infinite values (train): {quality['infinite_values_train']}")
-            print(f"Infinite values (test): {quality['infinite_values_test']}")
+            logger.info("\n" + "="*80)
+            logger.info("DATA QUALITY")
+            logger.info("="*80)
+            logger.info(f"Missing values (train): {quality['missing_values_train']}")
+            logger.info(f"Missing values (test): {quality['missing_values_test']}")
+            logger.info(f"Infinite values (train): {quality['infinite_values_train']}")
+            logger.info(f"Infinite values (test): {quality['infinite_values_test']}")
             
             high_outlier_features = [
                 (feat, info["percentage"]) 
@@ -1072,10 +1073,10 @@ class TabularDatasetLoader:
             ]
             
             if high_outlier_features:
-                print(f"\nFeatures with >5% outliers: {len(high_outlier_features)}")
+                logger.info(f"\nFeatures with >5% outliers: {len(high_outlier_features)}")
                 for feat, pct in sorted(high_outlier_features, key=lambda x: x[1], reverse=True)[:5]:
-                    print(f"  {feat}: {pct:.1f}%")
+                    logger.info(f"  {feat}: {pct:.1f}%")
             else:
-                print("\n✓ No significant outliers detected (>5%)")
+                logger.info("\n✓ No significant outliers detected (>5%)")
         
         return quality

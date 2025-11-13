@@ -4,6 +4,8 @@ from typing import Dict, Optional, List, Any, Tuple
 from pathlib import Path
 import os
 import sys
+import logging
+logger = logging.getLogger(__name__)
 
 from benchmarl.algorithms.common import AlgorithmConfig
 from benchmarl.experiment import Experiment, ExperimentConfig
@@ -77,7 +79,7 @@ class AnchorTrainer:
         target_classes: Optional[List[int]] = None,
         max_cycles: int = 500,
         device: str = "cpu",
-        eval_on_test_data: bool = False
+        eval_on_test_data: bool = True
     ) -> Experiment:
         if self.dataset_loader.classifier is None:
             raise ValueError(
@@ -91,23 +93,29 @@ class AnchorTrainer:
                 "Call dataset_loader.preprocess_data() first."
             )
         
-        print("\n" + "="*80)
-        print("SETTING UP ANCHOR TRAINING EXPERIMENT")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("SETTING UP ANCHOR TRAINING EXPERIMENT")
+        logger.info("="*80)
         
+        # Main configurations that controls the training process in BenchMARL.
+        # Loaded from the conf/*.yaml files.
         self.experiment_config = ExperimentConfig.get_from_yaml(self.experiment_config_path)
         self.algorithm_config = self.algorithm_config_class.get_from_yaml(self.algorithm_config_path)
         self.model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
         self.critic_model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
         
+        # Get the anchor environment data.
         env_data = self.dataset_loader.get_anchor_env_data()
         
+        # Get the default environment configuration.
         if env_config is None:
             env_config = self._get_default_env_config()
         
+        # Get the target classes.
         if target_classes is None:
             target_classes = list(np.unique(self.dataset_loader.y_train))
         
+        # Create the environment configuration with the data.
         env_config_with_data = {
             **env_config,
             "X_min": env_data["X_min"],
@@ -127,11 +135,12 @@ class AnchorTrainer:
                 "X_test_std": env_data["X_test_std"],
                 "y_test": env_data["y_test"],
             })
-            print(f"  Evaluation configured to use TEST data")
+            logger.info(f"  Evaluation configured to use TEST data")
         else:
             env_config_with_data["eval_on_test_data"] = False
-            print(f"  Evaluation configured to use TRAINING data")
+            logger.info(f"  Evaluation configured to use TRAINING data")
         
+        # Create the anchor configuration.
         anchor_config = {
             "X_unit": env_data["X_unit"],
             "X_std": env_data["X_std"],
@@ -146,11 +155,12 @@ class AnchorTrainer:
         
         self.task = AnchorTask.ANCHOR.get_task(config=anchor_config)
         
+        # SS Bug: Check if the collec_anchor_data is actually working
         self.callback = AnchorMetricsCallback(
             log_training_metrics=True, 
             log_evaluation_metrics=True,
             save_to_file=True,
-            collect_anchor_data=True  # Collect anchor data during evaluation for rule extraction
+            collect_anchor_data=True
         )
         self.experiment = Experiment(
             config=self.experiment_config,
@@ -162,13 +172,13 @@ class AnchorTrainer:
             callbacks=[self.callback]
         )
         
-        print(f"Experiment setup complete:")
-        print(f"  Algorithm: {self.algorithm.upper()}")
-        print(f"  Model: MLP")
-        print(f"  Target classes: {target_classes}")
-        print(f"  Max cycles per episode: {max_cycles}")
-        print(f"  Experiment folder: {self.experiment.folder_name}")
-        print("="*80)
+        logger.info(f"Experiment setup complete:")
+        logger.info(f"  Algorithm: {self.algorithm.upper()}")
+        logger.info(f"  Model: MLP")
+        logger.info(f"  Target classes: {target_classes}")
+        logger.info(f"  Max cycles per episode: {max_cycles}")
+        logger.info(f"  Experiment folder: {self.experiment.folder_name}")
+        logger.info("="*80)
         
         return self.experiment
     
@@ -178,16 +188,16 @@ class AnchorTrainer:
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         
-        print("\n" + "="*80)
-        print("STARTING ANCHOR TRAINING")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("STARTING ANCHOR TRAINING")
+        logger.info("="*80)
         
         self.experiment.run()
         
-        print("\n" + "="*80)
-        print("TRAINING COMPLETE!")
-        print("="*80)
-        print(f"Results saved to: {self.experiment.folder_name}")
+        logger.info("\n" + "="*80)
+        logger.info("TRAINING COMPLETE!")
+        logger.info("="*80)
+        logger.info(f"Results saved to: {self.experiment.folder_name}")
         
         return self.experiment
     
@@ -196,52 +206,39 @@ class AnchorTrainer:
         n_eval_episodes: Optional[int] = None,
         collect_anchor_data: bool = True
     ) -> Dict[str, Any]:
-        """
-        Run BenchMARL evaluation and collect anchor data.
-        
-        Note: BenchMARL's evaluate() method doesn't pass rollouts to callbacks after training.
-        This method manually runs rollouts to collect evaluation data.
-        
-        Args:
-            n_eval_episodes: Number of episodes to run for evaluation (default: from config)
-            collect_anchor_data: Whether to collect anchor data during evaluation
-        
-        Returns:
-            Dictionary containing evaluation results and collected anchor data
-        """
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         
-        print("\n" + "="*80)
-        print("RUNNING EVALUATION")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("RUNNING EVALUATION")
+        logger.info("="*80)
         
-        # Get anchor data collected during training evaluations (before clearing)
-        # BenchMARL's periodic evaluations during training DO pass rollouts to callbacks
+        # Get anchor data collected during training evaluations
+        # BenchMARL's periodic evaluations during training DO pass rollouts to callbacks - SS: If we get info from callbacks, we don't need to run manual rollouts
         evaluation_anchor_data = []
         if hasattr(self.callback, 'get_evaluation_anchor_data'):
             evaluation_anchor_data = self.callback.get_evaluation_anchor_data()
-            print(f"  Found {len(evaluation_anchor_data)} episodes of anchor data from training evaluations")
+            logger.info(f"  Found {len(evaluation_anchor_data)} episodes of anchor data from training evaluations")
         
-        # Try BenchMARL's standard evaluate() for metrics logging
+        # BenchMARL's standard evaluate() for metrics logging (This is not working right now - SS)
         try:
             self.experiment.evaluate()
         except Exception as e:
             # Handle wandb run finished error gracefully
             if "wandb" in str(type(e)).lower() or "finished" in str(e).lower() or "UsageError" in str(type(e)):
-                print(f"Warning: Evaluation completed but could not log to wandb (run may be finished): {e}")
-                print("Evaluation metrics are still saved to CSV and other loggers.")
+                logger.warning(f"Warning: Evaluation completed but could not log to wandb (run may be finished): {e}")
+                logger.warning("Evaluation metrics are still saved to CSV and other loggers.")
             else:
                 # Re-raise if it's a different error
                 raise
         
         # IMPORTANT: BenchMARL's evaluate() doesn't pass rollouts to callbacks after training
-        # So we need to manually run rollouts to collect anchor data
+        # Manually run rollouts to collect anchor data. BenchMARL evaluate does do rollouts.
         if collect_anchor_data:
-            print(f"\n  Running manual rollouts to collect anchor data...")
-            print(f"  (BenchMARL's evaluate() doesn't pass rollouts to callbacks after training)")
+            logger.info(f"\n  Running manual rollouts to collect anchor data...")
+            logger.info(f"  (BenchMARL's evaluate() doesn't pass rollouts to callbacks after training)")
             
             # Get number of episodes from config if not provided
             if n_eval_episodes is None:
@@ -275,21 +272,21 @@ class AnchorTrainer:
                 # Create environment instance on the same device as policy
                 env = self._create_env_instance(device=str(policy_device))
                 
-                # Debug: Check group_map structure (before episode loop)
-                print(f"  Debug: algorithm.group_map = {algorithm.group_map}")
-                print(f"  Debug: group_map keys = {list(algorithm.group_map.keys())}")
+                # Debug: Check group_map structure (before episode loop) - SS: REMOVE THIS DEBUG LATER
+                logger.info(f"  Debug: algorithm.group_map = {algorithm.group_map}")
+                logger.info(f"  Debug: group_map keys = {list(algorithm.group_map.keys())}")
                 for group, agents in algorithm.group_map.items():
-                    print(f"    Group '{group}' contains agents: {agents}")
+                    logger.info(f"    Group '{group}' contains agents: {agents}")
                 
-                # Get unwrapped environment to check actual agents
+                # Get unwrapped environment to check actual agents - SS: REMOVE THIS DEBUG LATER
                 unwrapped_env = None
                 if hasattr(env, 'env') or hasattr(env, '_env'):
                     unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
                     if unwrapped_env is not None:
                         if hasattr(unwrapped_env, 'possible_agents'):
-                            print(f"  Debug: Environment has {len(unwrapped_env.possible_agents)} agents: {unwrapped_env.possible_agents}")
+                            logger.info(f"  Debug: Environment has {len(unwrapped_env.possible_agents)} agents: {unwrapped_env.possible_agents}")
                         if hasattr(unwrapped_env, 'agent_to_class'):
-                            print(f"  Debug: Agent to class mapping: {unwrapped_env.agent_to_class}")
+                            logger.info(f"  Debug: Agent to class mapping: {unwrapped_env.agent_to_class}")
                 
                 # Run evaluation episodes
                 manual_rollouts = []
@@ -303,13 +300,13 @@ class AnchorTrainer:
                     step_count = 0
                     max_steps = self.task.max_steps(env) if hasattr(self.task, 'max_steps') else 100
                     
-                    # Debug: Check initial td structure
+                    # Debug: Check initial td structure - SS: REMOVE THIS DEBUG LATER
                     if episode == 0:
-                        print(f"  Debug: Initial td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
+                        logger.info(f"  Debug: Initial td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
                         if hasattr(td, 'keys'):
                             for key in td.keys():
                                 if hasattr(td[key], 'keys'):
-                                    print(f"    {key} keys: {list(td[key].keys())}")
+                                    logger.info(f"    {key} keys: {list(td[key].keys())}")
                     
                     while not done and step_count < max_steps:
                         # Get action from policy (deterministic for evaluation)
@@ -388,13 +385,12 @@ class AnchorTrainer:
                         done = td.get("done", torch.zeros(1, dtype=torch.bool)).any().item()
                         step_count += 1
                     
-                    # Collect final metrics from info
-                    # Try to get info from the unwrapped environment if available
+                    # Collect final metrics from info - SS: REMOVE THIS DEBUG LATER
                     unwrapped_env = None
                     if hasattr(env, 'env') or hasattr(env, '_env'):
                         unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
                     
-                    # Debug: Check unwrapped environment state
+                    # Debug: Check unwrapped environment state - SS: REMOVE THIS DEBUG LATER
                     if episode == 0 and unwrapped_env is not None:
                         if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
                             if isinstance(unwrapped_env.lower, dict):
@@ -402,17 +398,17 @@ class AnchorTrainer:
                                     if agent_name in unwrapped_env.lower:
                                         lower = unwrapped_env.lower[agent_name]
                                         upper = unwrapped_env.upper[agent_name]
-                                        print(f"  Debug: After episode, {agent_name} bounds:")
-                                        print(f"    Lower range: [{lower.min():.4f}, {lower.max():.4f}]")
-                                        print(f"    Upper range: [{upper.min():.4f}, {upper.max():.4f}]")
+                                        logger.info(f"  Debug: After episode, {agent_name} bounds:")
+                                        logger.info(f"    Lower range: [{lower.min():.4f}, {lower.max():.4f}]")
+                                        logger.info(f"    Upper range: [{upper.min():.4f}, {upper.max():.4f}]")
                                         # Get metrics to verify
                                         try:
                                             prec, cov, _ = unwrapped_env._current_metrics(agent_name)
-                                            print(f"    Precision: {prec:.4f}, Coverage: {cov:.4f}")
+                                            logger.info(f"    Precision: {prec:.4f}, Coverage: {cov:.4f}")
                                         except Exception as e:
-                                            print(f"    Could not get metrics: {e}")
+                                            logger.info(f"    Could not get metrics: {e}")
                     
-                    # Try multiple ways to access the final state
+                    # Try multiple ways to access the final state - SS: REMOVE THIS DEBUG LATER
                     # After the episode loop, td should contain the final state
                     # Check both td and td["next"] if it exists
                     final_td = td
@@ -458,18 +454,18 @@ class AnchorTrainer:
                     
                     # Process each agent separately
                     for group, agent_name in agents_to_process:
-                        # Debug: Check unwrapped_env state
+                        # Debug: Check unwrapped_env state - SS: REMOVE THIS DEBUG LATER
                         if episode == 0:
                             if unwrapped_env is None:
-                                print(f"  Debug: unwrapped_env is None for {agent_name}")
+                                logger.info(f"  Debug: unwrapped_env is None for {agent_name}")
                             elif not hasattr(unwrapped_env, 'agents'):
-                                print(f"  Debug: unwrapped_env doesn't have 'agents' attribute for {agent_name}")
+                                logger.info(f"  Debug: unwrapped_env doesn't have 'agents' attribute for {agent_name}")
                             elif len(unwrapped_env.agents) == 0:
-                                print(f"  Debug: unwrapped_env.agents is empty for {agent_name}")
+                                logger.info(f"  Debug: unwrapped_env.agents is empty for {agent_name}")
                                 if hasattr(unwrapped_env, 'possible_agents'):
-                                    print(f"  Debug: Using possible_agents instead: {unwrapped_env.possible_agents}")
+                                    logger.info(f"  Debug: Using possible_agents instead: {unwrapped_env.possible_agents}")
                             else:
-                                print(f"  Debug: unwrapped_env.agents = {unwrapped_env.agents} for {agent_name}")
+                                logger.info(f"  Debug: unwrapped_env.agents = {unwrapped_env.agents} for {agent_name}")
                         
                         # First, try to get info from unwrapped environment (most reliable)
                         # After episode, agents might be removed, so check possible_agents too
@@ -499,7 +495,7 @@ class AnchorTrainer:
                                     
                                     # Debug output for first episode
                                     if episode == 0:
-                                        print(f"  Debug: Got metrics from unwrapped_env for {agent_name}: precision={precision:.4f}, coverage={coverage:.4f}")
+                                        logger.info(f"  Debug: Got metrics from unwrapped_env for {agent_name}: precision={precision:.4f}, coverage={coverage:.4f}")
                                     
                                     # Get final observation (bounds) from environment state
                                     if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
@@ -519,12 +515,12 @@ class AnchorTrainer:
                                                 
                                                 if matching_key:
                                                     if episode == 0:
-                                                        print(f"  Debug: Using matching key '{matching_key}' for agent {agent_name}")
+                                                        logger.info(f"  Debug: Using matching key '{matching_key}' for agent {agent_name}")
                                                     lower_bounds = unwrapped_env.lower[matching_key]
                                                     upper_bounds = unwrapped_env.upper[matching_key]
                                                 else:
                                                     if episode == 0:
-                                                        print(f"  Debug: Agent {agent_name} not in lower/upper dict. Available keys: {list(unwrapped_env.lower.keys())}")
+                                                        logger.info(f"  Debug: Agent {agent_name} not in lower/upper dict. Available keys: {list(unwrapped_env.lower.keys())}")
                                                     continue  # Skip this agent if not in dict
                                         else:
                                             # If not a dict, might be a single array (single agent case)
@@ -533,7 +529,7 @@ class AnchorTrainer:
                                         
                                         # Debug: Check bounds values
                                         if episode == 0:
-                                            print(f"  Debug: {agent_name} bounds - lower range: [{lower_bounds.min():.4f}, {lower_bounds.max():.4f}], upper range: [{upper_bounds.min():.4f}, {upper_bounds.max():.4f}]")
+                                            logger.info(f"  Debug: {agent_name} bounds - lower range: [{lower_bounds.min():.4f}, {lower_bounds.max():.4f}], upper range: [{upper_bounds.min():.4f}, {upper_bounds.max():.4f}]")
                                         
                                         final_obs = np.concatenate([lower_bounds, upper_bounds, np.array([precision, coverage], dtype=np.float32)])
                                         
@@ -548,22 +544,22 @@ class AnchorTrainer:
                                         }
                                         
                                         if episode == 0:
-                                            print(f"  Debug: Stored data for {agent_name} with precision={precision:.4f}, coverage={coverage:.4f}")
+                                            logger.info(f"  Debug: Stored data for {agent_name} with precision={precision:.4f}, coverage={coverage:.4f}")
                                         
                                         # Try to get total_reward from last step's info if available
                                         # (This is a fallback - we already have precision/coverage from env)
                                         continue  # Skip to next agent since we got data from env
                                     else:
                                         if episode == 0:
-                                            print(f"  Debug: unwrapped_env doesn't have lower/upper attributes")
+                                            logger.info(f"  Debug: unwrapped_env doesn't have lower/upper attributes")
                                 except Exception as e:
                                     if episode == 0:
-                                        print(f"  Debug: Could not get metrics from unwrapped env for agent {agent_name}: {e}")
+                                        logger.info(f"  Debug: Could not get metrics from unwrapped env for agent {agent_name}: {e}")
                                         import traceback
-                                        traceback.print_exc()
+                                        traceback.print_exc()  # SS: REMOVE THIS DEBUG LATER
                         
-                        # Fallback: Try to get from TensorDict structure
-                        # Try both final_td (which might be next_td) and td directly
+                        # Fallback: Try to get from TensorDict structure - SS: ONLY THIS PART IS CURRENTLY WORKING
+                        # Try both final_td (which might be next_td) and td directly - SS: ONLY THIS PART IS CURRENTLY WORKING
                         group_data = None
                         
                         # First try final_td (state after last step)
@@ -732,61 +728,61 @@ class AnchorTrainer:
                                     else:
                                         episode_data[agent_name]["final_observation"] = list(final_obs) if hasattr(final_obs, '__iter__') else [final_obs]
                     
-                    # Debug first episode
+                    # Debug first episode - SS: REMOVE THIS DEBUG LATER
                     if episode == 0:
-                        print(f"  Debug: Episode {episode} completed, step_count={step_count}, done={done}")
-                        print(f"  Debug: episode_data keys: {list(episode_data.keys())}")
+                        logger.info(f"  Debug: Episode {episode} completed, step_count={step_count}, done={done}")
+                        logger.info(f"  Debug: episode_data keys: {list(episode_data.keys())}")
                         if not episode_data:
-                            print(f"  Debug: td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
+                            logger.info(f"  Debug: td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
                             if "next" in td.keys():
                                 next_td = td["next"]
-                                print(f"  Debug: next_td keys: {list(next_td.keys()) if hasattr(next_td, 'keys') else 'N/A'}")
+                                logger.info(f"  Debug: next_td keys: {list(next_td.keys()) if hasattr(next_td, 'keys') else 'N/A'}")
                                 # Check what's in the agent group
                                 for group in algorithm.group_map.keys():
                                     if group in next_td.keys():
                                         group_data = next_td[group]
-                                        print(f"  Debug: next_td['{group}'] type: {type(group_data)}")
+                                        logger.info(f"  Debug: next_td['{group}'] type: {type(group_data)}")
                                         if hasattr(group_data, 'keys'):
-                                            print(f"  Debug: next_td['{group}'] keys: {list(group_data.keys())}")
+                                            logger.info(f"  Debug: next_td['{group}'] keys: {list(group_data.keys())}")
                                         elif isinstance(group_data, dict):
-                                            print(f"  Debug: next_td['{group}'] dict keys: {list(group_data.keys())}")
+                                            logger.info(f"  Debug: next_td['{group}'] dict keys: {list(group_data.keys())}")
                             # Also check td directly (not just next)
                             for group in algorithm.group_map.keys():
                                 if group in td.keys():
                                     group_data = td[group]
-                                    print(f"  Debug: td['{group}'] type: {type(group_data)}")
+                                    logger.info(f"  Debug: td['{group}'] type: {type(group_data)}")
                                     if hasattr(group_data, 'keys'):
-                                        print(f"  Debug: td['{group}'] keys: {list(group_data.keys())}")
+                                        logger.info(f"  Debug: td['{group}'] keys: {list(group_data.keys())}")
                                         # Check if info is nested deeper
                                         for key in group_data.keys():
                                             if hasattr(group_data[key], 'keys'):
-                                                print(f"  Debug: td['{group}']['{key}'] keys: {list(group_data[key].keys())}")
+                                                logger.info(f"  Debug: td['{group}']['{key}'] keys: {list(group_data[key].keys())}")
                                     elif isinstance(group_data, dict):
-                                        print(f"  Debug: td['{group}'] dict keys: {list(group_data.keys())}")
+                                        logger.info(f"  Debug: td['{group}'] dict keys: {list(group_data.keys())}")
                     
                     if episode_data:
                         manual_rollouts.append(episode_data)
                         if hasattr(self.callback, 'evaluation_anchor_data'):
                             self.callback.evaluation_anchor_data.append(episode_data)
                 
-                print(f"  ✓ Collected {len(manual_rollouts)} episodes from manual rollouts")
+                logger.info(f"  ✓ Collected {len(manual_rollouts)} episodes from manual rollouts")
                 evaluation_anchor_data.extend(manual_rollouts)
                 
             except Exception as e:
-                print(f"  ⚠ Warning: Could not run manual rollouts: {e}")
-                print(f"    Error type: {type(e).__name__}")
+                logger.warning(f"  ⚠ Warning: Could not run manual rollouts: {e}")
+                logger.warning(f"    Error type: {type(e).__name__}")
                 import traceback
                 traceback.print_exc()
         
         # Final summary
         if not evaluation_anchor_data:
-            print("\n  ⚠ Warning: No anchor data collected from any evaluation.")
-            print("  This may happen if:")
-            print("    1. Training evaluations didn't run (check evaluation_interval in config)")
-            print("    2. Manual rollouts failed (see error above)")
-            print("  Consider using inference.py to extract rules directly from the trained model.")
+            logger.warning("\n  ⚠ Warning: No anchor data collected from any evaluation.")
+            logger.warning("  This may happen if:")
+            logger.warning("    1. Training evaluations didn't run (check evaluation_interval in config)")
+            logger.warning("    2. Manual rollouts failed (see error above)")
+            logger.warning("  Consider using inference.py to extract rules directly from the trained model.")
         else:
-            print(f"\n  ✓ Total episodes collected: {len(evaluation_anchor_data)}")
+            logger.info(f"\n  ✓ Total episodes collected: {len(evaluation_anchor_data)}")
         
         return {
             "experiment_folder": str(self.experiment.folder_name),
@@ -797,24 +793,15 @@ class AnchorTrainer:
         }
     
     def get_checkpoint_path(self) -> str:
-        """
-        Get the path to BenchMARL's experiment folder where checkpoints are saved.
-        
-        BenchMARL automatically saves checkpoints in the experiment folder.
-        This method returns the path to that folder for later use.
-        
-        Returns:
-            Path to BenchMARL experiment folder containing checkpoints
-        """
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         
         experiment_folder = str(self.experiment.folder_name)
-        print(f"BenchMARL experiment folder: {experiment_folder}")
-        print(f"  This folder contains all checkpoints, logs, and model states")
-        print(f"  Use this path to load checkpoints later with BenchMARL's load_state_dict()")
+        logger.info(f"BenchMARL experiment folder: {experiment_folder}")
+        logger.info(f"  This folder contains all checkpoints, logs, and model states")
+        logger.info(f"  Use this path to load checkpoints later with BenchMARL's load_state_dict()")
         
         return experiment_folder
     
@@ -850,19 +837,19 @@ class AnchorTrainer:
         algorithm = self.experiment.algorithm
         
         # Always save in the experiment's run log directory (where BenchMARL saves logs/checkpoints)
-        # This ensures models are saved alongside the run logs, not in a separate location
+        # SS: Models are saved alongside the run logs, not in a separate location
         output_dir = os.path.join(str(self.experiment.folder_name), "individual_models")
         
         os.makedirs(output_dir, exist_ok=True)
         
         saved_models = {}
         
-        print("\n" + "="*80)
-        print("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
+        logger.info("="*80)
         
         for group in algorithm.group_map.keys():
-            print(f"\nExtracting models for group: {group}")
+            logger.info(f"\nExtracting models for group: {group}")
             
             if save_policies:
                 try:
@@ -880,15 +867,15 @@ class AnchorTrainer:
                         actor_module = policy.net
                     
                     if actor_module is None:
-                        print(f"  ⚠ Warning: Could not extract actor module from policy for group {group}")
-                        print(f"    Policy type: {type(policy)}")
-                        print(f"    Policy attributes: {dir(policy)}")
+                        logger.warning(f"  ⚠ Warning: Could not extract actor module from policy for group {group}")
+                        logger.warning(f"    Policy type: {type(policy)}")
+                        logger.warning(f"    Policy attributes: {dir(policy)}")
                     else:
                         # Save the actor module
                         policy_path = os.path.join(output_dir, f"policy_{group}.pth")
                         torch.save(actor_module.state_dict(), policy_path)
                         saved_models[f"policy_{group}"] = policy_path
-                        print(f"  ✓ Saved policy model to: {policy_path}")
+                        logger.info(f"  ✓ Saved policy model to: {policy_path}")
                         
                         # Also save metadata about the model structure
                         metadata = {
@@ -902,14 +889,13 @@ class AnchorTrainer:
                         import json
                         with open(metadata_path, 'w') as f:
                             json.dump(metadata, f, indent=2)
-                        print(f"  ✓ Saved policy metadata to: {metadata_path}")
+                        logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
                         
                 except Exception as e:
-                    print(f"  ✗ Error extracting policy for group {group}: {e}")
+                    logger.warning(f"  ✗ Error extracting policy for group {group}: {e}")
             
             if save_critics:
                 try:
-                    # Get critic using BenchMARL's official API (if available)
                     if hasattr(algorithm, "get_value_module"):
                         critic = algorithm.get_value_module(group)
                         
@@ -923,27 +909,27 @@ class AnchorTrainer:
                             critic_module = critic.net
                         
                         if critic_module is None:
-                            print(f"  ⚠ Warning: Could not extract critic module for group {group}")
+                            logger.warning(f"  ⚠ Warning: Could not extract critic module for group {group}")
                         else:
                             # Save the critic module
                             critic_path = os.path.join(output_dir, f"critic_{group}.pth")
                             torch.save(critic_module.state_dict(), critic_path)
                             saved_models[f"critic_{group}"] = critic_path
-                            print(f"  ✓ Saved critic model to: {critic_path}")
+                            logger.info(f"  ✓ Saved critic model to: {critic_path}")
                     else:
-                        print(f"  ⚠ Algorithm {self.algorithm} does not have get_value_module() method")
+                        logger.warning(f"  ⚠ Algorithm {self.algorithm} does not have get_value_module() method")
                         
                 except Exception as e:
-                    print(f"  ✗ Error extracting critic for group {group}: {e}")
+                    logger.warning(f"  ✗ Error extracting critic for group {group}: {e}")
         
-        print("\n" + "="*80)
-        print(f"Individual models saved to: {output_dir}")
-        print("="*80)
-        print("\nTo use these models for inference:")
-        print("  1. Load the model state_dict")
-        print("  2. Reconstruct the model architecture")
-        print("  3. Load state_dict into the model")
-        print("  4. Use model.eval() and model(observation) for inference")
+        logger.info("\n" + "="*80)
+        logger.info(f"Individual models saved to: {output_dir}")
+        logger.info("="*80)
+        logger.info("\nTo use these models for inference:")
+        logger.info("  1. Load the model state_dict")
+        logger.info("  2. Reconstruct the model architecture")
+        logger.info("  3. Load state_dict into the model")
+        logger.info("  4. Use model.eval() and model(observation) for inference")
         
         return saved_models
     
@@ -999,11 +985,11 @@ class AnchorTrainer:
                 f"Please provide a valid checkpoint file path."
             )
         
-        print(f"\n{'='*80}")
-        print("RELOADING ENTIRE EXPERIMENT")
-        print(f"{'='*80}")
-        print(f"Checkpoint file: {checkpoint_file}")
-        print("  Reference: https://benchmarl.readthedocs.io/en/latest/concepts/features.html#reloading")
+        logger.info(f"\n{'='*80}")
+        logger.info("RELOADING ENTIRE EXPERIMENT")
+        logger.info(f"{'='*80}")
+        logger.info(f"Checkpoint file: {checkpoint_file}")
+        logger.info("  Reference: https://benchmarl.readthedocs.io/en/latest/concepts/features.html#reloading")
         
         # Reload experiment from checkpoint (simple and direct as per documentation)
         experiment = reload_experiment_from_file(checkpoint_file)
@@ -1022,9 +1008,9 @@ class AnchorTrainer:
                     self.callback = cb
                     break
         
-        print("  ✓ Experiment reloaded successfully")
-        print(f"  Resuming from iteration: {self.experiment.n_iters_performed}")
-        print(f"  Total frames: {self.experiment.total_frames}")
+        logger.info("  ✓ Experiment reloaded successfully")
+        logger.info(f"  Resuming from iteration: {self.experiment.n_iters_performed}")
+        logger.info(f"  Total frames: {self.experiment.total_frames}")
     
     def get_experiment(self) -> Experiment:
         if self.experiment is None:
@@ -1033,14 +1019,9 @@ class AnchorTrainer:
             )
         return self.experiment
     
+    # SS: This is the environment instance that is used to collect anchor data. If we remove evaluate()
+    # then we won't need this method.
     def _create_env_instance(self, device=None):
-        """
-        Create an environment instance using the task's get_env_fun method.
-        This is needed because Experiment doesn't have a direct env attribute.
-        
-        Args:
-            device: Device to create environment on. If None, tries to infer from algorithm or config.
-        """
         if self.experiment is None or self.task is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
@@ -1092,6 +1073,7 @@ class AnchorTrainer:
         # Call the factory function to create the environment instance
         return env_fun()
     
+    # SS: This another method which is currently very messy. It is used to extract rules from the evaluation data.
     def extract_rules_from_evaluation(
         self,
         evaluation_data: Dict[str, Any],
@@ -1114,9 +1096,9 @@ class AnchorTrainer:
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         
-        print("\n" + "="*80)
-        print("EXTRACTING ANCHOR RULES FROM EVALUATION DATA")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("EXTRACTING ANCHOR RULES FROM EVALUATION DATA")
+        logger.info("="*80)
         
         env_data = self.dataset_loader.get_anchor_env_data()
         target_classes = list(np.unique(self.dataset_loader.y_train))
@@ -1137,10 +1119,10 @@ class AnchorTrainer:
         evaluation_anchor_data = evaluation_data.get("evaluation_anchor_data", [])
         
         if not evaluation_anchor_data:
-            print("Warning: No anchor data found in evaluation results.")
-            print("  This may happen if BenchMARL's evaluation doesn't generate rollouts.")
-            print("  Falling back to extracting rules from trained model directly.")
-            print("  Using deprecated extract_rules() method as fallback...")
+            logger.warning("Warning: No anchor data found in evaluation results.")
+            logger.warning("  This may happen if BenchMARL's evaluation doesn't generate rollouts.")
+            logger.warning("  Falling back to extracting rules from trained model directly.")
+            logger.warning("  Using deprecated extract_rules() method as fallback...")
             
             # Fallback: use the old method to extract rules directly
             try:
@@ -1151,8 +1133,8 @@ class AnchorTrainer:
                     eval_on_test_data=eval_on_test_data
                 )
             except Exception as e:
-                print(f"  Error in fallback rule extraction: {e}")
-                print("  Returning empty results structure.")
+                logger.warning(f"  Error in fallback rule extraction: {e}")
+                logger.warning("  Returning empty results structure.")
                 return results
         
         # Group evaluation episodes by agent/class
@@ -1160,7 +1142,7 @@ class AnchorTrainer:
             agent = f"agent_{target_class}"
             class_key = f"class_{target_class}"
             
-            print(f"\nExtracting rules for class {target_class} (agent: {agent})...")
+            logger.info(f"\nExtracting rules for class {target_class} (agent: {agent})...")
             
             # Collect all episodes for this agent
             agent_episodes = []
@@ -1169,10 +1151,10 @@ class AnchorTrainer:
                     agent_episodes.append(episode_data[agent])
             
             if not agent_episodes:
-                print(f"  No evaluation data found for {agent}")
+                logger.warning(f"  No evaluation data found for {agent}")
                 continue
             
-            print(f"  Found {len(agent_episodes)} evaluation episodes for {agent}")
+            logger.info(f"  Found {len(agent_episodes)} evaluation episodes for {agent}")
             
             # Extract rules from evaluation data
             # Note: We need to reconstruct anchor bounds from observations if available
@@ -1286,22 +1268,23 @@ class AnchorTrainer:
                 "overlap_info": overlap_info,
             }
             
-            print(f"  Processed {len(anchors_list)} episodes")
-            print(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-            print(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
-            print(f"  Unique rules: {len(unique_rules)}")
+            logger.info(f"  Processed {len(anchors_list)} episodes")
+            logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
+            logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+            logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
-                print(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
+                logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
             else:
-                print(f"  ✓ No overlaps with other classes")
+                logger.info(f"  ✓ No overlaps with other classes")
         
-        print("="*80)
+        logger.info("="*80)
         
         results["training_history"] = self.callback.get_training_history() if hasattr(self, 'callback') else []
         results["evaluation_history"] = evaluation_data.get("evaluation_history", [])
         
         return results
     
+    # SS: This is a duplicate of the method above. Get rid of this if we don't need it.
     def extract_rules(
         self,
         max_features_in_rule: Optional[int] = 5,
@@ -1318,9 +1301,9 @@ class AnchorTrainer:
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         
-        print("\n" + "="*80)
-        print("EXTRACTING ANCHOR RULES")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info("EXTRACTING ANCHOR RULES")
+        logger.info("="*80)
         
         env_data = self.dataset_loader.get_anchor_env_data()
         target_classes = list(np.unique(self.dataset_loader.y_train))
@@ -1339,7 +1322,7 @@ class AnchorTrainer:
             agent = f"agent_{target_class}"
             class_key = f"class_{target_class}"
             
-            print(f"\nExtracting rules for class {target_class} (agent: {agent})...")
+            logger.info(f"\nExtracting rules for class {target_class} (agent: {agent})...")
             
             env_config = self._get_default_env_config()
             env_config.update({
@@ -1385,13 +1368,13 @@ class AnchorTrainer:
                 data_source_name = "training"
             
             if len(class_instances) == 0:
-                print(f"  No instances found for class {target_class} in {data_source_name} data")
+                logger.warning(f"  No instances found for class {target_class} in {data_source_name} data")
                 continue
             
             n_samples = min(n_instances_per_class, len(class_instances))
             sampled_indices = np.random.choice(class_instances, size=n_samples, replace=False)
             
-            print(f"  Sampling {n_samples} instances from {data_source_name} data for class {target_class}")
+            logger.info(f"  Sampling {n_samples} instances from {data_source_name} data for class {target_class}")
             
             rules_list = []
             anchors_list = []
@@ -1694,22 +1677,23 @@ class AnchorTrainer:
                 "overlap_info": overlap_info,
             }
             
-            print(f"  Extracted {len(anchors_list)} anchors")
-            print(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-            print(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
-            print(f"  Unique rules: {len(unique_rules)}")
+            logger.info(f"  Extracted {len(anchors_list)} anchors")
+            logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
+            logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+            logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
-                print(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
+                logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
             else:
-                print(f"  ✓ No overlaps with other classes")
+                logger.info(f"  ✓ No overlaps with other classes")
         
-        print("="*80)
+        logger.info("="*80)
         
         results["training_history"] = self.callback.get_training_history() if hasattr(self, 'callback') else []
         results["evaluation_history"] = self.callback.get_evaluation_history() if hasattr(self, 'callback') else []
         
         return results
     
+    # SS: This method is needed for the metrics and I forgot if i am using it in the reward function.
     def _check_class_overlaps(
         self, 
         target_class: int, 
@@ -1794,9 +1778,9 @@ class AnchorTrainer:
             for class_data in serializable_results.get("per_class_results", {}).values()
         )
         
-        print(f"Rules and anchors saved to: {filepath}")
-        print(f"  Total anchors saved: {n_anchors_total}")
-        print(f"  Total rules saved: {n_rules_total}")
+        logger.info(f"Rules and anchors saved to: {filepath}")
+        logger.info(f"  Total anchors saved: {n_anchors_total}")
+        logger.info(f"  Total rules saved: {n_rules_total}")
         return filepath
     
     def _convert_to_serializable(self, obj: Any) -> Any:

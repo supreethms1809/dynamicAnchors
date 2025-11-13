@@ -9,6 +9,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trainers.device_utils import get_device
+import logging
+logger = logging.getLogger(__name__)
 
 
 class AnchorEnv(ParallelEnv):
@@ -135,6 +137,7 @@ class AnchorEnv(ParallelEnv):
         self.timestep = None
         self.max_cycles = env_config.get("max_cycles", 100)
 
+    # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
     def _normalize_data(X_std: np.ndarray, env_config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         X_min = env_config.get("X_min", None)
@@ -150,6 +153,7 @@ class AnchorEnv(ParallelEnv):
         
         return X_unit, X_min, X_range
 
+    # SS: It is used to mask the data in the box for the perturbation sampling.
     def _mask_in_box(self, agent: str) -> np.ndarray:
         if self.eval_on_test_data:
             X_eval_unit = self.X_test_unit
@@ -543,7 +547,7 @@ class AnchorEnv(ParallelEnv):
                      anchor_drift_penalty - 
                      js_penalty -
                      inter_class_overlap_penalty +
-                     shared_reward)  # Shared reward encourages cooperative behavior
+                     shared_reward)
             
             if not np.isfinite(reward):
                 reward = 0.0
@@ -924,7 +928,9 @@ class AnchorEnv(ParallelEnv):
     def close(self):
         pass
 
-
+# main function to test the environment compatibility with PettingZoo. 
+# The AnchorEnv is inherited from the ParallelEnv class in PettingZoo.
+# This is needed for the environment to be compatible with BenchMARL.
 def main():
     np.random.seed(42)
     torch.manual_seed(42)

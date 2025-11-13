@@ -14,7 +14,9 @@ from benchmarl.utils import DEVICE_TYPING
 
 import sys
 import os
-# Add BenchMARL directory to path to import AnchorEnv
+import logging
+logger = logging.getLogger(__name__)
+
 benchmarl_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, benchmarl_dir)
 from environment import AnchorEnv
@@ -30,18 +32,14 @@ class AnchorTaskClass(TaskClass):
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
         
-        # Extract max_cycles from top-level config (it's also needed for max_steps() method)
-        # We keep it in self.config for max_steps(), but also need it in env_config for the environment
+        # SS: Track where this max_cycles is set. The reading from yaml is not getting passed to the environment.
+        # Below code needs fixing.
         max_cycles = config.get("max_cycles", 100)
-        
-        # Remove max_cycles from top-level config (it shouldn't be passed directly to AnchorEnv)
-        # But ensure it's in env_config so the environment can access it
+
         env_config = {k: v for k, v in config.items() if k != "max_cycles"}
         
-        # Ensure env_config dict exists and add max_cycles to it (merge with existing env_config if present)
         if "env_config" not in env_config:
             env_config["env_config"] = {}
-        # Merge max_cycles into existing env_config (don't overwrite the whole dict)
         if not isinstance(env_config["env_config"], dict):
             env_config["env_config"] = {}
         env_config["env_config"]["max_cycles"] = max_cycles
@@ -55,7 +53,7 @@ class AnchorTaskClass(TaskClass):
                 categorical_actions=False,
                 seed=seed,
                 device=device,
-                use_mask=True,  # Required to handle dead agents during rollouts
+                use_mask=True,
             )
         
         return _make_env
@@ -120,7 +118,8 @@ class AnchorTask(Task):
     def associated_class():
         return AnchorTaskClass
 
-
+# SS: This is the callback that is used to collect the metrics and the anchor data.
+# Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
     def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False):
@@ -212,7 +211,7 @@ class AnchorMetricsCallback(Callback):
                     episode_detail["total_reward"] = safe_get("total_reward", 0.0)
                     
                     # Extract final observation (contains bounds)
-                    # Try multiple possible observation key structures
+                    # SS: This is very messy. We need to fix this. (its messy but it works - change later)
                     obs = None
                     obs_keys_to_try = [
                         obs_key,  # ("next", group, "observation")
@@ -297,6 +296,7 @@ class AnchorMetricsCallback(Callback):
                         aggregated[key] = sum(values) / len(values)
                 
                 # Try to log to wandb, but handle case where run is finished
+                # SS: This is not working right now.
                 try:
                     self.experiment.logger.log(
                         aggregated,
@@ -305,7 +305,7 @@ class AnchorMetricsCallback(Callback):
                 except Exception as e:
                     # Handle wandb run finished error gracefully
                     if "wandb" in str(type(e)).lower() or "finished" in str(e).lower():
-                        print(f"Warning: Could not log to wandb (run may be finished): {e}")
+                        logger.warning(f"Warning: Could not log to wandb (run may be finished): {e}")
                         # Still save to file even if wandb logging fails
                     else:
                         # Re-raise if it's a different error
@@ -318,6 +318,7 @@ class AnchorMetricsCallback(Callback):
                 
                 self.training_metrics = []
     
+    # SS: This function is way too messy. We need to fix this. Its not working right now.
     def on_evaluation_end(self, rollouts: List[TensorDictBase]):
         if not self.log_evaluation_metrics:
             return
@@ -330,19 +331,20 @@ class AnchorMetricsCallback(Callback):
             # Initialize if not exists, otherwise keep existing data (append mode)
             if not hasattr(self, 'evaluation_anchor_data'):
                 self.evaluation_anchor_data = []
+
+        # SS: REMOVE THIS DEBUG LATER
+        # # Debug: check if rollouts is empty
+        # if not rollouts:
+        #     logger.warning("Warning: on_evaluation_end received empty rollouts list")
+        #     logger.warning(f"  Callback collect_anchor_data={self.collect_anchor_data}")
+        #     logger.warning(f"  Experiment group_map: {getattr(self.experiment, 'group_map', 'N/A')}")
+        #     return
         
-        # Debug: check if rollouts is empty
-        if not rollouts:
-            print("Warning: on_evaluation_end received empty rollouts list")
-            print(f"  Callback collect_anchor_data={self.collect_anchor_data}")
-            print(f"  Experiment group_map: {getattr(self.experiment, 'group_map', 'N/A')}")
-            return
-        
-        print(f"Debug: on_evaluation_end received {len(rollouts)} rollouts")
-        if rollouts:
-            print(f"  First rollout type: {type(rollouts[0])}")
-            if hasattr(rollouts[0], 'keys'):
-                print(f"  First rollout keys: {list(rollouts[0].keys())}")
+        # logger.info(f"Debug: on_evaluation_end received {len(rollouts)} rollouts")
+        # if rollouts:
+        #     logger.info(f"  First rollout type: {type(rollouts[0])}")
+        #     if hasattr(rollouts[0], 'keys'):
+        #         logger.info(f"  First rollout keys: {list(rollouts[0].keys())}")
         
         for rollout in rollouts:
             n_episodes += 1
@@ -523,7 +525,7 @@ class AnchorMetricsCallback(Callback):
             
             if self.collect_anchor_data and episode_data:
                 self.evaluation_anchor_data.append(episode_data)
-                print(f"  Collected anchor data for episode {n_episodes}: {list(episode_data.keys())}")
+                logger.info(f"  Collected anchor data for episode {n_episodes}: {list(episode_data.keys())}")
         
         if all_metrics:
             aggregated = {}
@@ -545,7 +547,7 @@ class AnchorMetricsCallback(Callback):
             except Exception as e:
                 # Handle wandb run finished error gracefully
                 if "wandb" in str(type(e)).lower() or "finished" in str(e).lower():
-                    print(f"Warning: Could not log to wandb (run may be finished): {e}")
+                    logger.warning(f"Warning: Could not log to wandb (run may be finished): {e}")
                     # Still save to file even if wandb logging fails
                 else:
                     # Re-raise if it's a different error
@@ -559,7 +561,7 @@ class AnchorMetricsCallback(Callback):
             precision_key = [k for k in aggregated.keys() if "precision" in k and "mean" in k and "evaluation" in k]
             coverage_key = [k for k in aggregated.keys() if "coverage" in k and "mean" in k and "evaluation" in k]
             if precision_key and coverage_key:
-                print(
+                logger.info(
                     f"Evaluation - Precision: {aggregated[precision_key[0]]:.4f}, "
                     f"Coverage: {aggregated[coverage_key[0]]:.4f} "
                     f"(n={n_episodes})"

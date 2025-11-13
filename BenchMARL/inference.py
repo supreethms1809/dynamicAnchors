@@ -20,6 +20,11 @@ from typing import Dict, Any, List, Optional
 import json
 from tensordict import TensorDict
 
+import logging
+from logging import INFO, WARNING, ERROR, CRITICAL
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 
 def load_policy_model(
     policy_path: str,
@@ -85,7 +90,7 @@ def load_policy_model(
             raise ValueError(f"Could not extract MLP parameters from nested structure in {policy_path}. Found nested keys: {nested_keys[:5]}")
         
         state_dict = mlp_state_dict
-        print(f"  Extracted MLP parameters from nested structure ({len(state_dict)} parameters)")
+        logger.info(f"  Extracted MLP parameters from nested structure ({len(state_dict)} parameters)")
     
     # Infer input dimension from first layer weight shape
     first_layer_key = None
@@ -111,7 +116,7 @@ def load_policy_model(
     if output_dim is None:
         raise ValueError(f"Could not infer output dimension from {policy_path}")
     
-    print(f"  Inferred model dimensions: input={input_dim}, output={output_dim}")
+    logger.info(f"  Inferred model dimensions: input={input_dim}, output={output_dim}")
     
     # Create MLP model using BenchMARL's MLP config
     # We need to create a simple MLP that matches the saved architecture
@@ -388,12 +393,12 @@ def extract_rules_from_policies(
     Returns:
         Dictionary containing extracted rules and evaluation data
     """
-    print("="*80)
-    print("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
-    print("="*80)
-    print(f"Experiment directory: {experiment_dir}")
-    print(f"Dataset: {dataset_name}")
-    print("="*80)
+    logger.info("="*80)
+    logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
+    logger.info("="*80)
+    logger.info(f"Experiment directory: {experiment_dir}")
+    logger.info(f"Dataset: {dataset_name}")
+    logger.info("="*80)
     
     # Find individual_models directory
     individual_models_dir = os.path.join(experiment_dir, "individual_models")
@@ -424,9 +429,9 @@ def extract_rules_from_policies(
             f"Expected files like: policy_<group>.pth"
         )
     
-    print(f"\nFound {len(policy_files)} policy model(s):")
+    logger.info(f"\nFound {len(policy_files)} policy model(s):")
     for group in sorted(policy_files.keys()):
-        print(f"  - {group}: {policy_files[group]}")
+        logger.info(f"  - {group}: {policy_files[group]}")
     
     # Load dataset
     dataset_loader = TabularDatasetLoader(
@@ -441,14 +446,14 @@ def extract_rules_from_policies(
     # Load classifier from experiment directory
     classifier_path = os.path.join(experiment_dir, "classifier.pth")
     if os.path.exists(classifier_path):
-        print(f"\nLoading classifier from: {classifier_path}")
+        logger.info(f"\nLoading classifier from: {classifier_path}")
         classifier = dataset_loader.load_classifier(
             filepath=classifier_path,
             classifier_type="dnn",
             device=device
         )
         dataset_loader.classifier = classifier
-        print("Classifier loaded successfully")
+        logger.info("Classifier loaded successfully")
     else:
         raise ValueError(
             f"Classifier not found at {classifier_path}\n"
@@ -462,14 +467,14 @@ def extract_rules_from_policies(
     n_features = len(feature_names)
     
     # Load all policy models and extract individual agent policies
-    print(f"\nLoading policy models...")
+    logger.info(f"\nLoading policy models...")
     policies = {}
     agent_policies = {}  # Individual agent policies extracted from combined policy
     
     for group in sorted(policy_files.keys()):
         metadata_path = metadata_files.get(group)
         if metadata_path is None:
-            print(f"  ⚠ Warning: No metadata found for {group}, using defaults")
+            logger.warning(f"  ⚠ Warning: No metadata found for {group}, using defaults")
         
         # Load the combined policy
         combined_policy = load_policy_model(
@@ -479,7 +484,7 @@ def extract_rules_from_policies(
             device=device
         )
         policies[group] = combined_policy
-        print(f"  ✓ Loaded combined policy for {group}")
+        logger.info(f"  ✓ Loaded combined policy for {group}")
         
         # Try to extract individual agent policies from the combined policy
         # Check if the state_dict has agent-specific keys (e.g., "0.mlp.params..." for agent_0)
@@ -487,8 +492,8 @@ def extract_rules_from_policies(
         raw_state_dict = torch.load(state_dict_path, map_location=device)
         
         # Debug: Print some keys to understand structure
-        print(f"  Debug: Total keys in state_dict: {len(raw_state_dict.keys())}")
-        print(f"  Debug: Sample state_dict keys (first 20): {list(raw_state_dict.keys())[:20]}")
+        logger.info(f"  Debug: Total keys in state_dict: {len(raw_state_dict.keys())}")
+        logger.info(f"  Debug: Sample state_dict keys (first 20): {list(raw_state_dict.keys())[:20]}")
         
         # Check for agent-specific keys in the raw state_dict
         # In MADDPG, the actor module might have separate networks for each agent
@@ -555,16 +560,16 @@ def extract_rules_from_policies(
         # If no agent indices found in raw state_dict, the policy might be shared
         # In that case, we'll use the same policy for all agents
         if not agent_indices:
-            print(f"  Debug: No agent-specific indices found in raw state_dict")
-            print(f"  Debug: This might be a shared policy for all agents")
+            logger.info(f"  Debug: No agent-specific indices found in raw state_dict")
+            logger.info(f"  Debug: This might be a shared policy for all agents")
         else:
-            print(f"  Debug: Found agent indices: {sorted(agent_indices)}")
+            logger.info(f"  Debug: Found agent indices: {sorted(agent_indices)}")
         
         # Use raw_state_dict for agent extraction
         state_dict = raw_state_dict
         
         if agent_indices:
-            print(f"  Found {len(agent_indices)} agents in combined policy: {sorted(agent_indices)}")
+            logger.info(f"  Found {len(agent_indices)} agents in combined policy: {sorted(agent_indices)}")
             
             # Extract individual agent policies
             from benchmarl.models.mlp import MlpConfig
@@ -629,9 +634,9 @@ def extract_rules_from_policies(
                                 if new_key and not new_key.startswith('__'):
                                     agent_state_dict[new_key] = value
                 
-                print(f"  Debug: Found {len(agent_keys_found)} keys for {agent_name}")
+                logger.info(f"  Debug: Found {len(agent_keys_found)} keys for {agent_name}")
                 if agent_keys_found:
-                    print(f"  Debug: Sample keys for {agent_name}: {agent_keys_found[:5]}")
+                    logger.info(f"  Debug: Sample keys for {agent_name}: {agent_keys_found[:5]}")
                 
                 if agent_state_dict:
                     # Infer dimensions from agent state_dict
@@ -665,17 +670,17 @@ def extract_rules_from_policies(
                             agent_mlp.load_state_dict(agent_state_dict)
                             agent_mlp.eval()
                             agent_policies[agent_name] = agent_mlp
-                            print(f"  ✓ Extracted policy for {agent_name}")
+                            logger.info(f"  ✓ Extracted policy for {agent_name}")
                         else:
-                            print(f"  ⚠ Could not infer output dimension for {agent_name}")
+                            logger.warning(f"  ⚠ Could not infer output dimension for {agent_name}")
                     else:
-                        print(f"  ⚠ Could not find weight parameters for {agent_name}")
+                        logger.warning(f"  ⚠ Could not find weight parameters for {agent_name}")
                 else:
-                    print(f"  ⚠ Could not extract state_dict for {agent_name}")
+                    logger.warning(f"  ⚠ Could not extract state_dict for {agent_name}")
         else:
             # No agent-specific keys found, policy might be shared
             # We'll handle this after we know the target_classes
-            print(f"  Debug: No agent-specific indices found, will use shared policy")
+            logger.info(f"  Debug: No agent-specific indices found, will use shared policy")
     
     # Check if we have policies for all expected agents
     # Expected agents are agent_0, agent_1, ..., agent_{n_classes-1}
@@ -683,9 +688,9 @@ def extract_rules_from_policies(
     missing_agents = [name for name in expected_agent_names if name not in agent_policies]
     
     if missing_agents:
-        print(f"\n  ⚠ Warning: Missing policies for agents: {missing_agents}")
-        print(f"  Found policies for: {list(agent_policies.keys())}")
-        print(f"  Expected policies for: {expected_agent_names}")
+        logger.warning(f"\n  ⚠ Warning: Missing policies for agents: {missing_agents}")
+        logger.info(f"  Found policies for: {list(agent_policies.keys())}")
+        logger.info(f"  Expected policies for: {expected_agent_names}")
         
         # If we have a combined policy but missing some agents, try to use the combined policy
         # for the missing agents (assuming shared policy)
@@ -697,12 +702,12 @@ def extract_rules_from_policies(
                 break
         
         if combined_policy is not None:
-            print(f"  Using combined policy for missing agents (assuming shared policy)")
+            logger.info(f"  Using combined policy for missing agents (assuming shared policy)")
             for missing_agent in missing_agents:
                 agent_policies[missing_agent] = combined_policy
-                print(f"  ✓ Assigned combined policy to {missing_agent}")
+                logger.info(f"  ✓ Assigned combined policy to {missing_agent}")
         else:
-            print(f"  ⚠ Error: No combined policy available to assign to missing agents")
+            logger.warning(f"  ⚠ Error: No combined policy available to assign to missing agents")
     
     # Create environment config (needed before we can determine if policy is shared)
     from anchor_trainer import AnchorTrainer
@@ -746,7 +751,7 @@ def extract_rules_from_policies(
     # If no agent-specific policies were extracted, or if we only found some agents,
     # use shared policy for missing agents
     if not agent_policies or len(agent_policies) < len(target_classes):
-        print(f"  Creating policies for all target classes...")
+        logger.info(f"  Creating policies for all target classes...")
         for group in sorted(policy_files.keys()):
             combined_policy = policies[group]
             for cls in target_classes:
@@ -754,20 +759,20 @@ def extract_rules_from_policies(
                 # Only add if not already extracted
                 if agent_name not in agent_policies:
                     agent_policies[agent_name] = combined_policy
-                    print(f"  ✓ Using shared policy for {agent_name}")
+                    logger.info(f"  ✓ Using shared policy for {agent_name}")
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
-        print(f"\nUsing individual agent policies: {list(agent_policies.keys())}")
+        logger.info(f"\nUsing individual agent policies: {list(agent_policies.keys())}")
         # Update policies dict to use agent names
         policies = agent_policies
     else:
-        print(f"\nUsing group policies: {list(policies.keys())}")
+        logger.info(f"\nUsing group policies: {list(policies.keys())}")
     
-    print(f"\nExtracting rules for classes: {target_classes}")
-    print(f"  Instances per class: {n_instances_per_class}")
-    print(f"  Steps per episode: {steps_per_episode}")
-    print(f"  Max features in rule: {max_features_in_rule}")
+    logger.info(f"\nExtracting rules for classes: {target_classes}")
+    logger.info(f"  Instances per class: {n_instances_per_class}")
+    logger.info(f"  Steps per episode: {steps_per_episode}")
+    logger.info(f"  Max features in rule: {max_features_in_rule}")
     
     # Run rollouts and extract rules
     results = {
@@ -808,9 +813,9 @@ def extract_rules_from_policies(
         target_class = agent_to_class.get(agent_name, target_classes[0] if target_classes else 0)
         class_key = f"class_{target_class}"
         
-        print(f"\n{'='*80}")
-        print(f"Processing class {target_class} (agent: {agent_name})")
-        print(f"{'='*80}")
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Processing class {target_class} (agent: {agent_name})")
+        logger.info(f"{'='*80}")
         
         # Run multiple rollouts
         anchors_list = []
@@ -940,12 +945,12 @@ def extract_rules_from_policies(
             "anchors": anchors_list,
         }
         
-        print(f"  Processed {len(anchors_list)} episodes")
-        print(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-        print(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
-        print(f"  Unique rules: {len(unique_rules)}")
+        logger.info(f"  Processed {len(anchors_list)} episodes")
+        logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
+        logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+        logger.info(f"  Unique rules: {len(unique_rules)}")
     
-    print("\n" + "="*80)
+    logger.info("\n" + "="*80)
     
     return results
 
@@ -1080,12 +1085,12 @@ def main():
         for class_data in serializable_results.get("per_class_results", {}).values()
     )
     
-    print(f"\n{'='*80}")
-    print(f"Rule extraction complete!")
-    print(f"Results saved to: {rules_filepath}")
-    print(f"  Total anchors saved: {n_anchors_total}")
-    print(f"  Total rules saved: {n_rules_total}")
-    print(f"{'='*80}")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Rule extraction complete!")
+    logger.info(f"Results saved to: {rules_filepath}")
+    logger.info(f"  Total anchors saved: {n_anchors_total}")
+    logger.info(f"  Total rules saved: {n_rules_total}")
+    logger.info(f"{'='*80}")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,33 @@
+"""
+Multi-Agent Dynamic Anchors Training Pipeline
+
+This script is used to train the multi-agent dynamic anchors model.
+
+Usage:
+python driver.py --dataset <dataset_name> --algorithm <algorithm_name> --seed <seed>
+
+Example:
+python driver.py --dataset breast_cancer --algorithm maddpg --seed 42
+
+We use the BenchMARL library to train the multi-agent dynamic anchors model.
+Training pipeline supports the following datasets and algorithms:
+Dataset: breast_cancer, wine, iris, synthetic, moons, circles, covtype, housing
+Algorithm: maddpg, masac
+Classifier: dnn, random_forest, gradient_boosting
+(Only supports continuous action algorithms)
+"""
 from tabular_datasets import TabularDatasetLoader
 from anchor_trainer import AnchorTrainer
 import argparse
 import os
 
+# Set up logging
+import logging
+from logging import INFO, WARNING, ERROR, CRITICAL
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+# main function
 def main():
     available_algorithms = list(AnchorTrainer.ALGORITHM_MAP.keys())
     
@@ -163,11 +187,10 @@ def main():
     
     dataset_loader.preprocess_data()
     
-    # Skip classifier training if loading from checkpoint (will load from checkpoint instead)
+    # Skip classifier training if loading from checkpoint
     if args.load_checkpoint:
-        # When loading from checkpoint, we'll load the classifier from the checkpoint directory
-        # Skip training here - it will be loaded later
-        print("\nSkipping classifier training (will load from checkpoint)")
+        # When loading from checkpoint, load the classifier from the checkpoint directory
+        logger.info("\nSkipping classifier training (will load from checkpoint)")
     elif not args.skip_classifier:
         classifier = dataset_loader.create_classifier(
             classifier_type=args.classifier_type,
@@ -185,22 +208,21 @@ def main():
             device=args.device
         )
         
-        print(f"\nClassifier trained with test accuracy: {test_acc:.4f}")
-        
-        # Save classifier for later use in inference
-        # We'll save it in the output directory (will be moved to checkpoint folder after training)
+        logger.info(f"\nClassifier trained with test accuracy: {test_acc:.4f}")
+
+        # Save classifier for later use in inference and this will be moved to BenchMARL checkpoint folder after training
         classifier_output_dir = f"{args.output_dir}training/"
         os.makedirs(classifier_output_dir, exist_ok=True)
         classifier_path = os.path.join(classifier_output_dir, "classifier.pth")
         dataset_loader.save_classifier(trained_classifier, classifier_path)
-        print(f"Classifier saved to: {classifier_path}")
+        logger.info(f"Classifier saved to: {classifier_path}")
     else:
         if dataset_loader.classifier is None:
             raise ValueError(
                 "Classifier not found. Either train a classifier first "
                 "or remove --skip_classifier flag."
             )
-        print("\nUsing existing classifier from dataset_loader")
+        logger.info("\nUsing existing classifier from dataset_loader")
     
     trainer = AnchorTrainer(
         dataset_loader=dataset_loader,
@@ -214,34 +236,33 @@ def main():
     
     if args.load_checkpoint:
         # Load existing experiment instead of training
-        print(f"\n{'='*80}")
-        print("RELOADING EXPERIMENT (Skipping training)")
-        print(f"{'='*80}")
-        print(f"Loading experiment from: {args.load_checkpoint}")
+        logger.info(f"\n{'='*80}")
+        logger.info("RELOADING EXPERIMENT (Skipping training)")
+        logger.info(f"{'='*80}")
+        logger.info(f"Loading experiment from: {args.load_checkpoint}")
         
         # Load classifier from checkpoint directory if available
         experiment_dir = args.load_checkpoint if os.path.isdir(args.load_checkpoint) else os.path.dirname(args.load_checkpoint)
         classifier_path = os.path.join(experiment_dir, "classifier.pth")
         if os.path.exists(classifier_path):
-            print(f"Loading classifier from: {classifier_path}")
+            logger.info(f"Loading classifier from: {classifier_path}")
             classifier = dataset_loader.load_classifier(
                 filepath=classifier_path,
                 classifier_type=args.classifier_type,
                 device=args.device
             )
             dataset_loader.classifier = classifier
-            print("Classifier loaded successfully")
+            logger.info("Classifier loaded successfully")
         else:
-            print(f"Warning: Classifier not found at {classifier_path}")
+            logger.warning(f"Warning: Classifier not found at {classifier_path}")
             if dataset_loader.classifier is None:
                 raise ValueError(
                     "Classifier not found in experiment directory and not available in dataset_loader. "
                     "Please train a classifier first or ensure it's saved in the experiment directory."
                 )
-            print("Using existing classifier from dataset_loader")
+            logger.info("Using existing classifier from dataset_loader")
         
-        # Reload the entire experiment using BenchMARL's official method
-        # Can pass either directory or checkpoint file - reload_experiment will find the checkpoint
+        # Reload the entire experiment using BenchMARL's official method. pass either directory
         trainer.reload_experiment(experiment_dir)
         
         # Use the experiment directory as the checkpoint path
@@ -260,8 +281,8 @@ def main():
         
         # Get BenchMARL checkpoint path (BenchMARL saves checkpoints automatically)
         checkpoint_path = trainer.get_checkpoint_path()
-        print(f"\nBenchMARL checkpoint location: {checkpoint_path}")
-        print(f"  Use this path to load checkpoints later for evaluation or continued training")
+        logger.info(f"\nBenchMARL checkpoint location: {checkpoint_path}")
+        logger.info(f"  Use this path to load checkpoints later for evaluation or continued training")
         
         # Copy classifier to checkpoint directory for easy access during inference
         if hasattr(dataset_loader, 'classifier') and dataset_loader.classifier is not None:
@@ -270,12 +291,12 @@ def main():
             classifier_dest = os.path.join(checkpoint_path, "classifier.pth")
             if os.path.exists(classifier_source):
                 shutil.copy2(classifier_source, classifier_dest)
-                print(f"  Classifier copied to checkpoint directory: {classifier_dest}")
+                logger.info(f"  Classifier copied to checkpoint directory: {classifier_dest}")
     
     # Run BenchMARL evaluation (for metrics only)
     eval_results = trainer.evaluate()
-    print(f"\nEvaluation complete")
-    print(f"  Total frames: {eval_results['total_frames']}")
+    logger.info(f"\nEvaluation complete")
+    logger.info(f"  Total frames: {eval_results['total_frames']}")
     
     # Save evaluation anchor data to JSON file
     evaluation_anchor_data = eval_results.get("evaluation_anchor_data", [])
@@ -317,33 +338,33 @@ def main():
                 }
             }, f, indent=2, ensure_ascii=False)
         
-        print(f"\n✓ Evaluation anchor data saved to: {json_path}")
-        print(f"  Total episodes: {len(evaluation_anchor_data)}")
+        logger.info(f"\n✓ Evaluation anchor data saved to: {json_path}")
+        logger.info(f"  Total episodes: {len(evaluation_anchor_data)}")
         
-        # Print summary of collected data
+        # Log summary of collected data
         if len(evaluation_anchor_data) > 0:
             first_episode = evaluation_anchor_data[0]
-            print(f"\n  Data structure:")
-            print(f"    Episodes: {len(evaluation_anchor_data)}")
+            logger.info(f"\n  Data structure:")
+            logger.info(f"    Episodes: {len(evaluation_anchor_data)}")
             if isinstance(first_episode, dict):
-                print(f"    Groups per episode: {list(first_episode.keys())}")
+                logger.info(f"    Groups per episode: {list(first_episode.keys())}")
                 for group, group_data in first_episode.items():
                     if isinstance(group_data, dict):
-                        print(f"      Group '{group}' contains: {list(group_data.keys())}")
+                        logger.info(f"      Group '{group}' contains: {list(group_data.keys())}")
                         if "precision" in group_data:
-                            print(f"        Precision: {group_data.get('precision', 'N/A')}")
+                            logger.info(f"        Precision: {group_data.get('precision', 'N/A')}")
                         if "coverage" in group_data:
-                            print(f"        Coverage: {group_data.get('coverage', 'N/A')}")
+                            logger.info(f"        Coverage: {group_data.get('coverage', 'N/A')}")
                         if "final_observation" in group_data:
                             obs_len = len(group_data.get("final_observation", []))
-                            print(f"        Final observation length: {obs_len}")
+                            logger.info(f"        Final observation length: {obs_len}")
     else:
-        print(f"\n⚠ No evaluation anchor data collected")
+        logger.warning(f"\n⚠ No evaluation anchor data collected")
     
     # Extract and save individual models for easier standalone inference
-    print(f"\n{'='*80}")
-    print("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
-    print("="*80)
+    logger.info(f"\n{'='*80}")
+    logger.info("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
+    logger.info("="*80)
     try:
         saved_models = trainer.extract_and_save_individual_models(
             save_policies=True,
@@ -351,33 +372,33 @@ def main():
         )
         # Models are saved in the experiment's run log directory
         models_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models")
-        print(f"\n✓ Individual models extracted successfully!")
-        print(f"  Models saved to: {models_dir}")
+        logger.info(f"\n✓ Individual models extracted successfully!")
+        logger.info(f"  Models saved to: {models_dir}")
     except Exception as e:
-        print(f"\n⚠ Warning: Could not extract individual models: {e}")
-        print("  You can still use the full BenchMARL checkpoint for inference")
+        logger.warning(f"\n⚠ Warning: Could not extract individual models: {e}")
+        logger.info("  You can still use the full BenchMARL checkpoint for inference")
     
     # Note: Rule extraction should be done separately using inference.py
-    print(f"\n{'='*80}")
+    logger.info(f"\n{'='*80}")
     if args.load_checkpoint:
-        print("EVALUATION COMPLETE!")
+        logger.info("EVALUATION COMPLETE!")
     else:
-        print("TRAINING COMPLETE!")
-    print(f"{'='*80}")
+        logger.info("TRAINING COMPLETE!")
+    logger.info(f"{'='*80}")
     
     if not args.load_checkpoint:
-        print(f"\nTo extract rules, run:")
-        print(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")
-        print(f"\nOr to re-run evaluation only, use:")
-        print(f"  python driver.py --load_checkpoint {checkpoint_path} --dataset {args.dataset} --algorithm {args.algorithm}")
-        print(f"\nThis will:")
-        print(f"  1. Load the trained model from checkpoint")
-        print(f"  2. Run evaluation")
-        print(f"  3. Extract and save individual models")
+        logger.info(f"\nTo extract rules, run:")
+        logger.info(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")
+        logger.info(f"\nOr to re-run evaluation only, use:")
+        logger.info(f"  python driver.py --load_checkpoint {checkpoint_path} --dataset {args.dataset} --algorithm {args.algorithm}")
+        logger.info(f"\nThis will:")
+        logger.info(f"  1. Load the trained model from checkpoint")
+        logger.info(f"  2. Run evaluation")
+        logger.info(f"  3. Extract and save individual models")
     else:
-        print(f"\nTo extract rules, run:")
-        print(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")
-    print(f"{'='*80}")
+        logger.info(f"\nTo extract rules, run:")
+        logger.info(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")
+    logger.info(f"{'='*80}")
 
 
 if __name__ == "__main__":
