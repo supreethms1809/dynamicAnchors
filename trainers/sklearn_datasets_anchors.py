@@ -320,7 +320,7 @@ def get_output_directory(
     return output_dir
 
 
-def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, continuous_algorithm: str = "ddpg", classifier_type: str = "dnn"):
+def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, continuous_algorithm: str = "ddpg", classifier_type: str = "dnn", device: str = "auto"):
     """
     Main function: Complete pipeline for sklearn datasets.
     
@@ -397,7 +397,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         # STEP 2: Set Device (Standardized - Set Once at Beginning)
         # ==========================================================================
         from trainers.device_utils import get_device_pair
-        device, device_str = get_device_pair("auto")  # Can be changed to "cuda" or "mps" or "cpu"
+        device_obj, device_str = get_device_pair(device)  # Can be "auto", "cuda", "mps", or "cpu"
+        device = device_obj  # Use device object for PyTorch operations
         print(f"\nUsing device: {device} ({device_str})")
         
         n_features = X_train.shape[1]
@@ -945,6 +946,13 @@ Datasets:
         choices=["dnn", "random_forest", "gradient_boosting"],
         help="Classifier type: 'dnn' (default), 'random_forest', or 'gradient_boosting'"
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device to use: 'auto' (default, auto-detect), 'cpu', 'cuda', or 'mps'"
+    )
     
     args = parser.parse_args()
     main(
@@ -953,6 +961,7 @@ Datasets:
         joint=args.joint,
         use_continuous_actions=args.use_continuous_actions,
         continuous_algorithm=args.continuous_algorithm,
-        classifier_type=args.classifier_type
+        classifier_type=args.classifier_type,
+        device=args.device
     )
 

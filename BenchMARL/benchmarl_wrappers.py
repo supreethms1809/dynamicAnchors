@@ -55,6 +55,7 @@ class AnchorTaskClass(TaskClass):
                 categorical_actions=False,
                 seed=seed,
                 device=device,
+                use_mask=True,  # Required to handle dead agents during rollouts
             )
         
         return _make_env
@@ -133,6 +134,8 @@ class AnchorMetricsCallback(Callback):
         self.evaluation_history = []
         # Store anchor data collected during evaluation
         self.evaluation_anchor_data = []  # List of episodes, each episode contains agent data
+        # Store training episode details (bounds, precision, coverage per episode)
+        self.training_episode_details = []  # List of episode details from training batches
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -167,9 +170,13 @@ class AnchorMetricsCallback(Callback):
             return
         
         all_metrics = {}
+        episode_details = {}
         
         for group in self.experiment.group_map.keys():
             group_key = ("next", group, "info")
+            obs_key = ("next", group, "observation")
+            
+            # Extract info metrics
             if group_key in batch.keys(include_nested=True):
                 info = batch[group_key]
                 
@@ -180,9 +187,107 @@ class AnchorMetricsCallback(Callback):
                         prefix=f"training/{group}/"
                     )
                     all_metrics.update(group_metrics)
+                    
+                    # Extract final state information (bounds, precision, coverage)
+                    episode_detail = {}
+                    
+                    # Get precision and coverage from info
+                    def safe_get(key, default=0.0):
+                        try:
+                            if hasattr(final_info, 'get'):
+                                val = final_info.get(key, default)
+                            elif hasattr(final_info, 'keys') and key in final_info.keys():
+                                val = final_info[key]
+                            else:
+                                val = getattr(final_info, key, default)
+                            
+                            if isinstance(val, torch.Tensor):
+                                return float(val.item() if val.numel() == 1 else val[-1].item())
+                            return float(val)
+                        except:
+                            return default
+                    
+                    episode_detail["precision"] = safe_get("precision", 0.0)
+                    episode_detail["coverage"] = safe_get("coverage", 0.0)
+                    episode_detail["total_reward"] = safe_get("total_reward", 0.0)
+                    
+                    # Extract final observation (contains bounds)
+                    # Try multiple possible observation key structures
+                    obs = None
+                    obs_keys_to_try = [
+                        obs_key,  # ("next", group, "observation")
+                        (group, "observation"),  # (group, "observation")
+                        ("next", group, "observation"),  # Explicit nested
+                    ]
+                    
+                    for key in obs_keys_to_try:
+                        try:
+                            if key in batch.keys(include_nested=True):
+                                obs = batch[key]
+                                break
+                        except (KeyError, TypeError):
+                            # Try accessing directly if nested key check fails
+                            try:
+                                if isinstance(key, tuple) and len(key) == 3:
+                                    # Try accessing as batch["next"][group]["observation"]
+                                    if "next" in batch.keys() and group in batch["next"].keys():
+                                        if "observation" in batch["next"][group].keys():
+                                            obs = batch["next"][group]["observation"]
+                                            break
+                                elif isinstance(key, tuple) and len(key) == 2:
+                                    # Try accessing as batch[group]["observation"]
+                                    if group in batch.keys() and "observation" in batch[group].keys():
+                                        obs = batch[group]["observation"]
+                                        break
+                            except (KeyError, TypeError, AttributeError):
+                                continue
+                    
+                    if obs is not None and hasattr(obs, 'shape') and obs.shape[0] > 0:
+                        final_obs = obs[-1]
+                        
+                        # Convert to numpy if tensor
+                        if isinstance(final_obs, torch.Tensor):
+                            final_obs = final_obs.cpu().numpy()
+                        elif not isinstance(final_obs, np.ndarray):
+                            final_obs = np.array(final_obs)
+                        
+                        # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
+                        # We need to infer n_features from the observation length
+                        obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
+                        if obs_len >= 4:  # At least 2 features + precision + coverage
+                            # n_features = (obs_len - 2) / 2
+                            n_features = (obs_len - 2) // 2
+                            
+                            if n_features > 0:
+                                lower_bounds = final_obs[:n_features]
+                                upper_bounds = final_obs[n_features:2*n_features]
+                                
+                                episode_detail["lower_bounds"] = lower_bounds.tolist() if hasattr(lower_bounds, 'tolist') else list(lower_bounds)
+                                episode_detail["upper_bounds"] = upper_bounds.tolist() if hasattr(upper_bounds, 'tolist') else list(upper_bounds)
+                                
+                                # Calculate box metrics
+                                box_widths = upper_bounds - lower_bounds
+                                episode_detail["box_widths"] = box_widths.tolist() if hasattr(box_widths, 'tolist') else list(box_widths)
+                                episode_detail["box_volume"] = float(np.prod(np.maximum(box_widths, 1e-9)))
+                                
+                                # Add bounds summary metrics to aggregated metrics
+                                all_metrics[f"training/{group}/box_volume"] = episode_detail["box_volume"]
+                                all_metrics[f"training/{group}/mean_box_width"] = float(np.mean(box_widths))
+                                all_metrics[f"training/{group}/min_box_width"] = float(np.min(box_widths))
+                                all_metrics[f"training/{group}/max_box_width"] = float(np.max(box_widths))
+                    
+                    episode_detail["group"] = group
+                    episode_detail["step"] = self.experiment.n_iters_performed if hasattr(self.experiment, 'n_iters_performed') else None
+                    episode_detail["total_frames"] = self.experiment.total_frames if hasattr(self.experiment, 'total_frames') else None
+                    
+                    episode_details[group] = episode_detail
         
         if all_metrics:
             self.training_metrics.append(all_metrics)
+            
+            # Store episode details if available
+            if episode_details:
+                self.training_episode_details.append(episode_details.copy())
             
             if len(self.training_metrics) >= 10:
                 aggregated = {}
@@ -335,6 +440,50 @@ class AnchorMetricsCallback(Callback):
                                 all_metrics[key] = []
                             all_metrics[key].append(value)
                         
+                        # Extract bounds and box metrics from observation
+                        if group_obs is not None:
+                            try:
+                                # Get final observation (last step of episode)
+                                if hasattr(group_obs, 'shape') and group_obs.shape[0] > 0:
+                                    final_obs = group_obs[-1] if len(group_obs.shape) > 1 else group_obs
+                                else:
+                                    final_obs = group_obs
+                                
+                                # Convert to numpy if tensor
+                                if isinstance(final_obs, torch.Tensor):
+                                    final_obs = final_obs.cpu().numpy()
+                                elif not isinstance(final_obs, np.ndarray):
+                                    final_obs = np.array(final_obs)
+                                
+                                # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
+                                obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
+                                if obs_len >= 4:  # At least 2 features + precision + coverage
+                                    n_features = (obs_len - 2) // 2
+                                    
+                                    if n_features > 0:
+                                        lower_bounds = final_obs[:n_features]
+                                        upper_bounds = final_obs[n_features:2*n_features]
+                                        
+                                        # Calculate box metrics
+                                        box_widths = upper_bounds - lower_bounds
+                                        box_volume = float(np.prod(np.maximum(box_widths, 1e-9)))
+                                        
+                                        # Add box metrics to aggregated metrics for wandb logging
+                                        box_metrics = {
+                                            f"evaluation/{group}/box_volume": box_volume,
+                                            f"evaluation/{group}/mean_box_width": float(np.mean(box_widths)),
+                                            f"evaluation/{group}/min_box_width": float(np.min(box_widths)),
+                                            f"evaluation/{group}/max_box_width": float(np.max(box_widths)),
+                                        }
+                                        
+                                        for key, value in box_metrics.items():
+                                            if key not in all_metrics:
+                                                all_metrics[key] = []
+                                            all_metrics[key].append(value)
+                            except Exception as e:
+                                # If bounds extraction fails, continue without box metrics
+                                pass
+                        
                         # Collect anchor data for rule extraction
                         if self.collect_anchor_data:
                             # Extract metrics from final info
@@ -421,6 +570,10 @@ class AnchorMetricsCallback(Callback):
     
     def get_evaluation_history(self) -> List[Dict[str, Any]]:
         return self.evaluation_history.copy()
+    
+    def get_training_episode_details(self) -> List[Dict[str, Any]]:
+        """Get episode details collected during training (bounds, precision, coverage, etc.)."""
+        return self.training_episode_details.copy()
     
     def get_evaluation_anchor_data(self) -> List[Dict[str, Any]]:
         """Get anchor data collected during evaluation for rule extraction."""

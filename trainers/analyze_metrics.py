@@ -671,44 +671,52 @@ def analyze_metrics(json_path):
     print("7. CONVERGENCE ANALYSIS")
     print("-"*80)
     if has_training_history and len(history) >= 10:
-        # Last 25% of episodes
-        last_quarter = max(1, len(history) // 4)
-        last_episodes = history[-last_quarter:]
-        first_quarter = history[:last_quarter]
+        # Check if RL metrics are available in history (required for convergence analysis)
+        first_entry = history[0] if history else {}
+        has_rl_metrics = 'rl_avg_precision' in first_entry and 'rl_avg_coverage' in first_entry
         
-        # RL Precision convergence
-        last_precisions = [e['rl_avg_precision'] for e in last_episodes]
-        first_precisions = [e['rl_avg_precision'] for e in first_quarter]
-        
-        last_prec_mean = np.mean(last_precisions)
-        last_prec_std = np.std(last_precisions)
-        first_prec_mean = np.mean(first_precisions)
-        
-        print(f"\nRL Precision:")
-        print(f"  First quarter mean: {first_prec_mean:.4f}")
-        print(f"  Last quarter mean: {last_prec_mean:.4f}")
-        print(f"  Last quarter std: {last_prec_std:.4f}")
-        if last_prec_std < 0.05:
-            print(f"  → Converged (low variance in final quarter)")
+        if has_rl_metrics:
+            # Last 25% of episodes
+            last_quarter = max(1, len(history) // 4)
+            last_episodes = history[-last_quarter:]
+            first_quarter = history[:last_quarter]
+            
+            # RL Precision convergence
+            last_precisions = [e.get('rl_avg_precision', 0.0) for e in last_episodes]
+            first_precisions = [e.get('rl_avg_precision', 0.0) for e in first_quarter]
+            
+            last_prec_mean = np.mean(last_precisions)
+            last_prec_std = np.std(last_precisions)
+            first_prec_mean = np.mean(first_precisions)
+            
+            print(f"\nRL Precision:")
+            print(f"  First quarter mean: {first_prec_mean:.4f}")
+            print(f"  Last quarter mean: {last_prec_mean:.4f}")
+            print(f"  Last quarter std: {last_prec_std:.4f}")
+            if last_prec_std < 0.05:
+                print(f"  → Converged (low variance in final quarter)")
+            else:
+                print(f"  → Still varying (std={last_prec_std:.4f})")
+            
+            # RL Coverage convergence
+            last_coverages = [e.get('rl_avg_coverage', 0.0) for e in last_episodes]
+            first_coverages = [e.get('rl_avg_coverage', 0.0) for e in first_quarter]
+            
+            last_cov_mean = np.mean(last_coverages)
+            last_cov_std = np.std(last_coverages)
+            first_cov_mean = np.mean(first_coverages)
+            
+            print(f"\nRL Coverage:")
+            print(f"  First quarter mean: {first_cov_mean:.4f}")
+            print(f"  Last quarter mean: {last_cov_mean:.4f}")
+            print(f"  Last quarter std: {last_cov_std:.4f}")
+            if last_cov_std < 0.01:
+                print(f"  → Converged (low variance in final quarter)")
+            else:
+                print(f"  → Still varying (std={last_cov_std:.4f})")
         else:
-            print(f"  → Still varying (std={last_prec_std:.4f})")
-        
-        # RL Coverage convergence
-        last_coverages = [e['rl_avg_coverage'] for e in last_episodes]
-        first_coverages = [e['rl_avg_coverage'] for e in first_quarter]
-        
-        last_cov_mean = np.mean(last_coverages)
-        last_cov_std = np.std(last_coverages)
-        first_cov_mean = np.mean(first_coverages)
-        
-        print(f"\nRL Coverage:")
-        print(f"  First quarter mean: {first_cov_mean:.4f}")
-        print(f"  Last quarter mean: {last_cov_mean:.4f}")
-        print(f"  Last quarter std: {last_cov_std:.4f}")
-        if last_cov_std < 0.01:
-            print(f"  → Converged (low variance in final quarter)")
-        else:
-            print(f"  → Still varying (std={last_cov_std:.4f})")
+            print("(Convergence analysis not available - RL metrics not found in training history)")
+            print("  → This is expected for post-hoc training where RL history may not be tracked")
     else:
         print("(Convergence analysis not available - requires training history)")
     
@@ -946,22 +954,32 @@ def analyze_metrics(json_path):
     # Plot 7: Convergence analysis (last quarter) - only for joint training
     ax7 = plt.subplot(3, 4, 7)
     if has_training_history and len(history) >= 10:
-        last_quarter = max(1, len(history) // 4)
-        last_episodes_data = history[-last_quarter:]
-        last_episodes = [e.get('episode', i) for i, e in enumerate(last_episodes_data)]
-        last_precisions = [e.get('rl_avg_precision', 0.0) for e in last_episodes_data]
-        last_coverages = [e.get('rl_avg_coverage', 0.0) for e in last_episodes_data]
+        # Check if RL metrics are available
+        first_entry = history[0] if history else {}
+        has_rl_metrics = 'rl_avg_precision' in first_entry and 'rl_avg_coverage' in first_entry
         
-        ax7_twin = ax7.twinx()
-        ax7.plot(last_episodes, last_precisions, 'g-', label='Precision', linewidth=2)
-        ax7_twin.plot(last_episodes, last_coverages, 'm-', label='Coverage', linewidth=2)
-        ax7.set_xlabel('Episode (Last Quarter)')
-        ax7.set_ylabel('RL Precision', color='g')
-        ax7_twin.set_ylabel('RL Coverage', color='m')
-        ax7.set_title('Convergence Analysis (Last Quarter)')
-        ax7.tick_params(axis='y', labelcolor='g')
-        ax7_twin.tick_params(axis='y', labelcolor='m')
-        ax7.grid(True, alpha=0.3)
+        if has_rl_metrics:
+            last_quarter = max(1, len(history) // 4)
+            last_episodes_data = history[-last_quarter:]
+            last_episodes = [e.get('episode', i) for i, e in enumerate(last_episodes_data)]
+            last_precisions = [e.get('rl_avg_precision', 0.0) for e in last_episodes_data]
+            last_coverages = [e.get('rl_avg_coverage', 0.0) for e in last_episodes_data]
+            
+            ax7_twin = ax7.twinx()
+            ax7.plot(last_episodes, last_precisions, 'g-', label='Precision', linewidth=2)
+            ax7_twin.plot(last_episodes, last_coverages, 'm-', label='Coverage', linewidth=2)
+            ax7.set_xlabel('Episode (Last Quarter)')
+            ax7.set_ylabel('RL Precision', color='g')
+            ax7_twin.set_ylabel('RL Coverage', color='m')
+            ax7.set_title('Convergence Analysis (Last Quarter)')
+            ax7.tick_params(axis='y', labelcolor='g')
+            ax7_twin.tick_params(axis='y', labelcolor='m')
+            ax7.grid(True, alpha=0.3)
+        else:
+            ax7.text(0.5, 0.5, 'Convergence analysis\nnot available\n(RL metrics not found)', 
+                    ha='center', va='center', transform=ax7.transAxes)
+            ax7.set_title('Convergence Analysis (N/A)')
+            ax7.axis('off')
     else:
         ax7.text(0.5, 0.5, 'Convergence analysis\nnot available\n(requires training history)', 
                 ha='center', va='center', transform=ax7.transAxes)

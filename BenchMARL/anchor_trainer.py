@@ -167,7 +167,7 @@ class AnchorTrainer:
         print(f"  Model: MLP")
         print(f"  Target classes: {target_classes}")
         print(f"  Max cycles per episode: {max_cycles}")
-        print(f"  Output directory: {self.output_dir}")
+        print(f"  Experiment folder: {self.experiment.folder_name}")
         print("="*80)
         
         return self.experiment
@@ -251,8 +251,45 @@ class AnchorTrainer:
             try:
                 from tensordict import TensorDict
                 
-                env = self.experiment.env
                 algorithm = self.experiment.algorithm
+                
+                # Get device from policy (to ensure environment and tensors are on same device)
+                policy_device = None
+                try:
+                    for group in algorithm.group_map.keys():
+                        policy = algorithm.get_policy_for_loss(group)
+                        if hasattr(policy, 'parameters'):
+                            for param in policy.parameters():
+                                if param is not None:
+                                    policy_device = param.device
+                                    break
+                        if policy_device is not None:
+                            break
+                except Exception:
+                    pass
+                
+                # Default to CPU if device not found
+                if policy_device is None:
+                    policy_device = torch.device("cpu")
+                
+                # Create environment instance on the same device as policy
+                env = self._create_env_instance(device=str(policy_device))
+                
+                # Debug: Check group_map structure (before episode loop)
+                print(f"  Debug: algorithm.group_map = {algorithm.group_map}")
+                print(f"  Debug: group_map keys = {list(algorithm.group_map.keys())}")
+                for group, agents in algorithm.group_map.items():
+                    print(f"    Group '{group}' contains agents: {agents}")
+                
+                # Get unwrapped environment to check actual agents
+                unwrapped_env = None
+                if hasattr(env, 'env') or hasattr(env, '_env'):
+                    unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+                    if unwrapped_env is not None:
+                        if hasattr(unwrapped_env, 'possible_agents'):
+                            print(f"  Debug: Environment has {len(unwrapped_env.possible_agents)} agents: {unwrapped_env.possible_agents}")
+                        if hasattr(unwrapped_env, 'agent_to_class'):
+                            print(f"  Debug: Agent to class mapping: {unwrapped_env.agent_to_class}")
                 
                 # Run evaluation episodes
                 manual_rollouts = []
@@ -266,6 +303,14 @@ class AnchorTrainer:
                     step_count = 0
                     max_steps = self.task.max_steps(env) if hasattr(self.task, 'max_steps') else 100
                     
+                    # Debug: Check initial td structure
+                    if episode == 0:
+                        print(f"  Debug: Initial td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
+                        if hasattr(td, 'keys'):
+                            for key in td.keys():
+                                if hasattr(td[key], 'keys'):
+                                    print(f"    {key} keys: {list(td[key].keys())}")
+                    
                     while not done and step_count < max_steps:
                         # Get action from policy (deterministic for evaluation)
                         with torch.no_grad():
@@ -278,9 +323,15 @@ class AnchorTrainer:
                                     group_obs = td[group]
                                     if "observation" in group_obs.keys():
                                         obs_tensor = group_obs["observation"]
+                                        
+                                        # Move observation to policy device
+                                        if isinstance(obs_tensor, torch.Tensor):
+                                            obs_tensor = obs_tensor.to(policy_device)
+                                        
                                         input_td = TensorDict(
                                             {group: {"observation": obs_tensor}},
-                                            batch_size=obs_tensor.shape[:1]
+                                            batch_size=obs_tensor.shape[:1],
+                                            device=policy_device
                                         )
                                         
                                         # Get action
@@ -289,10 +340,47 @@ class AnchorTrainer:
                                         else:
                                             action_output = policy(input_td)
                                         
-                                        # Extract action
+                                        # Extract action and move back to environment device if needed
                                         if isinstance(action_output, TensorDict):
-                                            if (group, "action") in action_output.keys():
+                                            # Try to get action from nested structure
+                                            # TensorDict doesn't support tuple key checks without include_nested=True
+                                            action = None
+                                            
+                                            # Method 1: Try nested key access directly (most common structure)
+                                            try:
                                                 action = action_output[(group, "action")]
+                                            except (KeyError, TypeError):
+                                                pass
+                                            
+                                            # Method 2: Try flat nested structure (group -> action)
+                                            if action is None:
+                                                try:
+                                                    if group in action_output.keys():
+                                                        group_data = action_output[group]
+                                                        if isinstance(group_data, TensorDict):
+                                                            if "action" in group_data.keys():
+                                                                action = group_data["action"]
+                                                        elif hasattr(group_data, 'get'):
+                                                            action = group_data.get("action", None)
+                                                except (KeyError, TypeError, AttributeError):
+                                                    pass
+                                            
+                                            # Method 3: Try direct "action" key (some policies return flat structure)
+                                            if action is None:
+                                                try:
+                                                    if "action" in action_output.keys():
+                                                        action = action_output["action"]
+                                                except (KeyError, TypeError):
+                                                    pass
+                                            
+                                            if action is not None:
+                                                # Move action to environment device
+                                                # The environment expects actions on its device (usually same as observations)
+                                                if isinstance(td, TensorDict) and hasattr(td, 'device'):
+                                                    # Move action to match the TensorDict device (environment device)
+                                                    action = action.to(td.device)
+                                                elif hasattr(env, 'device'):
+                                                    action = action.to(env.device)
                                                 td[group]["action"] = action
                         
                         # Step environment
@@ -301,41 +389,380 @@ class AnchorTrainer:
                         step_count += 1
                     
                     # Collect final metrics from info
+                    # Try to get info from the unwrapped environment if available
+                    unwrapped_env = None
+                    if hasattr(env, 'env') or hasattr(env, '_env'):
+                        unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+                    
+                    # Debug: Check unwrapped environment state
+                    if episode == 0 and unwrapped_env is not None:
+                        if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
+                            if isinstance(unwrapped_env.lower, dict):
+                                for agent_name in unwrapped_env.agents:
+                                    if agent_name in unwrapped_env.lower:
+                                        lower = unwrapped_env.lower[agent_name]
+                                        upper = unwrapped_env.upper[agent_name]
+                                        print(f"  Debug: After episode, {agent_name} bounds:")
+                                        print(f"    Lower range: [{lower.min():.4f}, {lower.max():.4f}]")
+                                        print(f"    Upper range: [{upper.min():.4f}, {upper.max():.4f}]")
+                                        # Get metrics to verify
+                                        try:
+                                            prec, cov, _ = unwrapped_env._current_metrics(agent_name)
+                                            print(f"    Precision: {prec:.4f}, Coverage: {cov:.4f}")
+                                        except Exception as e:
+                                            print(f"    Could not get metrics: {e}")
+                    
+                    # Try multiple ways to access the final state
+                    # After the episode loop, td should contain the final state
+                    # Check both td and td["next"] if it exists
+                    final_td = td
                     if "next" in td.keys():
                         next_td = td["next"]
-                        for group in algorithm.group_map.keys():
-                            if group in next_td.keys() and "info" in next_td[group].keys():
-                                info = next_td[group]["info"]
-                                if info.shape[0] > 0:
-                                    final_info = info[-1]
+                        # Use next_td as it contains the state after the last step
+                        final_td = next_td
+                    else:
+                        # If no "next" key, use td directly (it's the final state)
+                        next_td = td
+                        final_td = td
+                    
+                    # Collect data for each agent separately
+                    # If group_map has agents listed per group, iterate over those agents
+                    # Otherwise, iterate over groups and find matching agents
+                    agents_to_process = []
+                    for group in algorithm.group_map.keys():
+                        # Get agents in this group
+                        agents_in_group = algorithm.group_map[group]
+                        if isinstance(agents_in_group, list) and len(agents_in_group) > 0:
+                            # Group contains multiple agents - process each separately
+                            for agent in agents_in_group:
+                                agents_to_process.append((group, agent))
+                        else:
+                            # Group name might be the agent name, or we need to find matching agents
+                            agents_to_process.append((group, group))
+                    
+                    # If no agents found from group_map, try to get from environment
+                    if not agents_to_process and unwrapped_env is not None:
+                        if hasattr(unwrapped_env, 'agents') and len(unwrapped_env.agents) > 0:
+                            # Use actual agent names from environment
+                            for agent in unwrapped_env.agents:
+                                # Try to find which group this agent belongs to
+                                group = None
+                                for g, agents_list in algorithm.group_map.items():
+                                    if agent in agents_list or (isinstance(agents_list, str) and agent == agents_list):
+                                        group = g
+                                        break
+                                if group is None:
+                                    # Use agent name as group if no match found
+                                    group = agent
+                                agents_to_process.append((group, agent))
+                    
+                    # Process each agent separately
+                    for group, agent_name in agents_to_process:
+                        # Debug: Check unwrapped_env state
+                        if episode == 0:
+                            if unwrapped_env is None:
+                                print(f"  Debug: unwrapped_env is None for {agent_name}")
+                            elif not hasattr(unwrapped_env, 'agents'):
+                                print(f"  Debug: unwrapped_env doesn't have 'agents' attribute for {agent_name}")
+                            elif len(unwrapped_env.agents) == 0:
+                                print(f"  Debug: unwrapped_env.agents is empty for {agent_name}")
+                                if hasattr(unwrapped_env, 'possible_agents'):
+                                    print(f"  Debug: Using possible_agents instead: {unwrapped_env.possible_agents}")
+                            else:
+                                print(f"  Debug: unwrapped_env.agents = {unwrapped_env.agents} for {agent_name}")
+                        
+                        # First, try to get info from unwrapped environment (most reliable)
+                        # After episode, agents might be removed, so check possible_agents too
+                        agent_in_env = False
+                        if unwrapped_env is not None:
+                            # Check if agent is in current agents list
+                            if hasattr(unwrapped_env, 'agents') and agent_name in unwrapped_env.agents:
+                                agent_in_env = True
+                            # If not, check possible_agents (agents that can exist)
+                            elif hasattr(unwrapped_env, 'possible_agents') and agent_name in unwrapped_env.possible_agents:
+                                agent_in_env = True
+                                # Try to find matching agent if name doesn't match exactly
+                                if agent_name not in unwrapped_env.possible_agents:
+                                    matching_agent = None
+                                    for possible_agent in unwrapped_env.possible_agents:
+                                        if possible_agent == agent_name or (agent_name in possible_agent or possible_agent.startswith(agent_name)):
+                                            matching_agent = possible_agent
+                                            break
+                                    if matching_agent:
+                                        agent_name = matching_agent
+                                        agent_in_env = True
+                            
+                            if agent_in_env and hasattr(unwrapped_env, '_current_metrics'):
+                                try:
+                                    # Get current metrics directly from environment for this specific agent
+                                    precision, coverage, _ = unwrapped_env._current_metrics(agent_name)
                                     
-                                    # Extract metrics
-                                    def safe_get(key, default=0.0):
-                                        try:
-                                            if hasattr(final_info, 'get'):
-                                                val = final_info.get(key, default)
-                                            elif hasattr(final_info, 'keys') and key in final_info.keys():
-                                                val = final_info[key]
+                                    # Debug output for first episode
+                                    if episode == 0:
+                                        print(f"  Debug: Got metrics from unwrapped_env for {agent_name}: precision={precision:.4f}, coverage={coverage:.4f}")
+                                    
+                                    # Get final observation (bounds) from environment state
+                                    if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
+                                        # lower and upper are dictionaries keyed by agent name
+                                        if isinstance(unwrapped_env.lower, dict):
+                                            # Try agent_name first
+                                            if agent_name in unwrapped_env.lower:
+                                                lower_bounds = unwrapped_env.lower[agent_name]
+                                                upper_bounds = unwrapped_env.upper[agent_name]
                                             else:
-                                                val = getattr(final_info, key, default)
-                                            
-                                            if isinstance(val, torch.Tensor):
-                                                return float(val.item() if val.numel() == 1 else val[-1].item())
-                                            return float(val)
-                                        except:
-                                            return default
+                                                # If agent_name not found, try to find a matching key
+                                                matching_key = None
+                                                for key in unwrapped_env.lower.keys():
+                                                    if key == agent_name or agent_name in key or key.startswith(agent_name):
+                                                        matching_key = key
+                                                        break
+                                                
+                                                if matching_key:
+                                                    if episode == 0:
+                                                        print(f"  Debug: Using matching key '{matching_key}' for agent {agent_name}")
+                                                    lower_bounds = unwrapped_env.lower[matching_key]
+                                                    upper_bounds = unwrapped_env.upper[matching_key]
+                                                else:
+                                                    if episode == 0:
+                                                        print(f"  Debug: Agent {agent_name} not in lower/upper dict. Available keys: {list(unwrapped_env.lower.keys())}")
+                                                    continue  # Skip this agent if not in dict
+                                        else:
+                                            # If not a dict, might be a single array (single agent case)
+                                            lower_bounds = unwrapped_env.lower
+                                            upper_bounds = unwrapped_env.upper
+                                        
+                                        # Debug: Check bounds values
+                                        if episode == 0:
+                                            print(f"  Debug: {agent_name} bounds - lower range: [{lower_bounds.min():.4f}, {lower_bounds.max():.4f}], upper range: [{upper_bounds.min():.4f}, {upper_bounds.max():.4f}]")
+                                        
+                                        final_obs = np.concatenate([lower_bounds, upper_bounds, np.array([precision, coverage], dtype=np.float32)])
+                                        
+                                        # Store data keyed by agent name (not group) to distinguish between agents
+                                        episode_data[agent_name] = {
+                                            "precision": float(precision),
+                                            "coverage": float(coverage),
+                                            "total_reward": 0.0,  # Will try to get from info if available
+                                            "final_observation": final_obs.tolist(),
+                                            "group": group,  # Keep track of which group this agent belongs to
+                                            "target_class": unwrapped_env.agent_to_class.get(agent_name, None) if hasattr(unwrapped_env, 'agent_to_class') else None,
+                                        }
+                                        
+                                        if episode == 0:
+                                            print(f"  Debug: Stored data for {agent_name} with precision={precision:.4f}, coverage={coverage:.4f}")
+                                        
+                                        # Try to get total_reward from last step's info if available
+                                        # (This is a fallback - we already have precision/coverage from env)
+                                        continue  # Skip to next agent since we got data from env
+                                    else:
+                                        if episode == 0:
+                                            print(f"  Debug: unwrapped_env doesn't have lower/upper attributes")
+                                except Exception as e:
+                                    if episode == 0:
+                                        print(f"  Debug: Could not get metrics from unwrapped env for agent {agent_name}: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                        
+                        # Fallback: Try to get from TensorDict structure
+                        # Try both final_td (which might be next_td) and td directly
+                        group_data = None
+                        
+                        # First try final_td (state after last step)
+                        if group in final_td.keys():
+                            group_data = final_td[group]
+                        elif hasattr(final_td, 'get'):
+                            group_data = final_td.get(group, None)
+                        
+                        # If not found, try next_td
+                        if group_data is None:
+                            if group in next_td.keys():
+                                group_data = next_td[group]
+                            elif hasattr(next_td, 'get'):
+                                group_data = next_td.get(group, None)
+                        
+                        # If still not found, try td directly (current state)
+                        if group_data is None:
+                            if group in td.keys():
+                                group_data = td[group]
+                            elif hasattr(td, 'get'):
+                                group_data = td.get(group, None)
+                        
+                        if group_data is not None:
+                            # Try to get info first
+                            info = None
+                            if isinstance(group_data, TensorDict):
+                                if "info" in group_data.keys():
+                                    info = group_data["info"]
+                            elif hasattr(group_data, 'get'):
+                                info = group_data.get("info", None)
+                            elif hasattr(group_data, 'keys') and "info" in group_data.keys():
+                                info = group_data["info"]
+                            
+                            # Get final observation (anchor bounds) - this is always available
+                            obs = None
+                            if isinstance(group_data, TensorDict):
+                                if "observation" in group_data.keys():
+                                    obs = group_data["observation"]
+                            elif hasattr(group_data, 'get'):
+                                obs = group_data.get("observation", None)
+                            
+                            # Extract data from observation if available
+                            # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
+                            if obs is not None:
+                                if hasattr(obs, 'shape') and obs.shape[0] > 0:
+                                    final_obs = obs[-1]
+                                elif isinstance(obs, (list, tuple)) and len(obs) > 0:
+                                    final_obs = obs[-1]
+                                else:
+                                    final_obs = obs
+                                
+                                # Convert to numpy
+                                if isinstance(final_obs, torch.Tensor):
+                                    final_obs_np = final_obs.cpu().numpy()
+                                elif isinstance(final_obs, np.ndarray):
+                                    final_obs_np = final_obs
+                                else:
+                                    final_obs_np = np.array(final_obs)
+                                
+                                # Extract precision and coverage from observation
+                                # obs_len = 2*n_features + 2 (precision + coverage)
+                                obs_len = len(final_obs_np) if hasattr(final_obs_np, '__len__') else final_obs_np.shape[0] if hasattr(final_obs_np, 'shape') else 0
+                                
+                                if obs_len >= 4:  # At least 2 features + precision + coverage
+                                    n_features = (obs_len - 2) // 2
+                                    if n_features > 0:
+                                        # Extract precision and coverage from last two elements
+                                        precision = float(final_obs_np[-2])
+                                        coverage = float(final_obs_np[-1])
+                                        
+                                        # Store data keyed by agent name to distinguish between agents
+                                        episode_data[agent_name] = {
+                                            "precision": precision,
+                                            "coverage": coverage,
+                                            "total_reward": 0.0,  # Not available from observation
+                                            "final_observation": final_obs_np.tolist(),
+                                            "group": group,  # Keep track of which group this agent belongs to
+                                            "target_class": unwrapped_env.agent_to_class.get(agent_name, None) if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class') else None,
+                                        }
+                                        
+                                        # If we also have info, try to get total_reward from it
+                                        if info is not None:
+                                            try:
+                                                if hasattr(info, 'shape') and info.shape[0] > 0:
+                                                    final_info = info[-1]
+                                                elif isinstance(info, (list, tuple)) and len(info) > 0:
+                                                    final_info = info[-1]
+                                                elif isinstance(info, dict):
+                                                    final_info = info
+                                                else:
+                                                    final_info = info
+                                                
+                                                def safe_get(key, default=0.0):
+                                                    try:
+                                                        if isinstance(final_info, dict):
+                                                            return float(final_info.get(key, default))
+                                                        elif hasattr(final_info, 'get'):
+                                                            val = final_info.get(key, default)
+                                                        elif hasattr(final_info, 'keys') and key in final_info.keys():
+                                                            val = final_info[key]
+                                                        else:
+                                                            val = getattr(final_info, key, default)
+                                                        
+                                                        if isinstance(val, torch.Tensor):
+                                                            return float(val.item() if val.numel() == 1 else val[-1].item())
+                                                        return float(val)
+                                                    except:
+                                                        return default
+                                                
+                                                episode_data[group]["total_reward"] = safe_get("total_reward", 0.0)
+                                            except:
+                                                pass  # Keep default 0.0 if info extraction fails
+                            
+                            # If we didn't get data from observation, try info only
+                            elif info is not None:
+                                # Get final info (last step)
+                                if hasattr(info, 'shape') and info.shape[0] > 0:
+                                    final_info = info[-1]
+                                elif isinstance(info, (list, tuple)) and len(info) > 0:
+                                    final_info = info[-1]
+                                elif isinstance(info, dict):
+                                    final_info = info
+                                else:
+                                    final_info = info
+                                
+                                # Extract metrics
+                                def safe_get(key, default=0.0):
+                                    try:
+                                        if isinstance(final_info, dict):
+                                            val = final_info.get(key, default)
+                                        elif hasattr(final_info, 'get'):
+                                            val = final_info.get(key, default)
+                                        elif hasattr(final_info, 'keys') and key in final_info.keys():
+                                            val = final_info[key]
+                                        else:
+                                            val = getattr(final_info, key, default)
+                                        
+                                        if isinstance(val, torch.Tensor):
+                                            return float(val.item() if val.numel() == 1 else val[-1].item())
+                                        return float(val)
+                                    except:
+                                        return default
+                                
+                                # Store data keyed by agent name to distinguish between agents
+                                episode_data[agent_name] = {
+                                    "precision": safe_get("precision", 0.0),
+                                    "coverage": safe_get("coverage", 0.0),
+                                    "total_reward": safe_get("total_reward", 0.0),
+                                    "group": group,  # Keep track of which group this agent belongs to
+                                    "target_class": unwrapped_env.agent_to_class.get(agent_name, None) if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class') else None,
+                                }
+                                
+                                # Try to get observation for bounds
+                                if obs is not None:
+                                    if hasattr(obs, 'shape') and obs.shape[0] > 0:
+                                        final_obs = obs[-1]
+                                    elif isinstance(obs, (list, tuple)) and len(obs) > 0:
+                                        final_obs = obs[-1]
+                                    else:
+                                        final_obs = obs
                                     
-                                    episode_data[group] = {
-                                        "precision": safe_get("precision", 0.0),
-                                        "coverage": safe_get("coverage", 0.0),
-                                        "total_reward": safe_get("total_reward", 0.0),
-                                    }
-                                    
-                                    # Get final observation (anchor bounds)
-                                    if "observation" in next_td[group].keys():
-                                        final_obs = next_td[group]["observation"][-1]
-                                        if isinstance(final_obs, torch.Tensor):
-                                            episode_data[group]["final_observation"] = final_obs.cpu().numpy().tolist()
+                                    if isinstance(final_obs, torch.Tensor):
+                                        episode_data[agent_name]["final_observation"] = final_obs.cpu().numpy().tolist()
+                                    elif isinstance(final_obs, np.ndarray):
+                                        episode_data[agent_name]["final_observation"] = final_obs.tolist()
+                                    else:
+                                        episode_data[agent_name]["final_observation"] = list(final_obs) if hasattr(final_obs, '__iter__') else [final_obs]
+                    
+                    # Debug first episode
+                    if episode == 0:
+                        print(f"  Debug: Episode {episode} completed, step_count={step_count}, done={done}")
+                        print(f"  Debug: episode_data keys: {list(episode_data.keys())}")
+                        if not episode_data:
+                            print(f"  Debug: td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
+                            if "next" in td.keys():
+                                next_td = td["next"]
+                                print(f"  Debug: next_td keys: {list(next_td.keys()) if hasattr(next_td, 'keys') else 'N/A'}")
+                                # Check what's in the agent group
+                                for group in algorithm.group_map.keys():
+                                    if group in next_td.keys():
+                                        group_data = next_td[group]
+                                        print(f"  Debug: next_td['{group}'] type: {type(group_data)}")
+                                        if hasattr(group_data, 'keys'):
+                                            print(f"  Debug: next_td['{group}'] keys: {list(group_data.keys())}")
+                                        elif isinstance(group_data, dict):
+                                            print(f"  Debug: next_td['{group}'] dict keys: {list(group_data.keys())}")
+                            # Also check td directly (not just next)
+                            for group in algorithm.group_map.keys():
+                                if group in td.keys():
+                                    group_data = td[group]
+                                    print(f"  Debug: td['{group}'] type: {type(group_data)}")
+                                    if hasattr(group_data, 'keys'):
+                                        print(f"  Debug: td['{group}'] keys: {list(group_data.keys())}")
+                                        # Check if info is nested deeper
+                                        for key in group_data.keys():
+                                            if hasattr(group_data[key], 'keys'):
+                                                print(f"  Debug: td['{group}']['{key}'] keys: {list(group_data[key].keys())}")
+                                    elif isinstance(group_data, dict):
+                                        print(f"  Debug: td['{group}'] dict keys: {list(group_data.keys())}")
                     
                     if episode_data:
                         manual_rollouts.append(episode_data)
@@ -408,7 +835,7 @@ class AnchorTrainer:
         Reference: https://benchmarl.readthedocs.io/en/latest/_modules/benchmarl/algorithms/maddpg.html
         
         Args:
-            output_dir: Directory to save models (default: experiment folder / individual_models/)
+            output_dir: Directory to save models (ignored - always saves in experiment run log directory)
             save_policies: Whether to save policy models
             save_critics: Whether to save critic models
         
@@ -422,8 +849,9 @@ class AnchorTrainer:
         
         algorithm = self.experiment.algorithm
         
-        if output_dir is None:
-            output_dir = os.path.join(str(self.experiment.folder_name), "individual_models")
+        # Always save in the experiment's run log directory (where BenchMARL saves logs/checkpoints)
+        # This ensures models are saved alongside the run logs, not in a separate location
+        output_dir = os.path.join(str(self.experiment.folder_name), "individual_models")
         
         os.makedirs(output_dir, exist_ok=True)
         
@@ -520,102 +948,83 @@ class AnchorTrainer:
         return saved_models
     
     
-    def load_checkpoint(self, checkpoint_path: str):
+    def reload_experiment(self, checkpoint_file: str):
         """
-        Load a BenchMARL checkpoint from the experiment folder.
+        Reload the entire BenchMARL Experiment from a checkpoint file.
+        Uses BenchMARL's official reload_experiment_from_file() method.
+        
+        Reference: https://benchmarl.readthedocs.io/en/latest/concepts/features.html#reloading
         
         Args:
-            checkpoint_path: Path to BenchMARL experiment folder or specific checkpoint file
+            checkpoint_file: Path to BenchMARL checkpoint file (.pt or .pth file)
+                            If a directory is provided, will search for checkpoint files
         """
-        if self.experiment is None:
-            raise ValueError(
-                "Experiment not set up yet. Call setup_experiment() first."
-            )
+        from benchmarl.hydra_config import reload_experiment_from_file
         
-        # If it's a directory, look for checkpoint files
-        if os.path.isdir(checkpoint_path):
-            # BenchMARL typically saves checkpoints in the experiment folder
-            # Look for checkpoint files, but exclude classifier.pth
-            all_files = os.listdir(checkpoint_path)
-            checkpoint_files = [
-                f for f in all_files 
-                if (f.endswith('.pt') or f.endswith('.pth')) 
-                and f != 'classifier.pth'  # Exclude classifier
-                and not f.startswith('classifier')  # Exclude any classifier files
-            ]
-            
-            # Also check subdirectories for checkpoints
-            for root, dirs, files in os.walk(checkpoint_path):
-                # Skip wandb and other log directories
-                if 'wandb' in root or 'logs' in root.lower():
-                    continue
-                for f in files:
-                    if (f.endswith('.pt') or f.endswith('.pth')) and f != 'classifier.pth':
-                        rel_path = os.path.relpath(os.path.join(root, f), checkpoint_path)
-                        if rel_path not in checkpoint_files:
-                            checkpoint_files.append(rel_path)
-            
-            if checkpoint_files:
-                # Use the most recent checkpoint
-                checkpoint_file = max(
-                    checkpoint_files, 
-                    key=lambda f: os.path.getmtime(os.path.join(checkpoint_path, f))
-                )
-                checkpoint_path = os.path.join(checkpoint_path, checkpoint_file)
-                print(f"Found checkpoint file: {checkpoint_file}")
-            else:
-                # No checkpoint files found - BenchMARL might save state differently
-                # BenchMARL saves checkpoints automatically, but they might be in a different location
-                # or checkpointing might be disabled. Try using restore_file mechanism.
-                print(f"Warning: No checkpoint files found in {checkpoint_path}")
-                print("  BenchMARL checkpoints may be disabled (checkpoint_interval=0 in config)")
-                print("  Attempting to use BenchMARL's restore_file mechanism...")
-                
-                # Check if there's a checkpoint in a standard BenchMARL location
-                possible_checkpoint_locations = [
-                    os.path.join(checkpoint_path, "checkpoint.pt"),
-                    os.path.join(checkpoint_path, "checkpoint.pth"),
-                    os.path.join(checkpoint_path, "model.pt"),
-                    os.path.join(checkpoint_path, "model.pth"),
+        # If directory provided, find the checkpoint file
+        if os.path.isdir(checkpoint_file):
+            experiment_dir = checkpoint_file
+            # Check for checkpoints in the checkpoints subdirectory (BenchMARL standard location)
+            checkpoints_dir = os.path.join(experiment_dir, "checkpoints")
+            if os.path.exists(checkpoints_dir):
+                checkpoint_files = [
+                    f for f in os.listdir(checkpoints_dir)
+                    if (f.endswith('.pt') or f.endswith('.pth'))
                 ]
-                
-                found_checkpoint = None
-                for loc in possible_checkpoint_locations:
-                    if os.path.exists(loc):
-                        found_checkpoint = loc
-                        break
-                
-                if found_checkpoint:
-                    checkpoint_path = found_checkpoint
-                    print(f"  Found checkpoint at: {checkpoint_path}")
-                else:
-                    # No checkpoint found - this means checkpointing was disabled
-                    # We can't load a checkpoint that doesn't exist
-                    raise ValueError(
-                        f"No BenchMARL checkpoint found in {checkpoint_path}. "
-                        f"Checkpoints may be disabled (checkpoint_interval=0). "
-                        f"To enable checkpointing, set checkpoint_interval > 0 in base_experiment.yaml, "
-                        f"or set checkpoint_at_end: True to save at the end of training."
+                if checkpoint_files:
+                    # Use the most recent checkpoint
+                    checkpoint_file = os.path.join(
+                        checkpoints_dir,
+                        max(checkpoint_files, key=lambda f: os.path.getmtime(os.path.join(checkpoints_dir, f)))
+                    )
+            
+            # If not found in checkpoints subdirectory, check root directory
+            if not os.path.isfile(checkpoint_file):
+                all_files = os.listdir(experiment_dir)
+                checkpoint_files = [
+                    f for f in all_files 
+                    if (f.endswith('.pt') or f.endswith('.pth')) 
+                    and f != 'classifier.pth'
+                    and not f.startswith('classifier')
+                ]
+                if checkpoint_files:
+                    checkpoint_file = os.path.join(
+                        experiment_dir, 
+                        max(checkpoint_files, key=lambda f: os.path.getmtime(os.path.join(experiment_dir, f)))
                     )
         
-        # Only try to load if we found a checkpoint file
-        if os.path.isfile(checkpoint_path):
-            try:
-                state_dict = torch.load(checkpoint_path, map_location="cpu")
-                self.experiment.load_state_dict(state_dict)
-                print(f"Checkpoint loaded from: {checkpoint_path}")
-                print(f"Resuming from iteration: {self.experiment.n_iters_performed}")
-                print(f"Total frames: {self.experiment.total_frames}")
-            except Exception as e:
-                print(f"Warning: Could not load checkpoint from {checkpoint_path}: {e}")
-                print("  The checkpoint file may be corrupted or incompatible.")
-                print("  Continuing with current experiment state...")
-                raise
-        else:
+        if not os.path.isfile(checkpoint_file):
             raise ValueError(
-                f"Checkpoint file not found: {checkpoint_path}. "
-                f"Make sure checkpoint_at_end: True is set in the config to save checkpoints."
+                f"Checkpoint file not found: {checkpoint_file}. "
+                f"Please provide a valid checkpoint file path."
             )
+        
+        print(f"\n{'='*80}")
+        print("RELOADING ENTIRE EXPERIMENT")
+        print(f"{'='*80}")
+        print(f"Checkpoint file: {checkpoint_file}")
+        print("  Reference: https://benchmarl.readthedocs.io/en/latest/concepts/features.html#reloading")
+        
+        # Reload experiment from checkpoint (simple and direct as per documentation)
+        experiment = reload_experiment_from_file(checkpoint_file)
+        
+        # Assign the reloaded experiment to the trainer
+        self.experiment = experiment
+        
+        # Extract task from the reloaded experiment
+        if hasattr(experiment, 'task'):
+            self.task = experiment.task
+        
+        # Find the callback if it exists in the experiment
+        if hasattr(experiment, 'callbacks') and experiment.callbacks:
+            for cb in experiment.callbacks:
+                if hasattr(cb, 'get_evaluation_anchor_data'):
+                    self.callback = cb
+                    break
+        
+        print("  ✓ Experiment reloaded successfully")
+        print(f"  Resuming from iteration: {self.experiment.n_iters_performed}")
+        print(f"  Total frames: {self.experiment.total_frames}")
     
     def get_experiment(self) -> Experiment:
         if self.experiment is None:
@@ -623,6 +1032,65 @@ class AnchorTrainer:
                 "Experiment not set up yet. Call setup_experiment() first."
             )
         return self.experiment
+    
+    def _create_env_instance(self, device=None):
+        """
+        Create an environment instance using the task's get_env_fun method.
+        This is needed because Experiment doesn't have a direct env attribute.
+        
+        Args:
+            device: Device to create environment on. If None, tries to infer from algorithm or config.
+        """
+        if self.experiment is None or self.task is None:
+            raise ValueError(
+                "Experiment not set up yet. Call setup_experiment() first."
+            )
+        
+        # Get device from parameter, algorithm, experiment config, or use default
+        if device is None:
+            device = "cpu"
+            # Try to get device from algorithm (most reliable)
+            if hasattr(self.experiment, 'algorithm') and self.experiment.algorithm is not None:
+                algorithm = self.experiment.algorithm
+                # Try to get device from policy parameters
+                try:
+                    for group in algorithm.group_map.keys():
+                        policy = algorithm.get_policy_for_loss(group)
+                        if hasattr(policy, 'parameters'):
+                            # Get device from first parameter
+                            for param in policy.parameters():
+                                if param is not None:
+                                    device = str(param.device)
+                                    break
+                        if device != "cpu":
+                            break
+                except Exception:
+                    pass
+            
+            # Fallback to config if algorithm device not found
+            if device == "cpu":
+                if hasattr(self.experiment_config, 'device'):
+                    device = self.experiment_config.device
+                elif hasattr(self.experiment, 'device'):
+                    device = self.experiment.device
+        
+        # Convert device to string if it's a torch.device
+        if hasattr(device, 'type'):
+            device = str(device)
+        
+        # Get seed from experiment or use None
+        seed = getattr(self.experiment, 'seed', None)
+        
+        # Create environment using task's get_env_fun
+        env_fun = self.task.get_env_fun(
+            num_envs=1,
+            continuous_actions=True,
+            seed=seed,
+            device=device
+        )
+        
+        # Call the factory function to create the environment instance
+        return env_fun()
     
     def extract_rules_from_evaluation(
         self,
@@ -1030,7 +1498,9 @@ class AnchorTrainer:
                             try:
                                 # Get observation spec from the experiment's task
                                 if hasattr(self.experiment, 'task') and hasattr(self.experiment.task, 'observation_spec'):
-                                    obs_spec = self.experiment.task.observation_spec(self.experiment.env)
+                                    # Create environment instance (Experiment doesn't have direct env attribute)
+                                    env = self._create_env_instance()
+                                    obs_spec = self.experiment.task.observation_spec(env)
                                     if obs_spec is not None and agent_group in obs_spec.keys():
                                         # Use the spec to create the correct structure
                                         group_obs_spec = obs_spec[agent_group]

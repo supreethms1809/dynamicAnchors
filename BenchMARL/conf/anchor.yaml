@@ -38,5 +38,5 @@ env_config:
   shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
 
 # Maximum number of steps per episode
-max_cycles: 100
+max_cycles: 500
 
