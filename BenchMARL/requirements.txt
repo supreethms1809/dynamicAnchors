@@ -1,0 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torchrl
+torch==2.9.1+cu128
+torchvision==0.24.1+cu128
+benchmarl
+vmas
+pettingzoo
+scikit-learn
+wandb
+gymnasium
+moviepy
+tensorboard
+ydata-profiling

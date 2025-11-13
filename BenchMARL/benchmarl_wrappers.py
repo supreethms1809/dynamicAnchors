@@ -30,7 +30,21 @@ class AnchorTaskClass(TaskClass):
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
         
+        # Extract max_cycles from top-level config (it's also needed for max_steps() method)
+        # We keep it in self.config for max_steps(), but also need it in env_config for the environment
+        max_cycles = config.get("max_cycles", 100)
+        
+        # Remove max_cycles from top-level config (it shouldn't be passed directly to AnchorEnv)
+        # But ensure it's in env_config so the environment can access it
         env_config = {k: v for k, v in config.items() if k != "max_cycles"}
+        
+        # Ensure env_config dict exists and add max_cycles to it (merge with existing env_config if present)
+        if "env_config" not in env_config:
+            env_config["env_config"] = {}
+        # Merge max_cycles into existing env_config (don't overwrite the whole dict)
+        if not isinstance(env_config["env_config"], dict):
+            env_config["env_config"] = {}
+        env_config["env_config"]["max_cycles"] = max_cycles
         
         def _make_env():
             anchor_env = AnchorEnv(**env_config)
@@ -108,14 +122,17 @@ class AnchorTask(Task):
 
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
         self.save_to_file = save_to_file
+        self.collect_anchor_data = collect_anchor_data
         self.training_metrics = []
         self.training_history = []
         self.evaluation_history = []
+        # Store anchor data collected during evaluation
+        self.evaluation_anchor_data = []  # List of episodes, each episode contains agent data
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -126,7 +143,8 @@ class AnchorMetricsCallback(Callback):
         metric_keys = [
             "precision", "coverage", "drift", "anchor_drift", "js_penalty",
             "precision_gain", "coverage_gain", "coverage_bonus", "target_class_bonus",
-            "overlap_penalty", "drift_penalty", "anchor_drift_penalty", "total_reward",
+            "overlap_penalty", "drift_penalty", "anchor_drift_penalty", 
+            "inter_class_overlap_penalty", "shared_reward", "total_reward",
             "coverage_floor_hits", "coverage_clipped"
         ]
         
@@ -173,10 +191,20 @@ class AnchorMetricsCallback(Callback):
                     if values:
                         aggregated[key] = sum(values) / len(values)
                 
-                self.experiment.logger.log(
-                    aggregated,
-                    step=self.experiment.n_iters_performed
-                )
+                # Try to log to wandb, but handle case where run is finished
+                try:
+                    self.experiment.logger.log(
+                        aggregated,
+                        step=self.experiment.n_iters_performed
+                    )
+                except Exception as e:
+                    # Handle wandb run finished error gracefully
+                    if "wandb" in str(type(e)).lower() or "finished" in str(e).lower():
+                        print(f"Warning: Could not log to wandb (run may be finished): {e}")
+                        # Still save to file even if wandb logging fails
+                    else:
+                        # Re-raise if it's a different error
+                        raise
                 
                 if self.save_to_file:
                     aggregated["step"] = self.experiment.n_iters_performed
@@ -192,27 +220,161 @@ class AnchorMetricsCallback(Callback):
         all_metrics = {}
         n_episodes = 0
         
+        # Collect anchor data if requested
+        if self.collect_anchor_data:
+            # Initialize if not exists, otherwise keep existing data (append mode)
+            if not hasattr(self, 'evaluation_anchor_data'):
+                self.evaluation_anchor_data = []
+        
+        # Debug: check if rollouts is empty
+        if not rollouts:
+            print("Warning: on_evaluation_end received empty rollouts list")
+            print(f"  Callback collect_anchor_data={self.collect_anchor_data}")
+            print(f"  Experiment group_map: {getattr(self.experiment, 'group_map', 'N/A')}")
+            return
+        
+        print(f"Debug: on_evaluation_end received {len(rollouts)} rollouts")
+        if rollouts:
+            print(f"  First rollout type: {type(rollouts[0])}")
+            if hasattr(rollouts[0], 'keys'):
+                print(f"  First rollout keys: {list(rollouts[0].keys())}")
+        
         for rollout in rollouts:
             n_episodes += 1
+            episode_data = {}
             
-            for group in self.experiment.group_map.keys():
-                if group in rollout.keys():
-                    group_rollout = rollout[group]
-                    
-                    if "info" in group_rollout.keys():
-                        info = group_rollout["info"]
+            # Rollout structure: ['agent', 'done', 'terminated', 'truncated', 'next']
+            # Data is nested: rollout['next']['agent'] or rollout['agent'] for current state
+            # Info is in: rollout['next']['agent']['info'] or rollout['next'][group]['info']
+            
+            rollout_keys = list(rollout.keys()) if hasattr(rollout, 'keys') else []
+            
+            # Check if we have 'next' key (contains next state info)
+            next_data = None
+            if "next" in rollout_keys:
+                next_data = rollout["next"]
+            elif hasattr(rollout, 'get'):
+                next_data = rollout.get("next", None)
+            
+            # Also check for direct 'agent' key
+            agent_data = None
+            if "agent" in rollout_keys:
+                agent_data = rollout["agent"]
+            elif hasattr(rollout, 'get'):
+                agent_data = rollout.get("agent", None)
+            
+            # Try to get groups from experiment, or use 'agent' as default
+            groups_to_check = list(self.experiment.group_map.keys()) if hasattr(self.experiment, 'group_map') else []
+            if not groups_to_check and agent_data is not None:
+                # If no groups, try 'agent' directly
+                groups_to_check = ["agent"]
+            
+            # If we have next_data, check for nested groups
+            if next_data is not None:
+                if hasattr(next_data, 'keys'):
+                    next_keys = list(next_data.keys())
+                    # Check if groups are nested in 'next'
+                    for group in groups_to_check:
+                        if group in next_keys:
+                            groups_to_check = [group]
+                            break
+                    # If no groups found, try 'agent' in next
+                    if "agent" in next_keys and not any(g in next_keys for g in groups_to_check):
+                        groups_to_check = ["agent"]
+            
+            # Extract data for each group
+            for group in groups_to_check:
+                group_data = None
+                group_info = None
+                group_obs = None
+                
+                # Try to get group data from 'next'
+                if next_data is not None:
+                    if hasattr(next_data, 'keys') and group in next_data.keys():
+                        group_data = next_data[group]
+                    elif hasattr(next_data, 'get'):
+                        group_data = next_data.get(group, None)
+                
+                # Fallback to direct access
+                if group_data is None:
+                    if group in rollout_keys:
+                        group_data = rollout[group]
+                    elif agent_data is not None and group == "agent":
+                        group_data = agent_data
+                
+                if group_data is None:
+                    continue
+                
+                # Extract info from group_data
+                if hasattr(group_data, 'keys') and "info" in group_data.keys():
+                    group_info = group_data["info"]
+                elif hasattr(group_data, 'get'):
+                    group_info = group_data.get("info", None)
+                
+                # Extract observation
+                if hasattr(group_data, 'keys') and "observation" in group_data.keys():
+                    group_obs = group_data["observation"]
+                elif hasattr(group_data, 'get'):
+                    group_obs = group_data.get("observation", None)
+                
+                # Process info if available
+                if group_info is not None:
+                    # Handle TensorDict or tensor
+                    if hasattr(group_info, 'shape') and group_info.shape[0] > 0:
+                        # Get final info (last step of episode)
+                        final_info = group_info[-1] if len(group_info.shape) > 0 else group_info
                         
-                        if info.shape[0] > 0:
-                            final_info = info[-1]
-                            group_metrics = self._extract_metrics_from_info(
-                                final_info,
-                                prefix=f"evaluation/{group}/"
-                            )
+                        # Extract metrics
+                        group_metrics = self._extract_metrics_from_info(
+                            final_info,
+                            prefix=f"evaluation/{group}/"
+                        )
+                        
+                        for key, value in group_metrics.items():
+                            if key not in all_metrics:
+                                all_metrics[key] = []
+                            all_metrics[key].append(value)
+                        
+                        # Collect anchor data for rule extraction
+                        if self.collect_anchor_data:
+                            # Extract metrics from final info
+                            def safe_get(key, default=0.0):
+                                try:
+                                    if hasattr(final_info, 'get'):
+                                        val = final_info.get(key, default)
+                                    elif hasattr(final_info, 'keys') and key in final_info.keys():
+                                        val = final_info[key]
+                                    else:
+                                        val = getattr(final_info, key, default)
+                                    
+                                    if isinstance(val, torch.Tensor):
+                                        if val.numel() == 1:
+                                            return float(val.item())
+                                        else:
+                                            return float(val[-1].item()) if len(val.shape) > 0 else float(val.item())
+                                    return float(val)
+                                except:
+                                    return default
                             
-                            for key, value in group_metrics.items():
-                                if key not in all_metrics:
-                                    all_metrics[key] = []
-                                all_metrics[key].append(value)
+                            episode_data[group] = {
+                                "precision": safe_get("precision", 0.0),
+                                "coverage": safe_get("coverage", 0.0),
+                                "total_reward": safe_get("total_reward", 0.0),
+                            }
+                            
+                            # Get anchor bounds from observation
+                            if group_obs is not None:
+                                if hasattr(group_obs, 'shape') and group_obs.shape[0] > 0:
+                                    # Last observation contains final anchor state
+                                    final_obs = group_obs[-1] if len(group_obs.shape) > 1 else group_obs
+                                    if isinstance(final_obs, torch.Tensor):
+                                        episode_data[group]["final_observation"] = final_obs.cpu().numpy().tolist()
+                                    else:
+                                        episode_data[group]["final_observation"] = np.array(final_obs).tolist()
+            
+            if self.collect_anchor_data and episode_data:
+                self.evaluation_anchor_data.append(episode_data)
+                print(f"  Collected anchor data for episode {n_episodes}: {list(episode_data.keys())}")
         
         if all_metrics:
             aggregated = {}
@@ -225,10 +387,20 @@ class AnchorMetricsCallback(Callback):
             
             aggregated["evaluation/n_episodes"] = n_episodes
             
-            self.experiment.logger.log(
-                aggregated,
-                step=self.experiment.n_iters_performed
-            )
+            # Try to log to wandb, but handle case where run is finished
+            try:
+                self.experiment.logger.log(
+                    aggregated,
+                    step=self.experiment.n_iters_performed
+                )
+            except Exception as e:
+                # Handle wandb run finished error gracefully
+                if "wandb" in str(type(e)).lower() or "finished" in str(e).lower():
+                    print(f"Warning: Could not log to wandb (run may be finished): {e}")
+                    # Still save to file even if wandb logging fails
+                else:
+                    # Re-raise if it's a different error
+                    raise
             
             if self.save_to_file:
                 aggregated["step"] = self.experiment.n_iters_performed
@@ -249,4 +421,8 @@ class AnchorMetricsCallback(Callback):
     
     def get_evaluation_history(self) -> List[Dict[str, Any]]:
         return self.evaluation_history.copy()
+    
+    def get_evaluation_anchor_data(self) -> List[Dict[str, Any]]:
+        """Get anchor data collected during evaluation for rule extraction."""
+        return self.evaluation_anchor_data.copy()
 

@@ -422,47 +422,95 @@ class TabularDatasetLoader:
     
     def perform_eda_analysis(
         self,
-        output_dir: str = "./output/eda_output/",
+        output_dir: str = "./output/eda/",
         verbose: bool = True,
         use_ydata_profiling: bool = True,
-        minimal: bool = False
+        minimal: bool = False,
+        force_rerun: bool = False
     ) -> Dict[str, any]:
         if self.X_train is None or self.X_test is None:
             raise ValueError("Dataset not loaded yet. Call load_dataset() first.")
         
         os.makedirs(output_dir, exist_ok=True)
         
-        if verbose:
-            print(f"\nPerforming EDA analysis for dataset: {self.dataset_name}")
-            print("="*80)
+        # Check if EDA has already been done
+        summary_path = os.path.join(output_dir, "eda_summary.json")
+        train_report_path = os.path.join(output_dir, "training_data_profile.html")
+        test_report_path = os.path.join(output_dir, "test_data_profile.html")
         
-        eda_results = {}
-        
+        # Determine if EDA was done with ydata_profiling or custom
+        eda_already_done = False
         if use_ydata_profiling:
+            # Check for ydata_profiling outputs
+            if os.path.exists(summary_path) and os.path.exists(train_report_path) and os.path.exists(test_report_path):
+                eda_already_done = True
+        else:
+            # Check for custom EDA output (at minimum, summary should exist)
+            if os.path.exists(summary_path):
+                eda_already_done = True
+        
+        if eda_already_done and not force_rerun:
+            if verbose:
+                print(f"\nEDA analysis already exists for dataset: {self.dataset_name}")
+                print("="*80)
+                print(f"Found existing EDA results in: {output_dir}")
+                print("  - Skipping EDA generation (use force_rerun=True to regenerate)")
+                print("="*80)
+            
+            # Load and return existing results
+            eda_results = {}
             try:
-                from ydata_profiling import ProfileReport
-                eda_results["ydata_profiling"] = self._perform_ydata_profiling(
-                    output_dir, verbose, minimal
-                )
-            except ImportError:
+                import json
+                if os.path.exists(summary_path):
+                    with open(summary_path, 'r') as f:
+                        summary_data = json.load(f)
+                    eda_results["summary"] = summary_data
+                
+                if use_ydata_profiling:
+                    if os.path.exists(train_report_path) and os.path.exists(test_report_path):
+                        eda_results["ydata_profiling"] = {
+                            "training_report_path": train_report_path,
+                            "test_report_path": test_report_path,
+                            "summary_json_path": summary_path
+                        }
+            except Exception as e:
                 if verbose:
-                    print("\n⚠ ydata-profiling not installed. Falling back to custom EDA.")
-                    print("  Install with: pip install ydata-profiling")
-                use_ydata_profiling = False
+                    print(f"  ⚠ Warning: Could not load existing EDA results: {e}")
+                    print("  Continuing with fresh EDA generation...")
+                eda_already_done = False
         
-        if not use_ydata_profiling:
-            eda_results["dataset_overview"] = self._analyze_dataset_overview(verbose)
-            eda_results["feature_statistics"] = self._analyze_feature_statistics(verbose)
-            eda_results["class_distribution"] = self._analyze_class_distribution(verbose)
-            eda_results["feature_correlations"] = self._analyze_feature_correlations(output_dir, verbose)
-            eda_results["class_separability"] = self._analyze_class_separability(verbose)
-            eda_results["data_quality"] = self._analyze_data_quality(verbose)
-        
-        if verbose:
-            print("\n" + "="*80)
-            print("EDA COMPLETE!")
-            print("="*80)
-            print(f"Results saved to: {output_dir}")
+        if not eda_already_done or force_rerun:
+            if verbose:
+                print(f"\nPerforming EDA analysis for dataset: {self.dataset_name}")
+                print("="*80)
+            
+            eda_results = {}
+            
+            if use_ydata_profiling:
+                try:
+                    from ydata_profiling import ProfileReport
+                    eda_results["ydata_profiling"] = self._perform_ydata_profiling(
+                        output_dir, verbose, minimal
+                    )
+                except ImportError:
+                    if verbose:
+                        print("\n⚠ ydata-profiling not installed. Falling back to custom EDA.")
+                        print("  Install with: pip install ydata-profiling")
+                    use_ydata_profiling = False
+            
+            if not use_ydata_profiling:
+                eda_results["dataset_overview"] = self._analyze_dataset_overview(verbose)
+                eda_results["feature_statistics"] = self._analyze_feature_statistics(verbose)
+                eda_results["class_distribution"] = self._analyze_class_distribution(verbose)
+                eda_results["feature_correlations"] = self._analyze_feature_correlations(output_dir, verbose)
+                eda_results["class_separability"] = self._analyze_class_separability(verbose)
+                eda_results["data_quality"] = self._analyze_data_quality(verbose)
+            
+            if verbose:
+                print("\n" + "="*80)
+                print("EDA COMPLETE!")
+                print("="*80)
+                print(f"Results saved to: {output_dir}")
         
         return eda_results
     
@@ -567,39 +615,85 @@ class TabularDatasetLoader:
         train_description = profile_train.get_description()
         test_description = profile_test.get_description()
         
+        # Helper function to safely get attribute values from description objects
+        def get_table_stat(description, stat_name, default=0):
+            """Safely extract table statistics from description object."""
+            try:
+                table = getattr(description, 'table', None)
+                if table is None:
+                    return default
+                # Try accessing as attribute first
+                if hasattr(table, stat_name):
+                    return getattr(table, stat_name, default)
+                # Try accessing as dict key
+                if isinstance(table, dict):
+                    return table.get(stat_name, default)
+                # Try accessing via __dict__
+                if hasattr(table, '__dict__'):
+                    return table.__dict__.get(stat_name, default)
+                return default
+            except Exception:
+                return default
+        
+        # Extract table statistics
         results["training_summary"] = {
-            "n_variables": train_description.get("table", {}).get("n_variables", 0),
-            "n_observations": train_description.get("table", {}).get("n_observations", 0),
-            "n_cells": train_description.get("table", {}).get("n_cells", 0),
-            "n_duplicates": train_description.get("table", {}).get("n_duplicates", 0),
-            "p_duplicates": train_description.get("table", {}).get("p_duplicates", 0),
-            "n_missing": train_description.get("table", {}).get("n_missing", 0),
-            "p_missing": train_description.get("table", {}).get("p_missing", 0),
-            "memory_size": train_description.get("table", {}).get("memory_size", 0)
+            "n_variables": get_table_stat(train_description, "n_variables", 0),
+            "n_observations": get_table_stat(train_description, "n_observations", 0),
+            "n_cells": get_table_stat(train_description, "n_cells", 0),
+            "n_duplicates": get_table_stat(train_description, "n_duplicates", 0),
+            "p_duplicates": get_table_stat(train_description, "p_duplicates", 0.0),
+            "n_missing": get_table_stat(train_description, "n_missing", 0),
+            "p_missing": get_table_stat(train_description, "p_missing", 0.0),
+            "memory_size": get_table_stat(train_description, "memory_size", 0)
         }
         
         results["test_summary"] = {
-            "n_variables": test_description.get("table", {}).get("n_variables", 0),
-            "n_observations": test_description.get("table", {}).get("n_observations", 0),
-            "n_cells": test_description.get("table", {}).get("n_cells", 0),
-            "n_duplicates": test_description.get("table", {}).get("n_duplicates", 0),
-            "p_duplicates": test_description.get("table", {}).get("p_duplicates", 0),
-            "n_missing": test_description.get("table", {}).get("n_missing", 0),
-            "p_missing": test_description.get("table", {}).get("p_missing", 0),
-            "memory_size": test_description.get("table", {}).get("memory_size", 0)
+            "n_variables": get_table_stat(test_description, "n_variables", 0),
+            "n_observations": get_table_stat(test_description, "n_observations", 0),
+            "n_cells": get_table_stat(test_description, "n_cells", 0),
+            "n_duplicates": get_table_stat(test_description, "n_duplicates", 0),
+            "p_duplicates": get_table_stat(test_description, "p_duplicates", 0.0),
+            "n_missing": get_table_stat(test_description, "n_missing", 0),
+            "p_missing": get_table_stat(test_description, "p_missing", 0.0),
+            "memory_size": get_table_stat(test_description, "memory_size", 0)
         }
         
+        # Extract correlations and alerts if available
         results["correlations"] = {}
-        if "correlations" in train_description:
-            results["correlations"]["training"] = train_description["correlations"]
-        if "correlations" in test_description:
-            results["correlations"]["test"] = test_description["correlations"]
+        try:
+            train_corr = getattr(train_description, 'correlations', None)
+            if train_corr is not None:
+                if hasattr(train_corr, 'to_dict'):
+                    results["correlations"]["training"] = train_corr.to_dict()
+                else:
+                    results["correlations"]["training"] = train_corr
+        except Exception:
+            pass
+        
+        try:
+            test_corr = getattr(test_description, 'correlations', None)
+            if test_corr is not None:
+                if hasattr(test_corr, 'to_dict'):
+                    results["correlations"]["test"] = test_corr.to_dict()
+                else:
+                    results["correlations"]["test"] = test_corr
+        except Exception:
+            pass
         
         results["alerts"] = {}
-        if "alerts" in train_description:
-            results["alerts"]["training"] = train_description["alerts"]
-        if "alerts" in test_description:
-            results["alerts"]["test"] = test_description["alerts"]
+        try:
+            train_alerts = getattr(train_description, 'alerts', None)
+            if train_alerts is not None:
+                results["alerts"]["training"] = train_alerts
+        except Exception:
+            pass
+        
+        try:
+            test_alerts = getattr(test_description, 'alerts', None)
+            if test_alerts is not None:
+                results["alerts"]["test"] = test_alerts
+        except Exception:
+            pass
         
         if verbose:
             print("\n4. Key Statistics:")
@@ -619,17 +713,63 @@ class TabularDatasetLoader:
             print("\n5. Saving JSON summary...")
         
         import json
+        
+        # Helper function to convert NumPy types to native Python types for JSON serialization
+        def convert_to_json_serializable(obj):
+            """Recursively convert NumPy types to native Python types."""
+            # Check for NumPy integer types (compatible with NumPy 2.0)
+            if isinstance(obj, np.integer):
+                return int(obj)
+            # Check for NumPy floating point types (compatible with NumPy 2.0)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            # Check for NumPy arrays
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            # Check for NumPy boolean (compatible with NumPy 2.0)
+            elif isinstance(obj, bool):
+                return bool(obj)
+            elif hasattr(np, 'bool_') and isinstance(obj, np.bool_):
+                return bool(obj)
+            # Handle dictionaries recursively
+            elif isinstance(obj, dict):
+                return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+            # Handle lists and tuples recursively
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_json_serializable(item) for item in obj]
+            elif obj is None:
+                return None
+            else:
+                # Try to convert if it's a NumPy scalar (fallback for any NumPy type)
+                try:
+                    if hasattr(obj, 'item'):
+                        return obj.item()
+                    # Check if it's a NumPy dtype that can be converted
+                    if hasattr(obj, 'dtype'):
+                        if np.issubdtype(obj.dtype, np.integer):
+                            return int(obj)
+                        elif np.issubdtype(obj.dtype, np.floating):
+                            return float(obj)
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                return obj
+        
+        summary_data = {
+            "dataset_name": self.dataset_name,
+            "training_summary": results["training_summary"],
+            "test_summary": results["test_summary"],
+            "n_features": self.n_features,
+            "n_classes": self.n_classes,
+            "feature_names": self.feature_names,
+            "class_names": self.class_names
+        }
+        
+        # Convert all NumPy types to native Python types
+        summary_data = convert_to_json_serializable(summary_data)
+        
         summary_path = os.path.join(output_dir, "eda_summary.json")
         with open(summary_path, 'w') as f:
-            json.dump({
-                "dataset_name": self.dataset_name,
-                "training_summary": results["training_summary"],
-                "test_summary": results["test_summary"],
-                "n_features": self.n_features,
-                "n_classes": self.n_classes,
-                "feature_names": self.feature_names,
-                "class_names": self.class_names
-            }, f, indent=2)
+            json.dump(summary_data, f, indent=2)
         
         results["summary_json_path"] = summary_path
         

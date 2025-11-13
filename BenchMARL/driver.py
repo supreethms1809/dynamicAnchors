@@ -1,6 +1,7 @@
 from tabular_datasets import TabularDatasetLoader
 from anchor_trainer import AnchorTrainer
 import argparse
+import os
 
 
 def main():
@@ -167,6 +168,14 @@ def main():
         )
         
         print(f"\nClassifier trained with test accuracy: {test_acc:.4f}")
+        
+        # Save classifier for later use in inference
+        # We'll save it in the output directory (will be moved to checkpoint folder after training)
+        classifier_output_dir = f"{args.output_dir}training/"
+        os.makedirs(classifier_output_dir, exist_ok=True)
+        classifier_path = os.path.join(classifier_output_dir, "classifier.pth")
+        dataset_loader.save_classifier(trained_classifier, classifier_path)
+        print(f"Classifier saved to: {classifier_path}")
     else:
         if dataset_loader.classifier is None:
             raise ValueError(
@@ -195,18 +204,54 @@ def main():
     
     trainer.train()
     
+    # Get BenchMARL checkpoint path (BenchMARL saves checkpoints automatically)
+    checkpoint_path = trainer.get_checkpoint_path()
+    print(f"\nBenchMARL checkpoint location: {checkpoint_path}")
+    print(f"  Use this path to load checkpoints later for evaluation or continued training")
+    
+    # Copy classifier to checkpoint directory for easy access during inference
+    if hasattr(dataset_loader, 'classifier') and dataset_loader.classifier is not None:
+        import shutil
+        classifier_source = os.path.join(f"{args.output_dir}training/", "classifier.pth")
+        classifier_dest = os.path.join(checkpoint_path, "classifier.pth")
+        if os.path.exists(classifier_source):
+            shutil.copy2(classifier_source, classifier_dest)
+            print(f"  Classifier copied to checkpoint directory: {classifier_dest}")
+    
+    # Run BenchMARL evaluation (for metrics only)
     eval_results = trainer.evaluate()
-    print(f"\nEvaluation complete: {eval_results}")
+    print(f"\nEvaluation complete")
+    print(f"  Total frames: {eval_results['total_frames']}")
     
-    rules_results = trainer.extract_rules(
-        max_features_in_rule=5,
-        steps_per_episode=100,
-        n_instances_per_class=20,
-        eval_on_test_data=args.eval_on_test_data
-    )
+    # Extract and save individual models for easier standalone inference
+    print(f"\n{'='*80}")
+    print("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
+    print("="*80)
+    try:
+        saved_models = trainer.extract_and_save_individual_models(
+            output_dir=f"{args.output_dir}individual_models/",
+            save_policies=True,
+            save_critics=False  # Set to True if you need critic models
+        )
+        print(f"\n✓ Individual models extracted successfully!")
+        print(f"  Models saved to: {args.output_dir}individual_models/")
+    except Exception as e:
+        print(f"\n⚠ Warning: Could not extract individual models: {e}")
+        print("  You can still use the full BenchMARL checkpoint for inference")
     
-    rules_filepath = trainer.save_rules(rules_results)
-    print(f"\nRules extracted and saved to: {rules_filepath}")
+    # Note: Rule extraction should be done separately using inference.py
+    print(f"\n{'='*80}")
+    print("TRAINING COMPLETE!")
+    print(f"{'='*80}")
+    print(f"\nTo extract rules, run:")
+    print(f"  python inference.py --checkpoint {checkpoint_path} --dataset {args.dataset} --algorithm {args.algorithm}")
+    print(f"\nThis will:")
+    print(f"  1. Load the trained model from checkpoint")
+    print(f"  2. Run rollouts on instances to extract anchors")
+    print(f"  3. Extract and save rules")
+    print(f"\nAlternatively, you can use the extracted individual models for faster inference:")
+    print(f"  Individual models saved to: {args.output_dir}individual_models/")
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":

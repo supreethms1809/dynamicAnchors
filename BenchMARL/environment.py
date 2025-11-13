@@ -117,6 +117,8 @@ class AnchorEnv(ParallelEnv):
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
+        # Shared reward weight for cooperative behavior (applied to all agents)
+        self.shared_reward_weight = env_config.get("shared_reward_weight", 0.2)
         
         x_star_unit_config = env_config.get("x_star_unit", None)
         if isinstance(x_star_unit_config, dict):
@@ -396,12 +398,15 @@ class AnchorEnv(ParallelEnv):
         truncations = {}
         infos = {}
         
+        # Compute shared reward once for all agents (cooperative component)
+        shared_reward = self._compute_shared_reward() if len(self.agents) > 1 else 0.0
+        
         for agent in self.agents:
             if agent not in actions:
                 precision, coverage, _ = self._current_metrics(agent)
                 state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
                 observations[agent] = np.array(state, dtype=np.float32)
-                rewards[agent] = 0.0
+                rewards[agent] = float(shared_reward)  # Still get shared reward even without action
                 terminations[agent] = False
                 truncations[agent] = False
                 infos[agent] = {
@@ -425,7 +430,9 @@ class AnchorEnv(ParallelEnv):
                     "overlap_penalty": 0.0,
                     "drift_penalty": 0.0,
                     "anchor_drift_penalty": 0.0,
-                    "total_reward": 0.0,
+                    "inter_class_overlap_penalty": 0.0,
+                    "shared_reward": float(shared_reward),
+                    "total_reward": float(shared_reward),
                 }
                 continue
             
@@ -499,6 +506,8 @@ class AnchorEnv(ParallelEnv):
             anchor_drift_penalty = self._compute_anchor_drift_penalty(agent, prev_lower, prev_upper)
             
             inter_class_overlap_penalty = self._compute_inter_class_overlap_penalty(agent)
+            
+            # Use pre-computed shared reward (same for all agents to encourage cooperation)
 
             inter_lower = np.maximum(self.lower[agent], prev_lower)
             inter_upper = np.minimum(self.upper[agent], prev_upper)
@@ -533,7 +542,8 @@ class AnchorEnv(ParallelEnv):
                      drift_penalty - 
                      anchor_drift_penalty - 
                      js_penalty -
-                     inter_class_overlap_penalty)
+                     inter_class_overlap_penalty +
+                     shared_reward)  # Shared reward encourages cooperative behavior
             
             if not np.isfinite(reward):
                 reward = 0.0
@@ -605,6 +615,7 @@ class AnchorEnv(ParallelEnv):
                 "drift_penalty": float(drift_penalty),
                 "anchor_drift_penalty": float(anchor_drift_penalty),
                 "inter_class_overlap_penalty": float(inter_class_overlap_penalty),
+                "shared_reward": float(shared_reward),
                 "total_reward": float(reward),
             }
             
@@ -737,6 +748,100 @@ class AnchorEnv(ParallelEnv):
             target_class_bonus *= max(0.1, precision_ratio)
         
         return target_class_bonus
+    
+    def _compute_shared_reward(self) -> float:
+        """
+        Compute shared reward component for cooperative MARL.
+        All agents receive the same shared reward to encourage:
+        1. All agents meeting their targets (cooperative success)
+        2. Low overall overlap between all agents' rules
+        3. Good average performance across all agents
+        
+        Returns:
+            Shared reward value (same for all agents)
+        """
+        if len(self.agents) <= 1:
+            return 0.0
+        
+        # Collect metrics for all agents
+        all_precisions = []
+        all_coverages = []
+        all_targets_met = []
+        
+        for agent in self.agents:
+            precision, coverage, _ = self._current_metrics(agent)
+            all_precisions.append(precision)
+            all_coverages.append(coverage)
+            both_targets_met = (precision >= self.precision_target and 
+                               coverage >= self.coverage_target)
+            all_targets_met.append(both_targets_met)
+        
+        shared_reward = 0.0
+        shared_reward_weight = getattr(self, 'shared_reward_weight', 0.2)
+        
+        # 1. Bonus when ALL agents meet their targets (strong cooperative signal)
+        if all(all_targets_met):
+            shared_reward += shared_reward_weight * 1.0  # Large bonus for full cooperation
+        
+        # 2. Bonus for fraction of agents meeting targets (partial cooperation)
+        fraction_meeting_targets = sum(all_targets_met) / len(self.agents)
+        if fraction_meeting_targets > 0:
+            shared_reward += shared_reward_weight * 0.5 * fraction_meeting_targets
+        
+        # 3. Bonus for low overall overlap (complement to inter_class_overlap_penalty)
+        # Compute average overlap across all agent pairs
+        total_overlap = 0.0
+        n_pairs = 0
+        
+        for i, agent_i in enumerate(self.agents):
+            lower_i = self.lower[agent_i]
+            upper_i = self.upper[agent_i]
+            vol_i = float(np.prod(np.maximum(upper_i - lower_i, 1e-9)))
+            
+            if vol_i <= 1e-12:
+                continue
+            
+            for j, agent_j in enumerate(self.agents):
+                if i >= j:
+                    continue
+                
+                lower_j = self.lower[agent_j]
+                upper_j = self.upper[agent_j]
+                
+                inter_lower = np.maximum(lower_i, lower_j)
+                inter_upper = np.minimum(upper_i, upper_j)
+                inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
+                inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
+                
+                if inter_vol > 1e-12:
+                    # Normalize by average volume of the two boxes
+                    vol_j = float(np.prod(np.maximum(upper_j - lower_j, 1e-9)))
+                    avg_vol = 0.5 * (vol_i + vol_j)
+                    overlap_ratio = inter_vol / (avg_vol + 1e-12)
+                    total_overlap += overlap_ratio
+                    n_pairs += 1
+        
+        if n_pairs > 0:
+            avg_overlap = total_overlap / n_pairs
+            # Reward low overlap (inverse relationship)
+            overlap_bonus = shared_reward_weight * 0.3 * (1.0 - min(1.0, avg_overlap))
+            shared_reward += overlap_bonus
+        
+        # 4. Bonus for good average precision/coverage across all agents
+        avg_precision = np.mean(all_precisions) if all_precisions else 0.0
+        avg_coverage = np.mean(all_coverages) if all_coverages else 0.0
+        
+        eps = 1e-12
+        precision_progress = min(1.0, avg_precision / (self.precision_target + eps))
+        coverage_progress = min(1.0, avg_coverage / (self.coverage_target + eps))
+        
+        # Reward when average performance is good
+        if avg_precision >= self.precision_target * 0.8:
+            shared_reward += shared_reward_weight * 0.2 * precision_progress
+        if avg_coverage >= self.coverage_target * 0.5:
+            shared_reward += shared_reward_weight * 0.2 * coverage_progress
+        
+        return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.0))  # Cap at reasonable maximum
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Box:
