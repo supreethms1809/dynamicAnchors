@@ -100,6 +100,7 @@ class AnchorEnv(ParallelEnv):
         self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
         self.use_random_sampling = env_config.get("use_random_sampling", False)
+        self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
         
         self.eval_on_test_data = env_config.get("eval_on_test_data", False)
         if self.eval_on_test_data:
@@ -170,6 +171,56 @@ class AnchorEnv(ParallelEnv):
         if self.X_min is None or self.X_range is None:
             raise ValueError("X_min/X_range must be set for uniform perturbation sampling.")
         return (X_unit_samples * self.X_range) + self.X_min
+    
+    def _get_class_centroid(self, agent: str) -> Optional[np.ndarray]:
+        """
+        Get the centroid for the agent's target class.
+        
+        Priority:
+        1. Use precomputed cluster_centroids_per_class if available
+        2. Use fixed_instances_per_class if available (sample from them)
+        3. Compute mean centroid from class data
+        
+        Args:
+            agent: Agent name (e.g., "agent_0")
+            
+        Returns:
+            Centroid in unit space [0, 1], or None if no data available
+        """
+        target_class = self.agent_to_class.get(agent)
+        if target_class is None:
+            return None
+        
+        # Priority 1: Use precomputed cluster centroids
+        if self.cluster_centroids_per_class is not None:
+            if target_class in self.cluster_centroids_per_class:
+                centroids = self.cluster_centroids_per_class[target_class]
+                if len(centroids) > 0:
+                    # Sample a random centroid if multiple available
+                    centroid_idx = self.rng.integers(0, len(centroids))
+                    return np.array(centroids[centroid_idx], dtype=np.float32)
+        
+        # Priority 2: Use fixed instances (sample one as centroid)
+        if self.fixed_instances_per_class is not None:
+            if target_class in self.fixed_instances_per_class:
+                instances = self.fixed_instances_per_class[target_class]
+                if len(instances) > 0:
+                    instance_idx = self.rng.integers(0, len(instances))
+                    return np.array(instances[instance_idx], dtype=np.float32)
+        
+        # Priority 3: Compute mean centroid from class data
+        X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
+        y_data = self.y_test if self.eval_on_test_data else self.y
+        
+        class_mask = (y_data == target_class)
+        if class_mask.sum() == 0:
+            logger.warning(f"No instances found for class {target_class} to compute centroid")
+            return None
+        
+        class_data = X_data[class_mask]
+        centroid = np.mean(class_data, axis=0).astype(np.float32)
+        
+        return centroid
 
     def _current_metrics(self, agent: str) -> tuple:
         target_class = self.agent_to_class[agent]
@@ -318,13 +369,27 @@ class AnchorEnv(ParallelEnv):
         infos = {}
         
         for agent in self.agents:
-            if self.x_star_unit.get(agent) is None:
+            # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
+            if self.x_star_unit.get(agent) is not None:
+                w = self.initial_window
+                centroid = self.x_star_unit[agent]
+                self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
+                self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
+            # Priority 2: Use class centroid if enabled (for class-based)
+            elif self.use_class_centroids:
+                centroid = self._get_class_centroid(agent)
+                if centroid is not None:
+                    w = self.initial_window
+                    self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
+                    self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
+                else:
+                    # Fallback: Full space initialization
+                    self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
+                    self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
+            # Priority 3: Full space initialization (original behavior)
+            else:
                 self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
                 self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
-            else:
-                w = self.initial_window
-                self.lower[agent] = np.clip(self.x_star_unit[agent] - w, 0.0, 1.0)
-                self.upper[agent] = np.clip(self.x_star_unit[agent] + w, 0.0, 1.0)
             
             self.prev_lower[agent] = self.lower[agent].copy()
             self.prev_upper[agent] = self.upper[agent].copy()
@@ -538,6 +603,20 @@ class AnchorEnv(ParallelEnv):
                 details, precision, precision_threshold, eps
             )
 
+            # When action is reverted (coverage_clipped), reduce penalties significantly
+            # since no actual change occurred, but still give a small negative signal
+            coverage_floor_penalty = 0.0
+            if coverage_clipped:
+                # Reduce all penalties since action didn't actually take effect
+                # Drift is already ~0 since we reverted, but reduce other penalties
+                penalty_reduction_factor = 0.1  # Reduce penalties by 90%
+                overlap_penalty *= penalty_reduction_factor
+                anchor_drift_penalty *= penalty_reduction_factor
+                js_penalty *= penalty_reduction_factor
+                inter_class_overlap_penalty *= penalty_reduction_factor
+                # Give a small negative reward for attempting invalid action
+                coverage_floor_penalty = -0.05  # Small penalty for violating coverage floor
+
             reward = (self.alpha * precision_weight * precision_gain + 
                      coverage_weight * coverage_gain_for_reward + 
                      coverage_bonus +
@@ -547,6 +626,7 @@ class AnchorEnv(ParallelEnv):
                      anchor_drift_penalty - 
                      js_penalty -
                      inter_class_overlap_penalty +
+                     coverage_floor_penalty +
                      shared_reward)
             
             if not np.isfinite(reward):
@@ -619,6 +699,7 @@ class AnchorEnv(ParallelEnv):
                 "drift_penalty": float(drift_penalty),
                 "anchor_drift_penalty": float(anchor_drift_penalty),
                 "inter_class_overlap_penalty": float(inter_class_overlap_penalty),
+                "coverage_floor_penalty": float(coverage_floor_penalty),
                 "shared_reward": float(shared_reward),
                 "total_reward": float(reward),
             }

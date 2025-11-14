@@ -1824,5 +1824,6 @@ class AnchorTrainer:
             "min_absolute_step": 0.001,
             "inter_class_overlap_weight": 0.1,
             "shared_reward_weight": 0.2,  # Weight for shared cooperative reward
+            "use_class_centroids": True,  # Use class centroids for initial window (default: True)
         }
 

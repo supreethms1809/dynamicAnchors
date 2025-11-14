@@ -36,6 +36,19 @@ env_config:
   min_absolute_step: 0.001
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
   shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
+  # Use class centroids to initialize the initial window (default: true)
+  # If true: initial window is set around class centroid (mean of class instances)
+  # If false: initial window is full space (0 to 1 for all features)
+  # For instance-based: x_star_unit overrides this (instance centroid is used)
+  use_class_centroids: true
+  # Optional: Precomputed cluster centroids per class (dict of {class: [centroid1, centroid2, ...]})
+  # If provided, a random centroid is sampled for each episode reset
+  # If None, mean centroid is computed from class data
+  cluster_centroids_per_class: null
+  # Optional: Fixed instances per class to use as centroids (dict of {class: [instance1, instance2, ...]})
+  # If provided, a random instance is sampled as centroid for each episode reset
+  # If None, mean centroid is computed from class data
+  fixed_instances_per_class: null
 
 # Maximum number of steps per episode
 max_cycles: 1000
