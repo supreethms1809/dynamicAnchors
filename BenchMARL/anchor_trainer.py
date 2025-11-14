@@ -77,7 +77,7 @@ class AnchorTrainer:
         self,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 500,
+        max_cycles: int = 1000,
         device: str = "cpu",
         eval_on_test_data: bool = True
     ) -> Experiment:

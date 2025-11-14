@@ -20,8 +20,8 @@ env_config:
   precision_target: 0.8
   coverage_target: 0.02
   use_perturbation: false
-  perturbation_mode: "bootstrap"  # "bootstrap", "uniform", or "adaptive"
-  n_perturb: 1024
+  perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
+  n_perturb: 4096
   step_fracs: [0.005, 0.01, 0.02]
   min_width: 0.05
   alpha: 0.7
@@ -38,5 +38,5 @@ env_config:
   shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
 
 # Maximum number of steps per episode
-max_cycles: 500
+max_cycles: 1000
 

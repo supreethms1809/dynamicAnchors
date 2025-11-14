@@ -462,10 +462,36 @@ class AnchorEnv:
         return state
 
     def _apply_action(self, action: int):
+        # CRITICAL: Validate action bounds to prevent IndexError
+        if action < 0 or action >= self.n_actions:
+            raise ValueError(
+                f"Invalid action {action}. Action must be in [0, {self.n_actions - 1}]. "
+                f"Got action={action}, n_actions={self.n_actions}, "
+                f"n_features={self.n_features}, n_directions={len(self.directions)}, "
+                f"n_step_fracs={len(self.step_fracs)}"
+            )
+        
         f = action // (len(self.directions) * len(self.step_fracs))
         rem = action % (len(self.directions) * len(self.step_fracs))
         d = rem // len(self.step_fracs)
         m = rem % len(self.step_fracs)
+
+        # CRITICAL: Validate decoded indices to prevent IndexError
+        if f < 0 or f >= self.n_features:
+            raise ValueError(
+                f"Invalid feature index {f} decoded from action {action}. "
+                f"Feature index must be in [0, {self.n_features - 1}]"
+            )
+        if d < 0 or d >= len(self.directions):
+            raise ValueError(
+                f"Invalid direction index {d} decoded from action {action}. "
+                f"Direction index must be in [0, {len(self.directions) - 1}]"
+            )
+        if m < 0 or m >= len(self.step_fracs):
+            raise ValueError(
+                f"Invalid step fraction index {m} decoded from action {action}. "
+                f"Step fraction index must be in [0, {len(self.step_fracs) - 1}]"
+            )
 
         direction = self.directions[d]
         step = float(self.step_fracs[m])
@@ -498,6 +524,15 @@ class AnchorEnv:
         # Check if continuous actions are enabled
         if not hasattr(self, 'max_action_scale'):
             raise ValueError("Continuous actions not enabled. Set max_action_scale and min_absolute_step.")
+        
+        # CRITICAL: Validate action shape to prevent IndexError
+        action = np.asarray(action, dtype=np.float32)
+        expected_shape = (2 * self.n_features,)
+        if action.shape != expected_shape:
+            raise ValueError(
+                f"Invalid action shape. Expected shape {expected_shape} (2 * n_features), "
+                f"got shape {action.shape}. n_features={self.n_features}"
+            )
         
         # Clip actions to [-1, 1]
         action = np.clip(action, -1.0, 1.0)
@@ -556,13 +591,17 @@ class AnchorEnv:
         coverage_clipped = False
         coverage_before_revert = None
         coverage_after_revert = None
+        
+        # CRITICAL: If coverage drops below floor, revert bounds and recalculate gains from previous state
+        # This ensures reward reflects that the action was effectively undone
         if coverage < self.min_coverage_floor:
             # Store coverage before revert for tracking
             coverage_before_revert = float(coverage)
+            precision_before_revert = float(precision)
             # Revert bounds
             self.lower = prev_lower
             self.upper = prev_upper
-            # Recompute metrics after revert
+            # Recompute metrics after revert (should match prev_precision/prev_coverage)
             precision, coverage, details = self._current_metrics()
             # Re-validate after reset
             if not np.isfinite(precision):
@@ -573,6 +612,10 @@ class AnchorEnv:
             coverage_after_revert = float(coverage)
             self.coverage_floor_hits += 1
             coverage_clipped = True
+            # CRITICAL FIX: After revert, precision and coverage should match previous state
+            # So precision_gain and coverage_gain should be 0 (no change from previous step)
+            # This correctly reflects that the action was undone
+            # Note: prev_precision and prev_coverage are already validated above
 
         precision_gain = precision - prev_precision
         coverage_gain = coverage - prev_coverage

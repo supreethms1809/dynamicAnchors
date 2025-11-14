@@ -135,7 +135,7 @@ class AnchorEnv(ParallelEnv):
         self.box_history = {}
         self.coverage_floor_hits = {}
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 100)
+        self.max_cycles = env_config.get("max_cycles", 1000)
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod

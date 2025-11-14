@@ -320,7 +320,21 @@ def get_output_directory(
     return output_dir
 
 
-def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bool = True, use_continuous_actions: bool = False, continuous_algorithm: str = "ddpg", classifier_type: str = "dnn", device: str = "auto"):
+def main(
+    dataset_name: str = "breast_cancer", 
+    sample_size: int = None, 
+    joint: bool = True, 
+    use_continuous_actions: bool = False, 
+    continuous_algorithm: str = "ddpg", 
+    classifier_type: str = "dnn", 
+    device: str = "auto",
+    # Training parameters (optional, uses dataset-specific defaults if None)
+    episodes: int = None,
+    steps_per_episode: int = None,
+    batch_size: int = None,
+    n_perturb: int = None,
+    n_envs: int = None,
+):
     """
     Main function: Complete pipeline for sklearn datasets.
     
@@ -331,12 +345,22 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         use_continuous_actions: If True, use continuous actions (DDPG/TD3) instead of discrete (PPO)
         continuous_algorithm: "ddpg" or "td3" (only used if use_continuous_actions=True)
         classifier_type: "dnn", "random_forest", or "gradient_boosting"
+        device: Device to use ("auto", "cpu", "cuda", "mps")
+        episodes: Optional number of training episodes (uses dataset-specific default if None)
+        steps_per_episode: Optional steps per episode (uses dataset-specific default if None)
+        batch_size: Optional batch size (uses dataset-specific default if None)
+        n_perturb: Optional number of perturbation samples (uses dataset-specific default if None)
+        n_envs: Optional number of parallel environments (uses dataset-specific default if None, ignored for TD3/DDPG)
     
     Note:
         Perturbation modes (set in training functions):
         - "bootstrap": Resample empirical points with replacement (requires points in box)
         - "uniform": Generate uniform samples within box bounds (works even with 0 points)
         - "adaptive": Use bootstrap when plenty of points, uniform when sparse (recommended)
+        
+        Production defaults (conservative estimates for good performance):
+        - breast_cancer/wine: 200 episodes × 2000 steps, batch_size=512, n_perturb=4096
+        - covtype/housing: 200-250 episodes × 2500 steps, batch_size=1024, n_perturb=8192
     """
     # Generate timestamp and output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -385,13 +409,35 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         print(f"Class names: {class_names}")
         print(f"Number of features: {len(feature_names)}")
         
-        # Split data
+        # Split data with stratification
+        # Handle edge case: if some classes have < 2 samples after sampling, stratification will fail
+        # Check class distribution before splitting
+        unique_classes, class_counts = np.unique(y, return_counts=True)
+        min_class_count = class_counts.min() if len(class_counts) > 0 else 0
+        
+        # Use stratification only if all classes have at least 2 samples (required for stratify)
+        use_stratify = min_class_count >= 2
+        
+        if not use_stratify:
+            print(f"⚠ WARNING: Some classes have fewer than 2 samples. Cannot use stratification.")
+            print(f"  Class distribution: {dict(zip(unique_classes, class_counts))}")
+            print(f"  Using non-stratified split instead.")
+        
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=seed, stratify=y
+            X, y, test_size=0.2, random_state=seed, stratify=y if use_stratify else None
         )
         
         print(f"\nTrain set: {X_train.shape}")
         print(f"Test set: {X_test.shape}")
+        
+        # Validate that stratification worked (all classes present in both splits)
+        unique_train = np.unique(y_train)
+        unique_test = np.unique(y_test)
+        if len(unique_train) != len(np.unique(y)) or len(unique_test) != len(np.unique(y)):
+            print(f"⚠ WARNING: Some classes may be missing after train/test split")
+            print(f"  Original classes: {np.unique(y)}")
+            print(f"  Train classes: {unique_train}")
+            print(f"  Test classes: {unique_test}")
         
         # ==========================================================================
         # STEP 2: Set Device (Standardized - Set Once at Beginning)
@@ -534,7 +580,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 precision_target=0.95,  # High precision target
                 coverage_target=0.01,  # Realistic target (1% coverage) - can be increased as agent learns
                 n_eval_instances_per_class=50,
-                max_features_in_rule=-1,  # Use -1 or None to include all tightened features (for feature importance)
+                max_features_in_rule=-1,  # Use -1 to include ALL tightened features in rules (no limit)
+                # This is important for comprehensive feature importance analysis
                 use_random_sampling=True,  # Enable random sampling to reduce variance (avoids deterministic cycling patterns)
                 output_dir=output_dir,
                 save_checkpoints=True,
@@ -542,7 +589,9 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 verbose=1,
             )
             
-            classifier = results['classifier']
+            classifier = results.get('classifier')
+            if classifier is None:
+                raise ValueError("Classifier not found in results. Training may have failed.")
         
         else:
             # ======================================================================
@@ -586,27 +635,66 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             # Use classes that are actually present in training data (already set above)
             # target_classes is already set from unique_classes_train
 
-            # Training configuration using episodes and steps_per_episode convention
-            # From POC: Breast Cancer uses 25 episodes × 40 steps
-            # We'll use similar but with more steps per episode for better learning
-            episodes = 150
-            steps_per_episode = 1500
+            # Production-optimized training configuration with dataset-specific defaults
+            # These defaults are conservative but optimized for good performance
+            dataset_defaults = {
+                "breast_cancer": {
+                    "episodes": 200,
+                    "steps_per_episode": 2000,  # Increased from 1500 for better convergence
+                    "batch_size": 512,  # Larger batch for better GPU utilization
+                    "n_perturb": 4096,  # More samples for better precision estimates
+                    "n_envs": 2,
+                },
+                "wine": {
+                    "episodes": 200,
+                    "steps_per_episode": 2000,
+                    "batch_size": 512,
+                    "n_perturb": 4096,
+                    "n_envs": 2,
+                },
+                "covtype": {
+                    "episodes": 250,
+                    "steps_per_episode": 2500,  # More steps for complex dataset
+                    "batch_size": 1024,  # Larger batch for large dataset
+                    "n_perturb": 8192,  # More samples for complex dataset
+                    "n_envs": 4,  # More parallel envs for large dataset
+                },
+                "housing": {
+                    "episodes": 200,
+                    "steps_per_episode": 2500,
+                    "batch_size": 1024,
+                    "n_perturb": 8192,
+                    "n_envs": 4,
+                },
+            }
             
-            # Calculate PPO parameters from episodes convention
-            # total_timesteps = episodes × steps_per_episode × n_envs
-            # n_steps should be approximately steps_per_episode or slightly less
-            n_envs = 2
-            total_timesteps = episodes * steps_per_episode * n_envs  # 25 × 40 × 2 = 2000
-            n_steps = steps_per_episode  # Use same as steps_per_episode for alignment
+            # Use provided parameters or dataset-specific defaults
+            config = dataset_defaults.get(dataset_name, dataset_defaults["breast_cancer"])
+            training_episodes = episodes if episodes is not None else config["episodes"]
+            training_steps_per_episode = steps_per_episode if steps_per_episode is not None else config["steps_per_episode"]
+            training_batch_size = batch_size if batch_size is not None else config["batch_size"]
+            training_n_perturb = n_perturb if n_perturb is not None else config["n_perturb"]
+            training_n_envs = n_envs if n_envs is not None else config["n_envs"]
+            
+            # For continuous actions (TD3/DDPG), n_envs should be 1 (they handle parallelism differently)
+            actual_n_envs = 1 if use_continuous_actions else training_n_envs
+            
+            # Calculate total timesteps from episodes convention
+            # For TD3/DDPG: total_timesteps = episodes × steps_per_episode (n_envs=1)
+            # For PPO: total_timesteps = episodes × steps_per_episode × n_envs
+            total_timesteps = training_episodes * training_steps_per_episode * actual_n_envs
+            n_steps = training_steps_per_episode  # Use same as steps_per_episode for alignment
             
             # Evaluation uses same steps_per_episode
-            eval_steps_per_episode = steps_per_episode
+            eval_steps_per_episode = training_steps_per_episode
             
-            print(f"\nTraining Configuration:")
-            print(f"  Episodes: {episodes}")
-            print(f"  Steps per episode: {steps_per_episode}")
-            print(f"  Parallel envs: {n_envs}")
-            print(f"  Total timesteps: {total_timesteps}")
+            print(f"\nTraining Configuration (Production-Optimized):")
+            print(f"  Episodes: {training_episodes}")
+            print(f"  Steps per episode: {training_steps_per_episode}")
+            print(f"  Parallel envs: {actual_n_envs}")
+            print(f"  Total timesteps: {total_timesteps:,}")
+            print(f"  Batch size: {training_batch_size}")
+            print(f"  N perturb samples: {training_n_perturb:,}")
             print(f"  N steps per rollout: {n_steps}")
             
             results = train_and_evaluate_dynamic_anchors(
@@ -618,29 +706,30 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 classifier=classifier,
                 target_classes=target_classes,
                 device=device,
-                n_envs=n_envs if not use_continuous_actions else 1,  # DDPG/TD3 don't use vectorized envs the same way
+                n_envs=actual_n_envs,
                 total_timesteps=total_timesteps,
                 learning_rate=3e-4,
                 n_steps=n_steps,
-                batch_size=256,
+                batch_size=training_batch_size,
                 n_epochs=10,
                 use_continuous_actions=use_continuous_actions,  # Enable continuous actions if requested
                 continuous_algorithm=continuous_algorithm,  # "ddpg" or "td3"
                 continuous_learning_rate=5e-5,  # Lower LR for TD3/DDPG to reduce reward variance
                 use_perturbation=True,
                 perturbation_mode="adaptive",  # "bootstrap", "uniform", or "adaptive" (recommended: "adaptive")
-                n_perturb=2048,
+                n_perturb=training_n_perturb,
                 step_fracs=(0.005, 0.01, 0.02),
                 min_width=0.05,
                 precision_target=0.98,
                 coverage_target=0.5,  # 50% coverage - very high threshold, requires large boxes
                 n_eval_instances_per_class=20,
-                max_features_in_rule=-1,  # Use -1 or None to include all tightened features (for feature importance)
+                max_features_in_rule=-1,  # Use -1 to include ALL tightened features in rules (no limit)
+                # This is important for comprehensive feature importance analysis
                 steps_per_episode=eval_steps_per_episode,
                 use_random_sampling=True,  # Enable random sampling to reduce variance (avoids deterministic cycling patterns)
                 output_dir=output_dir,
                 save_checkpoints=True,
-                checkpoint_freq=2000,
+                checkpoint_freq=5000,  # Increased from 2000 for production runs (checkpoints every 5000 timesteps)
                 eval_freq=0,
                 verbose=1,
             )
@@ -687,7 +776,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
         # Show joint training history if available
         if 'joint_training_history' in results:
             print(f"\nJoint Training History:")
-            for episode_info in results['joint_training_history']:
+            joint_history = results.get('joint_training_history', [])
+            for episode_info in joint_history:
                 episode_num = episode_info.get('episode', 'N/A')
                 classifier_acc = episode_info.get('classifier_test_acc', 0.0)
                 rl_timesteps = episode_info.get('rl_timesteps', 0)
@@ -714,7 +804,8 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
             # Show instance-level results
             if 'per_class_results' in instance_results:
                 print(f"\n[Instance-Level Results] (One anchor per test instance):")
-                for cls, class_data in instance_results['per_class_results'].items():
+                instance_per_class = instance_results.get('per_class_results', {})
+                for cls, class_data in instance_per_class.items():
                     cls_int = int(cls.replace('class_', '')) if isinstance(cls, str) and cls.startswith('class_') else int(cls) if isinstance(cls, (int, str)) else cls
                     cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
                     print(f"\n  Class {cls_int} ({cls_name}):")
@@ -726,27 +817,33 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                     # If precision/coverage are 0 but best_rule exists, try to get from individual_results
                     if (precision == 0.0 or coverage == 0.0) and 'best_rule' in class_data and class_data.get('best_rule'):
                         # Try to get from individual_results if available
-                        if 'individual_results' in class_data and len(class_data['individual_results']) > 0:
+                        individual_results_list = class_data.get('individual_results', [])
+                        if individual_results_list and len(individual_results_list) > 0:
                             # Get average from individual results
-                            individual_precisions = [r.get('hard_precision', r.get('precision', 0.0)) for r in class_data['individual_results']]
-                            individual_coverages = [r.get('coverage', r.get('local_coverage', r.get('global_coverage', 0.0))) for r in class_data['individual_results']]
+                            individual_precisions = [r.get('hard_precision', r.get('precision', 0.0)) for r in individual_results_list]
+                            individual_coverages = [r.get('coverage', r.get('local_coverage', r.get('global_coverage', 0.0))) for r in individual_results_list]
                             if individual_precisions:
                                 precision = np.mean(individual_precisions)
                             if individual_coverages:
                                 coverage = np.mean(individual_coverages)
                         # Also try best_precision if available
                         if precision == 0.0 and 'best_precision' in class_data:
-                            precision = class_data['best_precision']
+                            precision = class_data.get('best_precision', 0.0)
                     
                     print(f"    Precision: {precision:.3f}")
                     print(f"    Coverage:  {coverage:.3f}")
                     if 'best_rule' in class_data:
-                        print(f"    Best Rule: {class_data['best_rule'][:100]}...")
+                        best_rule = class_data.get('best_rule', 'N/A')
+                        if best_rule and best_rule != 'N/A':
+                            print(f"    Best Rule: {best_rule[:100]}...")
+                        else:
+                            print(f"    Best Rule: N/A")
             
             # Show class-level results
             if 'per_class_results' in class_results:
                 print(f"\n[Class-Level Results] (One anchor per class, dynamic anchors advantage):")
-                for cls, class_data in class_results['per_class_results'].items():
+                class_per_class = class_results.get('per_class_results', {})
+                for cls, class_data in class_per_class.items():
                     cls_int = int(cls.replace('class_', '')) if isinstance(cls, str) and cls.startswith('class_') else int(cls) if isinstance(cls, (int, str)) else cls
                     cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
                     print(f"\n  Class {cls_int} ({cls_name}):")
@@ -768,20 +865,25 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                     print(f"    Precision: {precision:.3f}")
                     print(f"    Coverage:  {coverage:.3f}")
                     if 'rule' in class_data:
-                        print(f"    Rule: {class_data['rule'][:100]}...")
+                        rule = class_data.get('rule', 'N/A')
+                        if rule and rule != 'N/A':
+                            print(f"    Rule: {rule[:100]}...")
+                        else:
+                            print(f"    Rule: N/A")
         elif 'per_class_results' in eval_results:
-            for cls, class_results in eval_results['per_class_results'].items():
+            per_class_results_dict = eval_results.get('per_class_results', {})
+            for cls, class_results in per_class_results_dict.items():
                 cls_int = int(cls) if isinstance(cls, (int, str)) else cls
                 cls_name = class_names[cls_int] if cls_int < len(class_names) else f"Class {cls_int}"
                 print(f"\n  Class {cls_int} ({cls_name}):")
                 if 'avg_precision' in class_results:
-                    print(f"    Avg Precision: {class_results['avg_precision']:.3f}")
-                    print(f"    Avg Coverage:  {class_results['avg_coverage']:.3f}")
+                    print(f"    Avg Precision: {class_results.get('avg_precision', 0.0):.3f}")
+                    print(f"    Avg Coverage:  {class_results.get('avg_coverage', 0.0):.3f}")
                 elif 'precision' in class_results:
-                    print(f"    Precision: {class_results['precision']:.3f}")
-                    print(f"    Coverage:  {class_results['coverage']:.3f}")
+                    print(f"    Precision: {class_results.get('precision', 0.0):.3f}")
+                    print(f"    Coverage:  {class_results.get('coverage', 0.0):.3f}")
                 if 'best_rule' in class_results:
-                    print(f"    Best Rule: {class_results['best_rule']}")
+                    print(f"    Best Rule: {class_results.get('best_rule', 'N/A')}")
                 
                 # Try to create 2D visualization if not already created
                 if 'anchors' in class_results and len(class_results.get('anchors', [])) > 0:
@@ -793,24 +895,28 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                             print(f"\n  Creating 2D visualization...")
                             # Need X_test_scaled, X_min, X_range from results
                             # These might not be available, so skip if missing
-                            if 'X_test_scaled' in results and 'X_min' in results and 'X_range' in results:
+                            x_test_scaled = results.get('X_test_scaled')
+                            x_min = results.get('X_min')
+                            x_range = results.get('X_range')
+                            if x_test_scaled is not None and x_min is not None and x_range is not None:
                                 plot_path = plot_rules_2d(
                                     eval_results=eval_results,
-                                    X_test=results['X_test_scaled'],
+                                    X_test=x_test_scaled,
                                     y_test=y_test,
                                     feature_names=feature_names,
                                     class_names=class_names,
                                     output_path=plot_path,
-                                    X_min=results['X_min'],
-                                    X_range=results['X_range'],
+                                    X_min=x_min,
+                                    X_range=x_range,
                                 )
                                 print(f"    Saved: {plot_path}")
                     except Exception as e:
                         pass  # Silently skip if visualization fails
                 
                 # Show all rules with their individual coverage
-                if 'individual_results' in class_results and len(class_results['individual_results']) > 0:
-                    individual_results = class_results['individual_results']
+                individual_results_list = class_results.get('individual_results', [])
+                if individual_results_list and len(individual_results_list) > 0:
+                    individual_results = individual_results_list
                     print(f"\n    All Rules ({len(individual_results)} total):")
                     print(f"    {'Rule':<60} {'Precision':<12} {'Coverage':<12}")
                     print(f"    {'-'*60} {'-'*12} {'-'*12}")
@@ -841,7 +947,7 @@ def main(dataset_name: str = "breast_cancer", sample_size: int = None, joint: bo
                 # Show unique rules if available (legacy code)
                 if 'individual_results' in class_results and len(class_results['individual_results']) > 0:
                     from collections import Counter
-                    all_rules = [r['rule'] for r in class_results['individual_results']]
+                    all_rules = [r.get('rule', '') for r in class_results.get('individual_results', [])]
                     rule_counts = Counter(all_rules)
                     n_unique = len(rule_counts)
                     
@@ -953,6 +1059,36 @@ Datasets:
         choices=["auto", "cpu", "cuda", "mps"],
         help="Device to use: 'auto' (default, auto-detect), 'cpu', 'cuda', or 'mps'"
     )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="Number of training episodes (default: dataset-specific optimized value)"
+    )
+    parser.add_argument(
+        "--steps-per-episode",
+        type=int,
+        default=None,
+        help="Steps per episode (default: dataset-specific optimized value)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size for training (default: dataset-specific optimized value)"
+    )
+    parser.add_argument(
+        "--n-perturb",
+        type=int,
+        default=None,
+        help="Number of perturbation samples (default: dataset-specific optimized value)"
+    )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=None,
+        help="Number of parallel environments (default: dataset-specific optimized value, ignored for TD3/DDPG)"
+    )
     
     args = parser.parse_args()
     main(
@@ -962,6 +1098,11 @@ Datasets:
         use_continuous_actions=args.use_continuous_actions,
         continuous_algorithm=args.continuous_algorithm,
         classifier_type=args.classifier_type,
-        device=args.device
+        device=args.device,
+        episodes=args.episodes,
+        steps_per_episode=args.steps_per_episode,
+        batch_size=args.batch_size,
+        n_perturb=args.n_perturb,
+        n_envs=args.n_envs
     )
 

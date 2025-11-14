@@ -111,7 +111,10 @@ def analyze_metrics(json_path):
     print("\n" + "="*80)
     print("OVERALL STATISTICS")
     print("="*80)
-    overall = data['overall_statistics']
+    overall = data.get('overall_statistics', {})
+    if not overall:
+        print("⚠ WARNING: No overall_statistics found in metrics file")
+        return
     
     # Handle both new structure (instance_level/class_level) and old structure (backward compatibility)
     if 'instance_level' in overall:
@@ -335,6 +338,7 @@ def analyze_metrics(json_path):
     # Save plot
     output_path = json_path.replace('.json', '_analysis.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)  # Close figure to free memory
     print(f"Saved analysis plots to: {output_path}")
     
     # Feature frequency analysis
@@ -406,15 +410,24 @@ def analyze_metrics(json_path):
             if len(precisions) > 1 and len(coverages) > 1:
                 # Correlation
                 if len(precisions) == len(coverages):
-                    corr = np.corrcoef(precisions, coverages)[0, 1]
-                    print(f"\n{cls_key}:")
-                    print(f"  Precision-Coverage correlation: {corr:.3f}")
-                    if corr < -0.3:
-                        print(f"    → Strong negative tradeoff (more precise = less coverage)")
-                    elif corr > 0.3:
-                        print(f"    → Positive relationship (more precise = more coverage)")
-                    else:
-                        print(f"    → Weak relationship")
+                    try:
+                        # Check for constant arrays (zero variance) before correlation
+                        if np.std(precisions) > 1e-10 and np.std(coverages) > 1e-10:
+                            corr = np.corrcoef(precisions, coverages)[0, 1]
+                            print(f"\n{cls_key}:")
+                            print(f"  Precision-Coverage correlation: {corr:.3f}")
+                            if corr < -0.3:
+                                print(f"    → Strong negative tradeoff (more precise = less coverage)")
+                            elif corr > 0.3:
+                                print(f"    → Positive relationship (more precise = more coverage)")
+                            else:
+                                print(f"    → Weak relationship")
+                        else:
+                            print(f"\n{cls_key}:")
+                            print(f"  Precision-Coverage correlation: N/A (insufficient variance)")
+                    except Exception as e:
+                        print(f"\n{cls_key}:")
+                        print(f"  Precision-Coverage correlation: Error computing ({str(e)})")
                 
                 # Pareto frontier analysis (high precision, reasonable coverage)
                 high_prec_rules = [r for r in rules_data if r.get('hard_precision', 0) > 0.8]
@@ -557,7 +570,10 @@ def analyze_metrics(json_path):
                 'global_score': global_score
             })
         
-        global_scores.sort(key=lambda x: x['global_score'], reverse=True)
+        # Sort once and store sorted list (don't modify in place multiple times)
+        global_scores_sorted = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)
+        global_scores = global_scores_sorted  # Update to sorted version for consistent use
+        
         print("\nTop 10 globally important features:")
         for i, feat_data in enumerate(global_scores[:10], 1):
             print(f"  {i}. {feat_data['feature']}: "
@@ -730,25 +746,37 @@ def analyze_metrics(json_path):
         rl_coverage_corr = [e.get('rl_avg_coverage', 0.0) for e in history]
         
         if len(classifier_acc_corr) > 1 and any(acc > 0 for acc in classifier_acc_corr):
-            corr_prec = np.corrcoef(classifier_acc_corr, rl_precision_corr)[0, 1]
-            corr_cov = np.corrcoef(classifier_acc_corr, rl_coverage_corr)[0, 1]
-            
             print(f"\nCorrelation between classifier accuracy and RL metrics:")
-            print(f"  Classifier vs RL Precision: {corr_prec:.3f}")
-            if abs(corr_prec) > 0.5:
-                print(f"    → Strong correlation ({'positive' if corr_prec > 0 else 'negative'})")
-            elif abs(corr_prec) > 0.3:
-                print(f"    → Moderate correlation")
-            else:
-                print(f"    → Weak correlation")
+            try:
+                # Check for constant arrays before correlation
+                if np.std(classifier_acc_corr) > 1e-10 and np.std(rl_precision_corr) > 1e-10:
+                    corr_prec = np.corrcoef(classifier_acc_corr, rl_precision_corr)[0, 1]
+                    print(f"  Classifier vs RL Precision: {corr_prec:.3f}")
+                    if abs(corr_prec) > 0.5:
+                        print(f"    → Strong correlation ({'positive' if corr_prec > 0 else 'negative'})")
+                    elif abs(corr_prec) > 0.3:
+                        print(f"    → Moderate correlation")
+                    else:
+                        print(f"    → Weak correlation")
+                else:
+                    print(f"  Classifier vs RL Precision: N/A (insufficient variance)")
+            except Exception as e:
+                print(f"  Classifier vs RL Precision: Error computing ({str(e)})")
             
-            print(f"  Classifier vs RL Coverage: {corr_cov:.3f}")
-            if abs(corr_cov) > 0.5:
-                print(f"    → Strong correlation ({'positive' if corr_cov > 0 else 'negative'})")
-            elif abs(corr_cov) > 0.3:
-                print(f"    → Moderate correlation")
-            else:
-                print(f"    → Weak correlation")
+            try:
+                if np.std(classifier_acc_corr) > 1e-10 and np.std(rl_coverage_corr) > 1e-10:
+                    corr_cov = np.corrcoef(classifier_acc_corr, rl_coverage_corr)[0, 1]
+                    print(f"  Classifier vs RL Coverage: {corr_cov:.3f}")
+                    if abs(corr_cov) > 0.5:
+                        print(f"    → Strong correlation ({'positive' if corr_cov > 0 else 'negative'})")
+                    elif abs(corr_cov) > 0.3:
+                        print(f"    → Moderate correlation")
+                    else:
+                        print(f"    → Weak correlation")
+                else:
+                    print(f"  Classifier vs RL Coverage: N/A (insufficient variance)")
+            except Exception as e:
+                print(f"  Classifier vs RL Coverage: Error computing ({str(e)})")
         else:
             print("(Correlation analysis not available - requires classifier training history)")
     else:
@@ -767,11 +795,11 @@ def analyze_metrics(json_path):
         
         summary = {
             'class': cls_key,
-            'precision': cls_data['hard_precision'],
-            'coverage': cls_data['coverage'],
-            'best_precision': cls_data['best_precision'],
-            'n_rules': len(cls_data['rules']),
-            'unique_rules': len(set(cls_data['rules'])),
+            'precision': cls_data.get('hard_precision', 0.0),
+            'coverage': cls_data.get('coverage', 0.0),
+            'best_precision': cls_data.get('best_precision', 0.0),
+            'n_rules': len(cls_data.get('rules', [])),
+            'unique_rules': len(set(cls_data.get('rules', []))),
         }
         
         if rules_data:
@@ -1010,9 +1038,10 @@ def analyze_metrics(json_path):
     # Plot 9: Global Feature Importance (Top 15)
     ax9 = plt.subplot(3, 4, 9)
     if global_scores:
-        global_scores_sorted = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:15]
-        features = [f['feature'] for f in global_scores_sorted]
-        scores = [f['global_score'] for f in global_scores_sorted]
+        # global_scores is already sorted by global_score, just take top 15
+        top_15 = global_scores[:15]
+        features = [f['feature'] for f in top_15]
+        scores = [f['global_score'] for f in top_15]
         ax9.barh(range(len(features)), scores, alpha=0.7)
         ax9.set_yticks(range(len(features)))
         ax9.set_yticklabels(features)
@@ -1108,7 +1137,8 @@ def analyze_metrics(json_path):
     else:
         # Fallback: Feature Importance Comparison (if no class-level data)
         if global_scores:
-            top_10_features = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:10]
+            # global_scores is already sorted by global_score, just take top 10
+            top_10_features = global_scores[:10]
             features = [f['feature'] for f in top_10_features]
             
             # Calculate scores from available data
@@ -1150,6 +1180,7 @@ def analyze_metrics(json_path):
     # Save additional plots
     output_path2 = json_path.replace('.json', '_detailed_analysis.png')
     plt.savefig(output_path2, dpi=150, bbox_inches='tight')
+    plt.close(fig2)  # Close figure to free memory
     print(f"Saved detailed analysis plots to: {output_path2}")
     
     # Create dedicated feature importance visualization
@@ -1159,7 +1190,8 @@ def analyze_metrics(json_path):
         
         # Plot 1: Global feature importance bar chart
         ax1 = plt.subplot(2, 3, 1)
-        top_15_global = sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:15]
+        # global_scores is already sorted by global_score, just take top 15
+        top_15_global = global_scores[:15]
         features = [f['feature'] for f in top_15_global]
         scores = [f['global_score'] for f in top_15_global]
         colors = plt.cm.viridis(np.linspace(0, 1, len(features)))
@@ -1174,8 +1206,8 @@ def analyze_metrics(json_path):
         # Plot 2: Feature importance by class (stacked or grouped)
         ax2 = plt.subplot(2, 3, 2)
         if all_class_feature_importance:
-            # Get top 10 features globally
-            top_features = [f['feature'] for f in sorted(global_scores, key=lambda x: x['global_score'], reverse=True)[:10]]
+            # Get top 10 features globally (global_scores is already sorted)
+            top_features = [f['feature'] for f in global_scores[:10]]
             
             x = np.arange(len(top_features))
             width = 0.8 / len(all_class_feature_importance)
@@ -1261,6 +1293,7 @@ def analyze_metrics(json_path):
         # Save feature importance plots
         output_path3 = json_path.replace('.json', '_feature_importance.png')
         plt.savefig(output_path3, dpi=150, bbox_inches='tight')
+        plt.close(fig3)  # Close figure to free memory
         print(f"Saved feature importance visualizations to: {output_path3}")
 
 if __name__ == '__main__':
