@@ -1034,15 +1034,40 @@ class AnchorEnv(ParallelEnv):
         agent: str, 
         max_features_in_rule: Optional[int] = 5,
         initial_lower: Optional[np.ndarray] = None,
-        initial_upper: Optional[np.ndarray] = None
+        initial_upper: Optional[np.ndarray] = None,
+        denormalize: bool = False
     ) -> str:
         lower = self.lower[agent].copy()
         upper = self.upper[agent].copy()
         
+        # Denormalize bounds if requested (convert from [0, 1] to original feature space)
+        if denormalize:
+            if self.X_min is None or self.X_range is None:
+                logger.warning("Cannot denormalize: X_min or X_range not available. Using normalized bounds.")
+                denormalize = False  # Disable denormalization if params not available
+            else:
+                lower = self._unit_to_std(lower)
+                upper = self._unit_to_std(upper)
+        
         if initial_lower is None or initial_upper is None:
-            initial_width = np.ones(self.n_features, dtype=np.float32)
+            # Default initial width is full normalized space [0, 1]
+            initial_width_normalized = np.ones(self.n_features, dtype=np.float32)
+            if denormalize and self.X_min is not None and self.X_range is not None:
+                # Denormalize initial width to match current width scale
+                initial_width = initial_width_normalized * self.X_range
+            else:
+                initial_width = initial_width_normalized
         else:
+            # If initial bounds are provided, they should already be in the same space as current bounds
+            # But if we're denormalizing current bounds, we need to check if initial bounds are normalized
             initial_width = initial_upper - initial_lower
+            # If denormalizing and initial bounds look normalized (all in [0, 1]), denormalize them too
+            if denormalize and self.X_min is not None and self.X_range is not None:
+                if np.all(initial_lower >= 0) and np.all(initial_lower <= 1) and np.all(initial_upper >= 0) and np.all(initial_upper <= 1):
+                    # Initial bounds appear to be normalized, denormalize them
+                    initial_lower_denorm = self._unit_to_std(initial_lower)
+                    initial_upper_denorm = self._unit_to_std(initial_upper)
+                    initial_width = initial_upper_denorm - initial_lower_denorm
         
         current_width = upper - lower
         
@@ -1054,14 +1079,33 @@ class AnchorEnv(ParallelEnv):
         if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
             tightened = np.array([], dtype=int)
         else:
+            # Relative thresholds (work in any scale)
             tightened = np.where(current_width < initial_width_ref * 0.98)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.99)[0]
+            
+            # Absolute thresholds (need to be scale-aware)
             if tightened.size == 0:
-                tightened = np.where(current_width < 0.95)[0]
+                if denormalize and self.X_range is not None:
+                    # In denormalized space, use 0.95 * feature range as threshold
+                    threshold_95 = 0.95 * self.X_range
+                    tightened = np.where(current_width < threshold_95)[0]
+                else:
+                    # In normalized space, use 0.95 directly
+                    tightened = np.where(current_width < 0.95)[0]
+            
             if tightened.size == 0:
-                if np.all(initial_width_ref >= 0.9):
-                    tightened = np.where(current_width < 0.9)[0]
+                if denormalize and self.X_range is not None:
+                    # In denormalized space, use 0.9 * feature range as threshold
+                    threshold_90 = 0.9 * self.X_range
+                    if np.all(initial_width_ref >= threshold_90):
+                        tightened = np.where(current_width < threshold_90)[0]
+                else:
+                    # In normalized space, use 0.9 directly
+                    if np.all(initial_width_ref >= 0.9):
+                        tightened = np.where(current_width < 0.9)[0]
+            
+            # Final fallback: any feature that tightened
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref)[0]
         

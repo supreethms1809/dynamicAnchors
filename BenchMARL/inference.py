@@ -21,7 +21,43 @@ import json
 from tensordict import TensorDict
 
 import logging
+import sys
+from datetime import datetime
 from logging import INFO, WARNING, ERROR, CRITICAL
+
+# Configure logging to write to both console and file
+def setup_logging(log_file=None):
+    """Setup logging to write to both console and a log file."""
+    if log_file is None:
+        # Create a temporary log file with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"/tmp/inference_debug_{timestamp}.log"
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Get root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    
+    # Remove existing handlers
+    root_logger.handlers = []
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.DEBUG)  # Write all debug info to file
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    return log_file
+
+# Initialize with default (will be reconfigured in main if needed)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -145,220 +181,298 @@ def load_policy_model(
 def run_rollout_with_policy(
     env: AnchorEnv,
     policy: torch.nn.Module,
-    group: str,
+    agent_id: str,
     max_steps: int = 100,
-    device: str = "cpu"
+    device: str = "cpu",
+    seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Run a single rollout episode using a loaded policy.
+    Run a single rollout episode using a loaded policy on a raw PettingZoo environment.
+    
+    This bypasses BenchMARL/TorchRL complexity and works directly with the PettingZoo
+    ParallelEnv interface, treating policies as plain MLPs.
     
     Args:
-        env: AnchorEnv environment instance
-        policy: Loaded policy model
-        group: Agent group name
+        env: Raw AnchorEnv (PettingZoo ParallelEnv) - NOT TorchRL-wrapped
+        policy: Loaded policy model (plain PyTorch nn.Module)
+        agent_id: Agent ID (e.g., "agent_0") - must match env's agent names
         max_steps: Maximum steps per episode
         device: Device for tensors
     
     Returns:
         Dictionary with episode data (precision, coverage, observation, etc.)
     """
-    # Reset environment
-    td = env.reset()
+    # Ensure policy is in eval mode
+    policy.to(device)
+    policy.eval()
+    
+    # Reset environment (returns dict, not TensorDict)
+    obs_dict, infos_dict = env.reset(seed=seed)
+    
+    if agent_id not in obs_dict:
+        # Try to find the actual agent name
+        if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
+            agent_id = env.possible_agents[0]
+            logger.warning(f"  Agent '{agent_id}' not found in reset obs, using '{agent_id}' from possible_agents")
+        else:
+            raise ValueError(f"Agent '{agent_id}' not found in environment. Available agents: {list(obs_dict.keys())}")
+    
+    # Debug: Check initial box state
+    if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
+        lower_init = env.lower[agent_id]
+        upper_init = env.upper[agent_id]
+        widths_init = upper_init - lower_init
+        precision_init, coverage_init, details_init = env._current_metrics(agent_id)
+        logger.info(f"  Initial box state for {agent_id}:")
+        logger.info(f"    Box center: {((lower_init + upper_init) / 2).mean():.4f} (mean across features)")
+        logger.info(f"    Box widths: min={widths_init.min():.4f}, max={widths_init.max():.4f}, mean={widths_init.mean():.4f}")
+        logger.info(f"    Initial precision: {precision_init:.4f}, coverage: {coverage_init:.4f}")
+        logger.info(f"    Initial n_points: {details_init.get('n_points', 'N/A')}")
+    
     done = False
     step_count = 0
+    total_reward = 0.0
     
+    # Store box state before first action for debugging
+    lower_before = None
+    upper_before = None
+    if step_count == 0 and hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
+        lower_before = env.lower[agent_id].copy()
+        upper_before = env.upper[agent_id].copy()
+    
+    # Main rollout loop - work directly with PettingZoo dict interface
     while not done and step_count < max_steps:
-        # Get observation for this group
-        if group not in td.keys():
+        # Check if agent is still active
+        if agent_id not in obs_dict:
+            logger.warning(f"  Agent '{agent_id}' not in observations at step {step_count}")
             break
         
-        group_obs = td[group]
-        if "observation" not in group_obs.keys():
-            break
+        # Get observation for this agent (raw numpy array from PettingZoo)
+        obs_vec = obs_dict[agent_id]  # shape: (2*n_features + 2,) - [lower, upper, precision, coverage]
         
-        obs_tensor = group_obs["observation"]
+        # Convert to tensor for policy
+        obs_tensor = torch.as_tensor(obs_vec, dtype=torch.float32, device=device).unsqueeze(0)  # Add batch dim
         
-        # Move to device and ensure correct shape
-        if isinstance(obs_tensor, torch.Tensor):
-            obs_tensor = obs_tensor.to(device)
-        else:
-            obs_tensor = torch.tensor(obs_tensor, device=device)
-        
-        # Add batch dimension if needed
-        if len(obs_tensor.shape) == 1:
-            obs_tensor = obs_tensor.unsqueeze(0)
+        # Debug: Log observation for first step
+        if step_count == 0:
+            logger.info(f"  Observation shape: {obs_vec.shape}, first 5 values: {obs_vec[:5]}, last 5: {obs_vec[-5:]}")
+            logger.info(f"  Observation stats: mean={obs_vec.mean():.4f}, std={obs_vec.std():.4f}, min={obs_vec.min():.4f}, max={obs_vec.max():.4f}")
         
         # Get action from policy (deterministic for inference)
         with torch.no_grad():
-            action = policy(obs_tensor)
-            # Remove batch dimension if added
-            if action.shape[0] == 1:
-                action = action.squeeze(0)
+            # Test if policy responds to different inputs (only once)
+            if step_count == 0 and not hasattr(run_rollout_with_policy, '_tested_policy_response'):
+                zero_obs = torch.zeros_like(obs_tensor)
+                zero_output = policy(zero_obs)
+                actual_output = policy(obs_tensor)
+                
+                if isinstance(zero_output, torch.Tensor) and isinstance(actual_output, torch.Tensor):
+                    zero_output_np = zero_output.cpu().numpy().flatten()
+                    actual_output_np = actual_output.cpu().numpy().flatten()
+                    diff = np.abs(actual_output_np - zero_output_np).max()
+                    logger.info(f"  Policy response test: max difference between zero obs and actual obs = {diff:.2f}")
+                    if diff < 1e-6:
+                        logger.warning(f"  ⚠ Policy outputs IDENTICAL values for zero and actual observations!")
+                    else:
+                        logger.info(f"  ✓ Policy responds differently to different observations (good!)")
+                run_rollout_with_policy._tested_policy_response = True
+                fwd_outputs = actual_output
+            else:
+                fwd_outputs = policy(obs_tensor)
+            
+            # Debug: Log raw policy output before any processing
+            if step_count == 0:
+                if isinstance(fwd_outputs, torch.Tensor):
+                    raw_output = fwd_outputs.cpu().numpy().flatten()
+                    logger.info(f"  Raw policy output (before processing): shape={raw_output.shape}, first 5: {raw_output[:5]}, mean={raw_output.mean():.4f}, std={raw_output.std():.4f}, min={raw_output.min():.4f}, max={raw_output.max():.4f}")
+                elif isinstance(fwd_outputs, dict):
+                    logger.info(f"  Policy output is dict with keys: {list(fwd_outputs.keys())}")
+                    for k, v in fwd_outputs.items():
+                        if isinstance(v, torch.Tensor):
+                            v_np = v.cpu().numpy().flatten()
+                            logger.info(f"    {k}: shape={v_np.shape}, first 5: {v_np[:5]}, mean={v_np.mean():.4f}, std={v_np.std():.4f}")
+            
+            # Handle different policy output formats
+            # BenchMARL policies may output action_dist_inputs (logits) that need TanhNormal conversion
+            if isinstance(fwd_outputs, dict):
+                if "action_dist_inputs" in fwd_outputs:
+                    # Policy outputs logits for TanhNormal distribution
+                    from torchrl.modules import TanhNormal
+                    action_dist_inputs = fwd_outputs["action_dist_inputs"]
+                    action_dist = TanhNormal.from_logits(action_dist_inputs)
+                    # Use mean for deterministic inference
+                    action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                elif "action" in fwd_outputs:
+                    action = fwd_outputs["action"]
+                else:
+                    # Fallback: assume output is action directly
+                    action = fwd_outputs
+            else:
+                # Policy outputs action directly (might be raw logits that need normalization)
+                action = fwd_outputs
+                # If values are out of [-1, 1] range, they're likely raw logits that need normalization
+                if isinstance(action, torch.Tensor):
+                    action_vals = action.cpu().numpy().flatten()
+                    if len(action_vals) > 0 and (action_vals.min() < -1.1 or action_vals.max() > 1.1):
+                        # Values are raw logits that are too large
+                        # Use a fixed scaling factor to preserve relative differences between episodes
+                        # This prevents identical actions when raw outputs are proportional
+                        max_abs = np.abs(action_vals).max()
+                        # Use a fixed scaling factor that keeps values in a reasonable range for tanh
+                        # Typical outputs are 20-30M, so divide by 30M to get values around 0.7-1.0
+                        # This keeps values in tanh's active range (not saturated) while preserving differences
+                        fixed_scale = 30000000.0  # 30M - keeps values in reasonable range for tanh
+                        # Define sample_idx for logging (used in multiple places)
+                        sample_idx = [0, 1, 2, 29, 30, 59] if step_count == 0 else []
+                        if max_abs > 10.0:
+                            if step_count == 0:
+                                logger.info(f"  Scaling large logits by fixed factor {fixed_scale:.2f} (max_abs={max_abs:.2f})")
+                                logger.info(f"  Before scaling (sample): {[action_vals[i] for i in sample_idx]}")
+                            action = action / fixed_scale
+                            if step_count == 0:
+                                action_scaled_vals = action.cpu().numpy().flatten()
+                                logger.info(f"  After scaling (sample): {[action_scaled_vals[i] for i in sample_idx]}")
+                        # Now apply tanh to get actions in [-1, 1]
+                        action = torch.tanh(action)
+                        if step_count == 0 and len(sample_idx) > 0:
+                            action_tanh_vals = action.cpu().numpy().flatten()
+                            logger.info(f"  After tanh (sample): {[action_tanh_vals[i] for i in sample_idx]}")
+            
+            # Ensure action has batch dimension to match TensorDict batch size
+            if len(action.shape) == 1:
+                action = action.unsqueeze(0)
+            
+            # Convert to numpy for debugging and ensure it's the right shape
+            action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
+            if step_count == 0:
+                # Flatten for comparison
+                action_flat = action_np.flatten()
+                logger.info(f"  Action shape: {action_np.shape}, mean: {action_flat.mean():.4f}, std: {action_flat.std():.4f}, min: {action_flat.min():.4f}, max: {action_flat.max():.4f}")
+                logger.info(f"  Action first 10 values: {action_flat[:10]}")
+                
+                # Store first action for comparison (to detect if actions are identical across episodes)
+                if not hasattr(run_rollout_with_policy, '_first_action'):
+                    run_rollout_with_policy._first_action = action_flat.copy()
+                    run_rollout_with_policy._action_count = 1
+                    logger.info(f"  Stored first action for comparison")
+                else:
+                    run_rollout_with_policy._action_count += 1
+                    # Compare with first action
+                    diff = np.abs(action_flat - run_rollout_with_policy._first_action)
+                    max_diff = diff.max()
+                    mean_diff = diff.mean()
+                    logger.info(f"  Action comparison with first episode: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+                    if max_diff < 1e-6:
+                        logger.warning(f"  ⚠ Actions are IDENTICAL to first episode! Policy may not be responding to observations.")
+                    else:
+                        logger.info(f"  ✓ Actions are DIFFERENT from first episode (good!)")
+                    
+                    # Also compare with previous action to see if there's any variation
+                    if hasattr(run_rollout_with_policy, '_prev_action'):
+                        prev_diff = np.abs(action_flat - run_rollout_with_policy._prev_action).max()
+                        logger.info(f"  Action comparison with previous episode: max_diff={prev_diff:.6f}")
+                    run_rollout_with_policy._prev_action = action_flat.copy()
+                
+                # Check if actions are in valid range
+                if action_flat.min() < -1.1 or action_flat.max() > 1.1:
+                    logger.warning(f"  ⚠ Actions out of [-1, 1] range! Applying tanh normalization...")
+                    action = torch.tanh(action) if isinstance(action, torch.Tensor) else np.tanh(action)
+                    action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
+                    action_flat = action_np.flatten()
+                    logger.info(f"  After tanh - mean: {action_flat.mean():.4f}, min: {action_flat.min():.4f}, max: {action_flat.max():.4f}")
+                
+                # Debug: Check if actions are all zeros or very small
+                action_abs = np.abs(action_flat)
+                non_zero_count = np.sum(action_abs > 1e-6)
+                logger.info(f"  Action stats: {non_zero_count}/{len(action_abs)} non-zero values, max_abs: {action_abs.max():.6f}")
         
-        # Set action in TensorDict
-        td[group]["action"] = action
+        # Convert action to numpy and remove batch dimension
+        action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
+        if len(action_np.shape) > 1:
+            action_np = action_np.squeeze(0)  # Remove batch dimension: [1, 60] -> [60]
         
-        # Step environment
-        td = env.step(td)
-        done = td.get("done", torch.zeros(1, dtype=torch.bool)).any().item()
+        # Check if action needs to be sliced (policy might output actions for multiple agents)
+        expected_action_dim = 2 * env.n_features  # Should be 60 for 30 features
+        if action_np.shape[0] == 2 * expected_action_dim:
+            # Policy outputs actions for 2 agents concatenated (120 dims for 2 agents * 60 each)
+            # Extract the appropriate slice based on agent_id
+            agent_num = int(agent_id.split('_')[-1]) if '_' in agent_id else 0
+            start_idx = agent_num * expected_action_dim
+            end_idx = start_idx + expected_action_dim
+            action_np = action_np[start_idx:end_idx]
+            if step_count == 0:
+                logger.info(f"  Extracted action slice for {agent_id}: indices [{start_idx}:{end_idx}] from policy output")
+        elif action_np.shape[0] != expected_action_dim:
+            # Unexpected action dimension
+            logger.warning(f"  ⚠ Unexpected action dimension: {action_np.shape[0]} (expected {expected_action_dim})")
+            # Try to take first expected_action_dim elements
+            if action_np.shape[0] > expected_action_dim:
+                action_np = action_np[:expected_action_dim]
+                logger.warning(f"  Taking first {expected_action_dim} elements")
+        
+        # Debug: Log action for first step
+        if step_count == 0:
+            logger.info(f"  Action before step: shape={action_np.shape}, sample values: {action_np[:5]}")
+            logger.info(f"    Action lower_deltas (first {env.n_features}): mean={action_np[:env.n_features].mean():.4f}, std={action_np[:env.n_features].std():.4f}")
+            logger.info(f"    Action upper_deltas (last {env.n_features}): mean={action_np[env.n_features:].mean():.4f}, std={action_np[env.n_features:].std():.4f}")
+        
+        # Step environment directly (raw PettingZoo interface)
+        action_dict = {agent_id: action_np}
+        obs_dict, rewards_dict, terminations_dict, truncations_dict, infos_dict = env.step(action_dict)
+        
+        # Accumulate reward
+        if agent_id in rewards_dict:
+            total_reward += float(rewards_dict[agent_id])
+        
+        # Check if done
+        done = terminations_dict.get(agent_id, False) or truncations_dict.get(agent_id, False)
+        
+        # Debug: Check if box changed after first action
+        if step_count == 0 and lower_before is not None and upper_before is not None:
+            if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
+                lower_after = env.lower[agent_id].copy()
+                upper_after = env.upper[agent_id].copy()
+                lower_diff = np.abs(lower_after - lower_before).max()
+                upper_diff = np.abs(upper_after - upper_before).max()
+                logger.info(f"  Box change after step 0: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}")
+                if lower_diff < 1e-6 and upper_diff < 1e-6:
+                    logger.warning(f"  ⚠ Box did not change after action! Actions may not be applied correctly.")
+        
         step_count += 1
     
-    # Extract final metrics from info
-    # Try to get from unwrapped environment first (most reliable)
+    # Extract final metrics directly from environment (raw PettingZoo interface)
     episode_data = {}
-    unwrapped_env = None
-    if hasattr(env, 'env') or hasattr(env, '_env'):
-        unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
     
-    # Get actual agent name from environment
-    actual_agent_name = group
-    if unwrapped_env is not None:
-        # Check if group matches an agent in the environment
-        if hasattr(unwrapped_env, 'agents') and group in unwrapped_env.agents:
-            actual_agent_name = group
-        elif hasattr(unwrapped_env, 'possible_agents'):
-            # Try to find matching agent
-            for agent in unwrapped_env.possible_agents:
-                if agent == group or group in agent or agent.startswith(group):
-                    actual_agent_name = agent
-                    break
-            # If still not found, use first available agent
-            if actual_agent_name == group and len(unwrapped_env.possible_agents) > 0:
-                actual_agent_name = unwrapped_env.possible_agents[0]
-    
-    # Try to get metrics from unwrapped environment
-    if unwrapped_env is not None and hasattr(unwrapped_env, '_current_metrics'):
-        try:
-            precision, coverage, _ = unwrapped_env._current_metrics(actual_agent_name)
-            
-            # Get final observation (bounds) from environment state
-            if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
-                if isinstance(unwrapped_env.lower, dict):
-                    if actual_agent_name in unwrapped_env.lower:
-                        lower_bounds = unwrapped_env.lower[actual_agent_name]
-                        upper_bounds = unwrapped_env.upper[actual_agent_name]
-                    else:
-                        # Try to find matching key
-                        matching_key = None
-                        for key in unwrapped_env.lower.keys():
-                            if key == actual_agent_name or actual_agent_name in key or key.startswith(actual_agent_name):
-                                matching_key = key
-                                break
-                        if matching_key:
-                            lower_bounds = unwrapped_env.lower[matching_key]
-                            upper_bounds = unwrapped_env.upper[matching_key]
-                        else:
-                            # Fall back to first available
-                            if len(unwrapped_env.lower) > 0:
-                                first_key = list(unwrapped_env.lower.keys())[0]
-                                lower_bounds = unwrapped_env.lower[first_key]
-                                upper_bounds = unwrapped_env.upper[first_key]
-                            else:
-                                lower_bounds = None
-                                upper_bounds = None
-                else:
-                    lower_bounds = unwrapped_env.lower
-                    upper_bounds = unwrapped_env.upper
-                
-                if lower_bounds is not None and upper_bounds is not None:
-                    final_obs = np.concatenate([lower_bounds, upper_bounds, np.array([precision, coverage], dtype=np.float32)])
-                    
-                    episode_data = {
-                        "precision": float(precision),
-                        "coverage": float(coverage),
-                        "total_reward": 0.0,
-                        "final_observation": final_obs.tolist(),
-                    }
-        except Exception as e:
-            # Fall through to TensorDict extraction
-            pass
-    
-    # Fallback: Try to get from TensorDict structure
-    if not episode_data and "next" in td.keys():
-        next_td = td["next"]
+    try:
+        # Get metrics directly from environment
+        precision, coverage, details = env._current_metrics(agent_id)
         
-        # Try group name first
-        if group in next_td.keys():
-            group_data = next_td[group]
-            if "info" in group_data.keys():
-                info = group_data["info"]
-                if hasattr(info, 'shape') and info.shape[0] > 0:
-                    final_info = info[-1]
-                    
-                    def safe_get(key, default=0.0):
-                        try:
-                            if hasattr(final_info, 'get'):
-                                val = final_info.get(key, default)
-                            elif hasattr(final_info, 'keys') and key in final_info.keys():
-                                val = final_info[key]
-                            else:
-                                val = getattr(final_info, key, default)
-                            
-                            if isinstance(val, torch.Tensor):
-                                return float(val.item() if val.numel() == 1 else val[-1].item())
-                            return float(val)
-                        except:
-                            return default
-                    
-                    episode_data = {
-                        "precision": safe_get("precision", 0.0),
-                        "coverage": safe_get("coverage", 0.0),
-                        "total_reward": safe_get("total_reward", 0.0),
-                    }
-                    
-                    # Get final observation (anchor bounds)
-                    if "observation" in group_data.keys():
-                        obs = group_data["observation"]
-                        if hasattr(obs, 'shape') and obs.shape[0] > 0:
-                            final_obs = obs[-1]
-                            if isinstance(final_obs, torch.Tensor):
-                                episode_data["final_observation"] = final_obs.cpu().numpy().tolist()
-                            else:
-                                episode_data["final_observation"] = np.array(final_obs).tolist()
-                        else:
-                            # Extract from observation if available
-                            final_obs_np = np.array(final_obs) if 'final_obs' in locals() else None
-                            if final_obs_np is not None:
-                                episode_data["final_observation"] = final_obs_np.tolist()
+        # Get final box bounds
+        lower = env.lower[agent_id]
+        upper = env.upper[agent_id]
         
-        # If still no data, try actual_agent_name
-        if not episode_data and actual_agent_name != group and actual_agent_name in next_td.keys():
-            group_data = next_td[actual_agent_name]
-            if "info" in group_data.keys():
-                info = group_data["info"]
-                if hasattr(info, 'shape') and info.shape[0] > 0:
-                    final_info = info[-1]
-                    
-                    def safe_get(key, default=0.0):
-                        try:
-                            if hasattr(final_info, 'get'):
-                                val = final_info.get(key, default)
-                            elif hasattr(final_info, 'keys') and key in final_info.keys():
-                                val = final_info[key]
-                            else:
-                                val = getattr(final_info, key, default)
-                            
-                            if isinstance(val, torch.Tensor):
-                                return float(val.item() if val.numel() == 1 else val[-1].item())
-                            return float(val)
-                        except:
-                            return default
-                    
-                    episode_data = {
-                        "precision": safe_get("precision", 0.0),
-                        "coverage": safe_get("coverage", 0.0),
-                        "total_reward": safe_get("total_reward", 0.0),
-                    }
-                    
-                    # Get final observation
-                    if "observation" in group_data.keys():
-                        obs = group_data["observation"]
-                        if hasattr(obs, 'shape') and obs.shape[0] > 0:
-                            final_obs = obs[-1]
-                            if isinstance(final_obs, torch.Tensor):
-                                episode_data["final_observation"] = final_obs.cpu().numpy().tolist()
-                            else:
-                                episode_data["final_observation"] = np.array(final_obs).tolist()
+        # Construct final observation
+        final_obs = np.concatenate([lower, upper, np.array([precision, coverage], dtype=np.float32)])
+        
+        episode_data = {
+            "precision": float(precision),
+            "coverage": float(coverage),
+            "total_reward": total_reward,
+            "final_observation": final_obs.tolist(),
+        }
+        
+        logger.debug(f"  Extracted metrics from environment: precision={precision:.4f}, coverage={coverage:.4f}")
+        
+    except Exception as e:
+        logger.warning(f"  ⚠ Error getting metrics from environment for {agent_id}: {e}")
+        import traceback
+        logger.debug(f"  Traceback: {traceback.format_exc()}")
+        # Return empty episode data
+        episode_data = {
+            "precision": 0.0,
+            "coverage": 0.0,
+            "total_reward": total_reward,
+        }
     
     return episode_data
 
@@ -370,7 +484,7 @@ def extract_rules_from_policies(
     max_features_in_rule: int = 5,
     steps_per_episode: int = 100,
     n_instances_per_class: int = 20,
-    eval_on_test_data: bool = False,
+    eval_on_test_data: bool = True,  # Always use test data for inference by default
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu"
@@ -385,7 +499,7 @@ def extract_rules_from_policies(
         max_features_in_rule: Maximum features to include in rules
         steps_per_episode: Maximum steps per rollout
         n_instances_per_class: Number of instances to evaluate per class
-        eval_on_test_data: Whether to evaluate on test data
+        eval_on_test_data: Whether to evaluate on test data (default: True - always uses test data for inference)
         output_dir: Output directory for results (default: experiment_dir/inference/)
         seed: Random seed
         device: Device to use
@@ -718,22 +832,64 @@ def extract_rules_from_policies(
         seed=seed
     )
     env_config = trainer._get_default_env_config()
+    # Disable coverage floor check during inference to allow exploration even with low coverage
+    env_config["min_coverage_floor"] = 0.0
     env_config.update({
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
     })
     
+    # For class-level inference, compute cluster centroids per class
+    # This ensures each episode starts from a representative cluster centroid
+    # (similar to training), rather than just the mean centroid
+    logger.info("\nComputing cluster centroids per class for class-level inference...")
+    try:
+        from trainers.vecEnv import compute_cluster_centroids_per_class
+        # Use a reasonable number of clusters per class (10 is a good default)
+        # This allows diversity across episodes while ensuring good coverage
+        n_clusters_per_class = min(10, n_instances_per_class)  # At least one cluster per instance
+        cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=env_data["X_unit"],
+            y=env_data["y"],
+            n_clusters_per_class=n_clusters_per_class,
+            random_state=seed if seed is not None else 42
+        )
+        logger.info(f"  ✓ Cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in cluster_centroids_per_class:
+                n_centroids = len(cluster_centroids_per_class[cls])
+                logger.info(f"    Class {cls}: {n_centroids} cluster centroids")
+            else:
+                logger.warning(f"    Class {cls}: No centroids available")
+        
+        # Set cluster centroids in env_config so environment uses them
+        env_config["cluster_centroids_per_class"] = cluster_centroids_per_class
+        logger.info("  ✓ Cluster centroids set in environment config")
+    except ImportError as e:
+        logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+        logger.warning(f"  Falling back to mean centroid per class. Install sklearn: pip install scikit-learn")
+        env_config["cluster_centroids_per_class"] = None
+    except Exception as e:
+        logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+        logger.warning(f"  Falling back to mean centroid per class")
+        env_config["cluster_centroids_per_class"] = None
+    
+    # Always use test data for inference (unless explicitly overridden)
     if eval_on_test_data:
         if env_data.get("X_test_unit") is None:
-            raise ValueError("Test data not available for evaluation")
+            raise ValueError("Test data not available for evaluation. Inference requires test data.")
         env_config.update({
             "eval_on_test_data": True,
             "X_test_unit": env_data["X_test_unit"],
             "X_test_std": env_data["X_test_std"],
             "y_test": env_data["y_test"],
         })
+        logger.info("✓ Using test data for inference (default behavior)")
+    else:
+        logger.warning("⚠ WARNING: Using training data for inference (not recommended!)")
+        logger.warning("  This may lead to overoptimistic results. Use test data for proper evaluation.")
     
-    # Create task config for environment creation
+    # Create config for direct AnchorEnv creation (bypass BenchMARL/TorchRL)
     anchor_config = {
         "X_unit": env_data["X_unit"],
         "X_std": env_data["X_std"],
@@ -743,10 +899,7 @@ def extract_rules_from_policies(
         "device": device,
         "target_classes": target_classes,
         "env_config": env_config,
-        "max_cycles": steps_per_episode,
     }
-    
-    task = AnchorTask.ANCHOR.get_task(config=anchor_config)
     
     # If no agent-specific policies were extracted, or if we only found some agents,
     # use shared policy for missing agents
@@ -832,46 +985,41 @@ def extract_rules_from_policies(
             single_agent_config = anchor_config.copy()
             single_agent_config["target_classes"] = [target_class]  # Only this class
             
-            # Create task for single agent
-            single_agent_task = AnchorTask.ANCHOR.get_task(config=single_agent_config)
-            
-            env_fun = single_agent_task.get_env_fun(
-                num_envs=1,
-                continuous_actions=True,
-                seed=rollout_seed,
-                device=device
-            )
-            env = env_fun()
+            # Create raw AnchorEnv directly (bypass BenchMARL/TorchRL wrapper)
+            env = AnchorEnv(**single_agent_config)
             
             # Get the actual agent name from the environment
-            # In single-agent mode, there should be one agent
-            unwrapped_env = None
-            if hasattr(env, 'env') or hasattr(env, '_env'):
-                unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+            # We need to reset once to initialize agents, but the function will reset again for the rollout
+            env.reset(seed=rollout_seed)
+            if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
+                actual_agent_name = env.possible_agents[0]
+            elif hasattr(env, 'agents') and len(env.agents) > 0:
+                actual_agent_name = env.agents[0]
+            else:
+                # Fallback to agent_name
+                actual_agent_name = agent_name
             
-            # Determine the agent name to use
-            actual_agent_name = agent_name
-            if unwrapped_env is not None:
-                if hasattr(unwrapped_env, 'agents') and len(unwrapped_env.agents) > 0:
-                    # Use the first (and only) agent in single-agent environment
-                    actual_agent_name = unwrapped_env.agents[0]
-                elif hasattr(unwrapped_env, 'possible_agents') and len(unwrapped_env.possible_agents) > 0:
-                    # Check if our agent_name is in possible_agents
-                    if agent_name in unwrapped_env.possible_agents:
-                        actual_agent_name = agent_name
-                    else:
-                        # Use the first possible agent
-                        actual_agent_name = unwrapped_env.possible_agents[0]
-            
-            # Run rollout
-            # Note: The environment uses agent names, so we pass actual_agent_name as the group
+            # Run rollout with raw PettingZoo environment
             episode_data = run_rollout_with_policy(
-                env=env,
+                env=env,  # Raw AnchorEnv, not TorchRL-wrapped
                 policy=policy,
-                group=actual_agent_name,  # Use actual agent name from environment
+                agent_id=actual_agent_name,  # Use actual agent name from environment
                 max_steps=steps_per_episode,
-                device=device
+                device=device,
+                seed=rollout_seed  # Pass seed for reproducible rollouts
             )
+            
+            # Debug logging for first episode of each class
+            if instance_idx == 0:
+                logger.info(f"  Debug class {target_class} episode 0:")
+                logger.info(f"    actual_agent_name: {actual_agent_name}")
+                logger.info(f"    episode_data keys: {list(episode_data.keys()) if episode_data else 'empty'}")
+                if episode_data:
+                    logger.info(f"    precision: {episode_data.get('precision', 'missing')}")
+                    logger.info(f"    coverage: {episode_data.get('coverage', 'missing')}")
+                    logger.info(f"    has final_observation: {'final_observation' in episode_data}")
+                else:
+                    logger.warning(f"    ⚠ episode_data is empty for class {target_class}!")
             
             if episode_data:
                 precision = episode_data.get("precision", 0.0)
@@ -879,61 +1027,91 @@ def extract_rules_from_policies(
                 
                 precisions.append(float(precision))
                 coverages.append(float(coverage))
-                
-                # Extract rule from final observation
-                rule = "any values (no tightened features)"
-                lower = None
-                upper = None
-                
-                if "final_observation" in episode_data:
-                    obs = np.array(episode_data["final_observation"], dtype=np.float32)
-                    if len(obs) == 2 * n_features + 2:
-                        lower = obs[:n_features].copy()
-                        upper = obs[n_features:2*n_features].copy()
-                        
-                        # Create temporary environment for rule extraction
-                        temp_env = AnchorEnv(
-                            X_unit=env_data["X_unit"],
-                            X_std=env_data["X_std"],
-                            y=env_data["y"],
-                            feature_names=feature_names,
-                            classifier=dataset_loader.get_classifier(),
-                            device="cpu",
-                            target_classes=[target_class],
-                            env_config=env_config
-                        )
-                        temp_env.lower[group] = lower
-                        temp_env.upper[group] = upper
-                        
-                        rule = temp_env.extract_rule(
-                            group,
-                            max_features_in_rule=max_features_in_rule
-                        )
-                
-                anchor_data = {
-                    "instance_idx": instance_idx,
-                    "precision": float(precision),
-                    "coverage": float(coverage),
-                    "total_reward": float(episode_data.get("total_reward", 0.0)),
-                    "rule": rule,
-                }
-                
-                if lower is not None and upper is not None:
-                    anchor_data.update({
-                        "lower_bounds": lower.tolist(),
-                        "upper_bounds": upper.tolist(),
-                        "box_widths": (upper - lower).tolist(),
-                        "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
-                    })
-                
-                anchors_list.append(anchor_data)
-                rules_list.append(rule)
+            else:
+                # Log warning if episode_data is empty
+                if instance_idx == 0:
+                    logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx}")
+                precisions.append(0.0)
+                coverages.append(0.0)
+                precision = 0.0
+                coverage = 0.0
+            
+            # Extract rule from final observation (if available)
+            rule = "any values (no tightened features)"
+            lower = None
+            upper = None
+            lower_normalized = None
+            upper_normalized = None
+            
+            if episode_data and "final_observation" in episode_data:
+                obs = np.array(episode_data["final_observation"], dtype=np.float32)
+                if len(obs) == 2 * n_features + 2:
+                    lower_normalized = obs[:n_features].copy()
+                    upper_normalized = obs[n_features:2*n_features].copy()
+                    
+                    # Denormalize bounds to original feature space
+                    X_min = env_config.get("X_min")
+                    X_range = env_config.get("X_range")
+                    if X_min is not None and X_range is not None:
+                        lower = (lower_normalized * X_range) + X_min
+                        upper = (upper_normalized * X_range) + X_min
+                    else:
+                        # Fallback to normalized if denormalization params not available
+                        lower = lower_normalized
+                        upper = upper_normalized
+                        logger.warning(f"  ⚠ X_min/X_range not available for denormalization. Using normalized bounds.")
+                    
+                    # Create temporary environment for rule extraction
+                    temp_env = AnchorEnv(
+                        X_unit=env_data["X_unit"],
+                        X_std=env_data["X_std"],
+                        y=env_data["y"],
+                        feature_names=feature_names,
+                        classifier=dataset_loader.get_classifier(),
+                        device="cpu",
+                        target_classes=[target_class],
+                        env_config=env_config
+                    )
+                    # Use the agent name that matches the target_class
+                    temp_agent_name = f"agent_{target_class}"
+                    # Set normalized bounds in temp_env (extract_rule will denormalize internally)
+                    temp_env.lower[temp_agent_name] = lower_normalized
+                    temp_env.upper[temp_agent_name] = upper_normalized
+                    
+                    # Extract rule with denormalization enabled
+                    rule = temp_env.extract_rule(
+                        temp_agent_name,
+                        max_features_in_rule=max_features_in_rule,
+                        denormalize=True  # Denormalize to original feature space
+                    )
+            
+            anchor_data = {
+                "instance_idx": instance_idx,
+                "precision": float(precision),
+                "coverage": float(coverage),
+                "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
+                "rule": rule,
+            }
+            
+            if lower is not None and upper is not None:
+                anchor_data.update({
+                    "lower_bounds": lower.tolist(),  # Denormalized bounds in original feature space
+                    "upper_bounds": upper.tolist(),  # Denormalized bounds in original feature space
+                    "box_widths": (upper - lower).tolist(),
+                    "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
+                    # Also save normalized bounds for reference
+                    "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
+                    "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                })
+            
+            anchors_list.append(anchor_data)
+            rules_list.append(rule)
         
         unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
         
         results["per_class_results"][class_key] = {
             "class": int(target_class),
-            "group": group,
+            "group": agent_name,
             "precision": float(np.mean(precisions)) if precisions else 0.0,
             "coverage": float(np.mean(coverages)) if coverages else 0.0,
             "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
@@ -957,6 +1135,11 @@ def extract_rules_from_policies(
 
 def main():
     parser = argparse.ArgumentParser(description="Extract anchor rules using saved policy models")
+    
+    # Setup logging first (before any other operations)
+    log_file = setup_logging()
+    logger.info(f"Debug log file: {log_file}")
+    logger.info("="*80)
     
     parser.add_argument(
         "--experiment_dir",
@@ -1002,9 +1185,9 @@ def main():
     )
     
     parser.add_argument(
-        "--eval_on_test_data",
+        "--eval_on_train_data",
         action="store_true",
-        help="Evaluate on test data instead of training data"
+        help="Override default and evaluate on training data instead of test data (not recommended). Default: uses test data."
     )
     
     parser.add_argument(
@@ -1029,7 +1212,28 @@ def main():
         help="Device to use for inference"
     )
     
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default=None,
+        help="Path to debug log file (default: /tmp/inference_debug_<timestamp>.log)"
+    )
+    
     args = parser.parse_args()
+    
+    # Reconfigure logging with custom log file if provided
+    if args.log_file:
+        log_file = setup_logging(args.log_file)
+        logger.info(f"Using custom debug log file: {log_file}")
+    
+    # Always use test data by default (can be overridden with --eval_on_train_data)
+    use_test_data = not args.eval_on_train_data
+    
+    if not use_test_data:
+        logger.warning("⚠ WARNING: Running inference on training data is not recommended!")
+        logger.warning("  Inference should typically use test data to evaluate generalization.")
+    else:
+        logger.info("✓ Using test data for inference (default behavior)")
     
     # Extract rules
     results = extract_rules_from_policies(
@@ -1039,7 +1243,7 @@ def main():
         max_features_in_rule=args.max_features_in_rule,
         steps_per_episode=args.steps_per_episode,
         n_instances_per_class=args.n_instances_per_class,
-        eval_on_test_data=args.eval_on_test_data,
+        eval_on_test_data=use_test_data,
         output_dir=args.output_dir,
         seed=args.seed,
         device=args.device
@@ -1090,6 +1294,8 @@ def main():
     logger.info(f"Results saved to: {rules_filepath}")
     logger.info(f"  Total anchors saved: {n_anchors_total}")
     logger.info(f"  Total rules saved: {n_rules_total}")
+    logger.info(f"{'='*80}")
+    logger.info(f"\nDebug log file saved to: {log_file}")
     logger.info(f"{'='*80}")
 
 
