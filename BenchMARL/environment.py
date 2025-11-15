@@ -221,6 +221,61 @@ class AnchorEnv(ParallelEnv):
         centroid = np.mean(class_data, axis=0).astype(np.float32)
         
         return centroid
+    
+    def _compute_box_from_centroid(self, agent: str, centroid: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Compute box bounds from a centroid that are guaranteed to cover at least some points.
+        
+        This finds points in the class data that are closest to the centroid and computes
+        box bounds (min/max) that cover those points, ensuring the box has non-zero coverage.
+        
+        Args:
+            agent: Agent name
+            centroid: Centroid point in unit space [0, 1]
+            
+        Returns:
+            Tuple of (lower, upper) bounds, or None if no data available
+        """
+        target_class = self.agent_to_class.get(agent)
+        if target_class is None:
+            return None
+        
+        # Get class data
+        X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
+        y_data = self.y_test if self.eval_on_test_data else self.y
+        
+        class_mask = (y_data == target_class)
+        if class_mask.sum() == 0:
+            return None
+        
+        class_data = X_data[class_mask]
+        
+        # Find points closest to the centroid (use at least 10% of class points, or min 5 points)
+        n_neighbors = max(5, int(0.1 * len(class_data)))
+        n_neighbors = min(n_neighbors, len(class_data))
+        
+        # Compute distances to centroid
+        distances = np.linalg.norm(class_data - centroid, axis=1)
+        nearest_indices = np.argsort(distances)[:n_neighbors]
+        nearest_points = class_data[nearest_indices]
+        
+        # Compute box bounds from nearest points (with some padding)
+        # Use min/max of nearest points, then add a small padding (5% of feature range)
+        padding = 0.05
+        lower = np.maximum(0.0, nearest_points.min(axis=0) - padding)
+        upper = np.minimum(1.0, nearest_points.max(axis=0) + padding)
+        
+        # Ensure minimum width
+        widths = upper - lower
+        min_width_mask = widths < self.min_width
+        if min_width_mask.any():
+            # For features with width < min_width, center the box on the centroid
+            for f in np.where(min_width_mask)[0]:
+                half_width = self.min_width / 2.0
+                lower[f] = np.clip(centroid[f] - half_width, 0.0, 1.0 - self.min_width)
+                upper[f] = np.clip(lower[f] + self.min_width, self.min_width, 1.0)
+        
+        return lower.astype(np.float32), upper.astype(np.float32)
 
     def _current_metrics(self, agent: str) -> tuple:
         target_class = self.agent_to_class[agent]
@@ -379,9 +434,16 @@ class AnchorEnv(ParallelEnv):
             elif self.use_class_centroids:
                 centroid = self._get_class_centroid(agent)
                 if centroid is not None:
-                    w = self.initial_window
-                    self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
-                    self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
+                    # Compute box bounds that cover points near the centroid
+                    # This ensures the box covers at least some points from the cluster
+                    box_bounds = self._compute_box_from_centroid(agent, centroid)
+                    if box_bounds is not None:
+                        self.lower[agent], self.upper[agent] = box_bounds
+                    else:
+                        # Fallback: Use fixed window around centroid
+                        w = self.initial_window
+                        self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
+                        self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
                 else:
                     # Fallback: Full space initialization
                     self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
@@ -439,6 +501,10 @@ class AnchorEnv(ParallelEnv):
         max_delta_proportional = self.max_action_scale * widths
         max_delta = np.maximum(max_delta_proportional, self.min_absolute_step)
         
+        # Store before state for debugging
+        lower_before = self.lower[agent].copy()
+        upper_before = self.upper[agent].copy()
+        
         lower_changes = lower_deltas * max_delta
         self.lower[agent] = np.clip(self.lower[agent] + lower_changes, 0.0, self.upper[agent] - self.min_width)
         
@@ -450,6 +516,18 @@ class AnchorEnv(ParallelEnv):
                 mid = 0.5 * (self.upper[agent][f] + self.lower[agent][f])
                 self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
                 self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
+        
+        # Debug: Log if action was applied (only for first call per agent)
+        if not hasattr(self, '_action_debug_logged'):
+            self._action_debug_logged = set()
+        
+        if agent not in self._action_debug_logged:
+            lower_diff = np.abs(self.lower[agent] - lower_before).max()
+            upper_diff = np.abs(self.upper[agent] - upper_before).max()
+            logger.debug(f"  _apply_continuous_action for {agent}: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}, max_delta={max_delta.max():.6f}, action_mean={action.mean():.4f}")
+            if lower_diff < 1e-6 and upper_diff < 1e-6:
+                logger.warning(f"  ⚠ Action did not change box for {agent}! lower_deltas mean={lower_deltas.mean():.4f}, upper_deltas mean={upper_deltas.mean():.4f}, max_delta={max_delta.max():.6f}")
+            self._action_debug_logged.add(agent)
     
     def step(
         self, 
@@ -538,6 +616,7 @@ class AnchorEnv(ParallelEnv):
             coverage_after_revert = None
             if coverage < self.min_coverage_floor:
                 coverage_before_revert = float(coverage)
+                logger.debug(f"  Coverage floor hit for {agent}: coverage={coverage:.6f} < min_coverage_floor={self.min_coverage_floor:.6f}, reverting box bounds")
                 self.lower[agent] = prev_lower
                 self.upper[agent] = prev_upper
                 precision, coverage, details = self._current_metrics(agent)
@@ -548,6 +627,7 @@ class AnchorEnv(ParallelEnv):
                 coverage_after_revert = float(coverage)
                 self.coverage_floor_hits[agent] += 1
                 coverage_clipped = True
+                logger.debug(f"  Box reverted for {agent}: coverage after revert={coverage_after_revert:.6f}")
 
             precision_gain = precision - prev_precision
             coverage_gain = coverage - prev_coverage
