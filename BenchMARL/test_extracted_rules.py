@@ -110,6 +110,283 @@ def check_rule_satisfaction(
     return mask
 
 
+def analyze_rule_overlaps_detailed(
+    results: Dict,
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    feature_names: List[str],
+    unique_classes: List[int]
+) -> Dict:
+    """
+    Analyze how rules from different classes overlap in detail.
+    
+    Args:
+        results: Results dictionary from test_rules_from_json
+        X_data: Data matrix (n_samples, n_features) in standardized space
+        y_data: Class labels (n_samples,)
+        feature_names: List of feature names
+        unique_classes: List of unique class labels
+    
+    Returns:
+        Dictionary containing detailed overlap analysis
+    """
+    logger.info("\n" + "="*80)
+    logger.info("DETAILED RULE OVERLAP ANALYSIS")
+    logger.info("="*80)
+    
+    per_class_results = results.get("per_class_results", {})
+    rule_results = results.get("rule_results", [])
+    
+    # Build mapping of rules to their source classes from per_class_results
+    rule_to_source_classes = {}
+    for class_key, class_data in per_class_results.items():
+        target_class = class_data.get("class")
+        unique_rules = class_data.get("unique_rules", [])
+        for rule_str in unique_rules:
+            if rule_str not in rule_to_source_classes:
+                rule_to_source_classes[rule_str] = []
+            rule_to_source_classes[rule_str].append(target_class)
+    
+    # Analyze overlaps
+    overlap_analysis = {
+        "rule_overlaps": [],
+        "class_pair_overlaps": {},
+        "summary": {
+            "total_unique_rules": len(rule_to_source_classes),
+            "rules_with_overlaps": 0,
+            "total_overlap_pairs": 0
+        }
+    }
+    
+    # Use rule_results which already has overlap information
+    for rule_result in rule_results:
+        rule_str = rule_result.get("rule")
+        if rule_str == "any values (no tightened features)":
+            continue
+        
+        if rule_result.get("satisfies_multiple_classes", False):
+            classes_satisfied = rule_result.get("classes_satisfied", [])
+            source_classes = rule_to_source_classes.get(rule_str, [])
+            
+            overlap_analysis["summary"]["rules_with_overlaps"] += 1
+            
+            # Get class sample counts
+            class_sample_counts = {}
+            total_samples_satisfying = 0
+            for target_class in classes_satisfied:
+                class_key = f"class_{target_class}"
+                if class_key in rule_result.get("per_class_results", {}):
+                    class_res = rule_result["per_class_results"][class_key]
+                    n_satisfying = class_res.get("n_satisfying_class_samples", 0)
+                    class_sample_counts[target_class] = n_satisfying
+                    total_samples_satisfying += n_satisfying
+            
+            # Record overlap details
+            overlap_info = {
+                "rule": rule_str,
+                "rule_index": rule_result.get("rule_index"),
+                "source_classes": source_classes,
+                "satisfies_classes": classes_satisfied,
+                "class_sample_counts": class_sample_counts,
+                "total_samples_satisfying": total_samples_satisfying
+            }
+            overlap_analysis["rule_overlaps"].append(overlap_info)
+            
+            # Record class pair overlaps
+            for i, class1 in enumerate(classes_satisfied):
+                for class2 in classes_satisfied[i+1:]:
+                    pair_key = f"{min(class1, class2)}_{max(class1, class2)}"
+                    if pair_key not in overlap_analysis["class_pair_overlaps"]:
+                        overlap_analysis["class_pair_overlaps"][pair_key] = {
+                            "class1": int(min(class1, class2)),
+                            "class2": int(max(class1, class2)),
+                            "overlapping_rules": [],
+                            "n_overlapping_rules": 0
+                        }
+                    overlap_analysis["class_pair_overlaps"][pair_key]["overlapping_rules"].append(rule_str)
+                    overlap_analysis["class_pair_overlaps"][pair_key]["n_overlapping_rules"] += 1
+                    overlap_analysis["summary"]["total_overlap_pairs"] += 1
+    
+    # Identify unique rules per class (rules that don't overlap)
+    per_class_results = results.get("per_class_results", {})
+    unique_rules_per_class = {}
+    for class_key, class_data in per_class_results.items():
+        target_class = class_data.get("class")
+        unique_rules = class_data.get("unique_rules", [])
+        # Filter out overlapping rules
+        non_overlapping = [
+            rule for rule in unique_rules 
+            if rule not in [overlap["rule"] for overlap in overlap_analysis["rule_overlaps"]]
+        ]
+        unique_rules_per_class[target_class] = non_overlapping
+    
+    # Log summary
+    logger.info(f"Total unique rules: {overlap_analysis['summary']['total_unique_rules']}")
+    logger.info(f"Rules with overlaps: {overlap_analysis['summary']['rules_with_overlaps']}")
+    logger.info(f"Total overlap pairs: {overlap_analysis['summary']['total_overlap_pairs']}")
+    
+    # Log overlapping rules in detail
+    if overlap_analysis["rule_overlaps"]:
+        logger.info(f"\n{'='*80}")
+        logger.info("OVERLAPPING RULES (satisfy multiple classes):")
+        logger.info(f"{'='*80}")
+        for idx, overlap_info in enumerate(overlap_analysis["rule_overlaps"], 1):
+            logger.info(f"\nOverlapping Rule {idx}:")
+            logger.info(f"  Rule: {overlap_info['rule'][:100]}{'...' if len(overlap_info['rule']) > 100 else ''}")
+            logger.info(f"  Source classes (where rule was extracted): {overlap_info['source_classes']}")
+            logger.info(f"  Satisfies classes: {overlap_info['satisfies_classes']}")
+            logger.info(f"  Total samples satisfying: {overlap_info['total_samples_satisfying']}")
+            logger.info(f"  Class sample counts:")
+            for cls, count in overlap_info['class_sample_counts'].items():
+                logger.info(f"    Class {cls}: {count} samples")
+    else:
+        logger.info(f"\nNo overlapping rules found.")
+    
+    # Log class pair overlaps
+    if overlap_analysis["class_pair_overlaps"]:
+        logger.info(f"\n{'='*80}")
+        logger.info("CLASS PAIR OVERLAPS:")
+        logger.info(f"{'='*80}")
+        for pair_key, pair_info in overlap_analysis["class_pair_overlaps"].items():
+            logger.info(f"\nClasses {pair_info['class1']} & {pair_info['class2']}:")
+            logger.info(f"  Number of overlapping rules: {pair_info['n_overlapping_rules']}")
+            logger.info(f"  Overlapping rules:")
+            for rule_idx, rule_str in enumerate(pair_info['overlapping_rules'], 1):
+                logger.info(f"    {rule_idx}. {rule_str[:80]}{'...' if len(rule_str) > 80 else ''}")
+    
+    # Log unique rules per class
+    logger.info(f"\n{'='*80}")
+    logger.info("UNIQUE RULES (class-specific, no overlaps):")
+    logger.info(f"{'='*80}")
+    for target_class in sorted(unique_rules_per_class.keys()):
+        unique_rules = unique_rules_per_class[target_class]
+        logger.info(f"\nClass {target_class}:")
+        if unique_rules:
+            logger.info(f"  {len(unique_rules)} unique rule(s):")
+            for rule_idx, rule_str in enumerate(unique_rules, 1):
+                logger.info(f"    {rule_idx}. {rule_str[:80]}{'...' if len(rule_str) > 80 else ''}")
+        else:
+            logger.info(f"  No unique rules (all rules overlap with other classes)")
+    
+    # Add unique rules to analysis results
+    overlap_analysis["unique_rules_per_class"] = {
+        f"class_{cls}": {
+            "class": cls,
+            "unique_rules": rules,
+            "n_unique_rules": len(rules)
+        }
+        for cls, rules in unique_rules_per_class.items()
+    }
+    
+    return overlap_analysis
+
+
+def analyze_missed_samples(
+    results: Dict,
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    feature_names: List[str],
+    unique_classes: List[int]
+) -> Dict:
+    """
+    Analyze which samples are missed (not covered by any rule) in each class.
+    
+    Args:
+        results: Results dictionary from test_rules_from_json
+        X_data: Data matrix (n_samples, n_features) in standardized space
+        y_data: Class labels (n_samples,)
+        feature_names: List of feature names
+        unique_classes: List of unique class labels
+    
+    Returns:
+        Dictionary containing missed samples analysis
+    """
+    logger.info("\n" + "="*80)
+    logger.info("MISSED SAMPLES ANALYSIS")
+    logger.info("="*80)
+    
+    per_class_results = results.get("per_class_results", {})
+    
+    missed_samples_analysis = {
+        "per_class_analysis": {},
+        "summary": {}
+    }
+    
+    # For each class, collect all rules and check coverage
+    for class_key, class_data in per_class_results.items():
+        target_class = class_data.get("class")
+        unique_rules = class_data.get("unique_rules", [])
+        
+        # Get all samples for this class
+        class_mask = (y_data == target_class)
+        class_indices = np.where(class_mask)[0]
+        n_class_samples = len(class_indices)
+        
+        # Check which samples are covered by at least one rule
+        covered_mask = np.zeros(n_class_samples, dtype=bool)
+        
+        for rule_str in unique_rules:
+            if rule_str == "any values (no tightened features)":
+                # Empty rule covers all samples
+                covered_mask = np.ones(n_class_samples, dtype=bool)
+                break
+            
+            rule_conditions = parse_rule(rule_str)
+            if len(rule_conditions) == 0:
+                covered_mask = np.ones(n_class_samples, dtype=bool)
+                break
+            
+            # Check which samples satisfy this rule
+            satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
+            # Only consider samples from this class
+            class_satisfying = satisfying_mask[class_mask]
+            covered_mask = covered_mask | class_satisfying
+        
+        # Find missed samples
+        missed_indices = class_indices[~covered_mask]
+        n_missed = len(missed_indices)
+        n_covered = np.sum(covered_mask)
+        coverage_ratio = n_covered / n_class_samples if n_class_samples > 0 else 0.0
+        
+        class_analysis = {
+            "class": int(target_class),
+            "n_class_samples": int(n_class_samples),
+            "n_covered_samples": int(n_covered),
+            "n_missed_samples": int(n_missed),
+            "coverage_ratio": float(coverage_ratio),
+            "missed_sample_indices": missed_indices.tolist()
+        }
+        
+        missed_samples_analysis["per_class_analysis"][f"class_{target_class}"] = class_analysis
+        
+        logger.info(f"\nClass {target_class}:")
+        logger.info(f"  Total samples: {n_class_samples}")
+        logger.info(f"  Covered samples: {n_covered} ({100*coverage_ratio:.2f}%)")
+        logger.info(f"  Missed samples: {n_missed} ({100*(1-coverage_ratio):.2f}%)")
+    
+    # Summary
+    total_samples = len(y_data)
+    total_missed = sum(
+        class_analysis["n_missed_samples"]
+        for class_analysis in missed_samples_analysis["per_class_analysis"].values()
+    )
+    total_covered = total_samples - total_missed
+    
+    missed_samples_analysis["summary"] = {
+        "total_samples": int(total_samples),
+        "total_covered_samples": int(total_covered),
+        "total_missed_samples": int(total_missed),
+        "overall_coverage_ratio": float(total_covered / total_samples) if total_samples > 0 else 0.0
+    }
+    
+    logger.info(f"\nOverall Summary:")
+    logger.info(f"  Total samples: {total_samples}")
+    logger.info(f"  Covered samples: {total_covered} ({100*missed_samples_analysis['summary']['overall_coverage_ratio']:.2f}%)")
+    logger.info(f"  Missed samples: {total_missed} ({100*(1-missed_samples_analysis['summary']['overall_coverage_ratio']):.2f}%)")
+    
+    return missed_samples_analysis
+
+
 def test_rules_from_json(
     rules_file: str,
     dataset_name: str,
@@ -317,6 +594,26 @@ def test_rules_from_json(
                 logger.info(f"      Class {class_val}: precision={class_res['precision']:.4f}, coverage={class_res['coverage']:.4f}")
     else:
         logger.info(f"\nNo rules satisfy multiple classes.")
+    
+    # Analyze rule overlaps in detail
+    overlap_analysis = analyze_rule_overlaps_detailed(
+        results=results,
+        X_data=X_data,
+        y_data=y_data,
+        feature_names=feature_names,
+        unique_classes=unique_classes
+    )
+    results["overlap_analysis"] = overlap_analysis
+    
+    # Analyze missed samples per class
+    missed_samples_analysis = analyze_missed_samples(
+        results=results,
+        X_data=X_data,
+        y_data=y_data,
+        feature_names=feature_names,
+        unique_classes=unique_classes
+    )
+    results["missed_samples_analysis"] = missed_samples_analysis
     
     return results
 
