@@ -227,40 +227,40 @@ def analyze_rule_overlaps_detailed(
     
     # Log overlapping rules in detail
     if overlap_analysis["rule_overlaps"]:
-        logger.info(f"\n{'='*80}")
+        logger.info(f"{'='*80}")
         logger.info("OVERLAPPING RULES (satisfy multiple classes):")
         logger.info(f"{'='*80}")
         for idx, overlap_info in enumerate(overlap_analysis["rule_overlaps"], 1):
-            logger.info(f"\nOverlapping Rule {idx}:")
+            logger.info(f"Overlapping Rule {idx}:")
             logger.info(f"  Rule: {overlap_info['rule'][:100]}{'...' if len(overlap_info['rule']) > 100 else ''}")
             logger.info(f"  Source classes (where rule was extracted): {overlap_info['source_classes']}")
             logger.info(f"  Satisfies classes: {overlap_info['satisfies_classes']}")
             logger.info(f"  Total samples satisfying: {overlap_info['total_samples_satisfying']}")
             logger.info(f"  Class sample counts:")
             for cls, count in overlap_info['class_sample_counts'].items():
-                logger.info(f"    Class {cls}: {count} samples")
+                logger.info(f"Class {cls}: {count} samples")
     else:
-        logger.info(f"\nNo overlapping rules found.")
+        logger.info(f"No overlapping rules found.")
     
     # Log class pair overlaps
     if overlap_analysis["class_pair_overlaps"]:
-        logger.info(f"\n{'='*80}")
+        logger.info(f"{'='*80}")
         logger.info("CLASS PAIR OVERLAPS:")
         logger.info(f"{'='*80}")
         for pair_key, pair_info in overlap_analysis["class_pair_overlaps"].items():
-            logger.info(f"\nClasses {pair_info['class1']} & {pair_info['class2']}:")
+            logger.info(f"Classes {pair_info['class1']} & {pair_info['class2']}:")
             logger.info(f"  Number of overlapping rules: {pair_info['n_overlapping_rules']}")
             logger.info(f"  Overlapping rules:")
             for rule_idx, rule_str in enumerate(pair_info['overlapping_rules'], 1):
                 logger.info(f"    {rule_idx}. {rule_str[:80]}{'...' if len(rule_str) > 80 else ''}")
     
     # Log unique rules per class
-    logger.info(f"\n{'='*80}")
+    logger.info(f"{'='*80}")
     logger.info("UNIQUE RULES (class-specific, no overlaps):")
     logger.info(f"{'='*80}")
     for target_class in sorted(unique_rules_per_class.keys()):
         unique_rules = unique_rules_per_class[target_class]
-        logger.info(f"\nClass {target_class}:")
+        logger.info(f"Class {target_class}:")
         if unique_rules:
             logger.info(f"  {len(unique_rules)} unique rule(s):")
             for rule_idx, rule_str in enumerate(unique_rules, 1):
@@ -359,7 +359,7 @@ def analyze_missed_samples(
         
         missed_samples_analysis["per_class_analysis"][f"class_{target_class}"] = class_analysis
         
-        logger.info(f"\nClass {target_class}:")
+        logger.info(f"Class {target_class}:")
         logger.info(f"  Total samples: {n_class_samples}")
         logger.info(f"  Covered samples: {n_covered} ({100*coverage_ratio:.2f}%)")
         logger.info(f"  Missed samples: {n_missed} ({100*(1-coverage_ratio):.2f}%)")
@@ -379,7 +379,7 @@ def analyze_missed_samples(
         "overall_coverage_ratio": float(total_covered / total_samples) if total_samples > 0 else 0.0
     }
     
-    logger.info(f"\nOverall Summary:")
+    logger.info(f"Overall Summary:")
     logger.info(f"  Total samples: {total_samples}")
     logger.info(f"  Covered samples: {total_covered} ({100*missed_samples_analysis['summary']['overall_coverage_ratio']:.2f}%)")
     logger.info(f"  Missed samples: {total_missed} ({100*(1-missed_samples_analysis['summary']['overall_coverage_ratio']):.2f}%)")
@@ -414,14 +414,14 @@ def test_rules_from_json(
     logger.info("="*80)
     
     # Load rules from JSON
-    logger.info("\nLoading rules from JSON file...")
+    logger.info("Loading rules from JSON file...")
     with open(rules_file, 'r') as f:
         rules_data = json.load(f)
     
     logger.info(f"✓ Loaded rules file with {len(rules_data.get('per_class_results', {}))} classes")
     
     # Load dataset
-    logger.info(f"\nLoading dataset: {dataset_name}")
+    logger.info(f"Loading dataset: {dataset_name}")
     dataset_loader = TabularDatasetLoader(
         dataset_name=dataset_name,
         test_size=0.2,
@@ -460,7 +460,7 @@ def test_rules_from_json(
     
     all_unique_rules = sorted(list(all_unique_rules))  # Sort for consistent ordering
     
-    logger.info(f"\n{'='*80}")
+    logger.info(f"{'='*80}")
     logger.info(f"Testing {len(all_unique_rules)} unique rules against all classes")
     logger.info(f"{'='*80}")
     
@@ -483,7 +483,7 @@ def test_rules_from_json(
     rules_satisfying_both_classes = []
     
     for rule_idx, rule_str in enumerate(all_unique_rules):
-        logger.info(f"\n{'='*80}")
+        logger.info(f"{'='*80}")
         logger.info(f"Rule {rule_idx + 1}/{len(all_unique_rules)}: {rule_str[:100]}...")
         logger.info(f"{'='*80}")
         logger.info(f"  Source classes: {rule_to_source_classes[rule_str]}")
@@ -546,7 +546,7 @@ def test_rules_from_json(
             
             rule_result["per_class_results"][f"class_{target_class}"] = class_result
             
-            logger.info(f"\n  Class {target_class}:")
+            logger.info(f"  Class {target_class}:")
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
             logger.info(f"    Precision: {precision:.4f}")
             
@@ -563,7 +563,7 @@ def test_rules_from_json(
                 "classes_satisfied": classes_satisfied,
                 "per_class_results": rule_result["per_class_results"]
             })
-            logger.info(f"\n  ✓ Rule satisfies {len(classes_satisfied)} classes: {classes_satisfied}")
+            logger.info(f"✓ Rule satisfies {len(classes_satisfied)} classes: {classes_satisfied}")
         else:
             rule_result["satisfies_multiple_classes"] = False
             rule_result["classes_satisfied"] = classes_satisfied
@@ -577,14 +577,14 @@ def test_rules_from_json(
         "rules_satisfying_both_classes": rules_satisfying_both_classes
     }
     
-    logger.info(f"\n{'='*80}")
+    logger.info(f"{'='*80}")
     logger.info(f"SUMMARY")
     logger.info(f"{'='*80}")
     logger.info(f"Total unique rules tested: {len(all_unique_rules)}")
     logger.info(f"Rules satisfying multiple classes: {len(rules_satisfying_both_classes)}")
     
     if rules_satisfying_both_classes:
-        logger.info(f"\nRules that satisfy multiple classes:")
+        logger.info(f"Rules that satisfy multiple classes:")
         for rule_info in rules_satisfying_both_classes:
             logger.info(f"  Rule {rule_info['rule_index'] + 1}: {rule_info['rule'][:80]}...")
             logger.info(f"    Classes satisfied: {rule_info['classes_satisfied']}")
@@ -593,7 +593,7 @@ def test_rules_from_json(
                 class_res = rule_info['per_class_results'][class_key]
                 logger.info(f"      Class {class_val}: precision={class_res['precision']:.4f}, coverage={class_res['coverage']:.4f}")
     else:
-        logger.info(f"\nNo rules satisfy multiple classes.")
+        logger.info(f"No rules satisfy multiple classes.")
     
     # Analyze rule overlaps in detail
     overlap_analysis = analyze_rule_overlaps_detailed(
@@ -681,20 +681,20 @@ Examples:
     
     # Save results if output path specified
     if args.output:
-        logger.info(f"\n{'='*80}")
+        logger.info(f"{'='*80}")
         logger.info(f"Saving results to: {args.output}")
         with open(args.output, 'w') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         logger.info("✓ Results saved successfully")
     
     # Print per-class summary
-    logger.info(f"\n{'='*80}")
+    logger.info(f"{'='*80}")
     logger.info("PER-CLASS SUMMARY")
     logger.info(f"{'='*80}")
     
     unique_classes = results.get("classes", [])
     for target_class in unique_classes:
-        logger.info(f"\nClass {target_class}:")
+        logger.info(f"Class {target_class}:")
         class_precisions = []
         class_coverages = []
         
@@ -712,7 +712,7 @@ Examples:
             logger.info(f"  Best precision: {np.max(class_precisions):.4f}")
             logger.info(f"  Best coverage: {np.max(class_coverages):.4f}")
     
-    logger.info(f"\n{'='*80}")
+    logger.info(f"{'='*80}")
     logger.info("Rule testing complete!")
     logger.info(f"{'='*80}")
 

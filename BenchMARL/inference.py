@@ -405,11 +405,25 @@ def run_rollout_with_policy(
             action_np = action_np.squeeze(0)  # Remove batch dimension: [1, 60] -> [60]
         
         # Check if action needs to be sliced (policy might output actions for multiple agents)
-        expected_action_dim = 2 * env.n_features  # Should be 60 for 30 features
+        expected_action_dim = 2 * env.n_features  # Should be 16 for 8 features (2 * 8)
+        agent_num = int(agent_id.split('_')[-1]) if '_' in agent_id else 0
+        
         if action_np.shape[0] == 2 * expected_action_dim:
-            # Policy outputs actions for 2 agents concatenated (120 dims for 2 agents * 60 each)
+            # Policy outputs actions for 2 agents concatenated (32 dims for 2 agents * 16 each)
             # Extract the appropriate slice based on agent_id
-            agent_num = int(agent_id.split('_')[-1]) if '_' in agent_id else 0
+            # If agent_num >= 2, wrap around to use agent_0 or agent_1 (since policy only supports 2 agents)
+            num_agents_in_policy = 2
+            mapped_agent_num = agent_num % num_agents_in_policy
+            start_idx = mapped_agent_num * expected_action_dim
+            end_idx = start_idx + expected_action_dim
+            action_np = action_np[start_idx:end_idx]
+            if step_count == 0:
+                if agent_num != mapped_agent_num:
+                    logger.info(f"  Extracted action slice for {agent_id}: mapped agent_{agent_num} -> agent_{mapped_agent_num}, indices [{start_idx}:{end_idx}] from policy output")
+                else:
+                    logger.info(f"  Extracted action slice for {agent_id}: indices [{start_idx}:{end_idx}] from policy output")
+        elif action_np.shape[0] == 4 * expected_action_dim:
+            # Policy outputs actions for 4 agents concatenated (64 dims for 4 agents * 16 each)
             start_idx = agent_num * expected_action_dim
             end_idx = start_idx + expected_action_dim
             action_np = action_np[start_idx:end_idx]
@@ -422,6 +436,11 @@ def run_rollout_with_policy(
             if action_np.shape[0] > expected_action_dim:
                 action_np = action_np[:expected_action_dim]
                 logger.warning(f"  Taking first {expected_action_dim} elements")
+        
+        # Validate that action is not empty
+        if action_np.shape[0] == 0:
+            original_action_shape = action.shape if hasattr(action, 'shape') else (action_np.shape[0] if hasattr(action_np, 'shape') else 'unknown')
+            raise ValueError(f"Empty action extracted for {agent_id}. Original action shape: {original_action_shape}, agent_num: {agent_num}, expected_action_dim: {expected_action_dim}")
         
         # Debug: Log action for first step
         if step_count == 0:
