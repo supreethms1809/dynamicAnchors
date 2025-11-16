@@ -323,7 +323,20 @@ def run_rollout_with_policy(
                         # This keeps values in tanh's active range (not saturated) while preserving differences
                         fixed_scale = 30000000.0  # 30M - keeps values in reasonable range for tanh
                         # Define sample_idx for logging (used in multiple places)
-                        sample_idx = [0, 1, 2, 29, 30, 59] if step_count == 0 else []
+                        # Dynamically create sample indices based on actual action space size
+                        action_size = len(action_vals)
+                        if step_count == 0 and action_size > 0:
+                            # Sample from beginning, middle, and end of action space
+                            sample_idx = [0, 1, 2]  # Always include first few
+                            if action_size > 6:
+                                mid = action_size // 2
+                                sample_idx.extend([mid - 1, mid, mid + 1])
+                            if action_size > 10:
+                                sample_idx.append(action_size - 1)  # Last element
+                            # Ensure all indices are within bounds
+                            sample_idx = [i for i in sample_idx if i < action_size]
+                        else:
+                            sample_idx = []
                         if max_abs > 10.0:
                             if step_count == 0:
                                 logger.info(f"  Scaling large logits by fixed factor {fixed_scale:.2f} (max_abs={max_abs:.2f})")
