@@ -68,8 +68,54 @@ class AnchorEnv(ParallelEnv):
                 target_classes = sorted(np.unique(y).tolist())
         
         self.target_classes = target_classes
-        self.possible_agents = [f"agent_{cls}" for cls in target_classes]
-        self.agent_to_class = {f"agent_{cls}": cls for cls in target_classes}
+        
+        # Get number of agents per class (default: 1)
+        agents_per_class = env_config.get("agents_per_class", 1)
+        
+        # Create agents: multiple agents per class if agents_per_class > 1
+        self.possible_agents = []
+        self.agent_to_class = {}
+        for cls in target_classes:
+            for agent_idx in range(agents_per_class):
+                if agents_per_class == 1:
+                    agent_name = f"agent_{cls}"
+                else:
+                    agent_name = f"agent_{cls}_{agent_idx}"
+                self.possible_agents.append(agent_name)
+                self.agent_to_class[agent_name] = cls
+        
+        # Initialize group_map: can be passed explicitly or will be created from agents
+        # If not provided, create default 1:1 mapping (each agent gets its own group)
+        group_map = env_config.get("group_map", None)
+        if group_map is None:
+            # Default: each agent gets its own group
+            self.group_map = {agent: [agent] for agent in self.possible_agents}
+        else:
+            # Validate that the provided group_map matches the possible_agents
+            all_agents_in_groups = []
+            for group, agents in group_map.items():
+                if not isinstance(agents, list):
+                    raise ValueError(f"Group '{group}' must map to a list of agents, got {type(agents)}")
+                all_agents_in_groups.extend(agents)
+            
+            # Check that all agents in group_map are in possible_agents
+            missing_agents = set(all_agents_in_groups) - set(self.possible_agents)
+            if missing_agents:
+                raise ValueError(
+                    f"group_map contains agents not in possible_agents: {missing_agents}. "
+                    f"Possible agents: {self.possible_agents}"
+                )
+            
+            # Check that all possible_agents are in some group
+            agents_in_groups = set(all_agents_in_groups)
+            missing_from_groups = set(self.possible_agents) - agents_in_groups
+            if missing_from_groups:
+                raise ValueError(
+                    f"Some possible_agents are not in any group: {missing_from_groups}. "
+                    f"Groups: {list(group_map.keys())}"
+                )
+            
+            self.group_map = group_map
         
         step_fracs = env_config.get("step_fracs", (0.005, 0.01, 0.02))
         if step_fracs is None or len(step_fracs) == 0:
@@ -816,6 +862,10 @@ class AnchorEnv(ParallelEnv):
         return observations, rewards, terminations, truncations, infos
     
     def _compute_inter_class_overlap_penalty(self, agent: str) -> float:
+        """
+        Compute penalty for overlap with agents from DIFFERENT classes only.
+        Intra-class overlap (same class) is allowed and not penalized.
+        """
         if len(self.agents) <= 1:
             return 0.0
         
@@ -826,11 +876,35 @@ class AnchorEnv(ParallelEnv):
         if agent_vol <= 1e-12:
             return 0.0
         
+        # Get the target class for this agent
+        agent_class = self.agent_to_class.get(agent)
+        if agent_class is None:
+            # Fallback: if agent_to_class not available, compute from agent name
+            try:
+                agent_class = int(agent.split("_")[-1]) if "_" in agent else None
+            except (ValueError, IndexError):
+                agent_class = None
+        
         total_overlap_vol = 0.0
         
         for other_agent in self.agents:
             if other_agent == agent:
                 continue
+            
+            # Get the target class for the other agent
+            other_agent_class = self.agent_to_class.get(other_agent)
+            if other_agent_class is None:
+                # Fallback: if agent_to_class not available, compute from agent name
+                try:
+                    other_agent_class = int(other_agent.split("_")[-1]) if "_" in other_agent else None
+                except (ValueError, IndexError):
+                    other_agent_class = None
+            
+            # Only penalize overlap with agents from DIFFERENT classes
+            # Intra-class overlap (same class) is allowed
+            if agent_class is not None and other_agent_class is not None:
+                if agent_class == other_agent_class:
+                    continue  # Skip same-class agents (no penalty for intra-class overlap)
             
             other_lower = self.lower[other_agent]
             other_upper = self.upper[other_agent]
@@ -954,7 +1028,7 @@ class AnchorEnv(ParallelEnv):
             shared_reward += shared_reward_weight * 0.5 * fraction_meeting_targets
         
         # 3. Bonus for low overall overlap (complement to inter_class_overlap_penalty)
-        # Compute average overlap across all agent pairs
+        # Compute average overlap across INTER-CLASS agent pairs only (intra-class overlap is allowed)
         total_overlap = 0.0
         n_pairs = 0
         
@@ -966,9 +1040,31 @@ class AnchorEnv(ParallelEnv):
             if vol_i <= 1e-12:
                 continue
             
+            # Get class for agent_i
+            agent_i_class = self.agent_to_class.get(agent_i)
+            if agent_i_class is None:
+                try:
+                    agent_i_class = int(agent_i.split("_")[-1]) if "_" in agent_i else None
+                except (ValueError, IndexError):
+                    agent_i_class = None
+            
             for j, agent_j in enumerate(self.agents):
                 if i >= j:
                     continue
+                
+                # Get class for agent_j
+                agent_j_class = self.agent_to_class.get(agent_j)
+                if agent_j_class is None:
+                    try:
+                        agent_j_class = int(agent_j.split("_")[-1]) if "_" in agent_j else None
+                    except (ValueError, IndexError):
+                        agent_j_class = None
+                
+                # Only consider overlap between agents from DIFFERENT classes
+                # Intra-class overlap is allowed and not counted here
+                if agent_i_class is not None and agent_j_class is not None:
+                    if agent_i_class == agent_j_class:
+                        continue  # Skip same-class pairs
                 
                 lower_j = self.lower[agent_j]
                 upper_j = self.upper[agent_j]

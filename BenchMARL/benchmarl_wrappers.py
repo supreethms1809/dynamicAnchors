@@ -23,6 +23,30 @@ from environment import AnchorEnv
 
 class AnchorTaskClass(TaskClass):
     
+    @staticmethod
+    def _create_group_map(target_classes: List[int], agents_per_class: int = 1) -> Dict[str, List[str]]:
+        if agents_per_class == 1:
+            # Default: each agent gets its own group
+            return {f"agent_{cls}": [f"agent_{cls}"] for cls in target_classes}
+        else:
+            # Multiple agents per class: create groups for each agent
+            group_map = {}
+            for cls in target_classes:
+                for agent_idx in range(agents_per_class):
+                    agent_name = f"agent_{cls}_{agent_idx}"
+                    group_map[agent_name] = [agent_name]
+            return group_map
+    
+    @staticmethod
+    def _print_group_map(group_map: Dict[str, List[str]], logger_instance=None):
+        if logger_instance is None:
+            import logging
+            logger_instance = logging.getLogger(__name__)
+        
+        logger_instance.info("  Group mapping:")
+        for group, agents in group_map.items():
+            logger_instance.info(f"    {group}: {agents}")
+    
     def get_env_fun(
         self,
         num_envs: int,
@@ -44,10 +68,36 @@ class AnchorTaskClass(TaskClass):
             env_config["env_config"] = {}
         env_config["env_config"]["max_cycles"] = max_cycles
         
+        # Get target_classes and agents_per_class
+        target_classes = env_config.get("target_classes", None)
+        if target_classes is None:
+            # Fallback: try to get from env_config
+            target_classes = env_config.get("env_config", {}).get("target_classes", None)
+        
+        # Get agents_per_class from env_config (default: 1)
+        agents_per_class = env_config.get("agents_per_class", None)
+        if agents_per_class is None:
+            agents_per_class = env_config.get("env_config", {}).get("agents_per_class", 1)
+        
+        # Create group_map using the dedicated method
+        if target_classes is not None:
+            group_map = self._create_group_map(target_classes, agents_per_class)
+            # Pass group_map through env_config so AnchorEnv can use it
+            env_config["env_config"]["group_map"] = group_map
+            # Print group mapping information
+            self._print_group_map(group_map, logger)
+        else:
+            # If target_classes not available yet, will be created by AnchorEnv from agents
+            group_map = None
+        
         def _make_env():
             anchor_env = AnchorEnv(**env_config)
             
-            return PettingZooWrapper(
+            # Get the group_map from the environment (already created/validated in AnchorEnv.__init__)
+            group_map_final = anchor_env.group_map
+            
+            # Create the wrapped environment using TorchRL BaseEnv
+            wrapped_env = PettingZooWrapper(
                 env=anchor_env,
                 return_state=False,
                 categorical_actions=False,
@@ -55,6 +105,12 @@ class AnchorTaskClass(TaskClass):
                 device=device,
                 use_mask=True,
             )
+            
+            # Ensure group_map is accessible on the wrapped env
+            if not hasattr(wrapped_env, 'group_map'):
+                wrapped_env.group_map = group_map_final
+            
+            return wrapped_env
         
         return _make_env
     
@@ -74,7 +130,24 @@ class AnchorTaskClass(TaskClass):
         return self.config.get("max_cycles", 1000)
     
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
-        return env.group_map
+        # Try to get group_map from the wrapped env first
+        if hasattr(env, 'group_map'):
+            return env.group_map
+        
+        # Fallback: try to get from unwrapped env
+        if hasattr(env, 'env') and hasattr(env.env, 'group_map'):
+            return env.env.group_map
+        
+        # If still not found, try to construct from agents
+        # This should not happen if group_map is properly set, but provides a fallback
+        if hasattr(env, 'agent_names'):
+            agents = env.agent_names if isinstance(env.agent_names, list) else list(env.agent_names)
+            return {agent: [agent] for agent in agents}
+        
+        raise AttributeError(
+            "group_map not found on environment. "
+            "Make sure group_map is properly set in AnchorEnv."
+        )
     
     def state_spec(self, env: EnvBase) -> Optional[Composite]:
         return None

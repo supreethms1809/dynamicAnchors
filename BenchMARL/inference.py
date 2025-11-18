@@ -406,7 +406,21 @@ def run_rollout_with_policy(
         
         # Check if action needs to be sliced (policy might output actions for multiple agents)
         expected_action_dim = 2 * env.n_features  # Should be 16 for 8 features (2 * 8)
-        agent_num = int(agent_id.split('_')[-1]) if '_' in agent_id else 0
+        # Extract agent index from agent_id
+        # Format can be "agent_{class}" or "agent_{class}_{idx}"
+        agent_parts = agent_id.split('_')
+        if len(agent_parts) >= 2:
+            try:
+                # For "agent_{class}_{idx}", use the last part as index
+                # For "agent_{class}", use the class number as index
+                if len(agent_parts) == 3:
+                    agent_num = int(agent_parts[-1])  # agent_{class}_{idx} -> use idx
+                else:
+                    agent_num = int(agent_parts[1])  # agent_{class} -> use class
+            except (ValueError, IndexError):
+                agent_num = 0
+        else:
+            agent_num = 0
         
         if action_np.shape[0] == 2 * expected_action_dim:
             # Policy outputs actions for 2 agents concatenated (32 dims for 2 agents * 16 each)
@@ -829,8 +843,16 @@ def extract_rules_from_policies(
             logger.info(f"  Debug: No agent-specific indices found, will use shared policy")
     
     # Check if we have policies for all expected agents
-    # Expected agents are agent_0, agent_1, ..., agent_{n_classes-1}
-    expected_agent_names = [f"agent_{i}" for i in range(len(target_classes))]
+    # Expected agents depend on agents_per_class:
+    # - If agents_per_class == 1: agent_0, agent_1, ..., agent_{n_classes-1}
+    # - If agents_per_class > 1: agent_{cls}_0, agent_{cls}_1, ..., agent_{cls}_{agents_per_class-1} for each class
+    expected_agent_names = []
+    for cls in target_classes:
+        if agents_per_class == 1:
+            expected_agent_names.append(f"agent_{cls}")
+        else:
+            for agent_idx in range(agents_per_class):
+                expected_agent_names.append(f"agent_{cls}_{agent_idx}")
     missing_agents = [name for name in expected_agent_names if name not in agent_policies]
     
     if missing_agents:
@@ -870,6 +892,10 @@ def extract_rules_from_policies(
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
     })
+    
+    # Get agents_per_class from config (default: 1)
+    agents_per_class = env_config.get("agents_per_class", 1)
+    logger.info(f"  Agents per class: {agents_per_class}")
     
     # For class-level inference, compute cluster centroids per class
     # This ensures each episode starts from a representative cluster centroid
@@ -935,16 +961,22 @@ def extract_rules_from_policies(
     
     # If no agent-specific policies were extracted, or if we only found some agents,
     # use shared policy for missing agents
-    if not agent_policies or len(agent_policies) < len(target_classes):
-        logger.info(f"  Creating policies for all target classes...")
+    if not agent_policies or len(agent_policies) < len(expected_agent_names):
+        logger.info(f"  Creating policies for all expected agents...")
         for group in sorted(policy_files.keys()):
             combined_policy = policies[group]
             for cls in target_classes:
-                agent_name = f"agent_{cls}"
-                # Only add if not already extracted
-                if agent_name not in agent_policies:
-                    agent_policies[agent_name] = combined_policy
-                    logger.info(f"  ✓ Using shared policy for {agent_name}")
+                if agents_per_class == 1:
+                    agent_name = f"agent_{cls}"
+                    if agent_name not in agent_policies:
+                        agent_policies[agent_name] = combined_policy
+                        logger.info(f"  ✓ Using shared policy for {agent_name}")
+                else:
+                    for agent_idx in range(agents_per_class):
+                        agent_name = f"agent_{cls}_{agent_idx}"
+                        if agent_name not in agent_policies:
+                            agent_policies[agent_name] = combined_policy
+                            logger.info(f"  ✓ Using shared policy for {agent_name}")
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
@@ -974,14 +1006,33 @@ def extract_rules_from_policies(
     }
     
     # Map agent names to target classes
-    # Agent names are like "agent_0", "agent_1", etc., where the number is the class
+    # Agent names can be:
+    # - "agent_{class}" (when agents_per_class == 1)
+    # - "agent_{class}_{idx}" (when agents_per_class > 1)
     agent_to_class = {}
     for agent_name in policies.keys():
-        # Extract class from agent name (e.g., "agent_0" -> 0)
+        # Extract class from agent name
         if agent_name.startswith("agent_"):
+            parts = agent_name.split("_")
             try:
-                class_num = int(agent_name.split("_")[1])
-                agent_to_class[agent_name] = class_num
+                if len(parts) == 2:
+                    # Format: "agent_{class}"
+                    class_num = int(parts[1])
+                    agent_to_class[agent_name] = class_num
+                elif len(parts) == 3:
+                    # Format: "agent_{class}_{idx}"
+                    class_num = int(parts[1])
+                    agent_to_class[agent_name] = class_num
+                else:
+                    # Fallback: try to extract from parts
+                    for part in parts[1:]:
+                        try:
+                            class_num = int(part)
+                            if class_num in target_classes:
+                                agent_to_class[agent_name] = class_num
+                                break
+                        except ValueError:
+                            continue
             except (ValueError, IndexError):
                 # If parsing fails, try to map by index
                 pass
@@ -1016,6 +1067,8 @@ def extract_rules_from_policies(
             # Create environment config for single agent (this class only)
             single_agent_config = anchor_config.copy()
             single_agent_config["target_classes"] = [target_class]  # Only this class
+            # Pass agents_per_class to match training config
+            single_agent_config["env_config"]["agents_per_class"] = agents_per_class
             
             # Create raw AnchorEnv directly (bypass BenchMARL/TorchRL wrapper)
             env = AnchorEnv(**single_agent_config)
@@ -1024,9 +1077,18 @@ def extract_rules_from_policies(
             # We need to reset once to initialize agents, but the function will reset again for the rollout
             env.reset(seed=rollout_seed)
             if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
-                actual_agent_name = env.possible_agents[0]
+                # If multiple agents per class, find the one matching agent_name
+                if agents_per_class > 1 and agent_name in env.possible_agents:
+                    actual_agent_name = agent_name
+                else:
+                    # Use first agent (should match target_class)
+                    actual_agent_name = env.possible_agents[0]
             elif hasattr(env, 'agents') and len(env.agents) > 0:
-                actual_agent_name = env.agents[0]
+                # If multiple agents per class, find the one matching agent_name
+                if agents_per_class > 1 and agent_name in env.agents:
+                    actual_agent_name = agent_name
+                else:
+                    actual_agent_name = env.agents[0]
             else:
                 # Fallback to agent_name
                 actual_agent_name = agent_name
@@ -1104,11 +1166,22 @@ def extract_rules_from_policies(
                         target_classes=[target_class],
                         env_config=env_config
                     )
-                    # Use the agent name that matches the target_class
-                    temp_agent_name = f"agent_{target_class}"
+                    # Use the actual agent name from the rollout (matches the agent that generated the rule)
+                    temp_agent_name = actual_agent_name
+                    # Reset temp_env to initialize agents
+                    temp_env.reset()
                     # Set normalized bounds in temp_env (extract_rule will denormalize internally)
-                    temp_env.lower[temp_agent_name] = lower_normalized
-                    temp_env.upper[temp_agent_name] = upper_normalized
+                    if temp_agent_name in temp_env.lower:
+                        temp_env.lower[temp_agent_name] = lower_normalized
+                        temp_env.upper[temp_agent_name] = upper_normalized
+                    else:
+                        # Fallback: use first agent if temp_agent_name not found
+                        if hasattr(temp_env, 'possible_agents') and len(temp_env.possible_agents) > 0:
+                            temp_agent_name = temp_env.possible_agents[0]
+                            temp_env.lower[temp_agent_name] = lower_normalized
+                            temp_env.upper[temp_agent_name] = upper_normalized
+                        else:
+                            logger.warning(f"  ⚠ Could not find agent {temp_agent_name} in temp_env for rule extraction")
                     
                     # Extract rule with denormalization enabled
                     rule = temp_env.extract_rule(

@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import logging
+import yaml
 logger = logging.getLogger(__name__)
 
 from benchmarl.algorithms.common import AlgorithmConfig
@@ -45,6 +46,7 @@ class AnchorTrainer:
         algorithm_config_path: Optional[str] = None,
         experiment_config_path: str = "conf/base_experiment.yaml",
         mlp_config_path: str = "conf/mlp.yaml",
+        anchor_config_path: str = "conf/anchor.yaml",
         output_dir: str = "./output/anchor_training/",
         seed: int = 0
     ):
@@ -61,6 +63,7 @@ class AnchorTrainer:
         self.algorithm_config_path = algorithm_config_path or default_algorithm_path
         self.experiment_config_path = experiment_config_path
         self.mlp_config_path = mlp_config_path
+        self.anchor_config_path = anchor_config_path
         self.output_dir = output_dir
         self.seed = seed
         
@@ -107,9 +110,19 @@ class AnchorTrainer:
         # Get the anchor environment data.
         env_data = self.dataset_loader.get_anchor_env_data()
         
+        # Load anchor.yaml config if it exists, otherwise use defaults
+        anchor_yaml_config = self._load_anchor_yaml_config()
+        
         # Get the default environment configuration.
         if env_config is None:
             env_config = self._get_default_env_config()
+        
+        # Merge anchor.yaml config into env_config (yaml takes precedence)
+        if anchor_yaml_config:
+            # Merge env_config section from yaml
+            if "env_config" in anchor_yaml_config:
+                env_config.update(anchor_yaml_config["env_config"])
+            logger.info(f"  Loaded configuration from {self.anchor_config_path}")
         
         # Get the target classes.
         if target_classes is None:
@@ -669,7 +682,7 @@ class AnchorTrainer:
                                                     except:
                                                         return default
                                                 
-                                                episode_data[group]["total_reward"] = safe_get("total_reward", 0.0)
+                                                episode_data[agent_name]["total_reward"] = safe_get("total_reward", 0.0)
                                             except:
                                                 pass  # Keep default 0.0 if info extraction fails
                             
@@ -1803,8 +1816,26 @@ class AnchorTrainer:
         else:
             return str(obj)
     
+    def _load_anchor_yaml_config(self) -> Optional[Dict[str, Any]]:
+        """
+        Load configuration from anchor.yaml file.
+        Returns None if file doesn't exist or can't be loaded.
+        """
+        if not os.path.exists(self.anchor_config_path):
+            logger.debug(f"  anchor.yaml not found at {self.anchor_config_path}, using defaults")
+            return None
+        
+        try:
+            with open(self.anchor_config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            return config
+        except Exception as e:
+            logger.warning(f"  Failed to load {self.anchor_config_path}: {e}. Using defaults.")
+            return None
+    
     def _get_default_env_config(self) -> Dict[str, Any]:
         return {
+            "agents_per_class": 1,  # Number of agents per class (default: 1)
             "precision_target": 0.8,
             "coverage_target": 0.02,
             "use_perturbation": False,
