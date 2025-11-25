@@ -420,6 +420,21 @@ def test_rules_from_json(
     
     logger.info(f"✓ Loaded rules file with {len(rules_data.get('per_class_results', {}))} classes")
     
+    # Check if the rules file contains instance-level and class-level metrics
+    has_instance_metrics = False
+    has_class_metrics = False
+    per_class_results = rules_data.get("per_class_results", {})
+    for class_data in per_class_results.values():
+        if "instance_precision" in class_data:
+            has_instance_metrics = True
+        if "class_precision" in class_data:
+            has_class_metrics = True
+        if has_instance_metrics and has_class_metrics:
+            break
+    
+    if has_instance_metrics or has_class_metrics:
+        logger.info("✓ Found instance-level and/or class-level precision metrics in rules file")
+    
     # Load dataset
     logger.info(f"Loading dataset: {dataset_name}")
     dataset_loader = TabularDatasetLoader(
@@ -539,16 +554,40 @@ def test_rules_from_json(
                 "class": int(target_class),
                 "n_class_samples": int(n_class_samples),
                 "n_satisfying_class_samples": int(n_satisfying_class),
+                "rule_precision": float(precision),  # Renamed to clarify this is rule-level precision
+                "rule_coverage": float(coverage),    # Renamed to clarify this is rule-level coverage
+                # Legacy fields (for backward compatibility)
                 "precision": float(precision),
                 "coverage": float(coverage),
                 "satisfying_sample_indices": satisfying_class_indices
             }
             
+            # Try to get instance-level and class-level metrics from the rules file if available
+            class_key = f"class_{target_class}"
+            if class_key in per_class_results:
+                class_data = per_class_results[class_key]
+                # Instance-level metrics (from training/inference)
+                if "instance_precision" in class_data:
+                    class_result["instance_precision"] = float(class_data.get("instance_precision", 0.0))
+                    class_result["instance_coverage"] = float(class_data.get("instance_coverage", 0.0))
+                # Class-level metrics (from training/inference)
+                if "class_precision" in class_data:
+                    class_result["class_precision"] = float(class_data.get("class_precision", 0.0))
+                    class_result["class_coverage"] = float(class_data.get("class_coverage", 0.0))
+            
             rule_result["per_class_results"][f"class_{target_class}"] = class_result
             
             logger.info(f"  Class {target_class}:")
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
-            logger.info(f"    Precision: {precision:.4f}")
+            logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
+            
+            # Display instance-level and class-level metrics if available
+            if "instance_precision" in class_result:
+                logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from training/inference)")
+                logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from training/inference)")
+            if "class_precision" in class_result:
+                logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from training/inference)")
+                logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from training/inference)")
             
             if n_satisfying_class > 0:
                 classes_satisfied.append(target_class)
@@ -591,7 +630,11 @@ def test_rules_from_json(
             for class_val in rule_info['classes_satisfied']:
                 class_key = f"class_{class_val}"
                 class_res = rule_info['per_class_results'][class_key]
-                logger.info(f"      Class {class_val}: precision={class_res['precision']:.4f}, coverage={class_res['coverage']:.4f}")
+                logger.info(f"      Class {class_val}: rule_precision={class_res.get('rule_precision', class_res.get('precision', 0.0)):.4f}, rule_coverage={class_res.get('rule_coverage', class_res.get('coverage', 0.0)):.4f}")
+                if "instance_precision" in class_res:
+                    logger.info(f"        Instance-level: precision={class_res['instance_precision']:.4f}, coverage={class_res['instance_coverage']:.4f}")
+                if "class_precision" in class_res:
+                    logger.info(f"        Class-level: precision={class_res['class_precision']:.4f}, coverage={class_res['class_coverage']:.4f}")
     else:
         logger.info(f"No rules satisfy multiple classes.")
     
@@ -698,19 +741,48 @@ Examples:
         class_precisions = []
         class_coverages = []
         
+        rule_precisions = []
+        rule_coverages = []
+        instance_precisions = []
+        instance_coverages = []
+        class_precisions = []
+        class_coverages = []
+        
         for rule_result in results["rule_results"]:
             class_key = f"class_{target_class}"
             if class_key in rule_result["per_class_results"]:
                 class_res = rule_result["per_class_results"][class_key]
-                class_precisions.append(class_res["precision"])
-                class_coverages.append(class_res["coverage"])
+                # Rule-level metrics (calculated by this test script)
+                rule_precisions.append(class_res.get("rule_precision", class_res.get("precision", 0.0)))
+                rule_coverages.append(class_res.get("rule_coverage", class_res.get("coverage", 0.0)))
+                # Instance-level metrics (from training/inference, if available)
+                if "instance_precision" in class_res:
+                    instance_precisions.append(class_res["instance_precision"])
+                    instance_coverages.append(class_res["instance_coverage"])
+                # Class-level metrics (from training/inference, if available)
+                if "class_precision" in class_res:
+                    class_precisions.append(class_res["class_precision"])
+                    class_coverages.append(class_res["class_coverage"])
         
-        if class_precisions:
-            logger.info(f"  Rules tested: {len(class_precisions)}")
-            logger.info(f"  Mean precision: {np.mean(class_precisions):.4f} ± {np.std(class_precisions):.4f}")
-            logger.info(f"  Mean coverage: {np.mean(class_coverages):.4f} ± {np.std(class_coverages):.4f}")
-            logger.info(f"  Best precision: {np.max(class_precisions):.4f}")
-            logger.info(f"  Best coverage: {np.max(class_coverages):.4f}")
+        if rule_precisions:
+            logger.info(f"  Rules tested: {len(rule_precisions)}")
+            logger.info(f"  Rule-level metrics (from testing):")
+            logger.info(f"    Mean precision: {np.mean(rule_precisions):.4f} ± {np.std(rule_precisions):.4f}")
+            logger.info(f"    Mean coverage: {np.mean(rule_coverages):.4f} ± {np.std(rule_coverages):.4f}")
+            logger.info(f"    Best precision: {np.max(rule_precisions):.4f}")
+            logger.info(f"    Best coverage: {np.max(rule_coverages):.4f}")
+            
+            # Display instance-level metrics if available
+            if instance_precisions:
+                logger.info(f"  Instance-level metrics (from training/inference):")
+                logger.info(f"    Mean precision: {np.mean(instance_precisions):.4f} ± {np.std(instance_precisions):.4f}")
+                logger.info(f"    Mean coverage: {np.mean(instance_coverages):.4f} ± {np.std(instance_coverages):.4f}")
+            
+            # Display class-level metrics if available
+            if class_precisions:
+                logger.info(f"  Class-level metrics (from training/inference):")
+                logger.info(f"    Mean precision: {np.mean(class_precisions):.4f} ± {np.std(class_precisions):.4f}")
+                logger.info(f"    Mean coverage: {np.mean(class_coverages):.4f} ± {np.std(class_coverages):.4f}")
     
     logger.info(f"{'='*80}")
     logger.info("Rule testing complete!")

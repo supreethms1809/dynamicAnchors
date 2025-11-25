@@ -1161,6 +1161,13 @@ class AnchorTrainer:
             # For now, we'll use the metrics from evaluation
             rules_list = []
             anchors_list = []
+            # Instance-level metrics (per agent/instance)
+            instance_precisions = []
+            instance_coverages = []
+            # Class-level metrics (union of all agents for the class)
+            class_precisions = []
+            class_coverages = []
+            # Legacy lists (for backward compatibility)
             precisions = []
             coverages = []
             
@@ -1188,11 +1195,24 @@ class AnchorTrainer:
             )
             
             for episode_idx, episode in enumerate(agent_episodes):
-                precision = episode.get("precision", 0.0)
-                coverage = episode.get("coverage", 0.0)
+                # Instance-level metrics
+                instance_precision = episode.get("instance_precision", episode.get("precision", 0.0))
+                instance_coverage = episode.get("instance_coverage", episode.get("coverage", 0.0))
+                # Class-level metrics (may not be in episode data, will compute if needed)
+                class_precision = episode.get("class_precision", 0.0)
+                class_coverage = episode.get("class_coverage", 0.0)
                 
-                precisions.append(float(precision))
-                coverages.append(float(coverage))
+                instance_precisions.append(float(instance_precision))
+                instance_coverages.append(float(instance_coverage))
+                class_precisions.append(float(class_precision))
+                class_coverages.append(float(class_coverage))
+                
+                # Legacy fields (for backward compatibility)
+                precisions.append(float(instance_precision))
+                coverages.append(float(instance_coverage))
+                
+                precision = float(instance_precision)
+                coverage = float(instance_coverage)
                 
                 # Extract anchor bounds from observation
                 # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
@@ -1223,6 +1243,13 @@ class AnchorTrainer:
                 
                 anchor_data = {
                     "episode_idx": episode_idx,
+                    # Instance-level metrics
+                    "instance_precision": float(instance_precision),
+                    "instance_coverage": float(instance_coverage),
+                    # Class-level metrics
+                    "class_precision": float(class_precision),
+                    "class_coverage": float(class_coverage),
+                    # Legacy fields (for backward compatibility)
                     "precision": float(precision),
                     "coverage": float(coverage),
                     "total_reward": float(episode.get("total_reward", 0.0)),
@@ -1252,6 +1279,25 @@ class AnchorTrainer:
             results["per_class_results"][class_key] = {
                 "class": int(target_class),
                 "agent_id": agent,
+                # Instance-level metrics (averaged across all instances)
+                "instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+                "instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+                "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
+                "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
+                "instance_precision_min": float(np.min(instance_precisions)) if instance_precisions else 0.0,
+                "instance_precision_max": float(np.max(instance_precisions)) if instance_precisions else 0.0,
+                "instance_coverage_min": float(np.min(instance_coverages)) if instance_coverages else 0.0,
+                "instance_coverage_max": float(np.max(instance_coverages)) if instance_coverages else 0.0,
+                # Class-level metrics (union of all agents for this class)
+                "class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,
+                "class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,
+                "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
+                "class_coverage_std": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
+                "class_precision_min": float(np.min(class_precisions)) if class_precisions else 0.0,
+                "class_precision_max": float(np.max(class_precisions)) if class_precisions else 0.0,
+                "class_coverage_min": float(np.min(class_coverages)) if class_coverages else 0.0,
+                "class_coverage_max": float(np.max(class_coverages)) if class_coverages else 0.0,
+                # Legacy fields (for backward compatibility, using instance-level)
                 "precision": float(np.mean(precisions)) if precisions else 0.0,
                 "coverage": float(np.mean(coverages)) if coverages else 0.0,
                 "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
@@ -1269,8 +1315,8 @@ class AnchorTrainer:
             }
             
             logger.info(f"  Processed {len(anchors_list)} episodes")
-            logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-            logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+            logger.info(f"  Instance-level - Average precision: {results['per_class_results'][class_key]['instance_precision']:.4f}, coverage: {results['per_class_results'][class_key]['instance_coverage']:.4f}")
+            logger.info(f"  Class-level - Average precision: {results['per_class_results'][class_key]['class_precision']:.4f}, coverage: {results['per_class_results'][class_key]['class_coverage']:.4f}")
             logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
                 logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")

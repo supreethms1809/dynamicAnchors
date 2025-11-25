@@ -476,24 +476,53 @@ def run_rollout_with_policy(
     episode_data = {}
     
     try:
-        # Get metrics directly from environment
-        precision, coverage, details = env._current_metrics(agent_id)
+        # Get instance-level metrics directly from environment
+        instance_precision, instance_coverage, details = env._current_metrics(agent_id)
+        
+        # Get class-level metrics (union of all agents for this class)
+        target_class = env._get_class_for_agent(agent_id)
+        class_union_metrics = {}
+        class_precision = 0.0
+        class_coverage = 0.0
+        
+        if target_class is not None:
+            # Compute class-level union metrics
+            class_union_metrics = env._compute_class_union_metrics()
+            if target_class in class_union_metrics:
+                class_precision = float(class_union_metrics[target_class].get("union_precision", 0.0))
+                class_coverage = float(class_union_metrics[target_class].get("union_coverage", 0.0))
+            else:
+                # Debug: log why class-level metrics might be missing
+                logger.debug(f"  Class {target_class} not found in class_union_metrics. Available classes: {list(class_union_metrics.keys())}")
+                logger.debug(f"  Agents with boxes: {list(env.lower.keys())}")
+                logger.debug(f"  Active agents: {list(env.agents) if hasattr(env, 'agents') else 'N/A'}")
         
         # Get final box bounds
         lower = env.lower[agent_id]
         upper = env.upper[agent_id]
         
-        # Construct final observation
-        final_obs = np.concatenate([lower, upper, np.array([precision, coverage], dtype=np.float32)])
+        # Construct final observation (using instance-level metrics)
+        final_obs = np.concatenate([lower, upper, np.array([instance_precision, instance_coverage], dtype=np.float32)])
         
         episode_data = {
-            "precision": float(precision),
-            "coverage": float(coverage),
+            # Instance-level metrics (for this specific agent/instance)
+            "instance_precision": float(instance_precision),
+            "instance_coverage": float(instance_coverage),
+            # Class-level metrics (union of all agents for this class)
+            "class_precision": float(class_precision),
+            "class_coverage": float(class_coverage),
+            # Legacy fields (keeping for backward compatibility, using instance-level)
+            "precision": float(instance_precision),
+            "coverage": float(instance_coverage),
             "total_reward": total_reward,
             "final_observation": final_obs.tolist(),
         }
         
-        logger.debug(f"  Extracted metrics from environment: precision={precision:.4f}, coverage={coverage:.4f}")
+        logger.debug(
+            f"  Extracted metrics from environment: "
+            f"instance_precision={instance_precision:.4f}, instance_coverage={instance_coverage:.4f}, "
+            f"class_precision={class_precision:.4f}, class_coverage={class_coverage:.4f}"
+        )
         
     except Exception as e:
         logger.warning(f"  ⚠ Error getting metrics from environment for {agent_id}: {e}")
@@ -501,6 +530,10 @@ def run_rollout_with_policy(
         logger.debug(f"  Traceback: {traceback.format_exc()}")
         # Return empty episode data
         episode_data = {
+            "instance_precision": 0.0,
+            "instance_coverage": 0.0,
+            "class_precision": 0.0,
+            "class_coverage": 0.0,
             "precision": 0.0,
             "coverage": 0.0,
             "total_reward": total_reward,
@@ -1005,6 +1038,13 @@ def extract_rules_from_policies(
         # Run multiple rollouts
         anchors_list = []
         rules_list = []
+        # Instance-level metrics (per agent/instance)
+        instance_precisions = []
+        instance_coverages = []
+        # Class-level metrics (union of all agents for the class)
+        class_precisions = []
+        class_coverages = []
+        # Legacy lists (for backward compatibility)
         precisions = []
         coverages = []
         
@@ -1053,20 +1093,43 @@ def extract_rules_from_policies(
                 else:
                     logger.warning(f"    ⚠ episode_data is empty for class {target_class}!")
             
+            # Initialize metrics variables
+            instance_precision = 0.0
+            instance_coverage = 0.0
+            class_precision = 0.0
+            class_coverage = 0.0
+            precision = 0.0
+            coverage = 0.0
+            
             if episode_data:
-                precision = episode_data.get("precision", 0.0)
-                coverage = episode_data.get("coverage", 0.0)
+                # Instance-level metrics
+                instance_precision = episode_data.get("instance_precision", episode_data.get("precision", 0.0))
+                instance_coverage = episode_data.get("instance_coverage", episode_data.get("coverage", 0.0))
+                # Class-level metrics
+                class_precision = episode_data.get("class_precision", 0.0)
+                class_coverage = episode_data.get("class_coverage", 0.0)
                 
-                precisions.append(float(precision))
-                coverages.append(float(coverage))
+                instance_precisions.append(float(instance_precision))
+                instance_coverages.append(float(instance_coverage))
+                class_precisions.append(float(class_precision))
+                class_coverages.append(float(class_coverage))
+                
+                # Legacy fields (for backward compatibility)
+                precisions.append(float(instance_precision))
+                coverages.append(float(instance_coverage))
+                
+                precision = float(instance_precision)
+                coverage = float(instance_coverage)
             else:
                 # Log warning if episode_data is empty
                 if instance_idx == 0:
                     logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx}")
+                instance_precisions.append(0.0)
+                instance_coverages.append(0.0)
+                class_precisions.append(0.0)
+                class_coverages.append(0.0)
                 precisions.append(0.0)
                 coverages.append(0.0)
-                precision = 0.0
-                coverage = 0.0
             
             # Extract rule from final observation (if available)
             rule = "any values (no tightened features)"
@@ -1117,8 +1180,21 @@ def extract_rules_from_policies(
                         denormalize=True  # Denormalize to original feature space
                     )
             
+            # Extract metrics for anchor_data (variables are already defined above)
+            anchor_instance_precision = float(instance_precision)
+            anchor_instance_coverage = float(instance_coverage)
+            anchor_class_precision = float(class_precision)
+            anchor_class_coverage = float(class_coverage)
+            
             anchor_data = {
                 "instance_idx": instance_idx,
+                # Instance-level metrics
+                "instance_precision": anchor_instance_precision,
+                "instance_coverage": anchor_instance_coverage,
+                # Class-level metrics
+                "class_precision": anchor_class_precision,
+                "class_coverage": anchor_class_coverage,
+                # Legacy fields (for backward compatibility)
                 "precision": float(precision),
                 "coverage": float(coverage),
                 "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
@@ -1144,6 +1220,17 @@ def extract_rules_from_policies(
         results["per_class_results"][class_key] = {
             "class": int(target_class),
             "group": agent_name,
+            # Instance-level metrics (averaged across all instances)
+            "instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+            "instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+            "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
+            "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
+            # Class-level metrics (union of all agents for this class)
+            "class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,
+            "class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,
+            "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
+            "class_coverage_std": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
+            # Legacy fields (for backward compatibility, using instance-level)
             "precision": float(np.mean(precisions)) if precisions else 0.0,
             "coverage": float(np.mean(coverages)) if coverages else 0.0,
             "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
@@ -1156,8 +1243,8 @@ def extract_rules_from_policies(
         }
         
         logger.info(f"  Processed {len(anchors_list)} episodes")
-        logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-        logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+        logger.info(f"  Instance-level - Average precision: {results['per_class_results'][class_key]['instance_precision']:.4f}, coverage: {results['per_class_results'][class_key]['instance_coverage']:.4f}")
+        logger.info(f"  Class-level - Average precision: {results['per_class_results'][class_key]['class_precision']:.4f}, coverage: {results['per_class_results'][class_key]['class_coverage']:.4f}")
         logger.info(f"  Unique rules: {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
