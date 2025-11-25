@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import logging
+import yaml
 logger = logging.getLogger(__name__)
 
 from benchmarl.algorithms.common import AlgorithmConfig
@@ -45,6 +46,7 @@ class AnchorTrainer:
         algorithm_config_path: Optional[str] = None,
         experiment_config_path: str = "conf/base_experiment.yaml",
         mlp_config_path: str = "conf/mlp.yaml",
+        anchor_config_path: str = "conf/anchor.yaml",
         output_dir: str = "./output/anchor_training/",
         seed: int = 0
     ):
@@ -61,6 +63,7 @@ class AnchorTrainer:
         self.algorithm_config_path = algorithm_config_path or default_algorithm_path
         self.experiment_config_path = experiment_config_path
         self.mlp_config_path = mlp_config_path
+        self.anchor_config_path = anchor_config_path
         self.output_dir = output_dir
         self.seed = seed
         
@@ -70,6 +73,7 @@ class AnchorTrainer:
         self.model_config = None
         self.critic_model_config = None
         self.task = None
+        self._anchor_env_config = None  # Cache for loaded env_config from YAML
         
         os.makedirs(self.output_dir, exist_ok=True)
     
@@ -107,9 +111,9 @@ class AnchorTrainer:
         # Get the anchor environment data.
         env_data = self.dataset_loader.get_anchor_env_data()
         
-        # Get the default environment configuration.
+        # Get the environment configuration from YAML file or use defaults.
         if env_config is None:
-            env_config = self._get_default_env_config()
+            env_config = self._load_env_config_from_yaml()
         
         # Get the target classes.
         if target_classes is None:
@@ -198,6 +202,19 @@ class AnchorTrainer:
         logger.info("TRAINING COMPLETE!")
         logger.info("="*80)
         logger.info(f"Results saved to: {self.experiment.folder_name}")
+        
+        # Save callback data to files
+        if hasattr(self, 'callback') and self.callback is not None:
+            if hasattr(self.callback, 'save_data_to_files'):
+                logger.info("\nSaving callback data to files...")
+                try:
+                    saved_files = self.callback.save_data_to_files(str(self.experiment.folder_name))
+                    if saved_files:
+                        logger.info(f"  ✓ Saved {len(saved_files)} data files")
+                    else:
+                        logger.info("  No callback data to save")
+                except Exception as e:
+                    logger.warning(f"  ⚠ Warning: Could not save callback data: {e}")
         
         return self.experiment
     
@@ -784,6 +801,17 @@ class AnchorTrainer:
         else:
             logger.info(f"\n  ✓ Total episodes collected: {len(evaluation_anchor_data)}")
         
+        # Save callback data to files (including any new evaluation data)
+        if hasattr(self, 'callback') and self.callback is not None:
+            if hasattr(self.callback, 'save_data_to_files'):
+                logger.info("\nSaving callback data to files...")
+                try:
+                    saved_files = self.callback.save_data_to_files(str(self.experiment.folder_name))
+                    if saved_files:
+                        logger.info(f"  ✓ Saved {len(saved_files)} data files")
+                except Exception as e:
+                    logger.warning(f"  ⚠ Warning: Could not save callback data: {e}")
+        
         return {
             "experiment_folder": str(self.experiment.folder_name),
             "total_frames": self.experiment.total_frames,
@@ -1177,7 +1205,7 @@ class AnchorTrainer:
             
             # Create a temporary environment to use its extract_rule method
             # We'll extract rules from the observation data
-            temp_env_config = self._get_default_env_config()
+            temp_env_config = self._load_env_config_from_yaml()
             temp_env_config.update({
                 "X_min": env_data["X_min"],
                 "X_range": env_data["X_range"],
@@ -1370,7 +1398,7 @@ class AnchorTrainer:
             
             logger.info(f"\nExtracting rules for class {target_class} (agent: {agent})...")
             
-            env_config = self._get_default_env_config()
+            env_config = self._load_env_config_from_yaml()
             env_config.update({
                 "X_min": env_data["X_min"],
                 "X_range": env_data["X_range"],
@@ -1849,7 +1877,63 @@ class AnchorTrainer:
         else:
             return str(obj)
     
+    def _load_env_config_from_yaml(self) -> Dict[str, Any]:
+        """
+        Load environment configuration from anchor.yaml file.
+        Falls back to hardcoded defaults if file is not found or doesn't contain env_config.
+        
+        Returns:
+            Dictionary containing environment configuration parameters
+        """
+        # Return cached config if already loaded
+        if self._anchor_env_config is not None:
+            return self._anchor_env_config.copy()
+        
+        # Try to load from YAML file
+        config_path = self.anchor_config_path
+        if not os.path.isabs(config_path):
+            # If relative path, make it relative to the BenchMARL directory
+            benchmarl_dir = os.path.dirname(os.path.abspath(__file__))
+            config_path = os.path.join(benchmarl_dir, config_path)
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    yaml_data = yaml.safe_load(f)
+                
+                if yaml_data and "env_config" in yaml_data:
+                    env_config = yaml_data["env_config"]
+                    # Convert list to tuple for step_fracs if it's a list (YAML loads lists as lists)
+                    if "step_fracs" in env_config and isinstance(env_config["step_fracs"], list):
+                        env_config["step_fracs"] = tuple(env_config["step_fracs"])
+                    # Convert boolean strings to actual booleans if needed
+                    for key, value in env_config.items():
+                        if isinstance(value, str):
+                            if value.lower() == "true":
+                                env_config[key] = True
+                            elif value.lower() == "false":
+                                env_config[key] = False
+                    
+                    logger.info(f"  Loaded environment config from: {config_path}")
+                    self._anchor_env_config = env_config.copy()
+                    return env_config
+                else:
+                    logger.warning(f"  Warning: {config_path} exists but doesn't contain 'env_config' key. Using defaults.")
+            except Exception as e:
+                logger.warning(f"  Warning: Could not load config from {config_path}: {e}. Using defaults.")
+        else:
+            logger.warning(f"  Warning: Anchor config file not found at {config_path}. Using defaults.")
+        
+        # Fallback to hardcoded defaults
+        default_config = self._get_default_env_config()
+        self._anchor_env_config = default_config.copy()
+        return default_config
+    
     def _get_default_env_config(self) -> Dict[str, Any]:
+        """
+        Get hardcoded default environment configuration.
+        This is used as a fallback if YAML file is not found or doesn't contain env_config.
+        """
         return {
             "precision_target": 0.8,
             "coverage_target": 0.02,

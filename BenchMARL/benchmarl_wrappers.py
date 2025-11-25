@@ -44,6 +44,13 @@ class AnchorTaskClass(TaskClass):
             env_config["env_config"] = {}
         env_config["env_config"]["max_cycles"] = max_cycles
         
+        # Verify agents_per_class is in env_config (for debugging)
+        agents_per_class = env_config.get("env_config", {}).get("agents_per_class", None)
+        if agents_per_class is not None:
+            logger.info(f"  agents_per_class={agents_per_class} found in env_config")
+        else:
+            logger.warning(f"  Warning: agents_per_class not found in env_config, will use default (1)")
+        
         def _make_env():
             anchor_env = AnchorEnv(**env_config)
             
@@ -580,4 +587,83 @@ class AnchorMetricsCallback(Callback):
     def get_evaluation_anchor_data(self) -> List[Dict[str, Any]]:
         """Get anchor data collected during evaluation for rule extraction."""
         return self.evaluation_anchor_data.copy()
+    
+    def save_data_to_files(self, experiment_folder: str) -> Dict[str, str]:
+        """
+        Save all collected callback data to JSON files in the experiment folder.
+        
+        Args:
+            experiment_folder: Path to the experiment folder where data should be saved
+            
+        Returns:
+            Dictionary mapping data type to file path where it was saved
+        """
+        import json
+        import os
+        from pathlib import Path
+        
+        saved_files = {}
+        experiment_path = Path(experiment_folder)
+        experiment_path.mkdir(parents=True, exist_ok=True)
+        
+        def convert_to_serializable(obj: Any) -> Any:
+            """Convert numpy arrays and other non-serializable types to JSON-compatible formats."""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int_)):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, (float, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist() if obj.numel() > 0 else []
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        
+        # Save training history (aggregated metrics)
+        if self.training_history:
+            training_history_path = experiment_path / "training_history.json"
+            serializable_history = convert_to_serializable(self.training_history)
+            with open(training_history_path, 'w') as f:
+                json.dump(serializable_history, f, indent=2, ensure_ascii=False)
+            saved_files["training_history"] = str(training_history_path)
+            logger.info(f"  ✓ Saved training history ({len(self.training_history)} entries) to: {training_history_path}")
+        
+        # Save evaluation history (aggregated metrics)
+        if self.evaluation_history:
+            evaluation_history_path = experiment_path / "evaluation_history.json"
+            serializable_history = convert_to_serializable(self.evaluation_history)
+            with open(evaluation_history_path, 'w') as f:
+                json.dump(serializable_history, f, indent=2, ensure_ascii=False)
+            saved_files["evaluation_history"] = str(evaluation_history_path)
+            logger.info(f"  ✓ Saved evaluation history ({len(self.evaluation_history)} entries) to: {evaluation_history_path}")
+        
+        # Save training episode details (detailed per-episode data with bounds)
+        if self.training_episode_details:
+            training_episodes_path = experiment_path / "training_episode_details.json"
+            serializable_episodes = convert_to_serializable(self.training_episode_details)
+            with open(training_episodes_path, 'w') as f:
+                json.dump(serializable_episodes, f, indent=2, ensure_ascii=False)
+            saved_files["training_episode_details"] = str(training_episodes_path)
+            logger.info(f"  ✓ Saved training episode details ({len(self.training_episode_details)} episodes) to: {training_episodes_path}")
+        
+        # Save evaluation anchor data (for rule extraction)
+        if self.evaluation_anchor_data:
+            evaluation_anchor_path = experiment_path / "evaluation_anchor_data.json"
+            serializable_anchor_data = convert_to_serializable(self.evaluation_anchor_data)
+            with open(evaluation_anchor_path, 'w') as f:
+                json.dump(serializable_anchor_data, f, indent=2, ensure_ascii=False)
+            saved_files["evaluation_anchor_data"] = str(evaluation_anchor_path)
+            logger.info(f"  ✓ Saved evaluation anchor data ({len(self.evaluation_anchor_data)} episodes) to: {evaluation_anchor_path}")
+        
+        return saved_files
 

@@ -36,6 +36,7 @@ env_config:
   min_absolute_step: 0.001
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
   shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
+  agents_per_class: 3        # Number of agents per class (set >1 to learn multiple anchors per class)
   # Use class centroids to initialize the initial window (default: true)
   # If true: initial window is set around class centroid (mean of class instances)
   # If false: initial window is full space (0 to 1 for all features)

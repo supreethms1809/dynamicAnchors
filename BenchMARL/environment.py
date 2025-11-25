@@ -69,8 +69,28 @@ class AnchorEnv(ParallelEnv):
                 target_classes = sorted(np.unique(y).tolist())
         
         self.target_classes = target_classes
-        self.possible_agents = [f"agent_{cls}" for cls in target_classes]
-        self.agent_to_class = {f"agent_{cls}": cls for cls in target_classes}
+
+        # Number of agents per class. When set to 1 (default), behavior matches
+        # the original implementation with exactly one agent per class.
+        self.agents_per_class = env_config.get("agents_per_class", 1)
+
+        # Construct agent names and the mapping from agent to class.
+        # For agents_per_class == 1:
+        #   class c -> "agent_c"
+        # For agents_per_class > 1:
+        #   class c -> "agent_c_0", "agent_c_1", ..., "agent_c_{K-1}"
+        self.possible_agents = []
+        self.agent_to_class = {}
+        for cls in target_classes:
+            if self.agents_per_class == 1:
+                name = f"agent_{cls}"
+                self.possible_agents.append(name)
+                self.agent_to_class[name] = cls
+            else:
+                for k in range(self.agents_per_class):
+                    name = f"agent_{cls}_{k}"
+                    self.possible_agents.append(name)
+                    self.agent_to_class[name] = cls
         
         # Mapping from class id to list of agents belonging to that class.
         # This is used for class-level metrics (union coverage/precision) and
@@ -79,6 +99,11 @@ class AnchorEnv(ParallelEnv):
         self.class_to_agents = defaultdict(list)
         for agent, cls in self.agent_to_class.items():
             self.class_to_agents[cls].append(agent)
+        
+        # Group mapping for BenchMARL: maps group names to lists of agent names.
+        # By default, each agent is its own group (independent policies).
+        # This can be customized if agents should share policies (e.g., group by class).
+        self._group_map = self._compute_group_map()
         
         step_fracs = env_config.get("step_fracs", (0.005, 0.01, 0.02))
         if step_fracs is None or len(step_fracs) == 0:
@@ -1350,6 +1375,39 @@ class AnchorEnv(ParallelEnv):
             shared_reward += shared_reward_weight * 0.2 * coverage_progress
         
         return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.0))
+
+    def _compute_group_map(self) -> Dict[str, List[str]]:
+        """
+        Compute the group mapping for BenchMARL.
+        
+        By default, each agent is its own group (independent policies).
+        This means each agent learns its own policy/network.
+        
+        Returns:
+            Dictionary mapping group names to lists of agent names.
+            Format: {group_name: [agent1, agent2, ...]}
+        """
+        group_map = {}
+        
+        # Default: one group per agent (each agent has its own policy)
+        # This is the most common case for independent learning
+        for agent in self.possible_agents:
+            group_map[agent] = [agent]
+        
+        return group_map
+    
+    @property
+    def group_map(self) -> Dict[str, List[str]]:
+        """
+        Get the group mapping for BenchMARL.
+        
+        Returns a dictionary mapping group names to lists of agent names.
+        This is used by BenchMARL to organize agents into groups that share policies.
+        
+        Returns:
+            Dictionary mapping group names to lists of agent names.
+        """
+        return self._group_map.copy()
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent: str) -> spaces.Box:
