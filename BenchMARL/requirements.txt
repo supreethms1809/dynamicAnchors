@@ -11,3 +11,6 @@ gymnasium
 moviepy
 tensorboard
 ydata-profiling
+stable-baselines3[extra]
+ucimlrepo
+folktables

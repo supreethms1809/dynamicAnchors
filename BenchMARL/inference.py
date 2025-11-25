@@ -588,29 +588,85 @@ def extract_rules_from_policies(
         )
     
     # Find all saved policy models
+    # First, try to use the policies_index.json if it exists (new format with class organization)
     policy_files = {}
     metadata_files = {}
+    agents_per_class = 1
     
-    for filename in os.listdir(individual_models_dir):
-        if filename.startswith("policy_") and filename.endswith(".pth"):
-            group = filename.replace("policy_", "").replace(".pth", "")
-            policy_files[group] = os.path.join(individual_models_dir, filename)
-            
-            # Look for corresponding metadata file
-            metadata_filename = f"policy_{group}_metadata.json"
-            metadata_path = os.path.join(individual_models_dir, metadata_filename)
-            if os.path.exists(metadata_path):
-                metadata_files[group] = metadata_path
+    index_path = os.path.join(individual_models_dir, "policies_index.json")
+    if os.path.exists(index_path):
+        logger.info(f"Found policies_index.json, using it to locate policies...")
+        with open(index_path, 'r') as f:
+            index_data = json.load(f)
+        
+        agents_per_class = index_data.get("agents_per_class", 1)
+        policies_by_class = index_data.get("policies_by_class", {})
+        
+        for class_key, class_info in policies_by_class.items():
+            class_policies = class_info.get("policies", [])
+            for policy_info in class_policies:
+                group = policy_info.get("group") or policy_info.get("agent")
+                policy_file = policy_info.get("policy_file")
+                metadata_file = policy_info.get("metadata_file")
+                
+                if group and policy_file:
+                    # Resolve relative paths
+                    policy_path = os.path.join(individual_models_dir, policy_file)
+                    if os.path.exists(policy_path):
+                        policy_files[group] = policy_path
+                        
+                        if metadata_file:
+                            metadata_path = os.path.join(individual_models_dir, metadata_file)
+                            if os.path.exists(metadata_path):
+                                metadata_files[group] = metadata_path
+        
+        logger.info(f"  Loaded {len(policy_files)} policies from index (agents_per_class={agents_per_class})")
+    else:
+        # Fallback: Search for policies in flat structure (backward compatibility)
+        logger.info("No policies_index.json found, searching for policies in flat structure...")
+        
+        # Search in root directory
+        for filename in os.listdir(individual_models_dir):
+            if filename.startswith("policy_") and filename.endswith(".pth"):
+                group = filename.replace("policy_", "").replace(".pth", "")
+                policy_files[group] = os.path.join(individual_models_dir, filename)
+                
+                # Look for corresponding metadata file
+                metadata_filename = f"policy_{group}_metadata.json"
+                metadata_path = os.path.join(individual_models_dir, metadata_filename)
+                if os.path.exists(metadata_path):
+                    metadata_files[group] = metadata_path
+        
+        # Also search in class subdirectories (for class-organized structure without index)
+        for item in os.listdir(individual_models_dir):
+            item_path = os.path.join(individual_models_dir, item)
+            if os.path.isdir(item_path) and item.startswith("class_"):
+                # This is a class directory
+                for filename in os.listdir(item_path):
+                    if filename.startswith("policy_") and filename.endswith(".pth"):
+                        group = filename.replace("policy_", "").replace(".pth", "")
+                        policy_files[group] = os.path.join(item_path, filename)
+                        
+                        # Look for corresponding metadata file
+                        metadata_filename = f"policy_{group}_metadata.json"
+                        metadata_path = os.path.join(item_path, metadata_filename)
+                        if os.path.exists(metadata_path):
+                            metadata_files[group] = metadata_path
     
     if not policy_files:
         raise ValueError(
             f"No policy models found in {individual_models_dir}\n"
-            f"Expected files like: policy_<group>.pth"
+            f"Expected files like: policy_<group>.pth or class_*/policy_<group>.pth\n"
+            f"Or a policies_index.json file."
         )
     
     logger.info(f"\nFound {len(policy_files)} policy model(s):")
     for group in sorted(policy_files.keys()):
         logger.info(f"  - {group}: {policy_files[group]}")
+    
+    if agents_per_class > 1:
+        logger.info(f"\nNote: Multiple agents per class ({agents_per_class}) detected.")
+        logger.info(f"  Policies are organized by class.")
     
     # Load dataset
     dataset_loader = TabularDatasetLoader(
@@ -968,16 +1024,53 @@ def extract_rules_from_policies(
     
     # If no agent-specific policies were extracted, or if we only found some agents,
     # use shared policy for missing agents
+    # Note: When agents_per_class > 1, we need to handle multiple agents per class
     if not agent_policies or len(agent_policies) < len(target_classes):
         logger.info(f"  Creating policies for all target classes...")
         for group in sorted(policy_files.keys()):
             combined_policy = policies[group]
-            for cls in target_classes:
-                agent_name = f"agent_{cls}"
-                # Only add if not already extracted
-                if agent_name not in agent_policies:
-                    agent_policies[agent_name] = combined_policy
-                    logger.info(f"  ✓ Using shared policy for {agent_name}")
+            
+            # Determine which class this policy belongs to
+            target_class = None
+            if group in metadata_files:
+                try:
+                    with open(metadata_files[group], 'r') as f:
+                        metadata = json.load(f)
+                        target_class = metadata.get("target_class")
+                except:
+                    pass
+            
+            # If we can't determine class from metadata, try parsing from group name
+            if target_class is None and group.startswith("agent_"):
+                try:
+                    parts = group.split("_")
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        target_class = int(parts[1])
+                except:
+                    pass
+            
+            # Map policy to all agents of the same class
+            if target_class is not None:
+                # When agents_per_class > 1, create agents like "agent_0_0", "agent_0_1", etc.
+                # When agents_per_class == 1, create agent like "agent_0"
+                if agents_per_class > 1:
+                    for k in range(agents_per_class):
+                        agent_name = f"agent_{target_class}_{k}"
+                        if agent_name not in agent_policies:
+                            agent_policies[agent_name] = combined_policy
+                            logger.info(f"  ✓ Using policy for {agent_name} (class {target_class})")
+                else:
+                    agent_name = f"agent_{target_class}"
+                    if agent_name not in agent_policies:
+                        agent_policies[agent_name] = combined_policy
+                        logger.info(f"  ✓ Using policy for {agent_name}")
+            else:
+                # Fallback: map to all classes if we can't determine class
+                for cls in target_classes:
+                    agent_name = f"agent_{cls}"
+                    if agent_name not in agent_policies:
+                        agent_policies[agent_name] = combined_policy
+                        logger.info(f"  ✓ Using shared policy for {agent_name}")
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
@@ -1007,17 +1100,31 @@ def extract_rules_from_policies(
     }
     
     # Map agent names to target classes
-    # Agent names are like "agent_0", "agent_1", etc., where the number is the class
+    # Agent names can be:
+    # - "agent_0", "agent_1" (when agents_per_class == 1)
+    # - "agent_0_0", "agent_0_1", "agent_1_0", "agent_1_1" (when agents_per_class > 1)
     agent_to_class = {}
     for agent_name in policies.keys():
-        # Extract class from agent name (e.g., "agent_0" -> 0)
+        # Extract class from agent name
         if agent_name.startswith("agent_"):
             try:
-                class_num = int(agent_name.split("_")[1])
-                agent_to_class[agent_name] = class_num
+                parts = agent_name.split("_")
+                # For "agent_0" -> class 0
+                # For "agent_0_1" -> class 0 (first number after "agent")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    class_num = int(parts[1])
+                    agent_to_class[agent_name] = class_num
             except (ValueError, IndexError):
-                # If parsing fails, try to map by index
-                pass
+                # If parsing fails, try to get from metadata if available
+                # Check if we have metadata for this agent
+                if agent_name in metadata_files:
+                    try:
+                        with open(metadata_files[agent_name], 'r') as f:
+                            metadata = json.load(f)
+                            if "target_class" in metadata and metadata["target_class"] is not None:
+                                agent_to_class[agent_name] = int(metadata["target_class"])
+                    except:
+                        pass
     
     # If mapping failed, use index-based mapping
     if not agent_to_class:

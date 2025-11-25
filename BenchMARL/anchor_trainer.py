@@ -876,8 +876,36 @@ class AnchorTrainer:
         logger.info("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
         logger.info("="*80)
         
+        # Get environment to access agent-to-class mapping
+        env = self._create_env_instance()
+        unwrapped_env = None
+        if hasattr(env, 'env') or hasattr(env, '_env'):
+            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+        
+        # Determine if we have multiple agents per class
+        agents_per_class = 1
+        if unwrapped_env is not None and hasattr(unwrapped_env, 'agents_per_class'):
+            agents_per_class = unwrapped_env.agents_per_class
+        
+        # Track policies by class for organization
+        policies_by_class = {}
+        
         for group in algorithm.group_map.keys():
             logger.info(f"\nExtracting models for group: {group}")
+            
+            # Determine which class this agent/group belongs to
+            target_class = None
+            agent_name = group  # Group name is the agent name in our setup
+            if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class'):
+                target_class = unwrapped_env.agent_to_class.get(agent_name, None)
+                if target_class is None:
+                    # Try to parse from agent name (e.g., "agent_0" -> 0, "agent_0_1" -> 0)
+                    try:
+                        parts = agent_name.split("_")
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            target_class = int(parts[1])
+                    except:
+                        pass
             
             if save_policies:
                 try:
@@ -899,25 +927,51 @@ class AnchorTrainer:
                         logger.warning(f"    Policy type: {type(policy)}")
                         logger.warning(f"    Policy attributes: {dir(policy)}")
                     else:
+                        # Determine save location based on agents_per_class
+                        if agents_per_class > 1 and target_class is not None:
+                            # Organize by class when multiple agents per class
+                            class_dir = os.path.join(output_dir, f"class_{target_class}")
+                            os.makedirs(class_dir, exist_ok=True)
+                            policy_path = os.path.join(class_dir, f"policy_{agent_name}.pth")
+                            metadata_path = os.path.join(class_dir, f"policy_{agent_name}_metadata.json")
+                        else:
+                            # Flat structure when one agent per class
+                            policy_path = os.path.join(output_dir, f"policy_{group}.pth")
+                            metadata_path = os.path.join(output_dir, f"policy_{group}_metadata.json")
+                        
                         # Save the actor module
-                        policy_path = os.path.join(output_dir, f"policy_{group}.pth")
                         torch.save(actor_module.state_dict(), policy_path)
                         saved_models[f"policy_{group}"] = policy_path
                         logger.info(f"  ✓ Saved policy model to: {policy_path}")
                         
-                        # Also save metadata about the model structure
+                        # Track by class
+                        if target_class is not None:
+                            if target_class not in policies_by_class:
+                                policies_by_class[target_class] = []
+                            policies_by_class[target_class].append({
+                                "agent": agent_name,
+                                "group": group,
+                                "policy_path": policy_path,
+                                "metadata_path": metadata_path
+                            })
+                        
+                        # Also save metadata about the model structure with class information
                         metadata = {
                             "group": group,
+                            "agent": agent_name,
+                            "target_class": target_class,
+                            "agents_per_class": agents_per_class,
                             "model_type": "policy",
                             "algorithm": self.algorithm,
                             "input_spec": str(getattr(actor_module, "input_spec", None)),
                             "output_spec": str(getattr(actor_module, "output_spec", None)),
                         }
-                        metadata_path = os.path.join(output_dir, f"policy_{group}_metadata.json")
                         import json
                         with open(metadata_path, 'w') as f:
                             json.dump(metadata, f, indent=2)
                         logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
+                        if target_class is not None:
+                            logger.info(f"    Class: {target_class}, Agent: {agent_name}")
                         
                 except Exception as e:
                     logger.warning(f"  ✗ Error extracting policy for group {group}: {e}")
@@ -950,14 +1004,46 @@ class AnchorTrainer:
                 except Exception as e:
                     logger.warning(f"  ✗ Error extracting critic for group {group}: {e}")
         
+        # Save an index file mapping classes to policies
+        if policies_by_class:
+            import json
+            index_data = {
+                "agents_per_class": agents_per_class,
+                "policies_by_class": {}
+            }
+            for class_id, policies in sorted(policies_by_class.items()):
+                index_data["policies_by_class"][f"class_{class_id}"] = {
+                    "class": int(class_id),
+                    "n_agents": len(policies),
+                    "policies": [
+                        {
+                            "agent": p["agent"],
+                            "group": p["group"],
+                            "policy_file": os.path.relpath(p["policy_path"], output_dir),
+                            "metadata_file": os.path.relpath(p["metadata_path"], output_dir)
+                        }
+                        for p in policies
+                    ]
+                }
+            
+            index_path = os.path.join(output_dir, "policies_index.json")
+            with open(index_path, 'w') as f:
+                json.dump(index_data, f, indent=2)
+            logger.info(f"\n  ✓ Saved policies index to: {index_path}")
+            logger.info(f"    Classes: {len(policies_by_class)}, Total policies: {sum(len(p) for p in policies_by_class.values())}")
+        
         logger.info("\n" + "="*80)
         logger.info(f"Individual models saved to: {output_dir}")
         logger.info("="*80)
+        if agents_per_class > 1:
+            logger.info(f"\nNote: Multiple agents per class ({agents_per_class}) detected.")
+            logger.info(f"  Policies are organized in class-specific directories: class_0/, class_1/, etc.")
         logger.info("\nTo use these models for inference:")
         logger.info("  1. Load the model state_dict")
         logger.info("  2. Reconstruct the model architecture")
         logger.info("  3. Load state_dict into the model")
         logger.info("  4. Use model.eval() and model(observation) for inference")
+        logger.info("\n  See policies_index.json for a mapping of classes to policy files.")
         
         return saved_models
     
@@ -1165,24 +1251,52 @@ class AnchorTrainer:
                 logger.warning("  Returning empty results structure.")
                 return results
         
-        # Group evaluation episodes by agent/class
+        # Get agents_per_class from environment to know how to group agents
+        env = self._create_env_instance()
+        unwrapped_env = None
+        if hasattr(env, 'env') or hasattr(env, '_env'):
+            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+        
+        agents_per_class = 1
+        if unwrapped_env is not None and hasattr(unwrapped_env, 'agents_per_class'):
+            agents_per_class = unwrapped_env.agents_per_class
+        
+        # Group evaluation episodes by class (handling multiple agents per class)
         for target_class in target_classes:
-            agent = f"agent_{target_class}"
             class_key = f"class_{target_class}"
             
-            logger.info(f"\nExtracting rules for class {target_class} (agent: {agent})...")
+            logger.info(f"\nExtracting rules for class {target_class}...")
             
-            # Collect all episodes for this agent
+            # Collect all episodes for all agents of this class
+            # When agents_per_class == 1: look for "agent_0", "agent_1", etc.
+            # When agents_per_class > 1: look for "agent_0_0", "agent_0_1", "agent_1_0", "agent_1_1", etc.
             agent_episodes = []
+            agents_found = set()
+            
             for episode_data in evaluation_anchor_data:
-                if agent in episode_data:
-                    agent_episodes.append(episode_data[agent])
+                # Check all possible agent names for this class
+                if agents_per_class == 1:
+                    agent_name = f"agent_{target_class}"
+                    if agent_name in episode_data:
+                        agent_episodes.append(episode_data[agent_name])
+                        agents_found.add(agent_name)
+                else:
+                    # Multiple agents per class: agent_0_0, agent_0_1, etc.
+                    for k in range(agents_per_class):
+                        agent_name = f"agent_{target_class}_{k}"
+                        if agent_name in episode_data:
+                            agent_episodes.append(episode_data[agent_name])
+                            agents_found.add(agent_name)
             
             if not agent_episodes:
-                logger.warning(f"  No evaluation data found for {agent}")
+                logger.warning(f"  No evaluation data found for class {target_class}")
+                if agents_per_class == 1:
+                    logger.warning(f"    Expected agent: agent_{target_class}")
+                else:
+                    logger.warning(f"    Expected agents: agent_{target_class}_0, agent_{target_class}_1, ...")
                 continue
             
-            logger.info(f"  Found {len(agent_episodes)} evaluation episodes for {agent}")
+            logger.info(f"  Found {len(agent_episodes)} evaluation episodes from {len(agents_found)} agent(s): {sorted(agents_found)}")
             
             # Extract rules from evaluation data
             # Note: We need to reconstruct anchor bounds from observations if available
@@ -1304,9 +1418,17 @@ class AnchorTrainer:
             
             overlap_info = self._check_class_overlaps(target_class, anchors_list, results["per_class_results"])
             
+            # Build agent_id string (list of agents for this class)
+            if agents_per_class == 1:
+                agent_id = f"agent_{target_class}"
+            else:
+                agent_id = f"agent_{target_class}_0..{agents_per_class-1}" if agents_per_class > 1 else f"agent_{target_class}"
+            
             results["per_class_results"][class_key] = {
                 "class": int(target_class),
-                "agent_id": agent,
+                "agent_id": agent_id,
+                "agents_found": sorted(list(agents_found)) if agents_found else [],
+                "n_agents": len(agents_found),
                 # Instance-level metrics (averaged across all instances)
                 "instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
                 "instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
