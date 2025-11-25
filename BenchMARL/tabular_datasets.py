@@ -11,6 +11,17 @@ from sklearn.datasets import (
     fetch_california_housing,
     fetch_covtype
 )
+try:
+    from ucimlrepo import fetch_ucirepo
+    UCIML_AVAILABLE = True
+except ImportError:
+    UCIML_AVAILABLE = False
+
+try:
+    from folktables import ACSDataSource, ACSIncome, ACSPublicCoverage, ACSMobility, ACSEmployment, ACSTravelTime
+    FOLKTABLES_AVAILABLE = True
+except ImportError:
+    FOLKTABLES_AVAILABLE = False
 from sklearn.metrics import accuracy_score
 from typing import Dict, Tuple, Optional, List
 import os
@@ -111,10 +122,212 @@ class TabularDatasetLoader:
             logger.info(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
             logger.info(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
             logger.info(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
+        elif self.dataset_name.startswith("uci_"):
+            # UCIML Repository dataset
+            if not UCIML_AVAILABLE:
+                raise ImportError(
+                    "ucimlrepo package is required for UCIML datasets. "
+                    "Install with: pip install ucimlrepo"
+                )
+            
+            # Parse dataset identifier (can be ID or name)
+            dataset_id_str = self.dataset_name.replace("uci_", "")
+            
+            # Common UCIML dataset IDs
+            uci_dataset_map = {
+                "adult": 2,
+                "car": 19,
+                "credit": 27,
+                "nursery": 76,
+                "mushroom": 73,
+                "tic-tac-toe": 101,
+                "vote": 56,
+                "zoo": 111,
+            }
+            
+            # Try to get ID from map or parse as integer
+            try:
+                if dataset_id_str in uci_dataset_map:
+                    dataset_id = uci_dataset_map[dataset_id_str]
+                else:
+                    dataset_id = int(dataset_id_str)
+            except ValueError:
+                raise ValueError(
+                    f"Invalid UCIML dataset identifier: {dataset_id_str}. "
+                    f"Use format 'uci_<id>' or 'uci_<name>'. "
+                    f"Supported names: {list(uci_dataset_map.keys())}"
+                )
+            
+            logger.info(f"Fetching UCIML dataset (ID: {dataset_id})...")
+            dataset = fetch_ucirepo(id=dataset_id)
+            
+            # Extract features and targets
+            X_df = dataset.data.features
+            y_df = dataset.data.targets
+            
+            # Get feature names before processing
+            if hasattr(X_df, 'columns'):
+                feature_names = list(X_df.columns)
+            else:
+                feature_names = [f"feature_{i}" for i in range(X_df.shape[1])]
+            
+            # Handle missing values and non-numeric features
+            from sklearn.preprocessing import LabelEncoder
+            import pandas as pd
+            
+            # Convert to DataFrame if not already
+            if not isinstance(X_df, pd.DataFrame):
+                X_df = pd.DataFrame(X_df, columns=feature_names)
+            
+            # Handle missing values
+            if X_df.isnull().any().any():
+                missing_count = X_df.isnull().sum().sum()
+                logger.info(f"  Found {missing_count} missing values, filling with median/mode...")
+                # Fill numeric columns with median, categorical with mode
+                for col in X_df.columns:
+                    if X_df[col].dtype in ['int64', 'float64']:
+                        X_df[col].fillna(X_df[col].median(), inplace=True)
+                    else:
+                        X_df[col].fillna(X_df[col].mode()[0] if len(X_df[col].mode()) > 0 else 0, inplace=True)
+            
+            # Encode categorical features
+            label_encoders = {}
+            numeric_cols = []
+            for col in X_df.columns:
+                if X_df[col].dtype == 'object' or X_df[col].dtype.name == 'category':
+                    le = LabelEncoder()
+                    X_df[col] = le.fit_transform(X_df[col].astype(str))
+                    label_encoders[col] = le
+                else:
+                    numeric_cols.append(col)
+            
+            # Convert to numpy array
+            X = X_df.values.astype(np.float32)
+            
+            # Handle target
+            y = y_df.values if hasattr(y_df, 'values') else y_df
+            
+            # Handle target shape (may be 1D or 2D)
+            if y.ndim > 1:
+                if y.shape[1] == 1:
+                    y = y.flatten()
+                else:
+                    # Multi-label case - use first column or convert to binary
+                    logger.warning(f"Multi-column target detected, using first column")
+                    y = y[:, 0]
+            
+            # Convert target to integer labels if needed
+            if isinstance(y, pd.Series):
+                y = y.values
+            
+            if y.dtype == 'object' or not np.issubdtype(y.dtype, np.integer):
+                le = LabelEncoder()
+                y = le.fit_transform(y.astype(str)).astype(int)
+                class_names = le.classes_.tolist()
+            else:
+                y = y.astype(int)
+                unique_classes = np.unique(y)
+                class_names = [f"class_{i}" for i in unique_classes]
+            
+            logger.info(f"  Loaded UCIML dataset: {dataset.metadata.name if hasattr(dataset, 'metadata') else 'Unknown'}")
+            logger.info(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
+            if label_encoders:
+                logger.info(f"  Encoded {len(label_encoders)} categorical features")
+            
+        elif self.dataset_name.startswith("folktables_"):
+            # Folktables dataset
+            if not FOLKTABLES_AVAILABLE:
+                raise ImportError(
+                    "folktables package is required for Folktables datasets. "
+                    "Install with: pip install folktables"
+                )
+            
+            # Parse dataset specification: folktables_<task>_<state>_<year>
+            # Example: folktables_income_CA_2018
+            parts = self.dataset_name.replace("folktables_", "").split("_")
+            
+            if len(parts) < 3:
+                raise ValueError(
+                    f"Invalid Folktables dataset format: {self.dataset_name}. "
+                    f"Use format: folktables_<task>_<state>_<year>\n"
+                    f"Example: folktables_income_CA_2018\n"
+                    f"Available tasks: income, coverage, mobility, employment, travel"
+                )
+            
+            task_name = parts[0].lower()
+            state = parts[1].upper()
+            year = parts[2]
+            
+            # Map task names to Folktables tasks
+            task_map = {
+                "income": ACSIncome,
+                "coverage": ACSPublicCoverage,
+                "mobility": ACSMobility,
+                "employment": ACSEmployment,
+                "travel": ACSTravelTime,
+            }
+            
+            if task_name not in task_map:
+                raise ValueError(
+                    f"Unknown Folktables task: {task_name}. "
+                    f"Available tasks: {list(task_map.keys())}"
+                )
+            
+            task_class = task_map[task_name]
+            
+            logger.info(f"Loading Folktables dataset: {task_name} for {state} ({year})...")
+            
+            # Create data source
+            data_source = ACSDataSource(
+                survey_year=year,
+                horizon='1-Year',
+                survey='person'
+            )
+            
+            # Download and extract data
+            acs_data = data_source.get_data(states=[state], download=True)
+            
+            # Extract features and labels using the task
+            task = task_class()
+            X, y = task.df_to_numpy(acs_data)
+            
+            # Convert to float32
+            X = X.astype(np.float32)
+            y = y.astype(int)
+            
+            # Get feature names from task
+            feature_names = task.features
+            if feature_names is None:
+                feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+            
+            # Get class names
+            unique_classes = np.unique(y)
+            if task_name == "income":
+                class_names = ["income_<=50K", "income_>50K"]
+            elif task_name == "coverage":
+                class_names = ["no_coverage", "has_coverage"]
+            elif task_name == "mobility":
+                class_names = ["not_moved", "moved"]
+            elif task_name == "employment":
+                class_names = ["not_employed", "employed"]
+            elif task_name == "travel":
+                class_names = ["travel_<=30min", "travel_>30min"]
+            else:
+                class_names = [f"class_{i}" for i in unique_classes]
+            
+            logger.info(f"  Loaded Folktables dataset: {task_name} ({state}, {year})")
+            logger.info(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
+            
         else:
+            supported = ['breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing']
+            if UCIML_AVAILABLE:
+                supported.append('uci_<id_or_name> (e.g., uci_adult, uci_2)')
+            if FOLKTABLES_AVAILABLE:
+                supported.append('folktables_<task>_<state>_<year> (e.g., folktables_income_CA_2018)')
+            
             raise ValueError(
                 f"Unknown dataset: {self.dataset_name}. "
-                f"Supported: 'breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing'"
+                f"Supported: {', '.join(supported)}"
             )
         
         if self.sample_size is not None and self.sample_size < len(X):
