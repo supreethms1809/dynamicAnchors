@@ -665,5 +665,16 @@ class AnchorMetricsCallback(Callback):
             saved_files["evaluation_anchor_data"] = str(evaluation_anchor_path)
             logger.info(f"  ✓ Saved evaluation anchor data ({len(self.evaluation_anchor_data)} episodes) to: {evaluation_anchor_path}")
         
+        # Log diagnostic information if no data was saved
+        if not saved_files:
+            logger.info("  No callback data to save. Diagnostic info:")
+            logger.info(f"    - training_history: {len(self.training_history)} entries")
+            logger.info(f"    - evaluation_history: {len(self.evaluation_history)} entries")
+            logger.info(f"    - training_episode_details: {len(self.training_episode_details)} episodes")
+            logger.info(f"    - evaluation_anchor_data: {len(self.evaluation_anchor_data)} episodes")
+            logger.info(f"    - log_training_metrics: {self.log_training_metrics}")
+            logger.info(f"    - log_evaluation_metrics: {self.log_evaluation_metrics}")
+            logger.info(f"    - collect_anchor_data: {self.collect_anchor_data}")
+        
         return saved_files
 

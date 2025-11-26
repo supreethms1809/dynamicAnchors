@@ -144,6 +144,60 @@ class AnchorTrainer:
             env_config_with_data["eval_on_test_data"] = False
             logger.info(f"  Evaluation configured to use TRAINING data")
         
+        # Compute k-means centroids for multiple agents per class
+        # When agents_per_class > 1, compute k-means with k=agents_per_class for each class
+        # This ensures each agent gets a different initial anchor point
+        agents_per_class = env_config.get("agents_per_class", 1)
+        if agents_per_class > 1:
+            logger.info(f"\nComputing k-means centroids (k={agents_per_class}) for each class...")
+            try:
+                from trainers.vecEnv import compute_cluster_centroids_per_class
+                
+                # Always compute centroids on training data for initial anchor points
+                # (eval_on_test_data only affects which data is used for evaluation metrics)
+                X_data = env_data["X_unit"]
+                y_data = env_data["y"]
+                
+                cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                    X_unit=X_data,
+                    y=y_data,
+                    n_clusters_per_class=agents_per_class,  # k = agents_per_class
+                    random_state=self.seed if hasattr(self, 'seed') else 42,
+                    min_samples_per_cluster=1
+                )
+                
+                # Verify we have enough centroids for each class
+                for cls in target_classes:
+                    if cls in cluster_centroids_per_class:
+                        n_centroids = len(cluster_centroids_per_class[cls])
+                        if n_centroids < agents_per_class:
+                            logger.warning(
+                                f"  ⚠ Class {cls}: Only {n_centroids} centroids computed "
+                                f"(requested {agents_per_class}). "
+                                f"May not have enough samples for k-means."
+                            )
+                        else:
+                            logger.info(f"  ✓ Class {cls}: {n_centroids} centroids computed")
+                    else:
+                        logger.warning(f"  ⚠ Class {cls}: No centroids computed")
+                
+                # Set cluster centroids in env_config
+                env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
+                logger.info("  ✓ Cluster centroids set in environment config")
+            except ImportError as e:
+                logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+                logger.warning(f"  Install sklearn: pip install scikit-learn")
+                logger.warning(f"  Falling back to mean centroid per class (all agents will start from same point)")
+                env_config_with_data["cluster_centroids_per_class"] = None
+            except Exception as e:
+                logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+                logger.warning(f"  Falling back to mean centroid per class (all agents will start from same point)")
+                env_config_with_data["cluster_centroids_per_class"] = None
+        else:
+            # For agents_per_class == 1, we don't need k-means (single centroid per class)
+            logger.info(f"  agents_per_class={agents_per_class}, using mean centroid per class")
+            env_config_with_data["cluster_centroids_per_class"] = None
+        
         # Create the anchor configuration.
         anchor_config = {
             "X_unit": env_data["X_unit"],
@@ -809,6 +863,8 @@ class AnchorTrainer:
                     saved_files = self.callback.save_data_to_files(str(self.experiment.folder_name))
                     if saved_files:
                         logger.info(f"  ✓ Saved {len(saved_files)} data files")
+                    else:
+                        logger.info("  No callback data to save")
                 except Exception as e:
                     logger.warning(f"  ⚠ Warning: Could not save callback data: {e}")
         
@@ -887,21 +943,53 @@ class AnchorTrainer:
         if unwrapped_env is not None and hasattr(unwrapped_env, 'agents_per_class'):
             agents_per_class = unwrapped_env.agents_per_class
         
+        # Debug: Log environment and algorithm group information
+        logger.info(f"\nDebug: Environment agents_per_class = {agents_per_class}")
+        if unwrapped_env is not None:
+            if hasattr(unwrapped_env, 'possible_agents'):
+                logger.info(f"Debug: Environment possible_agents = {unwrapped_env.possible_agents}")
+            if hasattr(unwrapped_env, 'agent_to_class'):
+                logger.info(f"Debug: Environment agent_to_class = {unwrapped_env.agent_to_class}")
+            if hasattr(unwrapped_env, 'group_map'):
+                logger.info(f"Debug: Environment group_map keys = {list(unwrapped_env.group_map.keys())}")
+        
+        logger.info(f"Debug: Algorithm group_map keys = {list(algorithm.group_map.keys())}")
+        logger.info(f"Debug: Algorithm group_map = {algorithm.group_map}")
+        
         # Track policies by class for organization
         policies_by_class = {}
         
+        # Check if algorithm group_map matches expected number of agents
+        expected_num_groups = len(unwrapped_env.possible_agents) if unwrapped_env and hasattr(unwrapped_env, 'possible_agents') else None
+        actual_num_groups = len(algorithm.group_map.keys())
+        
+        if expected_num_groups is not None and actual_num_groups < expected_num_groups:
+            logger.warning(f"\n⚠ Warning: Algorithm has {actual_num_groups} groups but environment has {expected_num_groups} agents.")
+            logger.warning(f"  This suggests agents may be grouped together. Each group may contain multiple agents.")
+            logger.warning(f"  Algorithm groups: {list(algorithm.group_map.keys())}")
+            logger.warning(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
+        
         for group in algorithm.group_map.keys():
-            logger.info(f"\nExtracting models for group: {group}")
+            # Get all agents in this group
+            agents_in_group = algorithm.group_map.get(group, [group])
+            logger.info(f"\nExtracting models for group: {group} (contains {len(agents_in_group)} agent(s): {agents_in_group})")
+            
+            # If group contains multiple agents, we need to handle each separately
+            # However, in MADDPG, each agent typically has its own policy even if grouped
+            # So we'll extract one policy per group, but save it with proper agent names
             
             # Determine which class this agent/group belongs to
+            # Use the first agent in the group to determine class
+            primary_agent = agents_in_group[0] if agents_in_group else group
             target_class = None
-            agent_name = group  # Group name is the agent name in our setup
+            agent_name = primary_agent  # Use primary agent name
+            
             if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class'):
-                target_class = unwrapped_env.agent_to_class.get(agent_name, None)
+                target_class = unwrapped_env.agent_to_class.get(primary_agent, None)
                 if target_class is None:
                     # Try to parse from agent name (e.g., "agent_0" -> 0, "agent_0_1" -> 0)
                     try:
-                        parts = agent_name.split("_")
+                        parts = primary_agent.split("_")
                         if len(parts) >= 2 and parts[1].isdigit():
                             target_class = int(parts[1])
                     except:
@@ -927,51 +1015,65 @@ class AnchorTrainer:
                         logger.warning(f"    Policy type: {type(policy)}")
                         logger.warning(f"    Policy attributes: {dir(policy)}")
                     else:
-                        # Determine save location based on agents_per_class
-                        if agents_per_class > 1 and target_class is not None:
-                            # Organize by class when multiple agents per class
-                            class_dir = os.path.join(output_dir, f"class_{target_class}")
-                            os.makedirs(class_dir, exist_ok=True)
-                            policy_path = os.path.join(class_dir, f"policy_{agent_name}.pth")
-                            metadata_path = os.path.join(class_dir, f"policy_{agent_name}_metadata.json")
-                        else:
-                            # Flat structure when one agent per class
-                            policy_path = os.path.join(output_dir, f"policy_{group}.pth")
-                            metadata_path = os.path.join(output_dir, f"policy_{group}_metadata.json")
+                        # If group contains multiple agents, save a policy for each agent
+                        # (In most cases, each agent has its own policy even if grouped)
+                        agents_to_save = agents_in_group if len(agents_in_group) > 1 else [primary_agent]
                         
-                        # Save the actor module
-                        torch.save(actor_module.state_dict(), policy_path)
-                        saved_models[f"policy_{group}"] = policy_path
-                        logger.info(f"  ✓ Saved policy model to: {policy_path}")
-                        
-                        # Track by class
-                        if target_class is not None:
-                            if target_class not in policies_by_class:
-                                policies_by_class[target_class] = []
-                            policies_by_class[target_class].append({
-                                "agent": agent_name,
+                        for agent_to_save in agents_to_save:
+                            # Determine class for this specific agent
+                            agent_target_class = target_class
+                            if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class'):
+                                agent_target_class = unwrapped_env.agent_to_class.get(agent_to_save, target_class)
+                            
+                            # Determine save location based on agents_per_class
+                            if agents_per_class > 1 and agent_target_class is not None:
+                                # Organize by class when multiple agents per class
+                                class_dir = os.path.join(output_dir, f"class_{agent_target_class}")
+                                os.makedirs(class_dir, exist_ok=True)
+                                policy_path = os.path.join(class_dir, f"policy_{agent_to_save}.pth")
+                                metadata_path = os.path.join(class_dir, f"policy_{agent_to_save}_metadata.json")
+                            else:
+                                # Flat structure when one agent per class
+                                policy_path = os.path.join(output_dir, f"policy_{agent_to_save}.pth")
+                                metadata_path = os.path.join(output_dir, f"policy_{agent_to_save}_metadata.json")
+                            
+                            # Save the actor module (same module for all agents in group if shared, or individual if separate)
+                            # Note: In MADDPG, each agent typically has its own policy network
+                            # If policies are shared within a group, this will save the same policy multiple times
+                            # which is fine - they can be loaded separately
+                            torch.save(actor_module.state_dict(), policy_path)
+                            saved_models[f"policy_{agent_to_save}"] = policy_path
+                            logger.info(f"  ✓ Saved policy model to: {policy_path}")
+                            
+                            # Track by class
+                            if agent_target_class is not None:
+                                if agent_target_class not in policies_by_class:
+                                    policies_by_class[agent_target_class] = []
+                                policies_by_class[agent_target_class].append({
+                                    "agent": agent_to_save,
+                                    "group": group,
+                                    "policy_path": policy_path,
+                                    "metadata_path": metadata_path
+                                })
+                            
+                            # Also save metadata about the model structure with class information
+                            metadata = {
                                 "group": group,
-                                "policy_path": policy_path,
-                                "metadata_path": metadata_path
-                            })
-                        
-                        # Also save metadata about the model structure with class information
-                        metadata = {
-                            "group": group,
-                            "agent": agent_name,
-                            "target_class": target_class,
-                            "agents_per_class": agents_per_class,
-                            "model_type": "policy",
-                            "algorithm": self.algorithm,
-                            "input_spec": str(getattr(actor_module, "input_spec", None)),
-                            "output_spec": str(getattr(actor_module, "output_spec", None)),
-                        }
-                        import json
-                        with open(metadata_path, 'w') as f:
-                            json.dump(metadata, f, indent=2)
-                        logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
-                        if target_class is not None:
-                            logger.info(f"    Class: {target_class}, Agent: {agent_name}")
+                                "agent": agent_to_save,
+                                "target_class": agent_target_class,
+                                "agents_per_class": agents_per_class,
+                                "agents_in_group": agents_in_group,
+                                "model_type": "policy",
+                                "algorithm": self.algorithm,
+                                "input_spec": str(getattr(actor_module, "input_spec", None)),
+                                "output_spec": str(getattr(actor_module, "output_spec", None)),
+                            }
+                            import json
+                            with open(metadata_path, 'w') as f:
+                                json.dump(metadata, f, indent=2)
+                            logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
+                            if agent_target_class is not None:
+                                logger.info(f"    Class: {agent_target_class}, Agent: {agent_to_save}")
                         
                 except Exception as e:
                     logger.warning(f"  ✗ Error extracting policy for group {group}: {e}")
