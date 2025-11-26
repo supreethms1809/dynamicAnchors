@@ -995,6 +995,25 @@ class AnchorTrainer:
                     except:
                         pass
             
+            # Convert numpy types to native Python types for JSON serialization
+            def _convert_to_serializable(obj: Any) -> Any:
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, (np.integer, np.int_, np.int64, np.int32)):
+                    return int(obj)
+                elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                    return float(obj)
+                elif isinstance(obj, np.bool_):
+                    return bool(obj)
+                elif isinstance(obj, dict):
+                    return {k: _convert_to_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [_convert_to_serializable(item) for item in obj]
+                elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                    return obj
+                else:
+                    return str(obj)
+            
             if save_policies:
                 try:
                     # Get policy using BenchMARL's official API
@@ -1068,9 +1087,11 @@ class AnchorTrainer:
                                 "input_spec": str(getattr(actor_module, "input_spec", None)),
                                 "output_spec": str(getattr(actor_module, "output_spec", None)),
                             }
+                            
                             import json
+                            serializable_metadata = _convert_to_serializable(metadata)
                             with open(metadata_path, 'w') as f:
-                                json.dump(metadata, f, indent=2)
+                                json.dump(serializable_metadata, f, indent=2)
                             logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
                             if agent_target_class is not None:
                                 logger.info(f"    Class: {agent_target_class}, Agent: {agent_to_save}")
@@ -1129,8 +1150,9 @@ class AnchorTrainer:
                 }
             
             index_path = os.path.join(output_dir, "policies_index.json")
+            serializable_index_data = _convert_to_serializable(index_data)
             with open(index_path, 'w') as f:
-                json.dump(index_data, f, indent=2)
+                json.dump(serializable_index_data, f, indent=2)
             logger.info(f"\n  ✓ Saved policies index to: {index_path}")
             logger.info(f"    Classes: {len(policies_by_class)}, Total policies: {sum(len(p) for p in policies_by_class.values())}")
         

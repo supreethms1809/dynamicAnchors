@@ -581,13 +581,20 @@ def test_rules_from_json(
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
             logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
             
-            # Display instance-level and class-level metrics if available
-            if "instance_precision" in class_result:
-                logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from training/inference)")
-                logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from training/inference)")
-            if "class_precision" in class_result:
-                logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from training/inference)")
-                logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from training/inference)")
+            # Only display instance-level and class-level metrics if:
+            # 1. The rule matches samples from this class (n_satisfying_class > 0), OR
+            # 2. This class is a source class for this rule (where it was extracted from)
+            is_source_class = target_class in rule_to_source_classes[rule_str]
+            should_show_metrics = n_satisfying_class > 0 or is_source_class
+            
+            if should_show_metrics:
+                # Display instance-level and class-level metrics if available
+                if "instance_precision" in class_result:
+                    logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from training/inference)")
+                    logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from training/inference)")
+                if "class_precision" in class_result:
+                    logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from training/inference)")
+                    logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from training/inference)")
             
             if n_satisfying_class > 0:
                 classes_satisfied.append(target_class)
