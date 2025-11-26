@@ -243,11 +243,13 @@ class AnchorEnv(ParallelEnv):
         
         Priority:
         1. Use precomputed cluster_centroids_per_class if available
+           - If agents_per_class > 1, assign specific centroid based on agent index
+           - Otherwise, sample a random centroid
         2. Use fixed_instances_per_class if available (sample from them)
         3. Compute mean centroid from class data
         
         Args:
-            agent: Agent name (e.g., "agent_0")
+            agent: Agent name (e.g., "agent_0" or "agent_0_1")
             
         Returns:
             Centroid in unit space [0, 1], or None if no data available
@@ -261,7 +263,22 @@ class AnchorEnv(ParallelEnv):
             if target_class in self.cluster_centroids_per_class:
                 centroids = self.cluster_centroids_per_class[target_class]
                 if len(centroids) > 0:
-                    # Sample a random centroid if multiple available
+                    # If multiple agents per class, assign specific centroid based on agent index
+                    # agent_0_0 -> centroid[0], agent_0_1 -> centroid[1], etc.
+                    if self.agents_per_class > 1:
+                        # Extract agent index from name (e.g., "agent_0_1" -> 1)
+                        try:
+                            parts = agent.split("_")
+                            if len(parts) >= 3 and parts[2].isdigit():
+                                agent_idx = int(parts[2])
+                                # Use modulo to handle cases where we have more agents than centroids
+                                centroid_idx = agent_idx % len(centroids)
+                                return np.array(centroids[centroid_idx], dtype=np.float32)
+                        except (ValueError, IndexError):
+                            # Fallback to random if parsing fails
+                            pass
+                    
+                    # For agents_per_class == 1 or if parsing failed, sample a random centroid
                     centroid_idx = self.rng.integers(0, len(centroids))
                     return np.array(centroids[centroid_idx], dtype=np.float32)
         
