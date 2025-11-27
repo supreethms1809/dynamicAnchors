@@ -51,32 +51,43 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-max_n_frames: 3_072_000
+# Production setting: Increased for better convergence and stability
+# Adjusted to be divisible by off_policy_collected_frames_per_batch (128000) to avoid warnings
+# 39 * 128000 = 4,992,000 frames
+max_n_frames: 4_992_000
 
 # Number of frames collected and each experiment iteration
-on_policy_collected_frames_per_batch: 6000
+# GPU-optimized: Significantly increased batch size to utilize 40GB GPU memory
+on_policy_collected_frames_per_batch: 16000
 # Number of environments used for collection
+# GPU-optimized: Increased parallel environments for faster data collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-on_policy_n_envs_per_worker: 10
+on_policy_n_envs_per_worker: 20
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
-on_policy_n_minibatch_iters: 45
+on_policy_n_minibatch_iters: 60
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-on_policy_minibatch_size: 400
+# GPU-optimized: Increased minibatch size for better GPU utilization and gradient estimates
+on_policy_minibatch_size: 1024
 
 # Number of frames collected and each experiment iteration
-off_policy_collected_frames_per_batch: 48000
+# GPU-optimized: Significantly increased batch size to utilize 40GB GPU memory
+off_policy_collected_frames_per_batch: 128000
 # Number of environments used for collection
+# GPU-optimized: Increased parallel environments for faster data collection
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 80
+off_policy_n_envs_per_worker: 160
 # This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
-off_policy_n_optimizer_steps: 2000
+# GPU-optimized: Increased optimizer steps to utilize more GPU compute per iteration
+off_policy_n_optimizer_steps: 4000
 # Number of frames used for each off_policy_n_optimizer_steps when training off-policy algorithms
-off_policy_train_batch_size: 512
+# GPU-optimized: Significantly increased batch size for better GPU utilization and gradient estimates
+off_policy_train_batch_size: 2048
 # Maximum number of frames to keep in replay buffer memory for off-policy algorithms
-off_policy_memory_size: 5_000_000
+# GPU-optimized: Increased buffer size for better sample diversity (on GPU if buffer_device="cuda")
+off_policy_memory_size: 20_000_000
 # Number of random action frames to prefill the replay buffer with
 off_policy_init_random_frames: 0
 # whether to use priorities while sampling from the replay buffer
@@ -92,9 +103,11 @@ evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
 # Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-evaluation_interval: 48_000
+# Updated to match new batch sizes
+evaluation_interval: 128_000
 # Number of episodes that evaluation is run on
-evaluation_episodes: 4
+# Production setting: Increased for more reliable evaluation metrics
+evaluation_episodes: 10
 # If True, when stochastic policies are evaluated, their deterministic value is taken, otherwise, if False, they are sampled
 evaluation_deterministic_actions: True
 # If True, seed the environment before evaluation leading to always the same evaluation env being used
@@ -131,4 +144,4 @@ checkpoint_at_end: True  # Save checkpoint at end for inference
 # checkpoints. The checkpoint at the end is included in this number. Set to `null` to keep all checkpoints.
 keep_checkpoints_num: 3
 # Whether to exclude the replay buffers from the checkpoint
-exclude_buffer_from_checkpoint: False
+exclude_buffer_from_checkpoint: True

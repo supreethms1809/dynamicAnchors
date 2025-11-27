@@ -1,3 +1,12 @@
+# CRITICAL: Set environment variables BEFORE importing numpy to fix multiprocessing issues
+# This prevents OpenBLAS threading errors when multiprocessing spawns child processes
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+
 import numpy as np
 import torch
 import torch.nn as nn
