@@ -230,6 +230,10 @@ class AnchorTrainer:
             callbacks=[self.callback]
         )
         
+        # Set experiment folder on callback for periodic saving during training
+        if hasattr(self.callback, 'set_experiment_folder'):
+            self.callback.set_experiment_folder(str(self.experiment.folder_name))
+        
         logger.info(f"Experiment setup complete:")
         logger.info(f"  Algorithm: {self.algorithm.upper()}")
         logger.info(f"  Model: MLP")
@@ -256,6 +260,14 @@ class AnchorTrainer:
         logger.info("TRAINING COMPLETE!")
         logger.info("="*80)
         logger.info(f"Results saved to: {self.experiment.folder_name}")
+        
+        # Flush any remaining training metrics before final save
+        if hasattr(self, 'callback') and self.callback is not None:
+            if hasattr(self.callback, '_flush_remaining_metrics'):
+                try:
+                    self.callback._flush_remaining_metrics()
+                except Exception as e:
+                    logger.warning(f"  ⚠ Warning: Could not flush remaining metrics: {e}")
         
         # Save callback data to files
         if hasattr(self, 'callback') and self.callback is not None:
@@ -606,8 +618,8 @@ class AnchorTrainer:
                                         
                                         # Store data keyed by agent name (not group) to distinguish between agents
                                         episode_data[agent_name] = {
-                                            "precision": float(precision),
-                                            "coverage": float(coverage),
+                                            "anchor_precision": float(precision),
+                                            "anchor_coverage": float(coverage),
                                             "total_reward": 0.0,  # Will try to get from info if available
                                             "final_observation": final_obs.tolist(),
                                             "group": group,  # Keep track of which group this agent belongs to
@@ -703,8 +715,8 @@ class AnchorTrainer:
                                         
                                         # Store data keyed by agent name to distinguish between agents
                                         episode_data[agent_name] = {
-                                            "precision": precision,
-                                            "coverage": coverage,
+                                            "anchor_precision": precision,
+                                            "anchor_coverage": coverage,
                                             "total_reward": 0.0,  # Not available from observation
                                             "final_observation": final_obs_np.tolist(),
                                             "group": group,  # Keep track of which group this agent belongs to
@@ -775,9 +787,11 @@ class AnchorTrainer:
                                         return default
                                 
                                 # Store data keyed by agent name to distinguish between agents
+                                precision_val = safe_get("anchor_precision", 0.0)
+                                coverage_val = safe_get("anchor_coverage", 0.0)
                                 episode_data[agent_name] = {
-                                    "precision": safe_get("precision", 0.0),
-                                    "coverage": safe_get("coverage", 0.0),
+                                    "anchor_precision": precision_val,
+                                    "anchor_coverage": coverage_val,
                                     "total_reward": safe_get("total_reward", 0.0),
                                     "group": group,  # Keep track of which group this agent belongs to
                                     "target_class": unwrapped_env.agent_to_class.get(agent_name, None) if unwrapped_env is not None and hasattr(unwrapped_env, 'agent_to_class') else None,
@@ -1462,8 +1476,8 @@ class AnchorTrainer:
             
             for episode_idx, episode in enumerate(agent_episodes):
                 # Instance-level metrics
-                instance_precision = episode.get("instance_precision", episode.get("precision", 0.0))
-                instance_coverage = episode.get("instance_coverage", episode.get("coverage", 0.0))
+                instance_precision = episode.get("anchor_precision", episode.get("instance_precision", 0.0))
+                instance_coverage = episode.get("anchor_coverage", episode.get("instance_coverage", 0.0))
                 # Class-level metrics (may not be in episode data, will compute if needed)
                 class_precision = episode.get("class_precision", 0.0)
                 class_coverage = episode.get("class_coverage", 0.0)
@@ -1515,9 +1529,6 @@ class AnchorTrainer:
                     # Class-level metrics
                     "class_precision": float(class_precision),
                     "class_coverage": float(class_coverage),
-                    # Legacy fields (for backward compatibility)
-                    "precision": float(precision),
-                    "coverage": float(coverage),
                     "total_reward": float(episode.get("total_reward", 0.0)),
                     "rule": rule,
                 }
@@ -1571,15 +1582,14 @@ class AnchorTrainer:
                 "class_precision_max": float(np.max(class_precisions)) if class_precisions else 0.0,
                 "class_coverage_min": float(np.min(class_coverages)) if class_coverages else 0.0,
                 "class_coverage_max": float(np.max(class_coverages)) if class_coverages else 0.0,
-                # Legacy fields (for backward compatibility, using instance-level)
-                "precision": float(np.mean(precisions)) if precisions else 0.0,
-                "coverage": float(np.mean(coverages)) if coverages else 0.0,
-                "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
-                "coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
-                "precision_min": float(np.min(precisions)) if precisions else 0.0,
-                "precision_max": float(np.max(precisions)) if precisions else 0.0,
-                "coverage_min": float(np.min(coverages)) if coverages else 0.0,
-                "coverage_max": float(np.max(coverages)) if coverages else 0.0,
+                "anchor_precision_mean": float(np.mean(precisions)) if precisions else 0.0,
+                "anchor_coverage_mean": float(np.mean(coverages)) if coverages else 0.0,
+                "anchor_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
+                "anchor_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
+                "anchor_precision_min": float(np.min(precisions)) if precisions else 0.0,
+                "anchor_precision_max": float(np.max(precisions)) if precisions else 0.0,
+                "anchor_coverage_min": float(np.min(coverages)) if coverages else 0.0,
+                "anchor_coverage_max": float(np.max(coverages)) if coverages else 0.0,
                 "n_episodes": len(anchors_list),
                 "rules": rules_list,
                 "unique_rules": unique_rules,
@@ -1981,14 +1991,14 @@ class AnchorTrainer:
             results["per_class_results"][class_key] = {
                 "class": int(target_class),
                 "agent_id": agent,
-                "precision": float(np.mean(precisions)) if precisions else 0.0,
-                "coverage": float(np.mean(coverages)) if coverages else 0.0,
-                "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
-                "coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
-                "precision_min": float(np.min(precisions)) if precisions else 0.0,
-                "precision_max": float(np.max(precisions)) if precisions else 0.0,
-                "coverage_min": float(np.min(coverages)) if coverages else 0.0,
-                "coverage_max": float(np.max(coverages)) if coverages else 0.0,
+                "anchor_precision_mean": float(np.mean(precisions)) if precisions else 0.0,
+                "anchor_coverage_mean": float(np.mean(coverages)) if coverages else 0.0,
+                "anchor_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
+                "anchor_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
+                "anchor_precision_min": float(np.min(precisions)) if precisions else 0.0,
+                "anchor_precision_max": float(np.max(precisions)) if precisions else 0.0,
+                "anchor_coverage_min": float(np.min(coverages)) if coverages else 0.0,
+                "anchor_coverage_max": float(np.max(coverages)) if coverages else 0.0,
                 "n_instances_evaluated": len(anchors_list),
                 "rules": rules_list,
                 "unique_rules": unique_rules,
@@ -1998,8 +2008,8 @@ class AnchorTrainer:
             }
             
             logger.info(f"  Extracted {len(anchors_list)} anchors")
-            logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-            logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+            logger.info(f"  Average anchor_precision: {results['per_class_results'][class_key]['anchor_precision_mean']:.4f}")
+            logger.info(f"  Average anchor_coverage: {results['per_class_results'][class_key]['anchor_coverage_mean']:.4f}")
             logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
                 logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")

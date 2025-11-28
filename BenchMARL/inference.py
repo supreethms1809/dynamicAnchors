@@ -184,7 +184,9 @@ def run_rollout_with_policy(
     agent_id: str,
     max_steps: int = 100,
     device: str = "cpu",
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean"
+    action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
 ) -> Dict[str, Any]:
     """
     Run a single rollout episode using a loaded policy on a raw PettingZoo environment.
@@ -258,7 +260,8 @@ def run_rollout_with_policy(
             logger.info(f"  Observation shape: {obs_vec.shape}, first 5 values: {obs_vec[:5]}, last 5: {obs_vec[-5:]}")
             logger.info(f"  Observation stats: mean={obs_vec.mean():.4f}, std={obs_vec.std():.4f}, min={obs_vec.min():.4f}, max={obs_vec.max():.4f}")
         
-        # Get action from policy (deterministic for inference)
+        # Get action from policy (with exploration for diversity)
+        action_has_noise = False  # Track if noise was already added to action
         with torch.no_grad():
             # Test if policy responds to different inputs (only once)
             if step_count == 0 and not hasattr(run_rollout_with_policy, '_tested_policy_response'):
@@ -300,16 +303,33 @@ def run_rollout_with_policy(
                     from torchrl.modules import TanhNormal
                     action_dist_inputs = fwd_outputs["action_dist_inputs"]
                     action_dist = TanhNormal.from_logits(action_dist_inputs)
-                    # Use mean for deterministic inference
-                    action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                    # Use exploration mode for diversity: sample, mean, or noisy_mean
+                    action_has_noise = False  # Track if noise was already added
+                    if exploration_mode == "sample":
+                        # Sample from distribution for diversity
+                        action = action_dist.sample()
+                        action_has_noise = True  # Sampling provides randomness
+                    elif exploration_mode == "noisy_mean":
+                        # Add Gaussian noise to mean action
+                        mean_action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                        noise = torch.randn_like(mean_action) * action_noise_scale
+                        action = torch.clamp(mean_action + noise, -1.0, 1.0)
+                        action_has_noise = True  # Noise already added
+                    else:
+                        # Deterministic (mean) - original behavior
+                        action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                        action_has_noise = False  # No noise yet, can add later
                 elif "action" in fwd_outputs:
                     action = fwd_outputs["action"]
+                    action_has_noise = False  # Direct action, no noise yet
                 else:
                     # Fallback: assume output is action directly
                     action = fwd_outputs
+                    action_has_noise = False  # Direct action, no noise yet
             else:
                 # Policy outputs action directly (might be raw logits that need normalization)
                 action = fwd_outputs
+                action_has_noise = False  # Direct action, no noise yet
                 # If values are out of [-1, 1] range, they're likely raw logits that need normalization
                 if isinstance(action, torch.Tensor):
                     action_vals = action.cpu().numpy().flatten()
@@ -398,6 +418,19 @@ def run_rollout_with_policy(
                 action_abs = np.abs(action_flat)
                 non_zero_count = np.sum(action_abs > 1e-6)
                 logger.info(f"  Action stats: {non_zero_count}/{len(action_abs)} non-zero values, max_abs: {action_abs.max():.6f}")
+        
+        # Add action noise if enabled (for actions that don't already have noise)
+        # This applies to "mean" mode or non-distribution actions
+        if action_noise_scale > 0.0 and not action_has_noise:
+                if isinstance(action, torch.Tensor):
+                    noise = torch.randn_like(action) * action_noise_scale
+                    action = torch.clamp(action + noise, -1.0, 1.0)
+                else:
+                    # Convert to tensor, add noise, convert back
+                    action_tensor = torch.as_tensor(action, dtype=torch.float32, device=device)
+                    noise = torch.randn_like(action_tensor) * action_noise_scale
+                    action = torch.clamp(action_tensor + noise, -1.0, 1.0)
+                    action = action.cpu().numpy()
         
         # Convert action to numpy and remove batch dimension
         action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
@@ -508,12 +541,12 @@ def run_rollout_with_policy(
             # Instance-level metrics (for this specific agent/instance)
             "instance_precision": float(instance_precision),
             "instance_coverage": float(instance_coverage),
+            # Anchor metrics (same as instance-level for single agent)
+            "anchor_precision": float(instance_precision),
+            "anchor_coverage": float(instance_coverage),
             # Class-level metrics (union of all agents for this class)
             "class_precision": float(class_precision),
             "class_coverage": float(class_coverage),
-            # Legacy fields (keeping for backward compatibility, using instance-level)
-            "precision": float(instance_precision),
-            "coverage": float(instance_coverage),
             "total_reward": total_reward,
             "final_observation": final_obs.tolist(),
         }
@@ -532,10 +565,10 @@ def run_rollout_with_policy(
         episode_data = {
             "instance_precision": 0.0,
             "instance_coverage": 0.0,
+            "anchor_precision": 0.0,
+            "anchor_coverage": 0.0,
             "class_precision": 0.0,
             "class_coverage": 0.0,
-            "precision": 0.0,
-            "coverage": 0.0,
             "total_reward": total_reward,
         }
     
@@ -552,7 +585,9 @@ def extract_rules_from_policies(
     eval_on_test_data: bool = True,  # Always use test data for inference by default
     output_dir: Optional[str] = None,
     seed: int = 42,
-    device: str = "cpu"
+    device: str = "cpu",
+    exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean" for rule diversity
+    action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
 ) -> Dict[str, Any]:
     """
     Extract anchor rules using saved individual policy models.
@@ -968,14 +1003,15 @@ def extract_rules_from_policies(
         from trainers.vecEnv import compute_cluster_centroids_per_class
         
         # Use agents_per_class for k-means if available (matches training setup)
-        # Otherwise, use a reasonable default (10) for diversity across episodes
+        # Otherwise, use n_instances_per_class to ensure each episode starts from a unique centroid
         if agents_per_class > 1:
             n_clusters_per_class = agents_per_class
             logger.info(f"  Using agents_per_class={agents_per_class} for k-means clustering (matches training)")
         else:
-            # For single agent per class, use multiple clusters for diversity across episodes
-            n_clusters_per_class = min(10, n_instances_per_class)  # At least one cluster per instance
-            logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity across episodes")
+            # For single agent per class, use n_instances_per_class to ensure diverse starting points
+            # This ensures each episode can start from a different cluster centroid
+            n_clusters_per_class = n_instances_per_class
+            logger.info(f"  Using {n_clusters_per_class} clusters per class (one per instance) for maximum diversity")
         
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
             X_unit=env_data["X_unit"],
@@ -1092,6 +1128,8 @@ def extract_rules_from_policies(
     logger.info(f"  Instances per class: {n_instances_per_class}")
     logger.info(f"  Steps per episode: {steps_per_episode}")
     logger.info(f"  Max features in rule: {max_features_in_rule}")
+    logger.info(f"  Exploration mode: {exploration_mode}")
+    logger.info(f"  Action noise scale: {action_noise_scale}")
     
     # Run rollouts and extract rules
     results = {
@@ -1193,7 +1231,9 @@ def extract_rules_from_policies(
                 agent_id=actual_agent_name,  # Use actual agent name from environment
                 max_steps=steps_per_episode,
                 device=device,
-                seed=rollout_seed  # Pass seed for reproducible rollouts
+                seed=rollout_seed,  # Pass seed for reproducible rollouts
+                exploration_mode=exploration_mode,  # Pass exploration mode for diversity
+                action_noise_scale=action_noise_scale,  # Pass action noise scale
             )
             
             # Debug logging for first episode of each class
@@ -1202,8 +1242,10 @@ def extract_rules_from_policies(
                 logger.info(f"    actual_agent_name: {actual_agent_name}")
                 logger.info(f"    episode_data keys: {list(episode_data.keys()) if episode_data else 'empty'}")
                 if episode_data:
-                    logger.info(f"    precision: {episode_data.get('precision', 'missing')}")
-                    logger.info(f"    coverage: {episode_data.get('coverage', 'missing')}")
+                    prec_val = episode_data.get('anchor_precision', 'missing')
+                    cov_val = episode_data.get('anchor_coverage', 'missing')
+                    logger.info(f"    anchor_precision: {prec_val}")
+                    logger.info(f"    anchor_coverage: {cov_val}")
                     logger.info(f"    has final_observation: {'final_observation' in episode_data}")
                 else:
                     logger.warning(f"    ⚠ episode_data is empty for class {target_class}!")
@@ -1218,8 +1260,8 @@ def extract_rules_from_policies(
             
             if episode_data:
                 # Instance-level metrics
-                instance_precision = episode_data.get("instance_precision", episode_data.get("precision", 0.0))
-                instance_coverage = episode_data.get("instance_coverage", episode_data.get("coverage", 0.0))
+                instance_precision = episode_data.get("anchor_precision", episode_data.get("instance_precision", 0.0))
+                instance_coverage = episode_data.get("anchor_coverage", episode_data.get("instance_coverage", 0.0))
                 # Class-level metrics
                 class_precision = episode_data.get("class_precision", 0.0)
                 class_coverage = episode_data.get("class_coverage", 0.0)
@@ -1309,9 +1351,8 @@ def extract_rules_from_policies(
                 # Class-level metrics
                 "class_precision": anchor_class_precision,
                 "class_coverage": anchor_class_coverage,
-                # Legacy fields (for backward compatibility)
-                "precision": float(precision),
-                "coverage": float(coverage),
+                "anchor_precision": float(anchor_instance_precision),
+                "anchor_coverage": float(anchor_instance_coverage),
                 "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
                 "rule": rule,
             }
@@ -1345,11 +1386,11 @@ def extract_rules_from_policies(
             "class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,
             "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
             "class_coverage_std": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
-            # Legacy fields (for backward compatibility, using instance-level)
-            "precision": float(np.mean(precisions)) if precisions else 0.0,
-            "coverage": float(np.mean(coverages)) if coverages else 0.0,
-            "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
-            "coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
+            # Anchor metrics (same as instance-level for single agent)
+            "anchor_precision_mean": float(np.mean(precisions)) if precisions else 0.0,
+            "anchor_coverage_mean": float(np.mean(coverages)) if coverages else 0.0,
+            "anchor_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
+            "anchor_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
             "n_episodes": len(anchors_list),
             "rules": rules_list,
             "unique_rules": unique_rules,
@@ -1447,6 +1488,21 @@ def main():
     )
     
     parser.add_argument(
+        "--exploration_mode",
+        type=str,
+        default="sample",
+        choices=["sample", "mean", "noisy_mean"],
+        help="Exploration mode for rule diversity: 'sample' (sample from policy distribution), 'mean' (deterministic), 'noisy_mean' (mean + noise)"
+    )
+    
+    parser.add_argument(
+        "--action_noise_scale",
+        type=float,
+        default=0.05,
+        help="Scale of Gaussian noise to add to actions for exploration (0.0 = no noise, recommended: 0.05-0.1)"
+    )
+    
+    parser.add_argument(
         "--log_file",
         type=str,
         default=None,
@@ -1480,7 +1536,9 @@ def main():
         eval_on_test_data=use_test_data,
         output_dir=args.output_dir,
         seed=args.seed,
-        device=args.device
+        device=args.device,
+        exploration_mode=args.exploration_mode,
+        action_noise_scale=args.action_noise_scale,
     )
     
     # Save results

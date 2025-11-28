@@ -16,15 +16,73 @@ import json
 import argparse
 import numpy as np
 import re
-from typing import Dict, List, Tuple, Set
+import os
+import sys
+from typing import Dict, List, Tuple, Set, Any
 from collections import defaultdict
 import logging
+from datetime import datetime
 
 from tabular_datasets import TabularDatasetLoader
 
-# Set up logging
+# Set up basic logging (will be reconfigured in main)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def setup_file_logging(log_file_path: str):
+    """
+    Setup logging to write to both console and a log file.
+    
+    Args:
+        log_file_path: Path to the log file
+    """
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Get root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers
+    root_logger.handlers = []
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler (create directory if needed)
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir:  # Only create if there's a directory component
+        os.makedirs(log_dir, exist_ok=True)
+    file_handler = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    return log_file_path
+
+
+def get_experiment_dir_from_rules_file(rules_file: str) -> str:
+    """
+    Extract experiment directory from rules file path.
+    
+    Rules file is typically at: experiment_dir/inference/extracted_rules.json
+    Returns: experiment_dir
+    """
+    rules_file = os.path.abspath(rules_file)
+    
+    # If rules_file is in an 'inference' subdirectory, go up one level
+    parts = rules_file.split(os.sep)
+    if 'inference' in parts:
+        inference_idx = parts.index('inference')
+        experiment_dir = os.sep.join(parts[:inference_idx])
+        return experiment_dir
+    
+    # Otherwise, assume rules_file is directly in experiment_dir
+    return os.path.dirname(rules_file)
 
 
 def parse_rule(rule_str: str) -> List[Tuple[str, float, float]]:
@@ -387,11 +445,226 @@ def analyze_missed_samples(
     return missed_samples_analysis
 
 
+# Helper to select global rules per class for post-hoc explanations
+def select_global_rules_per_class(
+    results: Dict,
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    feature_names: List[str],
+    unique_classes: List[int],
+    precision_threshold: float = 0.9,
+    max_rules_per_class: int = 5,
+    overlap_penalty_weight: float = 0.0,
+) -> Dict:
+    """Select a small, high-precision set of rules per class to form global explanations.
+
+    This operates post-hoc on the tested rules:
+      * Uses rule-level precision/coverage computed in this script.
+      * For each class, greedily picks rules that cover new class samples,
+        optionally penalizing overlap between rules.
+      * Computes class-union coverage and class-union precision for the
+        selected subset, similar to the environment's class-level metrics.
+    
+    Uses the same source as missed_samples_analysis: unique_rules from per_class_results
+    (original rules file), not rule_results (test results), to ensure consistency.
+    """
+    per_class_results = results.get("per_class_results", {})
+    rule_results = results.get("rule_results", [])
+    n_samples = X_data.shape[0]
+
+    # Create a mapping from rule strings to rule indices in rule_results for lookup
+    rule_str_to_idx = {}
+    rule_str_to_global_indices = {}
+    for rule_idx, rr in enumerate(rule_results):
+        rule_str = rr.get("rule", "")
+        rule_str_to_idx[rule_str] = rule_idx
+        # Precompute global satisfying index sets for each rule to support union precision
+        conditions = rr.get("conditions", [])
+        rule_conditions = [
+            (cond["feature"], float(cond["lower"]), float(cond["upper"]))
+            for cond in conditions
+        ]
+        if len(rule_conditions) == 0:
+            satisfying_mask = np.ones(n_samples, dtype=bool)
+        else:
+            satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
+        indices = set(np.where(satisfying_mask)[0].tolist())
+        rule_str_to_global_indices[rule_str] = indices
+
+    global_explanations: Dict[str, Any] = {
+        "settings": {
+            "precision_threshold": float(precision_threshold),
+            "max_rules_per_class": int(max_rules_per_class) if max_rules_per_class != -1 else -1,
+            "overlap_penalty_weight": float(overlap_penalty_weight),
+        },
+        "per_class": {},
+    }
+
+    for cls in unique_classes:
+        class_key = f"class_{cls}"
+        # Indices of all samples of this class
+        class_mask = (y_data == cls)
+        class_indices = set(np.where(class_mask)[0].tolist())
+        n_class_samples = len(class_indices)
+
+        if n_class_samples == 0:
+            global_explanations["per_class"][class_key] = {
+                "class": int(cls),
+                "n_class_samples": 0,
+                "n_selected_rules": 0,
+                "selected_rule_indices": [],
+                "selected_rules": [],
+                "class_union_coverage": 0.0,
+                "class_union_precision": 0.0,
+                "n_covered_class_samples": 0,
+                "n_union_samples_total": 0,
+            }
+            continue
+
+        # Build candidate list for this class using unique_rules from per_class_results
+        # (same source as missed_samples_analysis to ensure consistency)
+        # Compute metrics directly from rule strings, matching missed_samples_analysis approach
+        candidates: List[Dict[str, Any]] = []
+        if class_key not in per_class_results:
+            # Fallback: if class_key not in per_class_results, try to get from rule_results
+            # This shouldn't happen if per_class_results is properly populated
+            logger.warning(f"  Class key {class_key} not found in per_class_results. Available keys: {list(per_class_results.keys())}")
+        else:
+            unique_rules = per_class_results[class_key].get("unique_rules", [])
+            if not unique_rules:
+                logger.debug(f"  No unique_rules found for {class_key} in per_class_results")
+            
+            for rule_str in unique_rules:
+                if rule_str == "any values (no tightened features)":
+                    continue
+                
+                # Parse rule and compute metrics directly (same as missed_samples_analysis)
+                rule_conditions = parse_rule(rule_str)
+                if len(rule_conditions) == 0:
+                    # Empty rule covers all samples
+                    satisfying_mask = np.ones(n_samples, dtype=bool)
+                else:
+                    satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
+                
+                # Get class-specific samples (same approach as missed_samples_analysis)
+                class_satisfying = satisfying_mask[class_mask]  # Index to get only class samples
+                n_satisfying_class = int(np.sum(class_satisfying))
+                if n_satisfying_class <= 0:
+                    continue
+                
+                # Compute precision: fraction of satisfying samples that belong to this class
+                n_satisfying_total = int(np.sum(satisfying_mask))
+                if n_satisfying_total > 0:
+                    rule_prec = float(n_satisfying_class / n_satisfying_total)
+                else:
+                    rule_prec = 0.0
+                
+                if rule_prec < precision_threshold:
+                    continue
+                
+                # Get indices of satisfying class samples (in full dataset indices)
+                class_satisfying_mask = satisfying_mask & class_mask
+                satisfying_class_indices = set(np.where(class_satisfying_mask)[0].tolist())
+                
+                # Find rule index in rule_results for union precision calculation
+                rule_idx = rule_str_to_idx.get(rule_str, -1)
+                
+                candidates.append({
+                    "rule_idx": rule_idx,
+                    "rule_str": rule_str,
+                    "precision": rule_prec,
+                    "class_indices": satisfying_class_indices,
+                })
+
+        selected: List[Dict[str, Any]] = []
+        covered_class_indices: Set[int] = set()
+
+        # If max_rules_per_class is -1, use ALL candidates (all rules that satisfy the class)
+        # Otherwise, use greedy selection to maximize new class coverage
+        use_all_rules = (max_rules_per_class == -1)
+        
+        if use_all_rules:
+            # Use all candidates to match missed samples analysis
+            selected = candidates.copy()
+            for cand in selected:
+                covered_class_indices |= cand["class_indices"]
+        else:
+            # Greedy selection: maximize new class coverage, optionally penalizing overlap
+            while len(selected) < max_rules_per_class and candidates:
+                best_candidate = None
+                best_score = 0.0
+
+                for cand in candidates:
+                    new_cover = cand["class_indices"] - covered_class_indices
+                    gain = len(new_cover)
+                    if gain <= 0:
+                        continue
+                    if overlap_penalty_weight > 0.0:
+                        overlap = len(cand["class_indices"] & covered_class_indices)
+                        score = gain - overlap_penalty_weight * overlap
+                    else:
+                        score = float(gain)
+                    if score > best_score:
+                        best_score = score
+                        best_candidate = cand
+
+                if best_candidate is None or best_score <= 0.0:
+                    break
+
+                selected.append(best_candidate)
+                covered_class_indices |= best_candidate["class_indices"]
+                # Remove by rule_str to avoid issues if rule_idx is -1
+                candidates = [c for c in candidates if c["rule_str"] != best_candidate["rule_str"]]
+
+        # Class-union coverage over this class (on true labels)
+        n_covered_class = len(covered_class_indices)
+        class_union_coverage = n_covered_class / n_class_samples if n_class_samples > 0 else 0.0
+
+        # Union precision: among all samples covered by selected rules, fraction belonging to this class
+        union_indices_global: Set[int] = set()
+        for s in selected:
+            rule_str = s["rule_str"]
+            if rule_str in rule_str_to_global_indices:
+                union_indices_global |= rule_str_to_global_indices[rule_str]
+            else:
+                # Compute global indices directly if not found in lookup
+                rule_conditions = parse_rule(rule_str)
+                if len(rule_conditions) == 0:
+                    satisfying_mask = np.ones(n_samples, dtype=bool)
+                else:
+                    satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
+                indices = set(np.where(satisfying_mask)[0].tolist())
+                union_indices_global |= indices
+        n_union_total = len(union_indices_global)
+        if n_union_total > 0:
+            n_union_class = sum(1 for idx in union_indices_global if y_data[idx] == cls)
+            class_union_precision = n_union_class / n_union_total
+        else:
+            class_union_precision = 0.0
+
+        global_explanations["per_class"][class_key] = {
+            "class": int(cls),
+            "n_class_samples": int(n_class_samples),
+            "n_selected_rules": len(selected),
+            "selected_rule_indices": [s["rule_idx"] for s in selected],
+            "selected_rules": [s["rule_str"] for s in selected],
+            "class_union_coverage": float(class_union_coverage),
+            "class_union_precision": float(class_union_precision),
+            "n_covered_class_samples": int(n_covered_class),
+            "n_union_samples_total": int(n_union_total),
+        }
+
+    return global_explanations
+
+
 def test_rules_from_json(
     rules_file: str,
     dataset_name: str,
     use_test_data: bool = True,
-    seed: int = 42
+    seed: int = 42,
+    precision_threshold: float = 0.9,
+    max_rules_per_class: int = -1,
+    overlap_penalty_weight: float = 0.0,
 ) -> Dict:
     """
     Test extracted rules against a dataset.
@@ -492,7 +765,10 @@ def test_rules_from_json(
         "n_features": X_data.shape[1],
         "classes": unique_classes,
         "rules_tested": len(all_unique_rules),
-        "rule_results": []
+        "rule_results": [],
+        # Include original per_class_results from rules file for consistency with missed_samples_analysis
+        # Use the same reference (not a copy) to ensure we're using the exact same data structure
+        "per_class_results": per_class_results
     }
     
     rules_satisfying_both_classes = []
@@ -554,11 +830,8 @@ def test_rules_from_json(
                 "class": int(target_class),
                 "n_class_samples": int(n_class_samples),
                 "n_satisfying_class_samples": int(n_satisfying_class),
-                "rule_precision": float(precision),  # Renamed to clarify this is rule-level precision
-                "rule_coverage": float(coverage),    # Renamed to clarify this is rule-level coverage
-                # Legacy fields (for backward compatibility)
-                "precision": float(precision),
-                "coverage": float(coverage),
+                "rule_precision": float(precision),  # Rule-level precision
+                "rule_coverage": float(coverage),    # Rule-level coverage
                 "satisfying_sample_indices": satisfying_class_indices
             }
             
@@ -637,7 +910,10 @@ def test_rules_from_json(
             for class_val in rule_info['classes_satisfied']:
                 class_key = f"class_{class_val}"
                 class_res = rule_info['per_class_results'][class_key]
-                logger.info(f"      Class {class_val}: rule_precision={class_res.get('rule_precision', class_res.get('precision', 0.0)):.4f}, rule_coverage={class_res.get('rule_coverage', class_res.get('coverage', 0.0)):.4f}")
+                # Try rule_precision/rule_coverage first (calculated in this script), then anchor_precision/anchor_coverage
+                rule_prec = class_res.get('rule_precision', class_res.get('anchor_precision', 0.0))
+                rule_cov = class_res.get('rule_coverage', class_res.get('anchor_coverage', 0.0))
+                logger.info(f"      Class {class_val}: rule_precision={rule_prec:.4f}, rule_coverage={rule_cov:.4f}")
                 if "instance_precision" in class_res:
                     logger.info(f"        Instance-level: precision={class_res['instance_precision']:.4f}, coverage={class_res['instance_coverage']:.4f}")
                 if "class_precision" in class_res:
@@ -664,6 +940,59 @@ def test_rules_from_json(
         unique_classes=unique_classes
     )
     results["missed_samples_analysis"] = missed_samples_analysis
+
+    # Build post-hoc global explanations using the requested selection parameters
+    global_explanations = select_global_rules_per_class(
+        results=results,
+        X_data=X_data,
+        y_data=y_data,
+        feature_names=feature_names,
+        unique_classes=unique_classes,
+        precision_threshold=precision_threshold,
+        max_rules_per_class=max_rules_per_class,
+        overlap_penalty_weight=overlap_penalty_weight,
+    )
+    results["global_explanations"] = global_explanations
+    
+    # Log global explanations results
+    logger.info("\n" + "="*80)
+    logger.info("GLOBAL EXPLANATIONS (All Available High-Precision Rules per Class)")
+    logger.info("="*80)
+    settings = global_explanations.get("settings", {})
+    max_rules_setting = settings.get('max_rules_per_class', -1)
+    max_rules_display = "all available" if max_rules_setting == -1 else str(max_rules_setting)
+    logger.info(f"Settings: precision_threshold={settings.get('precision_threshold', 0.9):.2f}, "
+                f"max_rules_per_class={max_rules_display}, "
+                f"overlap_penalty_weight={settings.get('overlap_penalty_weight', 0.0):.2f}")
+    logger.info("")
+    
+    for class_key, class_data in global_explanations.get("per_class", {}).items():
+        cls = class_data.get("class", -1)
+        n_selected = class_data.get("n_selected_rules", 0)
+        n_class_samples = class_data.get("n_class_samples", 0)
+        n_covered = class_data.get("n_covered_class_samples", 0)
+        union_cov = class_data.get("class_union_coverage", 0.0)
+        union_prec = class_data.get("class_union_precision", 0.0)
+        selected_rules = class_data.get("selected_rules", [])
+        selected_indices = class_data.get("selected_rule_indices", [])
+        
+        logger.info(f"Class {cls}:")
+        logger.info(f"  Class samples: {n_class_samples}")
+        logger.info(f"  Selected rules: {n_selected}")
+        logger.info(f"  Class-union coverage: {union_cov:.4f} ({n_covered}/{n_class_samples} samples covered)")
+        logger.info(f"  Class-union precision: {union_prec:.4f}")
+        
+        if n_selected > 0:
+            logger.info(f"  Selected rule indices: {selected_indices}")
+            for idx, rule_str in enumerate(selected_rules, 1):
+                # Truncate long rules for readability
+                rule_display = rule_str[:100] + "..." if len(rule_str) > 100 else rule_str
+                logger.info(f"    Rule {idx} (index {selected_indices[idx-1]}): {rule_display}")
+        else:
+            logger.info(f"  No rules selected (no rules met precision threshold {settings.get('precision_threshold', 0.9):.2f})")
+        logger.info("")
+    
+    logger.info("="*80)
     
     return results
 
@@ -705,12 +1034,6 @@ Examples:
         help="Test on training data instead of test data (default: test data)"
     )
     
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output file path to save results (JSON format). If not specified, results are only printed."
-    )
     
     parser.add_argument(
         "--seed",
@@ -719,23 +1042,57 @@ Examples:
         help="Random seed for dataset loading (default: 42)"
     )
     
+    parser.add_argument(
+        "--precision_threshold",
+        type=float,
+        default=0.9,
+        help="Minimum rule-level precision for a rule to be considered in global explanations (default: 0.9)"
+    )
+
+    parser.add_argument(
+        "--max_rules_per_class",
+        type=int,
+        default=-1,
+        help="Maximum number of rules to select per class for global explanations (-1 = no limit, use all)"
+    )
+
+    parser.add_argument(
+        "--overlap_penalty_weight",
+        type=float,
+        default=0.0,
+        help="Penalty weight for selecting highly overlapping rules in global explanations (default: 0.0)"
+    )
+
     args = parser.parse_args()
+
+    # Determine experiment directory and set up logging
+    experiment_dir = get_experiment_dir_from_rules_file(args.rules_file)
     
+    # Create log file in experiment directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file_path = os.path.join(experiment_dir, f"test_rules_{timestamp}.log")
+    
+    # Setup logging to both console and file
+    setup_file_logging(log_file_path)
+    logger.info(f"{'='*80}")
+    logger.info(f"Logging to file: {log_file_path}")
+    logger.info(f"Experiment directory: {experiment_dir}")
+    logger.info(f"{'='*80}")
+
     # Test rules
     results = test_rules_from_json(
         rules_file=args.rules_file,
         dataset_name=args.dataset,
         use_test_data=not args.use_train_data,
-        seed=args.seed
+        seed=args.seed,
+        precision_threshold=args.precision_threshold,
+        max_rules_per_class=args.max_rules_per_class,
+        overlap_penalty_weight=args.overlap_penalty_weight,
     )
     
-    # Save results if output path specified
-    if args.output:
-        logger.info(f"{'='*80}")
-        logger.info(f"Saving results to: {args.output}")
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        logger.info("✓ Results saved successfully")
+    # Results are logged to file automatically via logging
+    logger.info(f"{'='*80}")
+    logger.info(f"✓ Log file saved to: {log_file_path}")
     
     # Print per-class summary
     logger.info(f"{'='*80}")
@@ -743,34 +1100,23 @@ Examples:
     logger.info(f"{'='*80}")
     
     unique_classes = results.get("classes", [])
+    per_class_results = results.get("per_class_results", {})
     for target_class in unique_classes:
         logger.info(f"Class {target_class}:")
-        class_precisions = []
-        class_coverages = []
-        
+
         rule_precisions = []
         rule_coverages = []
-        instance_precisions = []
-        instance_coverages = []
-        class_precisions = []
-        class_coverages = []
-        
+
         for rule_result in results["rule_results"]:
             class_key = f"class_{target_class}"
             if class_key in rule_result["per_class_results"]:
                 class_res = rule_result["per_class_results"][class_key]
                 # Rule-level metrics (calculated by this test script)
-                rule_precisions.append(class_res.get("rule_precision", class_res.get("precision", 0.0)))
-                rule_coverages.append(class_res.get("rule_coverage", class_res.get("coverage", 0.0)))
-                # Instance-level metrics (from training/inference, if available)
-                if "instance_precision" in class_res:
-                    instance_precisions.append(class_res["instance_precision"])
-                    instance_coverages.append(class_res["instance_coverage"])
-                # Class-level metrics (from training/inference, if available)
-                if "class_precision" in class_res:
-                    class_precisions.append(class_res["class_precision"])
-                    class_coverages.append(class_res["class_coverage"])
-        
+                rule_prec = class_res.get("rule_precision", class_res.get("anchor_precision", 0.0))
+                rule_cov = class_res.get("rule_coverage", class_res.get("anchor_coverage", 0.0))
+                rule_precisions.append(rule_prec)
+                rule_coverages.append(rule_cov)
+
         if rule_precisions:
             logger.info(f"  Rules tested: {len(rule_precisions)}")
             logger.info(f"  Rule-level metrics (from testing):")
@@ -778,18 +1124,19 @@ Examples:
             logger.info(f"    Mean coverage: {np.mean(rule_coverages):.4f} ± {np.std(rule_coverages):.4f}")
             logger.info(f"    Best precision: {np.max(rule_precisions):.4f}")
             logger.info(f"    Best coverage: {np.max(rule_coverages):.4f}")
-            
-            # Display instance-level metrics if available
-            if instance_precisions:
+
+        # Training/inference-level metrics (if available) are stored once per class
+        class_key = f"class_{target_class}"
+        if class_key in per_class_results:
+            training_data = per_class_results[class_key]
+            if "instance_precision" in training_data:
                 logger.info(f"  Instance-level metrics (from training/inference):")
-                logger.info(f"    Mean precision: {np.mean(instance_precisions):.4f} ± {np.std(instance_precisions):.4f}")
-                logger.info(f"    Mean coverage: {np.mean(instance_coverages):.4f} ± {np.std(instance_coverages):.4f}")
-            
-            # Display class-level metrics if available
-            if class_precisions:
+                logger.info(f"    Precision: {training_data['instance_precision']:.4f}")
+                logger.info(f"    Coverage: {training_data['instance_coverage']:.4f}")
+            if "class_precision" in training_data:
                 logger.info(f"  Class-level metrics (from training/inference):")
-                logger.info(f"    Mean precision: {np.mean(class_precisions):.4f} ± {np.std(class_precisions):.4f}")
-                logger.info(f"    Mean coverage: {np.mean(class_coverages):.4f} ± {np.std(class_coverages):.4f}")
+                logger.info(f"    Precision: {training_data['class_precision']:.4f}")
+                logger.info(f"    Coverage: {training_data['class_coverage']:.4f}")
     
     logger.info(f"{'='*80}")
     logger.info("Rule testing complete!")

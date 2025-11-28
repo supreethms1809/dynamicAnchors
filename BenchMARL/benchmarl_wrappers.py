@@ -129,12 +129,14 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
         self.save_to_file = save_to_file
         self.collect_anchor_data = collect_anchor_data
+        self.save_frequency = save_frequency  # Save every N aggregated metrics
+        self.save_during_training = save_during_training  # Whether to save periodically during training
         self.training_metrics = []
         self.training_history = []
         self.evaluation_history = []
@@ -142,6 +144,7 @@ class AnchorMetricsCallback(Callback):
         self.evaluation_anchor_data = []  # List of episodes, each episode contains agent data
         # Store training episode details (bounds, precision, coverage per episode)
         self.training_episode_details = []  # List of episode details from training batches
+        self.experiment_folder = None  # Will be set when experiment starts
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -150,7 +153,8 @@ class AnchorMetricsCallback(Callback):
             return metrics
         
         metric_keys = [
-            "precision", "coverage", "drift", "anchor_drift", "js_penalty",
+            "anchor_precision", "anchor_coverage",
+            "drift", "anchor_drift", "js_penalty",
             "precision_gain", "coverage_gain", "coverage_bonus", "target_class_bonus",
             "overlap_penalty", "drift_penalty", "anchor_drift_penalty", 
             "inter_class_overlap_penalty", "shared_reward", "total_reward",
@@ -213,8 +217,8 @@ class AnchorMetricsCallback(Callback):
                         except:
                             return default
                     
-                    episode_detail["precision"] = safe_get("precision", 0.0)
-                    episode_detail["coverage"] = safe_get("coverage", 0.0)
+                    episode_detail["anchor_precision"] = safe_get("anchor_precision", 0.0)
+                    episode_detail["anchor_coverage"] = safe_get("anchor_coverage", 0.0)
                     episode_detail["total_reward"] = safe_get("total_reward", 0.0)
                     
                     # Extract final observation (contains bounds)
@@ -295,7 +299,8 @@ class AnchorMetricsCallback(Callback):
             if episode_details:
                 self.training_episode_details.append(episode_details.copy())
             
-            if len(self.training_metrics) >= 10:
+            # Aggregate and save when we have enough batches, or save remaining data at end
+            if len(self.training_metrics) >= self.save_frequency:
                 aggregated = {}
                 for key in self.training_metrics[0].keys():
                     values = [m[key] for m in self.training_metrics if key in m]
@@ -322,6 +327,13 @@ class AnchorMetricsCallback(Callback):
                     aggregated["step"] = self.experiment.n_iters_performed
                     aggregated["total_frames"] = self.experiment.total_frames
                     self.training_history.append(aggregated.copy())
+                    
+                    # Save periodically during training if enabled
+                    if self.save_during_training and self.experiment_folder:
+                        try:
+                            self._save_data_periodically()
+                        except Exception as e:
+                            logger.warning(f"Warning: Could not save metrics during training: {e}")
                 
                 self.training_metrics = []
     
@@ -514,9 +526,11 @@ class AnchorMetricsCallback(Callback):
                                 except:
                                     return default
                             
+                            precision_val = safe_get("anchor_precision", 0.0)
+                            coverage_val = safe_get("anchor_coverage", 0.0)
                             episode_data[group] = {
-                                "precision": safe_get("precision", 0.0),
-                                "coverage": safe_get("coverage", 0.0),
+                                "anchor_precision": precision_val,
+                                "anchor_coverage": coverage_val,
                                 "total_reward": safe_get("total_reward", 0.0),
                             }
                             
@@ -565,8 +579,8 @@ class AnchorMetricsCallback(Callback):
                 aggregated["total_frames"] = self.experiment.total_frames
                 self.evaluation_history.append(aggregated.copy())
             
-            precision_key = [k for k in aggregated.keys() if "precision" in k and "mean" in k and "evaluation" in k]
-            coverage_key = [k for k in aggregated.keys() if "coverage" in k and "mean" in k and "evaluation" in k]
+            precision_key = [k for k in aggregated.keys() if "anchor_precision" in k and "mean" in k and "evaluation" in k]
+            coverage_key = [k for k in aggregated.keys() if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
             if precision_key and coverage_key:
                 logger.info(
                     f"Evaluation - Precision: {aggregated[precision_key[0]]:.4f}, "
@@ -587,6 +601,82 @@ class AnchorMetricsCallback(Callback):
     def get_evaluation_anchor_data(self) -> List[Dict[str, Any]]:
         """Get anchor data collected during evaluation for rule extraction."""
         return self.evaluation_anchor_data.copy()
+    
+    def set_experiment_folder(self, folder_path: str):
+        """Set the experiment folder path for periodic saving during training."""
+        self.experiment_folder = folder_path
+    
+    def _flush_remaining_metrics(self):
+        """
+        Aggregate and save any remaining training metrics that haven't been saved yet.
+        Called at the end of training to ensure all data is saved.
+        """
+        if not self.training_metrics:
+            return
+        
+        # Aggregate remaining metrics
+        aggregated = {}
+        for key in self.training_metrics[0].keys():
+            values = [m[key] for m in self.training_metrics if key in m]
+            if values:
+                aggregated[key] = sum(values) / len(values)
+        
+        if aggregated:
+            aggregated["step"] = self.experiment.n_iters_performed if hasattr(self, 'experiment') and hasattr(self.experiment, 'n_iters_performed') else None
+            aggregated["total_frames"] = self.experiment.total_frames if hasattr(self, 'experiment') and hasattr(self.experiment, 'total_frames') else None
+            self.training_history.append(aggregated.copy())
+            self.training_metrics = []
+    
+    def _save_data_periodically(self):
+        """
+        Save current training metrics and episode details to files during training.
+        This is called periodically when metrics are aggregated.
+        """
+        if not self.experiment_folder:
+            return
+        
+        import json
+        from pathlib import Path
+        
+        experiment_path = Path(self.experiment_folder)
+        experiment_path.mkdir(parents=True, exist_ok=True)
+        
+        def convert_to_serializable(obj: Any) -> Any:
+            """Convert numpy arrays and other non-serializable types to JSON-compatible formats."""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int_)):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, (float, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist() if obj.numel() > 0 else []
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        
+        # Save training history (append mode - incremental saves)
+        if self.training_history:
+            training_history_path = experiment_path / "training_history.json"
+            serializable_history = convert_to_serializable(self.training_history)
+            with open(training_history_path, 'w') as f:
+                json.dump(serializable_history, f, indent=2, ensure_ascii=False)
+        
+        # Save training episode details (append mode - incremental saves)
+        if self.training_episode_details:
+            training_episodes_path = experiment_path / "training_episode_details.json"
+            serializable_episodes = convert_to_serializable(self.training_episode_details)
+            with open(training_episodes_path, 'w') as f:
+                json.dump(serializable_episodes, f, indent=2, ensure_ascii=False)
     
     def save_data_to_files(self, experiment_folder: str) -> Dict[str, str]:
         """

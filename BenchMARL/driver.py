@@ -389,10 +389,10 @@ def main():
                 for group, group_data in first_episode.items():
                     if isinstance(group_data, dict):
                         logger.info(f"      Group '{group}' contains: {list(group_data.keys())}")
-                        if "precision" in group_data:
-                            logger.info(f"        Precision: {group_data.get('precision', 'N/A')}")
-                        if "coverage" in group_data:
-                            logger.info(f"        Coverage: {group_data.get('coverage', 'N/A')}")
+                        if 'anchor_precision' in group_data:
+                            logger.info(f"        Anchor Precision: {group_data.get('anchor_precision', 'N/A')}")
+                        if 'anchor_coverage' in group_data:
+                            logger.info(f"        Anchor Coverage: {group_data.get('anchor_coverage', 'N/A')}")
                         if "final_observation" in group_data:
                             obs_len = len(group_data.get("final_observation", []))
                             logger.info(f"        Final observation length: {obs_len}")

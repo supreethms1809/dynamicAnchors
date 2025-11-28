@@ -660,8 +660,8 @@ class AnchorEnv(ParallelEnv):
                 truncations[agent] = False
                 
                 infos[agent] = {
-                    "precision": float(precision),
-                    "coverage": float(coverage),
+                    "anchor_precision": float(precision),
+                    "anchor_coverage": float(coverage),
                     "drift": 0.0,
                     "anchor_drift": 0.0,
                     "js_penalty": 0.0,
@@ -903,8 +903,8 @@ class AnchorEnv(ParallelEnv):
                 termination_reason_code = 4.0
             
             info: Dict[str, Any] = {
-                "precision": float(precision),
-                "coverage": float(coverage),
+                "anchor_precision": float(precision),
+                "anchor_coverage": float(coverage),
                 "drift": float(drift),
                 "anchor_drift": float(anchor_drift_penalty),
                 "js_penalty": float(js_penalty),
@@ -943,6 +943,12 @@ class AnchorEnv(ParallelEnv):
                     elif isinstance(value, str):
                         # Skip string entries; they are not easily logged numerically
                         continue
+            # Provide a clearer alias for target_class_fraction, if available
+            if "target_class_fraction" in details:
+                try:
+                    info["anchor_class_purity"] = float(details["target_class_fraction"])
+                except Exception:
+                    pass
             
             observations[agent] = np.array(state, dtype=np.float32)
             terminations[agent] = bool(done)
@@ -993,8 +999,8 @@ class AnchorEnv(ParallelEnv):
             else:
                 # In principle this should not happen, but guard just in case
                 infos[agent] = {
-                    "precision": 0.0,
-                    "coverage": 0.0,
+                    "anchor_precision": 0.0,
+                    "anchor_coverage": 0.0,
                     "drift": 0.0,
                     "anchor_drift": 0.0,
                     "js_penalty": 0.0,
