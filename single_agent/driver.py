@@ -291,8 +291,15 @@ def main():
                 )
             logger.info("Using existing classifier from dataset_loader")
         
-        # Reload the entire experiment
-        trainer.reload_experiment(experiment_dir)
+        # Reload the entire experiment (set up environments and load models)
+        trainer.reload_experiment(
+            experiment_dir=experiment_dir,
+            env_config=None,
+            target_classes=args.target_classes,
+            max_cycles=args.max_cycles,
+            device=args.device,
+            eval_on_test_data=args.eval_on_test_data
+        )
         
         # Use the experiment directory as the checkpoint path
         checkpoint_path = experiment_dir
@@ -325,7 +332,13 @@ def main():
     # Run evaluation
     eval_results = trainer.evaluate(n_episodes=10)
     logger.info(f"\nEvaluation complete")
-    logger.info(f"  Mean reward: {eval_results['mean_reward']:.4f} +/- {eval_results['std_reward']:.4f}")
+    if "overall" in eval_results:
+        overall = eval_results["overall"]
+        logger.info(f"  Overall mean reward: {overall['mean_reward']:.4f} +/- {overall['std_reward']:.4f}")
+        logger.info(f"  Evaluated {overall['n_classes']} classes")
+    else:
+        # Fallback for old format
+        logger.info(f"  Mean reward: {eval_results.get('mean_reward', 0):.4f} +/- {eval_results.get('std_reward', 0):.4f}")
     
     logger.info(f"\n{'='*80}")
     if args.load_checkpoint:

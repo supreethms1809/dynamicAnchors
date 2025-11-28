@@ -555,6 +555,9 @@ def test_rules_from_json(
                 "class": int(target_class),
                 "n_class_samples": int(n_class_samples),
                 "n_satisfying_class_samples": int(n_satisfying_class),
+                "rule_precision": float(precision),  # Rule-level precision (calculated from testing)
+                "rule_coverage": float(coverage),    # Rule-level coverage (calculated from testing)
+                # Aliases for consistency with BenchMARL
                 "precision": float(precision),
                 "coverage": float(coverage),
                 "satisfying_sample_indices": satisfying_class_indices
@@ -564,7 +567,7 @@ def test_rules_from_json(
             
             logger.info(f"  Class {target_class}:")
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
-            logger.info(f"    Precision: {precision:.4f}")
+            logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
             
             if n_satisfying_class > 0:
                 classes_satisfied.append(target_class)
@@ -607,7 +610,10 @@ def test_rules_from_json(
             for class_val in rule_info['classes_satisfied']:
                 class_key = f"class_{class_val}"
                 class_res = rule_info['per_class_results'][class_key]
-                logger.info(f"      Class {class_val}: precision={class_res['precision']:.4f}, coverage={class_res['coverage']:.4f}")
+                # Try rule_precision/rule_coverage first, then fallback to precision/coverage
+                rule_prec = class_res.get('rule_precision', class_res.get('precision', 0.0))
+                rule_cov = class_res.get('rule_coverage', class_res.get('coverage', 0.0))
+                logger.info(f"      Class {class_val}: rule_precision={rule_prec:.4f}, rule_coverage={rule_cov:.4f}")
     else:
         logger.info(f"No rules satisfy multiple classes.")
     
@@ -726,15 +732,19 @@ Examples:
             class_key = f"class_{target_class}"
             if class_key in rule_result["per_class_results"]:
                 class_res = rule_result["per_class_results"][class_key]
-                class_precisions.append(class_res["precision"])
-                class_coverages.append(class_res["coverage"])
+                # Use rule_precision/rule_coverage (calculated from testing) with fallback
+                rule_prec = class_res.get("rule_precision", class_res.get("precision", 0.0))
+                rule_cov = class_res.get("rule_coverage", class_res.get("coverage", 0.0))
+                class_precisions.append(rule_prec)
+                class_coverages.append(rule_cov)
         
         if class_precisions:
             logger.info(f"  Rules tested: {len(class_precisions)}")
-            logger.info(f"  Mean precision: {np.mean(class_precisions):.4f} ± {np.std(class_precisions):.4f}")
-            logger.info(f"  Mean coverage: {np.mean(class_coverages):.4f} ± {np.std(class_coverages):.4f}")
-            logger.info(f"  Best precision: {np.max(class_precisions):.4f}")
-            logger.info(f"  Best coverage: {np.max(class_coverages):.4f}")
+            logger.info(f"  Rule-level metrics (from testing):")
+            logger.info(f"    Mean precision: {np.mean(class_precisions):.4f} ± {np.std(class_precisions):.4f}")
+            logger.info(f"    Mean coverage: {np.mean(class_coverages):.4f} ± {np.std(class_coverages):.4f}")
+            logger.info(f"    Best precision: {np.max(class_precisions):.4f}")
+            logger.info(f"    Best coverage: {np.max(class_coverages):.4f}")
     
     logger.info(f"{'='*80}")
     logger.info("Single-agent rule testing complete!")

@@ -155,9 +155,14 @@ class SingleAgentAnchorEnv(Env):
 
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
+        # Multi-agent config options (kept for API compatibility, but not used in single-agent)
+        # Single-agent environments are independent (one per class), so these don't apply
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
-        # Shared reward weight for cooperative behavior (applied to all agents)
         self.shared_reward_weight = env_config.get("shared_reward_weight", 0.2)
+        # Optional: class union metrics weights (not used in single-agent, but kept for compatibility)
+        self.class_union_cov_weight = env_config.get("class_union_cov_weight", 0.0)
+        self.class_union_prec_weight = env_config.get("class_union_prec_weight", 0.0)
+        self.same_class_diversity_weight = env_config.get("same_class_diversity_weight", 0.0)
         
         x_star_unit_config = env_config.get("x_star_unit", None)
         if x_star_unit_config is not None:
@@ -745,9 +750,15 @@ class SingleAgentAnchorEnv(Env):
         elif termination_reason == "both_reasonably_close":
             termination_reason_code = 4.0
         
+        # Info dict structure matches multi-agent for consistency and fair comparison
+        # Note: Multi-agent features (inter-class overlap, shared reward, class union metrics)
+        # are not applicable for single-agent environments (one agent per class, trained independently)
         info = {
-            "precision": float(precision),
-            "coverage": float(coverage),
+            # Primary metrics (with aliases for consistency with multi-agent)
+            "anchor_precision": float(precision),  # Alias for consistency with multi-agent
+            "anchor_coverage": float(coverage),    # Alias for consistency with multi-agent
+            "precision": float(precision),         # Keep original for backward compatibility
+            "coverage": float(coverage),           # Keep original for backward compatibility
             "drift": float(drift),
             "anchor_drift": float(anchor_drift_penalty),
             "js_penalty": float(js_penalty),
@@ -767,9 +778,17 @@ class SingleAgentAnchorEnv(Env):
             "drift_penalty": float(drift_penalty),
             "anchor_drift_penalty": float(anchor_drift_penalty),
             "coverage_floor_penalty": float(coverage_floor_penalty),
+            # Multi-agent features (not applicable, set to 0.0 for consistency)
+            "inter_class_overlap_penalty": 0.0,  # Not applicable: single agent per environment
+            "same_class_overlap_penalty": 0.0,   # Not applicable: single agent per environment
+            "shared_reward": 0.0,                # Not applicable: single agent per environment
+            "class_union_coverage": 0.0,         # Not applicable: single agent per class
+            "class_union_precision": 0.0,        # Not applicable: single agent per class
+            "class_union_bonus": 0.0,             # Not applicable: single agent per class
             "total_reward": float(reward),
         }
         
+        # Attach classifier-level details if available
         for key, value in details.items():
             if value is not None:
                 if isinstance(value, (int, float, np.number)):
@@ -779,7 +798,15 @@ class SingleAgentAnchorEnv(Env):
                 elif isinstance(value, np.ndarray):
                     info[key] = float(value.item()) if value.size == 1 else value.tolist()
                 elif isinstance(value, str):
+                    # Skip string entries; they are not easily logged numerically
                     continue
+        
+        # Provide a clearer alias for target_class_fraction, if available (matches multi-agent)
+        if "target_class_fraction" in details:
+            try:
+                info["anchor_class_purity"] = float(details["target_class_fraction"])
+            except Exception:
+                pass
         
         observation = np.array(state, dtype=np.float32)
         

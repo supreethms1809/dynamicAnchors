@@ -45,10 +45,8 @@ logger = logging.getLogger(__name__)
 
 
 def run_single_agent_rollout(
-    env,
+    env: SingleAgentAnchorEnv,
     model,
-    target_class: int,
-    target_classes: List[int],
     max_steps: int = 100,
     seed: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -56,37 +54,24 @@ def run_single_agent_rollout(
     Run a single rollout episode using a trained SB3 model.
     
     Args:
-        env: Environment (SingleAgentAnchorEnv or MultiClassAnchorEnv wrapper)
-        model: Trained SB3 model (DDPG or SAC)
-        target_class: Target class for this rollout
-        target_classes: List of all target classes (for one-hot encoding)
+        env: SingleAgentAnchorEnv environment (already configured for target class)
+        model: Trained SB3 model (DDPG or SAC) for this class
         max_steps: Maximum steps per episode
         seed: Random seed
     
     Returns:
         Dictionary with episode data (precision, coverage, bounds, etc.)
     """
-    # Check if this is the MultiClassAnchorEnv wrapper
-    if hasattr(env, 'base_env'):
-        # MultiClassAnchorEnv wrapper - set target class and reset
-        env.base_env.target_class = target_class
-        obs, info = env.reset(seed=seed)
-        
-        # Extract base environment for metrics
-        base_env = env.base_env
-    else:
-        # Direct SingleAgentAnchorEnv
-        env.target_class = target_class
-        obs, info = env.reset(seed=seed)
-        base_env = env
+    # Reset environment
+    obs, info = env.reset(seed=seed)
     
     done = False
     step_count = 0
     total_reward = 0.0
     
     # Store initial state
-    initial_lower = base_env.lower.copy()
-    initial_upper = base_env.upper.copy()
+    initial_lower = env.lower.copy()
+    initial_upper = env.upper.copy()
     
     # Main rollout loop
     while not done and step_count < max_steps:
@@ -100,28 +85,20 @@ def run_single_agent_rollout(
         done = terminated or truncated
         step_count += 1
     
-    # Get final metrics from base environment
-    precision, coverage, details = base_env._current_metrics()
+    # Get final metrics
+    precision, coverage, details = env._current_metrics()
     
     # Get final bounds
-    final_lower = base_env.lower.copy()
-    final_upper = base_env.upper.copy()
-    
-    # Extract base observation (remove class encoding if present)
-    if hasattr(env, 'base_env'):
-        # Remove one-hot class encoding from observation
-        base_obs_dim = base_env.observation_space.shape[0]
-        base_obs = obs[:base_obs_dim]
-    else:
-        base_obs = obs
+    final_lower = env.lower.copy()
+    final_upper = env.upper.copy()
     
     episode_data = {
-        "target_class": int(target_class),
+        "target_class": int(env.target_class),
         "precision": float(precision),
         "coverage": float(coverage),
         "total_reward": float(total_reward),
         "n_steps": step_count,
-        "final_observation": base_obs.tolist(),
+        "final_observation": obs.tolist(),
         "initial_lower": initial_lower.tolist(),
         "initial_upper": initial_upper.tolist(),
         "final_lower": final_lower.tolist(),
@@ -167,23 +144,13 @@ def extract_rules_single_agent(
     """
     logger.info("="*80)
     logger.info("SINGLE-AGENT ANCHOR RULE EXTRACTION (Stable-Baselines3)")
+    logger.info("(One Policy Per Class Architecture)")
     logger.info("="*80)
     logger.info(f"Experiment directory: {experiment_dir}")
     logger.info(f"Dataset: {dataset_name}")
     logger.info("="*80)
     
-    # Find model file
-    model_path = os.path.join(experiment_dir, "final_model.zip")
-    if not os.path.exists(model_path):
-        # Try best model
-        best_model_path = os.path.join(experiment_dir, "best_model", "best_model.zip")
-        if os.path.exists(best_model_path):
-            model_path = best_model_path
-            logger.info(f"Using best model: {best_model_path}")
-        else:
-            raise ValueError(f"Model not found in {experiment_dir}. Expected: final_model.zip or best_model/best_model.zip")
-    
-    # Determine algorithm from model path or experiment folder name
+    # Determine algorithm from experiment folder name
     experiment_name = os.path.basename(experiment_dir)
     if "ddpg" in experiment_name.lower():
         algorithm = "ddpg"
@@ -192,14 +159,11 @@ def extract_rules_single_agent(
         algorithm = "sac"
         model_class = SAC
     else:
-        # Try to load and infer from model
-        logger.warning("Could not determine algorithm from path, trying to infer from model...")
-        # Default to DDPG, will fail if wrong
+        logger.warning("Could not determine algorithm from path, defaulting to DDPG")
         algorithm = "ddpg"
         model_class = DDPG
     
     logger.info(f"Algorithm: {algorithm.upper()}")
-    logger.info(f"Loading model from: {model_path}")
     
     # Load dataset
     dataset_loader = TabularDatasetLoader(
@@ -255,27 +219,81 @@ def extract_rules_single_agent(
         })
         logger.info("✓ Using test data for inference")
     
-    # Create MultiClassAnchorEnv wrapper (same as training) for model loading
-    # The model was trained with this wrapper, so we need to use it for inference too
-    trainer = AnchorTrainerSB3(
-        dataset_loader=dataset_loader,
-        algorithm=algorithm,
-        output_dir=experiment_dir,
-        seed=seed
-    )
+    # Compute cluster centroids per class for diversity across episodes
+    # This ensures each episode starts from a representative cluster centroid
+    # (similar to training), rather than just the mean centroid
+    logger.info("\nComputing cluster centroids per class for diversity...")
+    try:
+        from trainers.vecEnv import compute_cluster_centroids_per_class
+        
+        # Use multiple clusters for diversity across episodes
+        # Use at least one cluster per instance, but cap at 10 for efficiency
+        n_clusters_per_class = min(10, n_instances_per_class)
+        logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity across episodes")
+        
+        cluster_centroids_per_class = compute_cluster_centroids_per_class(
+            X_unit=env_data["X_unit"],
+            y=env_data["y"],
+            n_clusters_per_class=n_clusters_per_class,
+            random_state=seed if seed is not None else 42
+        )
+        logger.info(f"  ✓ Cluster centroids computed successfully!")
+        for cls in target_classes:
+            if cls in cluster_centroids_per_class:
+                n_centroids = len(cluster_centroids_per_class[cls])
+                logger.info(f"    Class {cls}: {n_centroids} cluster centroids")
+            else:
+                logger.warning(f"    Class {cls}: No centroids available")
+        
+        # Set cluster centroids in env_config so environment uses them
+        env_config["cluster_centroids_per_class"] = cluster_centroids_per_class
+        logger.info("  ✓ Cluster centroids set in environment config")
+    except ImportError as e:
+        logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+        logger.warning(f"  Falling back to mean centroid per class. Install sklearn: pip install scikit-learn")
+        env_config["cluster_centroids_per_class"] = None
+    except Exception as e:
+        logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+        logger.warning(f"  Falling back to mean centroid per class")
+        env_config["cluster_centroids_per_class"] = None
     
-    # Create the same wrapper environment used during training
-    env_wrapper = trainer._create_multi_class_env(
-        env_data=env_data,
-        env_config=env_config,
-        target_classes=target_classes,
-        device=device
-    )
+    # Load models for each class (one model per class)
+    logger.info(f"\nLoading models for {len(target_classes)} classes...")
+    models = {}  # class -> model
     
-    # Load model (SB3 requires an env to load)
-    logger.info("Loading SB3 model...")
-    model = model_class.load(model_path, env=env_wrapper, device=device)
-    logger.info("✓ Model loaded successfully")
+    for target_class in target_classes:
+        # Try final model first
+        model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip")
+        if not os.path.exists(model_path):
+            # Try best model
+            model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
+        
+        if not os.path.exists(model_path):
+            logger.warning(f"Model for class {target_class} not found at {model_path}")
+            logger.warning(f"  Tried: final_model/class_{target_class}.zip")
+            logger.warning(f"  Tried: best_model/class_{target_class}/class_{target_class}.zip")
+            continue
+        
+        # Create environment for this class (needed for model loading)
+        env = SingleAgentAnchorEnv(
+            X_unit=env_data["X_unit"],
+            X_std=env_data["X_std"],
+            y=env_data["y"],
+            feature_names=feature_names,
+            classifier=dataset_loader.get_classifier(),
+            device=device,
+            target_class=target_class,
+            env_config=env_config
+        )
+        
+        # Load model
+        logger.info(f"  Loading model for class {target_class} from: {model_path}")
+        models[target_class] = model_class.load(model_path, env=env, device=device)
+    
+    if not models:
+        raise ValueError(f"No models found in {experiment_dir}. Expected models in final_model/class_*/ or best_model/class_*/ directories.")
+    
+    logger.info(f"✓ Loaded {len(models)} model(s) successfully")
     
     # Extract rules for each class
     logger.info(f"\nExtracting rules for classes: {target_classes}")
@@ -305,42 +323,40 @@ def extract_rules_single_agent(
         logger.info(f"Processing class {target_class}")
         logger.info(f"{'='*80}")
         
+        # Get model for this class
+        if target_class not in models:
+            logger.warning(f"  Model for class {target_class} not found, skipping...")
+            continue
+        
+        model = models[target_class]
+        
         anchors_list = []
         rules_list = []
         precisions = []
         coverages = []
         
         for instance_idx in range(n_instances_per_class):
-            # Create MultiClassAnchorEnv wrapper for this rollout
-            # The model expects the extended observation space with class encoding
+            # Create environment for this class
             rollout_seed = seed + instance_idx if seed is not None else None
             
-            env = trainer._create_multi_class_env(
-                env_data=env_data,
-                env_config=env_config,
-                target_classes=target_classes,
-                device=device
+            env = SingleAgentAnchorEnv(
+                X_unit=env_data["X_unit"],
+                X_std=env_data["X_std"],
+                y=env_data["y"],
+                feature_names=feature_names,
+                classifier=dataset_loader.get_classifier(),
+                device=device,
+                target_class=target_class,
+                env_config=env_config
             )
-            
-            # Set the target class index for this rollout (for inference)
-            # Find the index of target_class in target_classes
-            target_class_idx = target_classes.index(target_class)
-            env.fixed_class_idx = target_class_idx  # Set fixed class for this rollout
-            env.current_class_idx = target_class_idx
-            env.base_env.target_class = target_class
             
             # Run rollout
             episode_data = run_single_agent_rollout(
                 env=env,
                 model=model,
-                target_class=target_class,
-                target_classes=target_classes,
                 max_steps=steps_per_episode,
                 seed=rollout_seed
             )
-            
-            # Clear fixed_class_idx after rollout
-            env.fixed_class_idx = None
             
             precision = episode_data.get("precision", 0.0)
             coverage = episode_data.get("coverage", 0.0)
