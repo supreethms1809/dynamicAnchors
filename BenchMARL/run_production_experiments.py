@@ -314,7 +314,7 @@ def test_extracted_rules(
         rules_file: Path to extracted_rules.json
         dataset: Dataset name
         seed: Random seed
-        output_file: Optional path to save test results
+        output_file: Deprecated - not used. The script automatically saves logs to the experiment directory.
     
     Returns:
         True if testing succeeded, False otherwise
@@ -330,9 +330,6 @@ def test_extracted_rules(
         "--dataset", dataset,
         "--seed", str(seed)
     ]
-    
-    if output_file:
-        cmd.extend(["--output", str(output_file)])
     
     try:
         result = run_command(cmd, description=f"Testing rules for {dataset}")
@@ -606,8 +603,11 @@ Examples:
     completed = 0
     failed = 0
     
-    for dataset in args.datasets:
-        for algorithm in args.algorithms:
+    # Run all experiments with maddpg first, then masac (respecting requested algorithms)
+    ordered_algorithms = [alg for alg in ["maddpg", "masac"] if alg in args.algorithms]
+    
+    for algorithm in ordered_algorithms:
+        for dataset in args.datasets:
             try:
                 result = run_experiment(
                     dataset=dataset,
