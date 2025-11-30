@@ -176,7 +176,16 @@ def extract_rules_single_agent(
     dataset_loader.preprocess_data()
     
     # Load classifier
-    classifier_path = os.path.join(experiment_dir, "classifier.pth")
+    # The classifier is saved in the parent training/ directory, not in the experiment directory
+    # experiment_dir is typically: .../training/{experiment_name}
+    # classifier is at: .../training/classifier.pth
+    experiment_parent = os.path.dirname(experiment_dir)
+    classifier_path = os.path.join(experiment_parent, "classifier.pth")
+    
+    # If not found, try in the experiment_dir itself (for backward compatibility)
+    if not os.path.exists(classifier_path):
+        classifier_path = os.path.join(experiment_dir, "classifier.pth")
+    
     if os.path.exists(classifier_path):
         logger.info(f"Loading classifier from: {classifier_path}")
         classifier = dataset_loader.load_classifier(
@@ -186,7 +195,7 @@ def extract_rules_single_agent(
         )
         dataset_loader.classifier = classifier
     else:
-        raise ValueError(f"Classifier not found at {classifier_path}")
+        raise ValueError(f"Classifier not found at {classifier_path} (also checked {os.path.join(experiment_dir, 'classifier.pth')})")
     
     # Get environment data
     env_data = dataset_loader.get_anchor_env_data()
