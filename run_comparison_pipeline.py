@@ -41,7 +41,7 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
         cmd: Command to run as a list
         description: Description of what the command does
         cwd: Working directory for the command (defaults to project root)
-        capture_output: If True, capture stdout/stderr and return it
+        capture_output: If True, capture stdout/stderr and return it (while still showing in real-time)
     
     Returns:
         Tuple of (success: bool, output: Optional[str])
@@ -57,19 +57,38 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
     
     try:
         if capture_output:
-            result = subprocess.run(
+            # Use Popen to stream output in real-time while also capturing it
+            process = subprocess.Popen(
                 cmd,
                 cwd=cwd,
-                check=True,
-                capture_output=True,  # Capture output for parsing
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Combine stderr into stdout
+                text=True,
+                bufsize=1,  # Line buffered
+                universal_newlines=True
             )
-            output = result.stdout + "\n" + result.stderr
-            # Also log the output
-            logger.info(f"Command output:\n{output}")
+            
+            output_lines = []
+            # Read and print output line by line in real-time
+            for line in process.stdout:
+                line = line.rstrip()
+                print(line, flush=True)  # Print immediately
+                output_lines.append(line)
+            
+            # Wait for process to complete
+            return_code = process.wait()
+            
+            if return_code != 0:
+                output = "\n".join(output_lines)
+                logger.error(f"✗ {description} failed with return code {return_code}")
+                logger.error(f"Output: {output}")
+                return False, output
+            
+            output = "\n".join(output_lines)
             logger.info(f"✓ {description} completed successfully")
             return True, output
         else:
+            # Show output in real-time without capturing
             result = subprocess.run(
                 cmd,
                 cwd=cwd,
@@ -181,10 +200,17 @@ def run_single_agent_training(
         Path to experiment directory if successful, None otherwise
     """
     if output_dir is None:
-        output_dir = str(PROJECT_ROOT / "single_agent" / "output" / f"single_agent_sb3_{dataset}_{algorithm}")
+        # The driver appends "training/" to the output_dir, so we need to ensure it has a trailing slash
+        # This creates: single_agent_sb3_{dataset}_{algorithm}/training/ instead of concatenating
+        base_output_dir = PROJECT_ROOT / "single_agent" / "output" / f"single_agent_sb3_{dataset}_{algorithm}"
+        # Ensure trailing slash so driver creates training/ subdirectory
+        output_dir = str(base_output_dir) + "/"
     else:
         # Resolve relative paths relative to project root
         output_dir = str(Path(output_dir).resolve())
+        # Ensure trailing slash so driver creates training/ subdirectory
+        if not output_dir.endswith("/"):
+            output_dir = output_dir + "/"
     
     # Check if experiment already exists
     if not force_retrain:
@@ -223,20 +249,54 @@ def run_single_agent_training(
     
     if success:
         # Find the experiment directory (checkpoint path)
-        # The checkpoint is typically in output_dir/training/<experiment_name>/
-        training_dir = Path(output_dir) / "training"
+        # The checkpoint can be in different locations:
+        # 1. output_dir/training/<experiment_name>/ (standard structure with trailing slash)
+        # 2. output_dir/<experiment_name>/ (direct structure)
+        
+        # Remove trailing slash if present for Path operations
+        output_dir_clean = output_dir.rstrip("/")
+        output_path = Path(output_dir_clean)
+        
+        # First, try the standard structure: output_dir/training/<experiment_name>/
+        training_dir = output_path / "training"
         if training_dir.exists():
-            # Find the most recent experiment directory
             experiment_dirs = [d for d in training_dir.iterdir() if d.is_dir()]
             if experiment_dirs:
-                # Sort by modification time, get most recent
+                # Filter for experiment directories (should contain final_model or best_model)
+                valid_dirs = [
+                    d for d in experiment_dirs
+                    if (d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists()
+                ]
+                if valid_dirs:
+                    experiment_dir = max(valid_dirs, key=lambda p: p.stat().st_mtime)
+                    logger.info(f"✓ Found experiment directory: {experiment_dir}")
+                    return str(experiment_dir)
+                # If no valid dirs, use most recent anyway
                 experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
                 logger.info(f"✓ Found experiment directory: {experiment_dir}")
                 return str(experiment_dir)
         
-        # Fallback: return training directory
-        logger.warning(f"⚠ Could not find experiment directory, using training directory: {training_dir}")
-        return str(training_dir)
+        # Second, try direct structure: output_dir/<experiment_name>/
+        # Look for directories that look like experiment directories
+        if output_path.exists():
+            experiment_dirs = [
+                d for d in output_path.iterdir()
+                if d.is_dir() and not d.name.startswith('.') and
+                ((d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists() or
+                 d.name.startswith(f"{algorithm}_single_agent_sb3_"))
+            ]
+            if experiment_dirs:
+                experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
+                logger.info(f"✓ Found experiment directory: {experiment_dir}")
+                return str(experiment_dir)
+        
+        # Fallback: return training directory if it exists, otherwise output_dir
+        if training_dir.exists():
+            logger.warning(f"⚠ Could not find experiment directory, using training directory: {training_dir}")
+            return str(training_dir)
+        else:
+            logger.warning(f"⚠ Could not find experiment directory, using output directory: {output_path}")
+            return str(output_path)
     
     return None
 
@@ -415,9 +475,7 @@ def run_multi_agent_training(
         "driver.py",  # Use relative path since we'll run from BenchMARL directory
         "--dataset", dataset,
         "--algorithm", algorithm,
-        "--seed", str(seed),
-        "--device", device,
-        "--output_dir", output_dir,
+        "--seed", str(seed)
     ]
     
     # Add additional arguments
@@ -992,12 +1050,22 @@ Examples:
             if args.single_agent_output_dir:
                 single_agent_experiment_dir = args.single_agent_output_dir
             else:
-                default_dir = PROJECT_ROOT / "single_agent" / "output" / f"single_agent_sb3_{args.dataset}_{single_agent_algorithm}" / "training"
-                if default_dir.exists():
-                    experiment_dirs = [d for d in default_dir.iterdir() if d.is_dir()]
+                # The driver creates output_dir/training/ structure
+                base_dir = PROJECT_ROOT / "single_agent" / "output" / f"single_agent_sb3_{args.dataset}_{single_agent_algorithm}"
+                # Check the standard structure: base_dir/training/
+                training_dir = base_dir / "training"
+                if training_dir.exists():
+                    experiment_dirs = [d for d in training_dir.iterdir() if d.is_dir()]
                     if experiment_dirs:
                         single_agent_experiment_dir = str(max(experiment_dirs, key=lambda p: p.stat().st_mtime))
                         logger.info(f"Found existing experiment directory: {single_agent_experiment_dir}")
+                # Also check if directory with "training" concatenated exists (old structure)
+                training_dir_old = Path(str(base_dir) + "training")
+                if training_dir_old.exists() and not single_agent_experiment_dir:
+                    experiment_dirs = [d for d in training_dir_old.iterdir() if d.is_dir()]
+                    if experiment_dirs:
+                        single_agent_experiment_dir = str(max(experiment_dirs, key=lambda p: p.stat().st_mtime))
+                        logger.info(f"Found existing experiment directory (old structure): {single_agent_experiment_dir}")
         
         # Inference
         if not args.skip_inference and single_agent_experiment_dir:
@@ -1052,7 +1120,6 @@ Examples:
                 dataset=args.dataset,
                 algorithm=multi_agent_algorithm,
                 seed=args.seed,
-                device=args.device,
                 output_dir=args.multi_agent_output_dir,
                 force_retrain=args.force_retrain
             )

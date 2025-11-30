@@ -219,3 +219,12 @@ BenchMARL/docs/*
 BenchMARL/maddpg*
 BenchMARL/output/*
 BenchMARL/masac*
+BenchMARL/wine*
+BenchMARL/iris*
+BenchMARL/synthetic*
+BenchMARL/moons*
+BenchMARL/circles*
+BenchMARL/covtype*
+BenchMARL/housing*
+BenchMARL/breast_cancer*
+single_agent/output/*

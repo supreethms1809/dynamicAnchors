@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from BenchMARL.tabular_datasets import TabularDatasetLoader
 from single_agentENV import SingleAgentAnchorEnv
@@ -175,16 +176,99 @@ def extract_rules_single_agent(
     dataset_loader.load_dataset()
     dataset_loader.preprocess_data()
     
-    # Load classifier
-    # The classifier is saved in the parent training/ directory, not in the experiment directory
-    # experiment_dir is typically: .../training/{experiment_name}
-    # classifier is at: .../training/classifier.pth
-    experiment_parent = os.path.dirname(experiment_dir)
-    classifier_path = os.path.join(experiment_parent, "classifier.pth")
+    # Resolve experiment directory - handle case where training directory or base output directory is passed
+    # instead of the actual experiment directory
+    resolved_experiment_dir = experiment_dir
+    experiment_path = Path(experiment_dir)
     
-    # If not found, try in the experiment_dir itself (for backward compatibility)
+    # Check if this is the actual experiment directory (has models)
+    has_models = (experiment_path / "final_model").exists() or (experiment_path / "best_model").exists()
+    has_classifier = (experiment_path / "classifier.pth").exists()
+    
+    # If it's not an experiment directory (no models), look for experiment subdirectories
+    if not has_models:
+        # Look for experiment directories within this directory
+        if experiment_path.is_dir():
+            experiment_dirs = [
+                d for d in experiment_path.iterdir()
+                if d.is_dir() and (
+                    (d / "final_model").exists() or
+                    (d / "best_model").exists() or
+                    (d / "classifier.pth").exists()
+                )
+            ]
+            if experiment_dirs:
+                # Prefer directories with models, then by modification time
+                dirs_with_models = [d for d in experiment_dirs if (d / "final_model").exists() or (d / "best_model").exists()]
+                if dirs_with_models:
+                    resolved_experiment_dir = str(max(dirs_with_models, key=lambda p: p.stat().st_mtime))
+                else:
+                    resolved_experiment_dir = str(max(experiment_dirs, key=lambda p: p.stat().st_mtime))
+                logger.info(f"Found experiment directory within: {resolved_experiment_dir}")
+                has_models = True  # Mark as found so we don't check parent
+    
+    # If still not found and we have a classifier but no models, try parent directory
+    if not has_models and has_classifier:
+        parent_dir = experiment_path.parent
+        # Look for experiment directories in parent
+        if parent_dir.is_dir():
+            experiment_dirs = [
+                d for d in parent_dir.iterdir()
+                if d.is_dir() and (
+                    (d / "final_model").exists() or
+                    (d / "best_model").exists() or
+                    (d / "classifier.pth").exists()
+                )
+            ]
+            if experiment_dirs:
+                # Prefer directories with models, then by modification time
+                dirs_with_models = [d for d in experiment_dirs if (d / "final_model").exists() or (d / "best_model").exists()]
+                if dirs_with_models:
+                    resolved_experiment_dir = str(max(dirs_with_models, key=lambda p: p.stat().st_mtime))
+                else:
+                    resolved_experiment_dir = str(max(experiment_dirs, key=lambda p: p.stat().st_mtime))
+                logger.info(f"Found experiment directory in parent: {resolved_experiment_dir}")
+    
+    # Update experiment_dir to the resolved path
+    experiment_dir = resolved_experiment_dir
+    logger.info(f"Using experiment directory: {experiment_dir}")
+    
+    # Load classifier
+    # The classifier can be in several locations:
+    # 1. In the experiment directory itself (copied during training)
+    # 2. In the training/ subdirectory (original location)
+    # 3. In the parent of training/ (if experiment_dir is a subdirectory)
+    checked_paths = []
+    
+    # First, try the experiment_dir itself (most common case after training)
+    classifier_path = os.path.join(experiment_dir, "classifier.pth")
+    checked_paths.append(classifier_path)
+    
     if not os.path.exists(classifier_path):
-        classifier_path = os.path.join(experiment_dir, "classifier.pth")
+        # Try the parent directory (in case experiment_dir is a subdirectory within training)
+        experiment_parent = os.path.dirname(experiment_dir)
+        classifier_path = os.path.join(experiment_parent, "classifier.pth")
+        checked_paths.append(classifier_path)
+    
+    if not os.path.exists(classifier_path):
+        # Try looking for training/ subdirectory and check there
+        # This handles the case where experiment_dir is the base output directory
+        training_dir = os.path.join(experiment_dir, "training")
+        if os.path.isdir(training_dir):
+            training_classifier = os.path.join(training_dir, "classifier.pth")
+            checked_paths.append(training_classifier)
+            if os.path.exists(training_classifier):
+                classifier_path = training_classifier
+    
+    if not os.path.exists(classifier_path):
+        # Try parent/training/classifier.pth (if experiment_dir is a subdirectory)
+        experiment_parent = os.path.dirname(experiment_dir)
+        training_dir = os.path.join(experiment_parent, "training")
+        if os.path.isdir(training_dir):
+            training_classifier = os.path.join(training_dir, "classifier.pth")
+            checked_paths.append(training_classifier)
+            if os.path.exists(training_classifier):
+                classifier_path = training_classifier
     
     if os.path.exists(classifier_path):
         logger.info(f"Loading classifier from: {classifier_path}")
@@ -195,7 +279,12 @@ def extract_rules_single_agent(
         )
         dataset_loader.classifier = classifier
     else:
-        raise ValueError(f"Classifier not found at {classifier_path} (also checked {os.path.join(experiment_dir, 'classifier.pth')})")
+        # Provide helpful error message with all checked paths
+        raise ValueError(
+            f"Classifier not found. Checked the following paths:\n" +
+            "\n".join(f"  - {path}" for path in checked_paths) +
+            f"\nPlease ensure the classifier was trained and saved during the training phase."
+        )
     
     # Get environment data
     env_data = dataset_loader.get_anchor_env_data()
