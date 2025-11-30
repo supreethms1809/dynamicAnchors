@@ -304,8 +304,8 @@ def run_single_agent_training(
 def run_single_agent_inference(
     experiment_dir: str,
     dataset: str,
-    max_features_in_rule: int = 5,
-    steps_per_episode: int = 100,
+    max_features_in_rule: int = -1,
+    steps_per_episode: int = 1000,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -567,8 +567,8 @@ def run_multi_agent_training(
 def run_multi_agent_inference(
     experiment_dir: str,
     dataset: str,
-    max_features_in_rule: int = 5,
-    steps_per_episode: int = 100,
+    max_features_in_rule: int = -1,
+    steps_per_episode: int = 1000,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -799,15 +799,29 @@ def create_comparison_summary(
     
     # Handle both formats: single-agent uses "mean_precision", multi-agent uses "mean_instance_precision"
     if sa_stats and ma_stats:
-        sa_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
-        sa_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
-        ma_precision = ma_stats.get("mean_instance_precision", 0.0)
-        ma_coverage = ma_stats.get("mean_instance_coverage", 0.0)
+        # Instance-level metrics
+        sa_instance_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
+        sa_instance_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
+        ma_instance_precision = ma_stats.get("mean_instance_precision", 0.0)
+        ma_instance_coverage = ma_stats.get("mean_instance_coverage", 0.0)
+        
+        # Class-level metrics
+        sa_class_precision = sa_stats.get("mean_class_precision", 0.0)
+        sa_class_coverage = sa_stats.get("mean_class_coverage", 0.0)
+        ma_class_precision = ma_stats.get("mean_class_precision", 0.0)
+        ma_class_coverage = ma_stats.get("mean_class_coverage", 0.0)
         
         comparison["comparison"] = {
-            "precision_diff": sa_precision - ma_precision,
-            "coverage_diff": sa_coverage - ma_coverage,
+            # Instance-level comparison
+            "instance_precision_diff": sa_instance_precision - ma_instance_precision,
+            "instance_coverage_diff": sa_instance_coverage - ma_instance_coverage,
+            # Class-level comparison
+            "class_precision_diff": sa_class_precision - ma_class_precision,
+            "class_coverage_diff": sa_class_coverage - ma_class_coverage,
             "rules_diff": sa_stats.get("total_unique_rules", 0) - ma_stats.get("total_unique_rules", 0),
+            # Legacy fields for backward compatibility
+            "precision_diff": sa_instance_precision - ma_instance_precision,
+            "coverage_diff": sa_instance_coverage - ma_instance_coverage,
         }
     
     # Save comparison
@@ -825,21 +839,27 @@ def create_comparison_summary(
     logger.info("COMPARISON SUMMARY")
     logger.info(f"{'='*80}")
     if sa_stats:
-        sa_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
-        sa_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
+        sa_instance_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
+        sa_instance_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
+        sa_class_precision = sa_stats.get("mean_class_precision", 0.0)
+        sa_class_coverage = sa_stats.get("mean_class_coverage", 0.0)
         logger.info(f"Single-Agent:")
-        logger.info(f"  Mean Precision: {sa_precision:.4f}")
-        logger.info(f"  Mean Coverage: {sa_coverage:.4f}")
+        logger.info(f"  Instance-Level - Precision: {sa_instance_precision:.4f}, Coverage: {sa_instance_coverage:.4f}")
+        logger.info(f"  Class-Level - Precision: {sa_class_precision:.4f}, Coverage: {sa_class_coverage:.4f}")
         logger.info(f"  Total Unique Rules: {sa_stats.get('total_unique_rules', 0)}")
     if ma_stats:
+        ma_instance_precision = ma_stats.get("mean_instance_precision", 0.0)
+        ma_instance_coverage = ma_stats.get("mean_instance_coverage", 0.0)
+        ma_class_precision = ma_stats.get("mean_class_precision", 0.0)
+        ma_class_coverage = ma_stats.get("mean_class_coverage", 0.0)
         logger.info(f"Multi-Agent:")
-        logger.info(f"  Mean Precision: {ma_stats.get('mean_instance_precision', 0.0):.4f}")
-        logger.info(f"  Mean Coverage: {ma_stats.get('mean_instance_coverage', 0.0):.4f}")
+        logger.info(f"  Instance-Level - Precision: {ma_instance_precision:.4f}, Coverage: {ma_instance_coverage:.4f}")
+        logger.info(f"  Class-Level - Precision: {ma_class_precision:.4f}, Coverage: {ma_class_coverage:.4f}")
         logger.info(f"  Total Unique Rules: {ma_stats.get('total_unique_rules', 0)}")
     if comparison["comparison"]:
         logger.info(f"Differences (Single - Multi):")
-        logger.info(f"  Precision: {comparison['comparison']['precision_diff']:.4f}")
-        logger.info(f"  Coverage: {comparison['comparison']['coverage_diff']:.4f}")
+        logger.info(f"  Instance-Level - Precision: {comparison['comparison']['instance_precision_diff']:.4f}, Coverage: {comparison['comparison']['instance_coverage_diff']:.4f}")
+        logger.info(f"  Class-Level - Precision: {comparison['comparison']['class_precision_diff']:.4f}, Coverage: {comparison['comparison']['class_coverage_diff']:.4f}")
         logger.info(f"  Rules: {comparison['comparison']['rules_diff']}")
     logger.info(f"{'='*80}")
 
@@ -868,7 +888,7 @@ Examples:
         "--dataset",
         type=str,
         required=True,
-        choices=["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"],
+        choices=["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "uci_adult", "uci_credit"],
         help="Dataset name"
     )
     
@@ -933,14 +953,14 @@ Examples:
     parser.add_argument(
         "--max_features_in_rule",
         type=int,
-        default=5,
-        help="Maximum features in extracted rules"
+        default=-1,
+        help="Maximum features in extracted rules (use -1 for all features)"
     )
     
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=100,
+        default=1000,
         help="Steps per episode"
     )
     

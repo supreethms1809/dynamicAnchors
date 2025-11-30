@@ -119,7 +119,7 @@ def extract_rules_single_agent(
     experiment_dir: str,
     dataset_name: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 100,
+    steps_per_episode: int = 1000,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
     output_dir: Optional[str] = None,
@@ -527,10 +527,64 @@ def extract_rules_single_agent(
         
         unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
         
+        # Compute instance-level metrics (average across all instances)
+        instance_precision = float(np.mean(precisions)) if precisions else 0.0
+        instance_coverage = float(np.mean(coverages)) if coverages else 0.0
+        
+        # Compute class-level metrics (union of all anchors for this class)
+        class_precision = 0.0
+        class_coverage = 0.0
+        
+        # Get the appropriate dataset (test or train) based on eval_on_test_data
+        if eval_on_test_data and env_data.get("X_test_unit") is not None:
+            X_data = env_data["X_test_unit"]
+            y_data = env_data["y_test"]
+        else:
+            X_data = env_data["X_unit"]
+            y_data = env_data["y"]
+        
+        # Compute union of all anchors for this class
+        if X_data is not None and y_data is not None and len(anchors_list) > 0:
+            n_samples = X_data.shape[0]
+            union_mask = np.zeros(n_samples, dtype=bool)
+            
+            # Build union mask from all anchors
+            for anchor_data in anchors_list:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+                    union_mask |= in_box
+            
+            # Class-level coverage: fraction of class samples that are in the union
+            mask_cls = (y_data == target_class)
+            if mask_cls.sum() > 0:
+                class_coverage = float(union_mask[mask_cls].mean())
+            else:
+                class_coverage = 0.0
+            
+            # Class-level precision: fraction of points in union that belong to target class
+            if union_mask.any():
+                y_union = y_data[union_mask]
+                class_precision = float((y_union == target_class).mean())
+            else:
+                class_precision = 0.0
+        
         results["per_class_results"][class_key] = {
             "class": int(target_class),
-            "precision": float(np.mean(precisions)) if precisions else 0.0,
-            "coverage": float(np.mean(coverages)) if coverages else 0.0,
+            # Instance-level metrics (averaged across all instances)
+            "instance_precision": instance_precision,
+            "instance_coverage": instance_coverage,
+            "instance_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
+            "instance_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
+            # Class-level metrics (union of all anchors for this class)
+            "class_precision": class_precision,
+            "class_coverage": class_coverage,
+            # Legacy fields for backward compatibility (same as instance-level)
+            "precision": instance_precision,
+            "coverage": instance_coverage,
             "precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
             "coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
             "n_episodes": len(anchors_list),
@@ -541,8 +595,8 @@ def extract_rules_single_agent(
         }
         
         logger.info(f"  Processed {len(anchors_list)} episodes")
-        logger.info(f"  Average precision: {results['per_class_results'][class_key]['precision']:.4f}")
-        logger.info(f"  Average coverage: {results['per_class_results'][class_key]['coverage']:.4f}")
+        logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
+        logger.info(f"  Class-level - Union precision: {class_precision:.4f}, coverage: {class_coverage:.4f}")
         logger.info(f"  Unique rules: {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
@@ -605,35 +659,59 @@ def compare_with_multiagent(
         sa_data = single_agent_classes.get(class_key, {})
         ma_data = multiagent_classes.get(class_key, {})
         
-        sa_precision = sa_data.get("precision", 0.0)
-        sa_coverage = sa_data.get("coverage", 0.0)
+        # Use instance-level metrics (explicit fields preferred, fallback to legacy)
+        sa_precision = sa_data.get("instance_precision", sa_data.get("precision", 0.0))
+        sa_coverage = sa_data.get("instance_coverage", sa_data.get("coverage", 0.0))
+        sa_class_precision = sa_data.get("class_precision", sa_precision)
+        sa_class_coverage = sa_data.get("class_coverage", sa_coverage)
         sa_unique_rules = sa_data.get("unique_rules_count", 0)
         
-        ma_precision = ma_data.get("precision", 0.0)
-        ma_coverage = ma_data.get("coverage", 0.0)
+        ma_precision = ma_data.get("instance_precision", ma_data.get("precision", 0.0))
+        ma_coverage = ma_data.get("instance_coverage", ma_data.get("coverage", 0.0))
+        ma_class_precision = ma_data.get("class_precision", ma_precision)
+        ma_class_coverage = ma_data.get("class_coverage", ma_coverage)
         ma_unique_rules = ma_data.get("unique_rules_count", 0)
         
         comparison["single_agent"][class_key] = {
+            "instance_precision": sa_precision,
+            "instance_coverage": sa_coverage,
+            "class_precision": sa_class_precision,
+            "class_coverage": sa_class_coverage,
+            "unique_rules": sa_unique_rules,
+            # Legacy fields for backward compatibility
             "precision": sa_precision,
             "coverage": sa_coverage,
-            "unique_rules": sa_unique_rules,
         }
         
         comparison["multi_agent"][class_key] = {
+            "instance_precision": ma_precision,
+            "instance_coverage": ma_coverage,
+            "class_precision": ma_class_precision,
+            "class_coverage": ma_class_coverage,
+            "unique_rules": ma_unique_rules,
+            # Legacy fields for backward compatibility
             "precision": ma_precision,
             "coverage": ma_coverage,
-            "unique_rules": ma_unique_rules,
         }
         
         comparison["differences"][class_key] = {
+            "instance_precision_diff": sa_precision - ma_precision,
+            "instance_coverage_diff": sa_coverage - ma_coverage,
+            "class_precision_diff": sa_class_precision - ma_class_precision,
+            "class_coverage_diff": sa_class_coverage - ma_class_coverage,
+            "unique_rules_diff": sa_unique_rules - ma_unique_rules,
+            # Legacy fields for backward compatibility
             "precision_diff": sa_precision - ma_precision,
             "coverage_diff": sa_coverage - ma_coverage,
-            "unique_rules_diff": sa_unique_rules - ma_unique_rules,
         }
         
         logger.info(f"\n{class_key}:")
-        logger.info(f"  Precision:  Single={sa_precision:.4f}, Multi={ma_precision:.4f}, Diff={sa_precision - ma_precision:.4f}")
-        logger.info(f"  Coverage:   Single={sa_coverage:.4f}, Multi={ma_coverage:.4f}, Diff={sa_coverage - ma_coverage:.4f}")
+        logger.info(f"  Instance-Level:")
+        logger.info(f"    Precision:  Single={sa_precision:.4f}, Multi={ma_precision:.4f}, Diff={sa_precision - ma_precision:.4f}")
+        logger.info(f"    Coverage:   Single={sa_coverage:.4f}, Multi={ma_coverage:.4f}, Diff={sa_coverage - ma_coverage:.4f}")
+        logger.info(f"  Class-Level:")
+        logger.info(f"    Precision:  Single={sa_class_precision:.4f}, Multi={ma_class_precision:.4f}, Diff={sa_class_precision - ma_class_precision:.4f}")
+        logger.info(f"    Coverage:   Single={sa_class_coverage:.4f}, Multi={ma_class_coverage:.4f}, Diff={sa_class_coverage - ma_class_coverage:.4f}")
         logger.info(f"  Unique Rules: Single={sa_unique_rules}, Multi={ma_unique_rules}, Diff={sa_unique_rules - ma_unique_rules}")
     
     # Summary statistics
@@ -688,13 +766,13 @@ def main():
         "--max_features_in_rule",
         type=int,
         default=-1,
-        help="Maximum number of features to include in extracted rules"
+        help="Maximum number of features to include in extracted rules (use -1 for all features)"
     )
     
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=100,
+        default=1000,
         help="Maximum steps per rollout episode"
     )
     

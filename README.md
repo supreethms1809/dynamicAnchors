@@ -29,7 +29,6 @@ python driver.py --dataset breast_cancer --algorithm maddpg --seed 42
     - `--algorithm_config conf/<algo>.yaml` (defaults if omitted)
     - `--mlp_config conf/mlp.yaml`
     - `--classifier_type {dnn,random_forest,gradient_boosting}`
-    - `--device {cpu,cuda,mps}`
 
 - **Outputs**
   - Training runs and classifiers are written under `BenchMARL/output/{dataset}_{algorithm}/training/`.
@@ -61,6 +60,20 @@ python inference.py \
 ```
 
 This uses the saved BenchMARL checkpoint (and classifier) to extract final dynamic anchor rules.
+
+- **Test rule extraction**
+```bash
+cd BenchMARL
+
+python test_extracted_rules.py \
+  --rules_file <path_to_extracted_rules.json> \
+  --dataset breast_cancer
+```
+
+Metrics
+- Precision and Coverage of each rule per class
+- Missed samples
+- Rule overlap analysis
 
 ### Single‑agent (Stable‑Baselines3) training
 
@@ -105,4 +118,16 @@ python single_agent/driver.py \
 
 This reloads the saved SB3 policy and classifier, runs evaluation over multiple episodes, and logs aggregate performance metrics.
 
+- **Test rule extraction**
+```bash
+cd single_agent
 
+python test_extracted_rules_single.py \
+  --rules_file <path_to_extracted_rules.json> \
+  --dataset breast_cancer
+```
+
+Metrics
+- Precision and Coverage of each rule per class
+- Missed samples
+- Rule overlap analysis

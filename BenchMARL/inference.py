@@ -579,8 +579,8 @@ def extract_rules_from_policies(
     experiment_dir: str,
     dataset_name: str,
     mlp_config_path: str = "conf/mlp.yaml",
-    max_features_in_rule: int = 5,
-    steps_per_episode: int = 100,
+    max_features_in_rule: int = -1,
+    steps_per_episode: int = 1000,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,  # Always use test data for inference by default
     output_dir: Optional[str] = None,
@@ -1373,17 +1373,65 @@ def extract_rules_from_policies(
         
         unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
         
+        # Compute instance-level metrics (average across all instances)
+        instance_precision = float(np.mean(instance_precisions)) if instance_precisions else 0.0
+        instance_coverage = float(np.mean(instance_coverages)) if instance_coverages else 0.0
+        
+        # Compute class-level metrics from union of all anchors across all episodes
+        class_precision_union = 0.0
+        class_coverage_union = 0.0
+        
+        # Get the appropriate dataset (test or train) based on eval_on_test_data
+        if eval_on_test_data and env_data.get("X_test_unit") is not None:
+            X_data = env_data["X_test_unit"]
+            y_data = env_data["y_test"]
+        else:
+            X_data = env_data["X_unit"]
+            y_data = env_data["y"]
+        
+        # Compute union of all anchors for this class
+        if X_data is not None and y_data is not None and len(anchors_list) > 0:
+            n_samples = X_data.shape[0]
+            union_mask = np.zeros(n_samples, dtype=bool)
+            
+            # Build union mask from all anchors
+            for anchor_data in anchors_list:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+                    union_mask |= in_box
+            
+            # Class-level coverage: fraction of class samples that are in the union
+            mask_cls = (y_data == target_class)
+            if mask_cls.sum() > 0:
+                class_coverage_union = float(union_mask[mask_cls].mean())
+            else:
+                class_coverage_union = 0.0
+            
+            # Class-level precision: fraction of points in union that belong to target class
+            if union_mask.any():
+                y_union = y_data[union_mask]
+                class_precision_union = float((y_union == target_class).mean())
+            else:
+                class_precision_union = 0.0
+        
         results["per_class_results"][class_key] = {
             "class": int(target_class),
             "group": agent_name,
             # Instance-level metrics (averaged across all instances)
-            "instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
-            "instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+            "instance_precision": instance_precision,
+            "instance_coverage": instance_coverage,
             "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
-            # Class-level metrics (union of all agents for this class)
-            "class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,
-            "class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,
+            # Class-level metrics (union of all anchors for this class across all episodes)
+            "class_precision": class_precision_union,
+            "class_coverage": class_coverage_union,
+            # Keep averaged class-level metrics for backward compatibility (but note they're averaged, not union)
+            "class_precision_avg": float(np.mean(class_precisions)) if class_precisions else 0.0,
+            "class_coverage_avg": float(np.mean(class_coverages)) if class_coverages else 0.0,
             "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
             "class_coverage_std": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
             # Anchor metrics (same as instance-level for single agent)
@@ -1399,8 +1447,8 @@ def extract_rules_from_policies(
         }
         
         logger.info(f"  Processed {len(anchors_list)} episodes")
-        logger.info(f"  Instance-level - Average precision: {results['per_class_results'][class_key]['instance_precision']:.4f}, coverage: {results['per_class_results'][class_key]['instance_coverage']:.4f}")
-        logger.info(f"  Class-level - Average precision: {results['per_class_results'][class_key]['class_precision']:.4f}, coverage: {results['per_class_results'][class_key]['class_coverage']:.4f}")
+        logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
+        logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
         logger.info(f"  Unique rules: {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
@@ -1441,14 +1489,14 @@ def main():
     parser.add_argument(
         "--max_features_in_rule",
         type=int,
-        default=5,
-        help="Maximum number of features to include in extracted rules"
+        default=-1,
+        help="Maximum number of features to include in extracted rules (use -1 for all features)"
     )
     
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=100,
+        default=1000,
         help="Maximum steps per rollout episode"
     )
     
