@@ -5,7 +5,7 @@ defaults:
 # The device for collection (e.g. cuda)
 sampling_device: "cpu"
 # The device for training (e.g. cuda)
-train_device: "cuda"
+train_device: "mps"
 # The device for the replay buffer of off-policy algorithms (e.g. cuda).
 # Use "disk" to store it on disk (in the experiment save_folder)
 buffer_device: "cpu"
@@ -51,43 +51,42 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-# Production setting: Increased for better convergence and stability
-# Adjusted to be divisible by off_policy_collected_frames_per_batch (128000) to avoid warnings
-# 39 * 128000 = 4,992,000 frames
-max_n_frames: 4_992_000
+# CPU-optimized: Reduced for faster iteration, adjusted to be divisible by off_policy_collected_frames_per_batch (32000)
+# 20 * 8000 = 160,000 frames
+max_n_frames: 160_000
 
 # Number of frames collected and each experiment iteration
-# GPU-optimized: Significantly increased batch size to utilize 40GB GPU memory
-on_policy_collected_frames_per_batch: 16000
+# CPU-optimized: Reduced batch size to prevent CPU overload and hangs
+on_policy_collected_frames_per_batch: 8000
 # Number of environments used for collection
-# GPU-optimized: Increased parallel environments for faster data collection
+# CPU-optimized: Reduced parallel environments to prevent CPU overload
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-on_policy_n_envs_per_worker: 20
+on_policy_n_envs_per_worker: 8
 # This is the number of times collected_frames_per_batch will be split into minibatches and trained
-on_policy_n_minibatch_iters: 60
+on_policy_n_minibatch_iters: 40
 # In on-policy algorithms the train_batch_size will be equal to the on_policy_collected_frames_per_batch
 # and it will be split into minibatches with this number of frames for training
-# GPU-optimized: Increased minibatch size for better GPU utilization and gradient estimates
-on_policy_minibatch_size: 1024
+# CPU-optimized: Reduced minibatch size to prevent CPU overload
+on_policy_minibatch_size: 512
 
 # Number of frames collected and each experiment iteration
-# GPU-optimized: Significantly increased batch size to utilize 40GB GPU memory
-off_policy_collected_frames_per_batch: 128000
+# CPU-optimized: Reduced batch size to prevent CPU overload and hangs
+off_policy_collected_frames_per_batch: 8000
 # Number of environments used for collection
-# GPU-optimized: Increased parallel environments for faster data collection
+# CPU-optimized: Significantly reduced parallel environments to prevent CPU overload and threading issues
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 160
+off_policy_n_envs_per_worker: 16
 # This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
-# GPU-optimized: Increased optimizer steps to utilize more GPU compute per iteration
-off_policy_n_optimizer_steps: 4000
+# CPU-optimized: Reduced optimizer steps to prevent CPU overload
+off_policy_n_optimizer_steps: 1000
 # Number of frames used for each off_policy_n_optimizer_steps when training off-policy algorithms
-# GPU-optimized: Significantly increased batch size for better GPU utilization and gradient estimates
-off_policy_train_batch_size: 2048
+# CPU-optimized: Reduced batch size to prevent CPU overload
+off_policy_train_batch_size: 512
 # Maximum number of frames to keep in replay buffer memory for off-policy algorithms
-# GPU-optimized: Increased buffer size for better sample diversity (on GPU if buffer_device="cuda")
-off_policy_memory_size: 20_000_000
+# CPU-optimized: Reduced buffer size to prevent memory issues
+off_policy_memory_size: 5_000_000
 # Number of random action frames to prefill the replay buffer with
 off_policy_init_random_frames: 0
 # whether to use priorities while sampling from the replay buffer
@@ -103,8 +102,8 @@ evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
 # Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-# Updated to match new batch sizes
-evaluation_interval: 128_000
+# CPU-optimized: Updated to match reduced batch sizes
+evaluation_interval: 8_000
 # Number of episodes that evaluation is run on
 # Production setting: Increased for more reliable evaluation metrics
 evaluation_episodes: 10
@@ -144,4 +143,4 @@ checkpoint_at_end: True  # Save checkpoint at end for inference
 # checkpoints. The checkpoint at the end is included in this number. Set to `null` to keep all checkpoints.
 keep_checkpoints_num: 3
 # Whether to exclude the replay buffers from the checkpoint
-exclude_buffer_from_checkpoint: True
+exclude_buffer_from_checkpoint: True  # Set to True to reduce checkpoint size (saves disk space)
