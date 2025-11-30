@@ -545,6 +545,7 @@ def extract_rules_single_agent(
         # Compute class-level metrics (union of all anchors for this class)
         class_precision = 0.0
         class_coverage = 0.0
+        anchors_with_bounds = 0  # Initialize to track anchors used in union computation
         
         # Get the appropriate dataset (test or train) based on eval_on_test_data
         # IMPORTANT: Must use the same dataset that was used during rollouts for consistency
@@ -563,6 +564,11 @@ def extract_rules_single_agent(
                 logger.info(f"  Computing class-level metrics on TRAIN data (eval_on_test_data=False)")
         
         # Compute union of all anchors for this class
+        # NOTE: This uses ALL anchors (including duplicates), not just unique rules.
+        # The test script uses unique rules, which may give slightly different results
+        # due to denormalization rounding. Both are valid but measure different things:
+        # - Inference (all anchors): Shows coverage of all generated anchors
+        # - Test script (unique rules): Shows coverage of deduplicated rules after denormalization
         if X_data is not None and y_data is not None and len(anchors_list) > 0:
             n_samples = X_data.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
@@ -570,34 +576,86 @@ def extract_rules_single_agent(
             # Count how many anchors have normalized bounds
             anchors_with_bounds = 0
             
+            # Debug: Track coverage per anchor
+            anchor_coverages = []
+            
             # Build union mask from all anchors
-            for anchor_data in anchors_list:
+            # TODO: Consider using unique rules instead to match test script results
+            for anchor_idx, anchor_data in enumerate(anchors_list):
                 if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    lower_norm = anchor_data["lower_bounds_normalized"]
+                    upper_norm = anchor_data["upper_bounds_normalized"]
+                    
+                    # Skip if bounds are None
+                    if lower_norm is None or upper_norm is None:
+                        logger.warning(f"  Anchor {anchor_idx} has None normalized bounds, skipping")
+                        continue
+                    
+                    lower = np.array(lower_norm, dtype=np.float32)
+                    upper = np.array(upper_norm, dtype=np.float32)
+                    
+                    # Validate bounds shape matches data
+                    if lower.shape[0] != X_data.shape[1] or upper.shape[0] != X_data.shape[1]:
+                        logger.warning(f"  Anchor {anchor_idx} bounds shape mismatch: lower.shape={lower.shape}, upper.shape={upper.shape}, X_data.shape[1]={X_data.shape[1]}, skipping")
+                        continue
+                    
+                    # Validate bounds are in [0, 1] range
+                    if np.any(lower < 0) or np.any(upper > 1):
+                        logger.warning(f"  Anchor {anchor_idx} has bounds outside [0,1]: lower min={lower.min():.4f}, upper max={upper.max():.4f}")
                     
                     # Check which points fall in this anchor box
                     in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+                    n_in_box = in_box.sum()
+                    anchor_coverages.append(n_in_box)
                     union_mask |= in_box
                     anchors_with_bounds += 1
+                else:
+                    logger.warning(f"  Anchor {anchor_idx} missing normalized bounds keys")
             
-            # Class-level coverage: fraction of class samples that are in the union
+            logger.debug(f"  Anchor individual coverages: {anchor_coverages[:5]}..." if len(anchor_coverages) > 5 else f"  Anchor individual coverages: {anchor_coverages}")
+            
+            # Class-level (class-union) metrics: union of all anchors for this class
+            # NOTE: "class-level" here refers to "class-union" metrics computed from the union of all anchors.
+            # This is different from "instance-level" metrics which are averaged across individual anchors.
+            # 
+            # IMPORTANT: This computation uses ALL anchors (including duplicates), not just unique rules.
+            # The test script (test_extracted_rules_single.py) uses unique rules after deduplication and denormalization,
+            # which may give slightly different results due to:
+            #   1. Deduplication: Only unique rules are tested (fewer anchors)
+            #   2. Denormalization: Rules are converted to standardized space, which may introduce rounding differences
+            # 
+            # Both metrics are valid but measure different things:
+            #   - Inference (all anchors): Shows coverage of all generated anchors with normalized bounds
+            #   - Test script (unique rules): Shows coverage of deduplicated rules after denormalization
+            # 
+            # For consistency with the test script, consider using unique rules for class-level metrics.
             mask_cls = (y_data == target_class)
             n_class_samples = mask_cls.sum()
+            n_total_samples = len(y_data)
             if n_class_samples > 0:
                 n_covered_class_samples = union_mask[mask_cls].sum()
+                n_covered_total_samples = union_mask.sum()
                 class_coverage = float(n_covered_class_samples / n_class_samples)
-                logger.info(f"  Class {target_class} union coverage on {data_source} data: {n_covered_class_samples}/{n_class_samples} = {class_coverage:.4f} (using {anchors_with_bounds} anchors with normalized bounds out of {len(anchors_list)} total anchors)")
+                logger.info(f"  Class {target_class} class-union coverage on {data_source} data: {n_covered_class_samples}/{n_class_samples} = {class_coverage:.4f}")
+                logger.info(f"    (using {anchors_with_bounds} anchors with normalized bounds out of {len(anchors_list)} total anchors)")
+                logger.info(f"    NOTE: This uses ALL anchors. Test script uses unique rules, which may differ slightly.")
+                logger.info(f"    Total samples in {data_source} data: {n_total_samples}, Class {target_class} samples: {n_class_samples}, Total covered by union: {n_covered_total_samples}")
+                
+                # Debug: Check if union covers all samples (which would indicate a problem)
+                if n_covered_total_samples == n_total_samples:
+                    logger.warning(f"    WARNING: Union covers ALL {n_total_samples} samples in {data_source} data! This might indicate anchors are too wide.")
+                elif n_covered_class_samples == n_class_samples:
+                    logger.info(f"    Union covers all {n_class_samples} class {target_class} samples (perfect coverage for this class)")
             else:
                 class_coverage = 0.0
                 logger.warning(f"  Class {target_class} has no samples in {data_source} data")
             
-            # Class-level precision: fraction of points in union that belong to target class
+            # Class-level (class-union) precision: fraction of points in union that belong to target class
             n_union_samples = union_mask.sum()
             if n_union_samples > 0:
                 n_union_class_samples = (y_data[union_mask] == target_class).sum()
                 class_precision = float(n_union_class_samples / n_union_samples)
-                logger.info(f"  Class {target_class} union precision on {data_source} data: {n_union_class_samples}/{n_union_samples} = {class_precision:.4f}")
+                logger.info(f"  Class {target_class} class-union precision on {data_source} data: {n_union_class_samples}/{n_union_samples} = {class_precision:.4f}")
             else:
                 class_precision = 0.0
                 logger.warning(f"  Class {target_class} union covers no samples in {data_source} data")
@@ -630,9 +688,12 @@ def extract_rules_single_agent(
         }
         
         logger.info(f"  Processed {len(anchors_list)} episodes")
-        logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
-        logger.info(f"  Class-level - Union precision: {class_precision:.4f}, coverage: {class_coverage:.4f}")
-        logger.info(f"  Unique rules: {len(unique_rules)}")
+        logger.info(f"  Instance-level metrics (averaged across all {len(anchors_list)} anchors):")
+        logger.info(f"    Average precision: {instance_precision:.4f}, Average coverage: {instance_coverage:.4f}")
+        n_anchors_for_union = anchors_with_bounds if anchors_with_bounds > 0 else len(anchors_list)
+        logger.info(f"  Class-level metrics (class-union: union of all {n_anchors_for_union} anchors):")
+        logger.info(f"    Union precision: {class_precision:.4f}, Union coverage: {class_coverage:.4f}")
+        logger.info(f"  Unique rules (after deduplication): {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
     
