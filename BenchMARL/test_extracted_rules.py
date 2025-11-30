@@ -708,6 +708,11 @@ def test_rules_from_json(
     if has_instance_metrics or has_class_metrics:
         logger.info("✓ Found instance-level and/or class-level precision metrics in rules file")
     
+    # Check metadata to determine data source for metrics labels
+    metadata = rules_data.get("metadata", {})
+    inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
+    metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+    
     # Load dataset
     logger.info(f"Loading dataset: {dataset_name}")
     dataset_loader = TabularDatasetLoader(
@@ -839,11 +844,11 @@ def test_rules_from_json(
             class_key = f"class_{target_class}"
             if class_key in per_class_results:
                 class_data = per_class_results[class_key]
-                # Instance-level metrics (from training/inference)
+                # Instance-level metrics (from inference)
                 if "instance_precision" in class_data:
                     class_result["instance_precision"] = float(class_data.get("instance_precision", 0.0))
                     class_result["instance_coverage"] = float(class_data.get("instance_coverage", 0.0))
-                # Class-level metrics (from training/inference)
+                # Class-level metrics (from inference)
                 if "class_precision" in class_data:
                     class_result["class_precision"] = float(class_data.get("class_precision", 0.0))
                     class_result["class_coverage"] = float(class_data.get("class_coverage", 0.0))
@@ -863,11 +868,11 @@ def test_rules_from_json(
             if should_show_metrics:
                 # Display instance-level and class-level metrics if available
                 if "instance_precision" in class_result:
-                    logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from training/inference)")
-                    logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from training/inference)")
+                    logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from inference on {metrics_data_source})")
+                    logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from inference on {metrics_data_source})")
                 if "class_precision" in class_result:
-                    logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from training/inference)")
-                    logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from training/inference)")
+                    logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from inference on {metrics_data_source})")
+                    logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from inference on {metrics_data_source})")
             
             if n_satisfying_class > 0:
                 classes_satisfied.append(target_class)
@@ -1079,6 +1084,16 @@ Examples:
     logger.info(f"Experiment directory: {experiment_dir}")
     logger.info(f"{'='*80}")
 
+    # Load rules_data to access metadata for metrics labels
+    logger.info("Loading rules file for metadata...")
+    with open(args.rules_file, 'r') as f:
+        rules_data = json.load(f)
+    
+    # Get metadata to determine data source for metrics labels
+    metadata = rules_data.get("metadata", {})
+    inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
+    metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+
     # Test rules
     results = test_rules_from_json(
         rules_file=args.rules_file,
@@ -1100,7 +1115,8 @@ Examples:
     logger.info(f"{'='*80}")
     
     unique_classes = results.get("classes", [])
-    per_class_results = results.get("per_class_results", {})
+    # Use inference results (from rules_data) for instance/class-level metrics, not test results
+    inference_per_class_results = rules_data.get("per_class_results", {})
     for target_class in unique_classes:
         logger.info(f"Class {target_class}:")
 
@@ -1125,18 +1141,18 @@ Examples:
             logger.info(f"    Best precision: {np.max(rule_precisions):.4f}")
             logger.info(f"    Best coverage: {np.max(rule_coverages):.4f}")
 
-        # Training/inference-level metrics (if available) are stored once per class
+        # Instance/class-level metrics from inference (stored in rules_data, not test results)
         class_key = f"class_{target_class}"
-        if class_key in per_class_results:
-            training_data = per_class_results[class_key]
-            if "instance_precision" in training_data:
-                logger.info(f"  Instance-level metrics (from training/inference):")
-                logger.info(f"    Precision: {training_data['instance_precision']:.4f}")
-                logger.info(f"    Coverage: {training_data['instance_coverage']:.4f}")
-            if "class_precision" in training_data:
-                logger.info(f"  Class-level metrics (from training/inference):")
-                logger.info(f"    Precision: {training_data['class_precision']:.4f}")
-                logger.info(f"    Coverage: {training_data['class_coverage']:.4f}")
+        if class_key in inference_per_class_results:
+            inference_data = inference_per_class_results[class_key]
+            if "instance_precision" in inference_data:
+                logger.info(f"  Instance-level metrics (from inference on {metrics_data_source}):")
+                logger.info(f"    Precision: {inference_data['instance_precision']:.4f}")
+                logger.info(f"    Coverage: {inference_data['instance_coverage']:.4f}")
+            if "class_precision" in inference_data:
+                logger.info(f"  Class-level metrics (from inference on {metrics_data_source}):")
+                logger.info(f"    Precision: {inference_data['class_precision']:.4f}")
+                logger.info(f"    Coverage: {inference_data['class_coverage']:.4f}")
     
     logger.info(f"{'='*80}")
     logger.info("Rule testing complete!")

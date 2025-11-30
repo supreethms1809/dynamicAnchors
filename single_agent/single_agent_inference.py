@@ -437,10 +437,21 @@ def extract_rules_single_agent(
             # Create environment for this class
             rollout_seed = seed + instance_idx if seed is not None else None
             
+            # Use test data for environment if eval_on_test_data=True
+            # This ensures rollouts and metrics are computed on the same dataset
+            if eval_on_test_data and env_data.get("X_test_unit") is not None:
+                env_X_unit = env_data["X_test_unit"]
+                env_X_std = env_data["X_test_std"]
+                env_y = env_data["y_test"]
+            else:
+                env_X_unit = env_data["X_unit"]
+                env_X_std = env_data["X_std"]
+                env_y = env_data["y"]
+            
             env = SingleAgentAnchorEnv(
-                X_unit=env_data["X_unit"],
-                X_std=env_data["X_std"],
-                y=env_data["y"],
+                X_unit=env_X_unit,
+                X_std=env_X_std,
+                y=env_y,
                 feature_names=feature_names,
                 classifier=dataset_loader.get_classifier(),
                 device=device,
@@ -484,11 +495,11 @@ def extract_rules_single_agent(
                     upper = upper_normalized
                 
                 # Extract rule using environment's extract_rule method
-                # Create temporary env for rule extraction
+                # Create temporary env for rule extraction (use same data as rollout env)
                 temp_env = SingleAgentAnchorEnv(
-                    X_unit=env_data["X_unit"],
-                    X_std=env_data["X_std"],
-                    y=env_data["y"],
+                    X_unit=env_X_unit,
+                    X_std=env_X_std,
+                    y=env_y,
                     feature_names=feature_names,
                     classifier=dataset_loader.get_classifier(),
                     device="cpu",
@@ -536,17 +547,28 @@ def extract_rules_single_agent(
         class_coverage = 0.0
         
         # Get the appropriate dataset (test or train) based on eval_on_test_data
+        # IMPORTANT: Must use the same dataset that was used during rollouts for consistency
         if eval_on_test_data and env_data.get("X_test_unit") is not None:
             X_data = env_data["X_test_unit"]
             y_data = env_data["y_test"]
+            data_source = "test"
+            logger.info(f"  Computing class-level metrics on TEST data (eval_on_test_data=True)")
         else:
             X_data = env_data["X_unit"]
             y_data = env_data["y"]
+            data_source = "train"
+            if eval_on_test_data:
+                logger.warning(f"  WARNING: eval_on_test_data=True but X_test_unit is None, using TRAIN data instead!")
+            else:
+                logger.info(f"  Computing class-level metrics on TRAIN data (eval_on_test_data=False)")
         
         # Compute union of all anchors for this class
         if X_data is not None and y_data is not None and len(anchors_list) > 0:
             n_samples = X_data.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
+            
+            # Count how many anchors have normalized bounds
+            anchors_with_bounds = 0
             
             # Build union mask from all anchors
             for anchor_data in anchors_list:
@@ -557,20 +579,33 @@ def extract_rules_single_agent(
                     # Check which points fall in this anchor box
                     in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
                     union_mask |= in_box
+                    anchors_with_bounds += 1
             
             # Class-level coverage: fraction of class samples that are in the union
             mask_cls = (y_data == target_class)
-            if mask_cls.sum() > 0:
-                class_coverage = float(union_mask[mask_cls].mean())
+            n_class_samples = mask_cls.sum()
+            if n_class_samples > 0:
+                n_covered_class_samples = union_mask[mask_cls].sum()
+                class_coverage = float(n_covered_class_samples / n_class_samples)
+                logger.info(f"  Class {target_class} union coverage on {data_source} data: {n_covered_class_samples}/{n_class_samples} = {class_coverage:.4f} (using {anchors_with_bounds} anchors with normalized bounds out of {len(anchors_list)} total anchors)")
             else:
                 class_coverage = 0.0
+                logger.warning(f"  Class {target_class} has no samples in {data_source} data")
             
             # Class-level precision: fraction of points in union that belong to target class
-            if union_mask.any():
-                y_union = y_data[union_mask]
-                class_precision = float((y_union == target_class).mean())
+            n_union_samples = union_mask.sum()
+            if n_union_samples > 0:
+                n_union_class_samples = (y_data[union_mask] == target_class).sum()
+                class_precision = float(n_union_class_samples / n_union_samples)
+                logger.info(f"  Class {target_class} union precision on {data_source} data: {n_union_class_samples}/{n_union_samples} = {class_precision:.4f}")
             else:
                 class_precision = 0.0
+                logger.warning(f"  Class {target_class} union covers no samples in {data_source} data")
+        else:
+            if X_data is None or y_data is None:
+                logger.warning(f"  Cannot compute class-level metrics: X_data or y_data is None")
+            if len(anchors_list) == 0:
+                logger.warning(f"  Cannot compute class-level metrics: no anchors found")
         
         results["per_class_results"][class_key] = {
             "class": int(target_class),
