@@ -203,25 +203,25 @@ class AnchorTrainer:
                     n_centroids = len(cluster_centroids_per_class[cls])
                     if n_centroids < n_clusters_per_class:
                         logger.warning(
-                            f"  ⚠ Class {cls}: Only {n_centroids} centroids computed "
+                            f"   Class {cls}: Only {n_centroids} centroids computed "
                             f"(requested {n_clusters_per_class}). "
                             f"May not have enough samples for k-means."
                         )
                     else:
-                        logger.info(f"  ✓ Class {cls}: {n_centroids} centroids computed")
+                        logger.info(f"   Class {cls}: {n_centroids} centroids computed")
                 else:
-                    logger.warning(f"  ⚠ Class {cls}: No centroids computed")
+                    logger.warning(f"   Class {cls}: No centroids computed")
             
             # Set cluster centroids in env_config
             env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
-            logger.info("  ✓ Cluster centroids set in environment config")
+            logger.info("   Cluster centroids set in environment config")
         except ImportError as e:
-            logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+            logger.warning(f"   Could not compute cluster centroids: {e}")
             logger.warning(f"  Install sklearn: pip install scikit-learn")
             logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
             env_config_with_data["cluster_centroids_per_class"] = None
         except Exception as e:
-            logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+            logger.warning(f"   Error computing cluster centroids: {e}")
             logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
             env_config_with_data["cluster_centroids_per_class"] = None
         
@@ -294,7 +294,7 @@ class AnchorTrainer:
                 try:
                     self.callback._flush_remaining_metrics()
                 except Exception as e:
-                    logger.warning(f"  ⚠ Warning: Could not flush remaining metrics: {e}")
+                    logger.warning(f"   Warning: Could not flush remaining metrics: {e}")
         
         # Save callback data to files
         if hasattr(self, 'callback') and self.callback is not None:
@@ -303,11 +303,11 @@ class AnchorTrainer:
                 try:
                     saved_files = self.callback.save_data_to_files(str(self.experiment.folder_name))
                     if saved_files:
-                        logger.info(f"  ✓ Saved {len(saved_files)} data files")
+                        logger.info(f"   Saved {len(saved_files)} data files")
                     else:
                         logger.info("  No callback data to save")
                 except Exception as e:
-                    logger.warning(f"  ⚠ Warning: Could not save callback data: {e}")
+                    logger.warning(f"   Warning: Could not save callback data: {e}")
         
         return self.experiment
     
@@ -877,24 +877,24 @@ class AnchorTrainer:
                         if hasattr(self.callback, 'evaluation_anchor_data'):
                             self.callback.evaluation_anchor_data.append(episode_data)
                 
-                logger.info(f"  ✓ Collected {len(manual_rollouts)} episodes from manual rollouts")
+                logger.info(f"   Collected {len(manual_rollouts)} episodes from manual rollouts")
                 evaluation_anchor_data.extend(manual_rollouts)
                 
             except Exception as e:
-                logger.warning(f"  ⚠ Warning: Could not run manual rollouts: {e}")
+                logger.warning(f"   Warning: Could not run manual rollouts: {e}")
                 logger.warning(f"    Error type: {type(e).__name__}")
                 import traceback
                 traceback.print_exc()
         
         # Final summary
         if not evaluation_anchor_data:
-            logger.warning("\n  ⚠ Warning: No anchor data collected from any evaluation.")
+            logger.warning("\n   Warning: No anchor data collected from any evaluation.")
             logger.warning("  This may happen if:")
             logger.warning("    1. Training evaluations didn't run (check evaluation_interval in config)")
             logger.warning("    2. Manual rollouts failed (see error above)")
             logger.warning("  Consider using inference.py to extract rules directly from the trained model.")
         else:
-            logger.info(f"\n  ✓ Total episodes collected: {len(evaluation_anchor_data)}")
+            logger.info(f"\n   Total episodes collected: {len(evaluation_anchor_data)}")
         
         # Save callback data to files (including any new evaluation data)
         if hasattr(self, 'callback') and self.callback is not None:
@@ -903,11 +903,11 @@ class AnchorTrainer:
                 try:
                     saved_files = self.callback.save_data_to_files(str(self.experiment.folder_name))
                     if saved_files:
-                        logger.info(f"  ✓ Saved {len(saved_files)} data files")
+                        logger.info(f"   Saved {len(saved_files)} data files")
                     else:
                         logger.info("  No callback data to save")
                 except Exception as e:
-                    logger.warning(f"  ⚠ Warning: Could not save callback data: {e}")
+                    logger.warning(f"   Warning: Could not save callback data: {e}")
         
         return {
             "experiment_folder": str(self.experiment.folder_name),
@@ -936,24 +936,6 @@ class AnchorTrainer:
         save_policies: bool = True,
         save_critics: bool = False
     ) -> Dict[str, str]:
-        """
-        Extract and save individual policy/critic models for easier standalone inference.
-        
-        Based on MADDPG source code structure:
-        - get_policy_for_loss(group) returns ProbabilisticActor wrapping actor_module
-        - get_value_module(group) returns critic module
-        - We extract the underlying neural network modules for standalone use
-        
-        Reference: https://benchmarl.readthedocs.io/en/latest/_modules/benchmarl/algorithms/maddpg.html
-        
-        Args:
-            output_dir: Directory to save models (ignored - always saves in experiment run log directory)
-            save_policies: Whether to save policy models
-            save_critics: Whether to save critic models
-        
-        Returns:
-            Dictionary mapping group names to saved model file paths
-        """
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
@@ -1005,7 +987,7 @@ class AnchorTrainer:
         actual_num_groups = len(algorithm.group_map.keys())
         
         if expected_num_groups is not None and actual_num_groups < expected_num_groups:
-            logger.warning(f"\n⚠ Warning: Algorithm has {actual_num_groups} groups but environment has {expected_num_groups} agents.")
+            logger.warning(f"\n Warning: Algorithm has {actual_num_groups} groups but environment has {expected_num_groups} agents.")
             logger.warning(f"  This suggests agents may be grouped together. Each group may contain multiple agents.")
             logger.warning(f"  Algorithm groups: {list(algorithm.group_map.keys())}")
             logger.warning(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
@@ -1071,7 +1053,7 @@ class AnchorTrainer:
                         actor_module = policy.net
                     
                     if actor_module is None:
-                        logger.warning(f"  ⚠ Warning: Could not extract actor module from policy for group {group}")
+                        logger.warning(f"   Warning: Could not extract actor module from policy for group {group}")
                         logger.warning(f"    Policy type: {type(policy)}")
                         logger.warning(f"    Policy attributes: {dir(policy)}")
                     else:
@@ -1103,7 +1085,7 @@ class AnchorTrainer:
                             # which is fine - they can be loaded separately
                             torch.save(actor_module.state_dict(), policy_path)
                             saved_models[f"policy_{agent_to_save}"] = policy_path
-                            logger.info(f"  ✓ Saved policy model to: {policy_path}")
+                            logger.info(f"   Saved policy model to: {policy_path}")
                             
                             # Track by class
                             if agent_target_class is not None:
@@ -1133,7 +1115,7 @@ class AnchorTrainer:
                             serializable_metadata = _convert_to_serializable(metadata)
                             with open(metadata_path, 'w') as f:
                                 json.dump(serializable_metadata, f, indent=2)
-                            logger.info(f"  ✓ Saved policy metadata to: {metadata_path}")
+                            logger.info(f"   Saved policy metadata to: {metadata_path}")
                             if agent_target_class is not None:
                                 logger.info(f"    Class: {agent_target_class}, Agent: {agent_to_save}")
                         
@@ -1155,15 +1137,15 @@ class AnchorTrainer:
                             critic_module = critic.net
                         
                         if critic_module is None:
-                            logger.warning(f"  ⚠ Warning: Could not extract critic module for group {group}")
+                            logger.warning(f"   Warning: Could not extract critic module for group {group}")
                         else:
                             # Save the critic module
                             critic_path = os.path.join(output_dir, f"critic_{group}.pth")
                             torch.save(critic_module.state_dict(), critic_path)
                             saved_models[f"critic_{group}"] = critic_path
-                            logger.info(f"  ✓ Saved critic model to: {critic_path}")
+                            logger.info(f"   Saved critic model to: {critic_path}")
                     else:
-                        logger.warning(f"  ⚠ Algorithm {self.algorithm} does not have get_value_module() method")
+                        logger.warning(f"   Algorithm {self.algorithm} does not have get_value_module() method")
                         
                 except Exception as e:
                     logger.warning(f"  ✗ Error extracting critic for group {group}: {e}")
@@ -1194,7 +1176,7 @@ class AnchorTrainer:
             serializable_index_data = _convert_to_serializable(index_data)
             with open(index_path, 'w') as f:
                 json.dump(serializable_index_data, f, indent=2)
-            logger.info(f"\n  ✓ Saved policies index to: {index_path}")
+            logger.info(f"\n   Saved policies index to: {index_path}")
             logger.info(f"    Classes: {len(policies_by_class)}, Total policies: {sum(len(p) for p in policies_by_class.values())}")
         
         logger.info("\n" + "="*80)
@@ -1214,16 +1196,6 @@ class AnchorTrainer:
     
     
     def reload_experiment(self, checkpoint_file: str):
-        """
-        Reload the entire BenchMARL Experiment from a checkpoint file.
-        Uses BenchMARL's official reload_experiment_from_file() method.
-        
-        Reference: https://benchmarl.readthedocs.io/en/latest/concepts/features.html#reloading
-        
-        Args:
-            checkpoint_file: Path to BenchMARL checkpoint file (.pt or .pth file)
-                            If a directory is provided, will search for checkpoint files
-        """
         from benchmarl.hydra_config import reload_experiment_from_file
         
         # If directory provided, find the checkpoint file
@@ -1287,7 +1259,7 @@ class AnchorTrainer:
                     self.callback = cb
                     break
         
-        logger.info("  ✓ Experiment reloaded successfully")
+        logger.info("   Experiment reloaded successfully")
         logger.info(f"  Resuming from iteration: {self.experiment.n_iters_performed}")
         logger.info(f"  Total frames: {self.experiment.total_frames}")
     
@@ -1359,17 +1331,6 @@ class AnchorTrainer:
         max_features_in_rule: Optional[int] = -1,
         eval_on_test_data: bool = False
     ) -> Dict[str, Any]:
-        """
-        Extract anchor rules from BenchMARL evaluation data.
-        
-        Args:
-            evaluation_data: Dictionary returned from evaluate() containing evaluation_anchor_data
-            max_features_in_rule: Maximum number of features to include in extracted rules
-            eval_on_test_data: Whether evaluation was done on test data
-        
-        Returns:
-            Dictionary containing extracted rules and anchor data
-        """
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
@@ -1679,9 +1640,9 @@ class AnchorTrainer:
             logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
             logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
-                logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
+                logger.warning(f"  ️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
             else:
-                logger.info(f"  ✓ No overlaps with other classes")
+                logger.info(f"   No overlaps with other classes")
         
         logger.info("="*80)
         
@@ -1690,7 +1651,7 @@ class AnchorTrainer:
         
         return results
     
-    # SS: This is a duplicate of the method above. Get rid of this if we don't need it.
+    # SS: This is a duplicate of the method above. Get rid of this later `if we don't need it.
     def extract_rules(
         self,
         max_features_in_rule: Optional[int] = -1,
@@ -2088,9 +2049,9 @@ class AnchorTrainer:
             logger.info(f"  Average anchor_coverage: {results['per_class_results'][class_key]['anchor_coverage_mean']:.4f}")
             logger.info(f"  Unique rules: {len(unique_rules)}")
             if overlap_info["has_overlaps"]:
-                logger.warning(f"  ⚠️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
+                logger.warning(f"  ️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
             else:
-                logger.info(f"  ✓ No overlaps with other classes")
+                logger.info(f"   No overlaps with other classes")
         
         logger.info("="*80)
         
@@ -2210,13 +2171,6 @@ class AnchorTrainer:
             return str(obj)
     
     def _load_env_config_from_yaml(self) -> Dict[str, Any]:
-        """
-        Load environment configuration from anchor.yaml file.
-        Falls back to hardcoded defaults if file is not found or doesn't contain env_config.
-        
-        Returns:
-            Dictionary containing environment configuration parameters
-        """
         # Return cached config if already loaded
         if self._anchor_env_config is not None:
             return self._anchor_env_config.copy()
@@ -2262,10 +2216,6 @@ class AnchorTrainer:
         return default_config
     
     def _get_default_env_config(self) -> Dict[str, Any]:
-        """
-        Get hardcoded default environment configuration.
-        This is used as a fallback if YAML file is not found or doesn't contain env_config.
-        """
         return {
             "precision_target": 0.8,
             "coverage_target": 0.02,
