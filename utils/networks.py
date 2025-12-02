@@ -7,7 +7,7 @@ This module provides all neural network definitions used in the project.
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Union, Optional
+from typing import Union, Optional, List
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 class bigClassifier(nn.Module):
@@ -61,7 +61,14 @@ class bigClassifier(nn.Module):
 class SimpleClassifier(nn.Module):
     """Simple neural network classifier for tabular data."""
     
-    def __init__(self, input_dim: int, num_classes: int, dropout_rate: float = 0.3, use_batch_norm: bool = True):
+    def __init__(
+        self, 
+        input_dim: int, 
+        num_classes: int, 
+        dropout_rate: float = 0.3, 
+        use_batch_norm: bool = True,
+        hidden_sizes: Optional[List[int]] = None
+    ):
         """
         Initialize the classifier.
         
@@ -70,34 +77,32 @@ class SimpleClassifier(nn.Module):
             num_classes: Number of output classes
             dropout_rate: Dropout rate for regularization (default: 0.3)
             use_batch_norm: Whether to use batch normalization (default: True)
+            hidden_sizes: List of hidden layer sizes (default: [256, 256, 128] for small datasets)
+                         Use [512, 512, 256] or [256, 256, 256, 128] for larger datasets
         """
         super().__init__()
         self.num_classes = num_classes
         
+        # Default architecture for small datasets
+        if hidden_sizes is None:
+            hidden_sizes = [256, 256, 128]
+        
         layers = []
-        # First layer
-        layers.append(nn.Linear(input_dim, 256))
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(256))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(dropout_rate))
+        prev_size = input_dim
         
-        # Second layer
-        layers.append(nn.Linear(256, 256))
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(256))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(dropout_rate))
-        
-        # Third layer (optional, for deeper network)
-        layers.append(nn.Linear(256, 128))
-        if use_batch_norm:
-            layers.append(nn.BatchNorm1d(128))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(dropout_rate * 0.5))  # Less dropout in later layers
+        # Build hidden layers
+        for i, hidden_size in enumerate(hidden_sizes):
+            layers.append(nn.Linear(prev_size, hidden_size))
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_size))
+            layers.append(nn.ReLU())
+            # Use full dropout for first layers, reduced for later layers
+            dropout = dropout_rate if i < len(hidden_sizes) - 1 else dropout_rate * 0.5
+            layers.append(nn.Dropout(dropout))
+            prev_size = hidden_size
         
         # Output layer
-        layers.append(nn.Linear(128, num_classes))
+        layers.append(nn.Linear(prev_size, num_classes))
         
         self.net = nn.Sequential(*layers)
 

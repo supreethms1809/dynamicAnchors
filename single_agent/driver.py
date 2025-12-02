@@ -273,6 +273,21 @@ def main():
         "tensorboard_log": True,
     }
     
+    # Use dataset-specific policy network sizes for larger datasets
+    n_train_samples = len(dataset_loader.y_train) if hasattr(dataset_loader, 'y_train') else 0
+    if n_train_samples > 10000:
+        # Large datasets (housing, etc.): use larger policy network
+        policy_net_arch = [512, 512]
+        logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger policy network: {policy_net_arch}")
+    elif n_train_samples > 5000:
+        # Medium-large datasets: slightly larger
+        policy_net_arch = [256, 256, 256]
+        logger.info(f"  Medium-large dataset detected ({n_train_samples} samples), using medium policy network: {policy_net_arch}")
+    else:
+        # Small datasets: default architecture
+        policy_net_arch = [256, 256]
+        logger.info(f"  Small dataset detected ({n_train_samples} samples), using default policy network: {policy_net_arch}")
+    
     algorithm_config = {
         "learning_rate": args.learning_rate,
         "buffer_size": 1_000_000,
@@ -284,7 +299,7 @@ def main():
         "gradient_steps": 1,
         "action_noise_sigma": 0.1,
         "policy_kwargs": {
-            "net_arch": [256, 256]
+            "net_arch": policy_net_arch
         },
     }
     

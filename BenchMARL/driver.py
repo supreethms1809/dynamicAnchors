@@ -19,8 +19,7 @@ Algorithm: maddpg, masac
 Classifier: dnn, random_forest, gradient_boosting
 (Only supports continuous action algorithms)
 """
-# CRITICAL: Set environment variables BEFORE any imports to fix numpy multiprocessing issues
-# This prevents OpenBLAS threading errors when multiprocessing spawns child processes
+
 import os
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
@@ -196,6 +195,7 @@ def main():
     if args.output_dir is None:
         args.output_dir = f"./output/{args.dataset}_{args.algorithm}/"
     
+    # Log details of the run
     print("="*80)
     if args.load_checkpoint:
         print("ANCHOR EVALUATION MODE (Loading from checkpoint)")
@@ -209,6 +209,7 @@ def main():
         print(f"Checkpoint: {args.load_checkpoint}")
     print("="*80)
     
+    # Load dataset and perform EDA analysis
     dataset_loader = TabularDatasetLoader(
         dataset_name=args.dataset,
         test_size=0.2,
@@ -227,7 +228,6 @@ def main():
     
     # Skip classifier training if loading from checkpoint
     if args.load_checkpoint:
-        # When loading from checkpoint, load the classifier from the checkpoint directory
         logger.info("\nSkipping classifier training (will load from checkpoint)")
     elif not args.skip_classifier:
         classifier = dataset_loader.create_classifier(
@@ -237,7 +237,6 @@ def main():
             device=args.device
         )
         
-        # Use dataset-specific patience: higher for complex datasets like housing
         # Housing dataset needs more patience to reach good accuracy
         dataset_patience = {
             "housing": 100,
@@ -246,6 +245,7 @@ def main():
             "iris": 30,
         }.get(args.dataset.lower(), 50)  # Default: 50
         
+        # Train classifier
         trained_classifier, test_acc, history = dataset_loader.train_classifier(
             classifier,
             epochs=args.classifier_epochs,
@@ -273,6 +273,10 @@ def main():
             )
         logger.info("\nUsing existing classifier from dataset_loader")
     
+    logger.info(f"\n{'='*80}")
+    logger.info("SETTING UP BANCHMARL TRAINER")
+    logger.info(f"{'='*80}")
+
     trainer = AnchorTrainer(
         dataset_loader=dataset_loader,
         algorithm=args.algorithm,
@@ -348,6 +352,7 @@ def main():
     logger.info(f"  Total frames: {eval_results['total_frames']}")
     
     # Save evaluation anchor data to JSON file
+    # SS: This is nasty workaround for json serialization issues. TODO: Create a function in utils 
     evaluation_anchor_data = eval_results.get("evaluation_anchor_data", [])
     if evaluation_anchor_data:
         import json
@@ -414,6 +419,18 @@ def main():
     logger.info(f"\n{'='*80}")
     logger.info("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
     logger.info("="*80)
+    # Check if best model exists and use it instead of final checkpoint
+    best_model_path = os.path.join(checkpoint_path, "best_model", "best_checkpoint.pt")
+    if os.path.exists(best_model_path):
+        logger.info(f"\n✓ Found best model checkpoint: {best_model_path}")
+        logger.info(f"  Reloading experiment from best model for individual model extraction...")
+        try:
+            trainer.reload_experiment(best_model_path)
+            logger.info(f"  ✓ Reloaded from best model checkpoint")
+        except Exception as e:
+            logger.warning(f"  ⚠ Could not reload from best model: {e}")
+            logger.info(f"  Falling back to final checkpoint")
+    
     try:
         saved_models = trainer.extract_and_save_individual_models(
             save_policies=True,
@@ -440,10 +457,13 @@ def main():
         logger.info(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")
         logger.info(f"\nOr to re-run evaluation only, use:")
         logger.info(f"  python driver.py --load_checkpoint {checkpoint_path} --dataset {args.dataset} --algorithm {args.algorithm}")
+        logger.info(f"\n To extract rules, run:")
+        logger.info(f"  python test_extracted_rules.py --rules_file {checkpoint_path}/inference/extracted_rules.json --dataset {args.dataset}")
         logger.info(f"\nThis will:")
         logger.info(f"  1. Load the trained model from checkpoint")
         logger.info(f"  2. Run evaluation")
         logger.info(f"  3. Extract and save individual models")
+        logger.info(f"  4. Test the extracted rules using test_extracted_rules.py")
     else:
         logger.info(f"\nTo extract rules, run:")
         logger.info(f"  python inference.py --experiment_dir {checkpoint_path} --dataset {args.dataset}")

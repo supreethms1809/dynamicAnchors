@@ -406,19 +406,39 @@ class TabularDatasetLoader:
         hidden_size: int = 256,
         dropout_rate: float = 0.3,
         use_batch_norm: bool = True,
-        device: str = "cpu"
+        device: str = "cpu",
+        hidden_sizes: Optional[List[int]] = None
     ) -> torch.nn.Module:
         logger.info(f"\nCreating classifier: {classifier_type}")
         logger.info("="*80)
         
         if classifier_type.lower() == "dnn":
+            # Use dataset-specific architecture for larger datasets
+            if hidden_sizes is None:
+                # Determine architecture based on dataset size
+                n_train_samples = len(self.y_train) if hasattr(self, 'y_train') else 0
+                if n_train_samples > 10000:
+                    # Large datasets (housing, etc.): use larger network
+                    hidden_sizes = [512, 512, 256]
+                    logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger architecture")
+                elif n_train_samples > 5000:
+                    # Medium-large datasets: slightly larger
+                    hidden_sizes = [256, 256, 256, 128]
+                    logger.info(f"  Medium-large dataset detected ({n_train_samples} samples), using medium architecture")
+                else:
+                    # Small datasets: default architecture
+                    hidden_sizes = [256, 256, 128]
+                    logger.info(f"  Small dataset detected ({n_train_samples} samples), using default architecture")
+            
             classifier = SimpleClassifier(
                 input_dim=self.n_features,
                 num_classes=self.n_classes,
                 dropout_rate=dropout_rate,
-                use_batch_norm=use_batch_norm
+                use_batch_norm=use_batch_norm,
+                hidden_sizes=hidden_sizes
             ).to(device)
-            logger.info(f"  Architecture: Input({self.n_features}) -> 256 -> 256 -> 128 -> Output({self.n_classes})")
+            arch_str = " -> ".join([f"Input({self.n_features})"] + [str(s) for s in hidden_sizes] + [f"Output({self.n_classes})"])
+            logger.info(f"  Architecture: {arch_str}")
             logger.info(f"  Dropout: {dropout_rate}, BatchNorm: {use_batch_norm}")
         elif classifier_type.lower() == "random_forest":
             classifier = UnifiedClassifier(

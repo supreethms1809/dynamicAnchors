@@ -177,7 +177,7 @@ class AnchorEnv(ParallelEnv):
         self.box_history = {}
         self.coverage_floor_hits = {}
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 1000)
+        self.max_cycles = env_config.get("max_cycles", 500)
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
@@ -817,18 +817,32 @@ class AnchorEnv(ParallelEnv):
                 # Give a small negative reward for attempting invalid action
                 coverage_floor_penalty = -0.05  # Small penalty for violating coverage floor
             
+            # Add small survival bonus to prevent excessive penalty for longer episodes
+            # This encourages exploration while still rewarding early termination
+            survival_bonus = 0.01  # Small positive reward per step to offset penalties
+            
+            # Scale penalties based on progress: reduce penalties when making progress
+            progress_factor = 1.0
+            if precision_gain > 0 or coverage_gain > 0:
+                # Reduce penalties when making progress (encourage exploration)
+                progress_factor = 0.5
+            elif precision >= precision_threshold * 0.8:
+                # Reduce penalties when close to target
+                progress_factor = 0.7
+            
             # Local reward component (without shared reward)
             reward_local = (
                 self.alpha * precision_weight * precision_gain
                 + coverage_weight * coverage_gain_for_reward
                 + coverage_bonus
                 + target_class_bonus
-                - overlap_penalty
-                - drift_penalty
-                - anchor_drift_penalty
-                - js_penalty
-                - inter_class_overlap_penalty
-                - same_class_overlap_penalty
+                + survival_bonus  # Add survival bonus
+                - progress_factor * overlap_penalty  # Scale penalties
+                - progress_factor * drift_penalty
+                - progress_factor * anchor_drift_penalty
+                - progress_factor * js_penalty
+                - progress_factor * inter_class_overlap_penalty
+                - progress_factor * same_class_overlap_penalty
                 + coverage_floor_penalty
             )
             

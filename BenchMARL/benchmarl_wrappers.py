@@ -129,7 +129,7 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -137,6 +137,7 @@ class AnchorMetricsCallback(Callback):
         self.collect_anchor_data = collect_anchor_data
         self.save_frequency = save_frequency  # Save every N aggregated metrics
         self.save_during_training = save_during_training  # Whether to save periodically during training
+        self.save_best_model = save_best_model  # Whether to save best model based on evaluation
         self.training_metrics = []
         self.training_history = []
         self.evaluation_history = []
@@ -145,6 +146,9 @@ class AnchorMetricsCallback(Callback):
         # Store training episode details (bounds, precision, coverage per episode)
         self.training_episode_details = []  # List of episode details from training batches
         self.experiment_folder = None  # Will be set when experiment starts
+        # Track best model
+        self.best_eval_score = -float('inf')  # Track best evaluation score (precision + coverage)
+        self.best_model_path = None  # Path to best model checkpoint
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -582,11 +586,37 @@ class AnchorMetricsCallback(Callback):
             precision_key = [k for k in aggregated.keys() if "anchor_precision" in k and "mean" in k and "evaluation" in k]
             coverage_key = [k for k in aggregated.keys() if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
             if precision_key and coverage_key:
+                precision = aggregated[precision_key[0]]
+                coverage = aggregated[coverage_key[0]]
                 logger.info(
-                    f"Evaluation - Precision: {aggregated[precision_key[0]]:.4f}, "
-                    f"Coverage: {aggregated[coverage_key[0]]:.4f} "
+                    f"Evaluation - Precision: {precision:.4f}, "
+                    f"Coverage: {coverage:.4f} "
                     f"(n={n_episodes})"
                 )
+                
+                # Save best model based on combined score (precision + coverage)
+                # This encourages both high precision and good coverage
+                if self.save_best_model and self.experiment is not None:
+                    eval_score = precision + coverage  # Combined score
+                    if eval_score > self.best_eval_score:
+                        self.best_eval_score = eval_score
+                        try:
+                            # Save best model checkpoint
+                            best_model_dir = os.path.join(str(self.experiment.folder_name), "best_model")
+                            os.makedirs(best_model_dir, exist_ok=True)
+                            best_model_path = os.path.join(best_model_dir, "best_checkpoint.pt")
+                            
+                            # Save experiment state
+                            self.experiment.save(best_model_path)
+                            self.best_model_path = best_model_path
+                            
+                            logger.info(
+                                f"  ✓ New best model saved! (Score: {eval_score:.4f}, "
+                                f"Precision: {precision:.4f}, Coverage: {coverage:.4f})"
+                            )
+                            logger.info(f"    Best model path: {best_model_path}")
+                        except Exception as e:
+                            logger.warning(f"  ⚠ Could not save best model: {e}")
     
     def get_training_history(self) -> List[Dict[str, Any]]:
         return self.training_history.copy()

@@ -360,16 +360,16 @@ def extract_rules_single_agent(
     models = {}  # class -> model
     
     for target_class in target_classes:
-        # Try final model first
-        model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip")
+        # Try best model first (prefer best model over final model)
+        model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
         if not os.path.exists(model_path):
-            # Try best model
-            model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
+            # Fallback to final model if best model doesn't exist
+            model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip")
         
         if not os.path.exists(model_path):
-            logger.warning(f"Model for class {target_class} not found at {model_path}")
-            logger.warning(f"  Tried: final_model/class_{target_class}.zip")
+            logger.warning(f"Model for class {target_class} not found")
             logger.warning(f"  Tried: best_model/class_{target_class}/class_{target_class}.zip")
+            logger.warning(f"  Tried: final_model/class_{target_class}.zip")
             continue
         
         # Create environment for this class (needed for model loading)

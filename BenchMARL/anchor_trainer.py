@@ -108,6 +108,24 @@ class AnchorTrainer:
         self.model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
         self.critic_model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
         
+        # Adjust network sizes based on dataset size for larger datasets
+        n_train_samples = len(self.dataset_loader.y_train) if hasattr(self.dataset_loader, 'y_train') and self.dataset_loader.y_train is not None else 0
+        if n_train_samples > 10000:
+            # Large datasets (housing, etc.): use larger policy network
+            new_num_cells = [512, 512]
+            logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger policy network: {new_num_cells}")
+            # Update model configs
+            self.model_config.num_cells = new_num_cells
+            self.critic_model_config.num_cells = new_num_cells
+        elif n_train_samples > 5000:
+            # Medium-large datasets: slightly larger
+            new_num_cells = [256, 256, 256]
+            logger.info(f"  Medium-large dataset detected ({n_train_samples} samples), using medium policy network: {new_num_cells}")
+            self.model_config.num_cells = new_num_cells
+            self.critic_model_config.num_cells = new_num_cells
+        else:
+            logger.info(f"  Small dataset detected ({n_train_samples} samples), using default policy network: {self.model_config.num_cells}")
+        
         # Get the anchor environment data.
         env_data = self.dataset_loader.get_anchor_env_data()
         
