@@ -1214,15 +1214,16 @@ def extract_rules_from_policies(
             env = AnchorEnv(**single_agent_config)
             
             # Get the actual agent name from the environment
-            # We need to reset once to initialize agents, but the function will reset again for the rollout
-            env.reset(seed=rollout_seed)
+            # Use possible_agents if available (set during __init__), otherwise fallback
+            # Don't reset here - run_rollout_with_policy will reset with the proper seed
             if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
                 actual_agent_name = env.possible_agents[0]
             elif hasattr(env, 'agents') and len(env.agents) > 0:
                 actual_agent_name = env.agents[0]
             else:
-                # Fallback to agent_name
-                actual_agent_name = agent_name
+                # Fallback: try to get from target_class
+                actual_agent_name = f"agent_{target_class}"
+                logger.warning(f"  ⚠ Could not determine agent name from environment, using {actual_agent_name}")
             
             # Run rollout with raw PettingZoo environment
             episode_data = run_rollout_with_policy(
@@ -1265,6 +1266,14 @@ def extract_rules_from_policies(
                 # Class-level metrics
                 class_precision = episode_data.get("class_precision", 0.0)
                 class_coverage = episode_data.get("class_coverage", 0.0)
+                
+                # Diagnostic: Log if metrics are zero (might indicate a problem)
+                if instance_idx < 3 and (instance_precision == 0.0 or instance_coverage == 0.0):
+                    logger.warning(
+                        f"  ⚠ Episode {instance_idx} for class {target_class} has zero metrics: "
+                        f"precision={instance_precision:.4f}, coverage={instance_coverage:.4f}. "
+                        f"This might indicate the policy didn't find any valid boxes or the environment isn't set up correctly."
+                    )
                 
                 instance_precisions.append(float(instance_precision))
                 instance_coverages.append(float(instance_coverage))
@@ -1471,12 +1480,39 @@ def main():
         help="Path to BenchMARL experiment directory (contains individual_models/)"
     )
     
+    # Build dataset choices dynamically
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    
+    # Add UCIML datasets if available
+    try:
+        from ucimlrepo import fetch_ucirepo
+        dataset_choices.extend([
+            "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+        ])
+    except ImportError:
+        pass
+    
+    # Add Folktables datasets if available
+    try:
+        from folktables import ACSDataSource
+        # Add common Folktables combinations
+        states = ["CA", "NY", "TX", "FL", "IL"]
+        years = ["2018", "2019", "2020"]
+        tasks = ["income", "coverage", "mobility", "employment", "travel"]
+        for task in tasks:
+            for state in states[:2]:  # Limit to first 2 states to avoid too many choices
+                for year in years[:1]:  # Limit to first year
+                    dataset_choices.append(f"folktables_{task}_{state}_{year}")
+    except ImportError:
+        pass
+    
     parser.add_argument(
         "--dataset",
         type=str,
         default="breast_cancer",
-        choices=["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"],
-        help="Dataset name (must match training)"
+        choices=dataset_choices,
+        help="Dataset name (must match training). For UCIML: uci_<name_or_id>. For Folktables: folktables_<task>_<state>_<year>"
     )
     
     parser.add_argument(

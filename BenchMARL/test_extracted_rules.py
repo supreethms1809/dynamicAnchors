@@ -1026,11 +1026,39 @@ Examples:
         help="Path to extracted_rules.json file"
     )
     
+    # Build dataset choices dynamically
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    
+    # Add UCIML datasets if available
+    try:
+        from ucimlrepo import fetch_ucirepo
+        dataset_choices.extend([
+            "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+        ])
+    except ImportError:
+        pass
+    
+    # Add Folktables datasets if available
+    try:
+        from folktables import ACSDataSource
+        # Add common Folktables combinations
+        states = ["CA", "NY", "TX", "FL", "IL"]
+        years = ["2018", "2019", "2020"]
+        tasks = ["income", "coverage", "mobility", "employment", "travel"]
+        for task in tasks:
+            for state in states[:2]:  # Limit to first 2 states to avoid too many choices
+                for year in years[:1]:  # Limit to first year
+                    dataset_choices.append(f"folktables_{task}_{state}_{year}")
+    except ImportError:
+        pass
+    
     parser.add_argument(
         "--dataset",
         type=str,
         required=True,
-        help="Dataset name (e.g., breast_cancer, wine, iris)"
+        choices=dataset_choices,
+        help="Dataset name. For UCIML: uci_<name_or_id>. For Folktables: folktables_<task>_<state>_<year>"
     )
     
     parser.add_argument(
