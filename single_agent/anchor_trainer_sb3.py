@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Import Stable-Baselines3
 try:
+    import wandb
+    from wandb.integration.sb3 import WandbCallback
     from stable_baselines3 import DDPG, SAC
     from stable_baselines3.common.noise import NormalActionNoise
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
@@ -124,7 +126,7 @@ class AnchorTrainerSB3:
             "learning_rate": 5e-5,
             "buffer_size": 1_000_000,
             "learning_starts": 1000,
-            "batch_size": 256,
+            "batch_size": 512,
             "tau": 0.005,
             "gamma": 0.99,
             "train_freq": (1, "step"),
@@ -148,7 +150,7 @@ class AnchorTrainerSB3:
         self,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 1000,
+        max_cycles: int = 500,
         device: str = "cpu",
         eval_on_test_data: bool = True
     ):
@@ -395,6 +397,16 @@ class AnchorTrainerSB3:
         logger.info(f"Total timesteps: {total_timesteps}")
         logger.info(f"Timesteps per class: {timesteps_per_class}")
         logger.info(f"Algorithm: {self.algorithm.upper()}\n")
+
+        wandb.init(project="single-agent-anchor-rl", name=f"single-agent-anchor-rl_{self.dataset_loader.dataset_name}", 
+        config=self.algorithm_config, sync_tensorboard=True)
+        wandb.config.update({
+            "total_timesteps": total_timesteps,
+            "timesteps_per_class": timesteps_per_class,
+            "algorithm": self.algorithm,
+            "learning_rate": self.algorithm_config["learning_rate"],
+            "buffer_size": self.algorithm_config["buffer_size"],
+        })
         
         # Train each model separately
         for target_class in self.target_classes:
@@ -432,11 +444,11 @@ class AnchorTrainerSB3:
                     render=False
                 )
                 callbacks.append(eval_callback)
-            
+
             # Train this model
             model.learn(
                 total_timesteps=timesteps_per_class,
-                callback=callbacks if callbacks else None,
+                callback=[WandbCallback(gradient_save_freq=100)] + callbacks if callbacks else None,
                 log_interval=self.experiment_config.get("log_interval", 10),
                 progress_bar=True
             )
@@ -506,7 +518,7 @@ class AnchorTrainerSB3:
         experiment_dir: str,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 1000,
+        max_cycles: int = 500,
         device: str = "cpu",
         eval_on_test_data: bool = True
     ):

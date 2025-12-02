@@ -81,7 +81,7 @@ class AnchorTrainer:
         self,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 1000,
+        max_cycles: int = 500,
         device: str = "cpu",
         eval_on_test_data: bool = True
     ) -> Experiment:
@@ -1389,7 +1389,7 @@ class AnchorTrainer:
             try:
                 return self.extract_rules(
                     max_features_in_rule=max_features_in_rule,
-                    steps_per_episode=1000,  # Default steps
+                    steps_per_episode=500,  # Default steps
                     n_instances_per_class=20,  # Default instances
                     eval_on_test_data=eval_on_test_data
                 )
@@ -1676,7 +1676,7 @@ class AnchorTrainer:
     def extract_rules(
         self,
         max_features_in_rule: Optional[int] = -1,
-        steps_per_episode: int = 1000,
+        steps_per_episode: int = 500,
         n_instances_per_class: int = 20,
         eval_on_test_data: bool = False
     ) -> Dict[str, Any]:

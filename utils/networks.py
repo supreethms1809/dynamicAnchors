@@ -10,6 +10,53 @@ import numpy as np
 from typing import Union, Optional
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
+class bigClassifier(nn.Module):
+    """Big neural network classifier for tabular data."""
+    
+    def __init__(self, input_dim: int, num_classes: int, dropout_rate: float = 0.3, use_batch_norm: bool = True):
+        super().__init__()
+        self.num_classes = num_classes
+        
+        layers = []
+        layers.append(nn.Linear(input_dim, 256))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(256))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate))
+        
+        layers.append(nn.Linear(256, 256))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(256))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate))
+        
+        layers.append(nn.Linear(256, 128))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(128))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate * 0.5))
+
+        layers.append(nn.Linear(128, 64))
+        if use_batch_norm:
+            layers.append(nn.BatchNorm1d(64))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout_rate * 0.5))
+        
+        layers.append(nn.Linear(64, num_classes))
+        
+        self.net = nn.Sequential(*layers)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the network.
+        
+        Args:
+            x: Input tensor of shape (batch_size, input_dim)
+        
+        Returns:
+            Output logits of shape (batch_size, num_classes)
+        """
+        return self.net(x)
 
 class SimpleClassifier(nn.Module):
     """Simple neural network classifier for tabular data."""

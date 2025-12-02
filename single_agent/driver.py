@@ -147,7 +147,7 @@ def main():
     parser.add_argument(
         "--max_cycles",
         type=int,
-        default=1000,
+        default=500,
         help="Maximum cycles per episode"
     )
     
@@ -170,7 +170,7 @@ def main():
     parser.add_argument(
         "--total_timesteps",
         type=int,
-        default=72_000,
+        default=144_000,
         help="Total training timesteps"
     )
     
@@ -277,7 +277,7 @@ def main():
         "learning_rate": args.learning_rate,
         "buffer_size": 1_000_000,
         "learning_starts": 1000,
-        "batch_size": 256,
+        "batch_size": 512,
         "tau": 0.005,
         "gamma": 0.99,
         "train_freq": (1, "step"),

@@ -232,3 +232,4 @@ BenchMARL/old_*
 single_agent/old_*
 comparison_results/*
 .DS_Store
+wandb/*

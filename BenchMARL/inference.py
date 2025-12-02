@@ -580,7 +580,7 @@ def extract_rules_from_policies(
     dataset_name: str,
     mlp_config_path: str = "conf/mlp.yaml",
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 1000,
+    steps_per_episode: int = 500,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,  # Always use test data for inference by default
     output_dir: Optional[str] = None,
@@ -1553,7 +1553,7 @@ def main():
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=1000,
+        default=500,
         help="Maximum steps per rollout episode"
     )
     

@@ -305,7 +305,7 @@ def run_single_agent_inference(
     experiment_dir: str,
     dataset: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 1000,
+    steps_per_episode: int = 500,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -568,7 +568,7 @@ def run_multi_agent_inference(
     experiment_dir: str,
     dataset: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 1000,
+    steps_per_episode: int = 500,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -960,7 +960,7 @@ Examples:
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=1000,
+        default=500,
         help="Steps per episode"
     )
     

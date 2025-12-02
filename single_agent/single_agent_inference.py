@@ -119,7 +119,7 @@ def extract_rules_single_agent(
     experiment_dir: str,
     dataset_name: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 1000,
+    steps_per_episode: int = 500,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
     output_dir: Optional[str] = None,
@@ -895,7 +895,7 @@ def main():
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=1000,
+        default=500,
         help="Maximum steps per rollout episode"
     )
     

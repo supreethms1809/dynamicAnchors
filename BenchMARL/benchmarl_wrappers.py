@@ -34,7 +34,7 @@ class AnchorTaskClass(TaskClass):
         
         # SS: Track where this max_cycles is set. The reading from yaml is not getting passed to the environment.
         # Below code needs fixing.
-        max_cycles = config.get("max_cycles", 1000)
+        max_cycles = config.get("max_cycles", 500)
 
         env_config = {k: v for k, v in config.items() if k != "max_cycles"}
         
@@ -78,7 +78,7 @@ class AnchorTaskClass(TaskClass):
         return False
     
     def max_steps(self, env: EnvBase) -> int:
-        return self.config.get("max_cycles", 1000)
+        return self.config.get("max_cycles", 500)
     
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
         return env.group_map

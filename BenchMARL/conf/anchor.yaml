@@ -52,5 +52,5 @@ env_config:
   fixed_instances_per_class: null
 
 # Maximum number of steps per episode
-max_cycles: 1000
+max_cycles: 500
 

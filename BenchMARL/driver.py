@@ -171,7 +171,7 @@ def main():
     parser.add_argument(
         "--max_cycles",
         type=int,
-        default=1000,
+        default=500,
         help="Maximum cycles per episode"
     )
     
