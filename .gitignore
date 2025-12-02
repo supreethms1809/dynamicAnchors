@@ -228,3 +228,7 @@ BenchMARL/covtype*
 BenchMARL/housing*
 BenchMARL/breast_cancer*
 single_agent/output/*
+BenchMARL/old_*
+single_agent/old_*
+comparison_results/*
+.DS_Store

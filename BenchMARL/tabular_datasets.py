@@ -551,9 +551,12 @@ class TabularDatasetLoader:
                       f"Test Acc: {test_acc:.4f} | LR: {current_lr:.2e} | "
                       f"Best: {best_test_acc:.4f}")
             
-            if patience_counter >= patience and epoch >= 50:
+            # Early stopping: require at least 10% of max epochs before stopping
+            # This ensures we don't stop too early, especially for complex datasets
+            min_epochs_before_stop = max(50, int(epochs * 0.1))
+            if patience_counter >= patience and epoch >= min_epochs_before_stop:
                 if verbose:
-                    logger.info(f"Early stopping at epoch {epoch}")
+                    logger.info(f"Early stopping at epoch {epoch} (patience: {patience}, min epochs: {min_epochs_before_stop})")
                 break
         
         if best_model_state is not None:

@@ -100,8 +100,8 @@ def main():
     parser.add_argument(
         "--classifier_epochs",
         type=int,
-        default=100,
-        help="Number of epochs to train classifier"
+        default=500,
+        help="Number of epochs to train classifier (default: 500 for better convergence)"
     )
     
     parser.add_argument(
@@ -227,12 +227,23 @@ def main():
             device=args.device
         )
         
+        # Use dataset-specific patience: higher for complex datasets like housing
+        # Housing dataset needs more patience to reach good accuracy
+        dataset_patience = {
+            "housing": 100,
+            "breast_cancer": 50,
+            "wine": 50,
+            "iris": 30,
+        }.get(args.dataset.lower(), 50)  # Default: 50
+        
         trained_classifier, test_acc, history = dataset_loader.train_classifier(
             classifier,
             epochs=args.classifier_epochs,
             batch_size=256,
             lr=1e-3,
-            patience=10,
+            patience=dataset_patience,
+            weight_decay=1e-4,
+            use_lr_scheduler=True,
             device=args.device
         )
         

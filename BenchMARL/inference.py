@@ -1003,15 +1003,17 @@ def extract_rules_from_policies(
         from trainers.vecEnv import compute_cluster_centroids_per_class
         
         # Use agents_per_class for k-means if available (matches training setup)
-        # Otherwise, use n_instances_per_class to ensure each episode starts from a unique centroid
+        # Otherwise, use 10 centroids per class (matching single-agent behavior and training)
         if agents_per_class > 1:
-            n_clusters_per_class = agents_per_class
-            logger.info(f"  Using agents_per_class={agents_per_class} for k-means clustering (matches training)")
+            # Use 10 centroids per agent for diversity (matches training setup)
+            n_clusters_per_class = agents_per_class * 10
+            logger.info(f"  Using {n_clusters_per_class} clusters per class ({n_clusters_per_class // agents_per_class} per agent) for k-means clustering (matches training)")
         else:
-            # For single agent per class, use n_instances_per_class to ensure diverse starting points
-            # This ensures each episode can start from a different cluster centroid
-            n_clusters_per_class = n_instances_per_class
-            logger.info(f"  Using {n_clusters_per_class} clusters per class (one per instance) for maximum diversity")
+            # For single agent per class, use 10 centroids per class for diversity
+            # This matches the training setup and single-agent behavior
+            # Cap at n_instances_per_class if it's smaller (for very small datasets)
+            n_clusters_per_class = min(10, n_instances_per_class)
+            logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity (matching training and single-agent behavior)")
         
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
             X_unit=env_data["X_unit"],

@@ -145,57 +145,66 @@ class AnchorTrainer:
             logger.info(f"  Evaluation configured to use TRAINING data")
         
         # Compute k-means centroids for multiple agents per class
-        # When agents_per_class > 1, compute k-means with k=agents_per_class for each class
-        # This ensures each agent gets a different initial anchor point
+        # Compute k-means centroids for diversity across episodes
+        # This ensures each episode can start from a different cluster centroid
+        # For agents_per_class > 1: use agents_per_class * 10 centroids (10 per agent for diversity)
+        # For agents_per_class == 1: use 10 centroids per class (for diversity, matching single-agent behavior)
         agents_per_class = env_config.get("agents_per_class", 1)
+        
+        # Determine number of centroids to compute
         if agents_per_class > 1:
-            logger.info(f"\nComputing k-means centroids (k={agents_per_class}) for each class...")
-            try:
-                from trainers.vecEnv import compute_cluster_centroids_per_class
-                
-                # Always compute centroids on training data for initial anchor points
-                # (eval_on_test_data only affects which data is used for evaluation metrics)
-                X_data = env_data["X_unit"]
-                y_data = env_data["y"]
-                
-                cluster_centroids_per_class = compute_cluster_centroids_per_class(
-                    X_unit=X_data,
-                    y=y_data,
-                    n_clusters_per_class=agents_per_class,  # k = agents_per_class
-                    random_state=self.seed if hasattr(self, 'seed') else 42,
-                    min_samples_per_cluster=1
-                )
-                
-                # Verify we have enough centroids for each class
-                for cls in target_classes:
-                    if cls in cluster_centroids_per_class:
-                        n_centroids = len(cluster_centroids_per_class[cls])
-                        if n_centroids < agents_per_class:
-                            logger.warning(
-                                f"  ⚠ Class {cls}: Only {n_centroids} centroids computed "
-                                f"(requested {agents_per_class}). "
-                                f"May not have enough samples for k-means."
-                            )
-                        else:
-                            logger.info(f"  ✓ Class {cls}: {n_centroids} centroids computed")
-                    else:
-                        logger.warning(f"  ⚠ Class {cls}: No centroids computed")
-                
-                # Set cluster centroids in env_config
-                env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
-                logger.info("  ✓ Cluster centroids set in environment config")
-            except ImportError as e:
-                logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
-                logger.warning(f"  Install sklearn: pip install scikit-learn")
-                logger.warning(f"  Falling back to mean centroid per class (all agents will start from same point)")
-                env_config_with_data["cluster_centroids_per_class"] = None
-            except Exception as e:
-                logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
-                logger.warning(f"  Falling back to mean centroid per class (all agents will start from same point)")
-                env_config_with_data["cluster_centroids_per_class"] = None
+            # Use 10 centroids per agent for diversity (each agent can sample from multiple centroids)
+            n_clusters_per_class = agents_per_class * 10
+            logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class...")
+            logger.info(f"  Note: agents_per_class={agents_per_class}, using {n_clusters_per_class} centroids ({n_clusters_per_class // agents_per_class} per agent) for episode diversity")
         else:
-            # For agents_per_class == 1, we don't need k-means (single centroid per class)
-            logger.info(f"  agents_per_class={agents_per_class}, using mean centroid per class")
+            # For single agent per class, use 10 centroids for diversity (matching single-agent behavior)
+            n_clusters_per_class = 10
+            logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class for diversity...")
+            logger.info(f"  Note: agents_per_class={agents_per_class}, using {n_clusters_per_class} centroids for episode diversity")
+        
+        try:
+            from trainers.vecEnv import compute_cluster_centroids_per_class
+            
+            # Always compute centroids on training data for initial anchor points
+            # (eval_on_test_data only affects which data is used for evaluation metrics)
+            X_data = env_data["X_unit"]
+            y_data = env_data["y"]
+            
+            cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                X_unit=X_data,
+                y=y_data,
+                n_clusters_per_class=n_clusters_per_class,
+                random_state=self.seed if hasattr(self, 'seed') else 42,
+                min_samples_per_cluster=1
+            )
+            
+            # Verify we have enough centroids for each class
+            for cls in target_classes:
+                if cls in cluster_centroids_per_class:
+                    n_centroids = len(cluster_centroids_per_class[cls])
+                    if n_centroids < n_clusters_per_class:
+                        logger.warning(
+                            f"  ⚠ Class {cls}: Only {n_centroids} centroids computed "
+                            f"(requested {n_clusters_per_class}). "
+                            f"May not have enough samples for k-means."
+                        )
+                    else:
+                        logger.info(f"  ✓ Class {cls}: {n_centroids} centroids computed")
+                else:
+                    logger.warning(f"  ⚠ Class {cls}: No centroids computed")
+            
+            # Set cluster centroids in env_config
+            env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
+            logger.info("  ✓ Cluster centroids set in environment config")
+        except ImportError as e:
+            logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+            logger.warning(f"  Install sklearn: pip install scikit-learn")
+            logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
+            env_config_with_data["cluster_centroids_per_class"] = None
+        except Exception as e:
+            logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+            logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
             env_config_with_data["cluster_centroids_per_class"] = None
         
         # Create the anchor configuration.

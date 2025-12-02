@@ -263,22 +263,9 @@ class AnchorEnv(ParallelEnv):
             if target_class in self.cluster_centroids_per_class:
                 centroids = self.cluster_centroids_per_class[target_class]
                 if len(centroids) > 0:
-                    # If multiple agents per class, assign specific centroid based on agent index
-                    # agent_0_0 -> centroid[0], agent_0_1 -> centroid[1], etc.
-                    if self.agents_per_class > 1:
-                        # Extract agent index from name (e.g., "agent_0_1" -> 1)
-                        try:
-                            parts = agent.split("_")
-                            if len(parts) >= 3 and parts[2].isdigit():
-                                agent_idx = int(parts[2])
-                                # Use modulo to handle cases where we have more agents than centroids
-                                centroid_idx = agent_idx % len(centroids)
-                                return np.array(centroids[centroid_idx], dtype=np.float32)
-                        except (ValueError, IndexError):
-                            # Fallback to random if parsing fails
-                            pass
-                    
-                    # For agents_per_class == 1 or if parsing failed, sample a random centroid
+                    # Always sample randomly from available centroids for diversity across episodes
+                    # This ensures each agent can explore from different starting points
+                    # even when agents_per_class > 1
                     centroid_idx = self.rng.integers(0, len(centroids))
                     return np.array(centroids[centroid_idx], dtype=np.float32)
         
@@ -1504,11 +1491,23 @@ class AnchorEnv(ParallelEnv):
             tightened = np.array([], dtype=int)
         else:
             # Relative thresholds (work in any scale)
-            tightened = np.where(current_width < initial_width_ref * 0.98)[0]
+            # More lenient thresholds for multi-agent: start with 0.97 (3% reduction) instead of 0.98
+            tightened = np.where(current_width < initial_width_ref * 0.97)[0]
+            if tightened.size == 0:
+                tightened = np.where(current_width < initial_width_ref * 0.98)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.99)[0]
             
             # Absolute thresholds (need to be scale-aware)
+            if tightened.size == 0:
+                if denormalize and self.X_range is not None:
+                    # In denormalized space, use 0.96 * feature range as threshold
+                    threshold_96 = 0.96 * self.X_range
+                    tightened = np.where(current_width < threshold_96)[0]
+                else:
+                    # In normalized space, use 0.96 directly
+                    tightened = np.where(current_width < 0.96)[0]
+            
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
                     # In denormalized space, use 0.95 * feature range as threshold
