@@ -1216,13 +1216,32 @@ def extract_rules_from_policies(
             # Get the actual agent name from the environment
             # Use possible_agents if available (set during __init__), otherwise fallback
             # Don't reset here - run_rollout_with_policy will reset with the proper seed
+            actual_agent_name = None
+            
+            # First, try to use the agent_name from the outer loop if it exists in the environment
+            # This is important when agents_per_class > 1 (e.g., agent_0_0, agent_0_1, etc.)
             if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
-                actual_agent_name = env.possible_agents[0]
+                if agent_name in env.possible_agents:
+                    actual_agent_name = agent_name
+                else:
+                    # Fallback to first agent if the specific agent_name doesn't exist
+                    actual_agent_name = env.possible_agents[0]
             elif hasattr(env, 'agents') and len(env.agents) > 0:
-                actual_agent_name = env.agents[0]
-            else:
-                # Fallback: try to get from target_class
-                actual_agent_name = f"agent_{target_class}"
+                if agent_name in env.agents:
+                    actual_agent_name = agent_name
+                else:
+                    actual_agent_name = env.agents[0]
+            
+            # Final fallback: construct agent name based on agents_per_class
+            if actual_agent_name is None:
+                # If we have agent_name from outer loop, use it (environment should match)
+                if agent_name:
+                    actual_agent_name = agent_name
+                elif agents_per_class == 1:
+                    actual_agent_name = f"agent_{target_class}"
+                else:
+                    # For agents_per_class > 1, default to first agent pattern
+                    actual_agent_name = f"agent_{target_class}_0"
                 logger.warning(f"  ⚠ Could not determine agent name from environment, using {actual_agent_name}")
             
             # Run rollout with raw PettingZoo environment
