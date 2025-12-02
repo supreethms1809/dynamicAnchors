@@ -327,7 +327,7 @@ class AnchorTrainerSB3:
     
     def _create_models(self, device: str = "cpu"):
         """Create one SB3 model per class."""
-        from trainers.device_utils import get_device_str
+        from utils.device_utils import get_device_str
         device_str = get_device_str(device) if device != "auto" else "auto"
         
         for target_class in self.target_classes:

@@ -9,7 +9,7 @@ from gymnasium import spaces
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from trainers.device_utils import get_device
+from utils.device_utils import get_device
 import logging
 logger = logging.getLogger(__name__)
 

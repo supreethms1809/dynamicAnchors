@@ -1000,7 +1000,7 @@ def extract_rules_from_policies(
     # (similar to training), rather than just the mean centroid
     logger.info("\nComputing cluster centroids per class for class-level inference...")
     try:
-        from trainers.vecEnv import compute_cluster_centroids_per_class
+        from utils.clusters import compute_cluster_centroids_per_class
         
         # Use agents_per_class for k-means if available (matches training setup)
         # Otherwise, use 10 centroids per class (matching single-agent behavior and training)

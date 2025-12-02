@@ -38,7 +38,7 @@ import sys
 import logging
 logger = logging.getLogger(__name__)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from trainers.networks import SimpleClassifier, UnifiedClassifier
+from utils.networks import SimpleClassifier, UnifiedClassifier
 
 
 class TabularDatasetLoader:

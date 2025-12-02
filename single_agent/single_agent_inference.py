@@ -322,7 +322,7 @@ def extract_rules_single_agent(
     # (similar to training), rather than just the mean centroid
     logger.info("\nComputing cluster centroids per class for diversity...")
     try:
-        from trainers.vecEnv import compute_cluster_centroids_per_class
+        from utils.clusters import compute_cluster_centroids_per_class
         
         # Use multiple clusters for diversity across episodes
         # Use at least one cluster per instance, but cap at 10 for efficiency

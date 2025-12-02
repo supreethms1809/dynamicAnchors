@@ -164,7 +164,7 @@ class AnchorTrainer:
             logger.info(f"  Note: agents_per_class={agents_per_class}, using {n_clusters_per_class} centroids for episode diversity")
         
         try:
-            from trainers.vecEnv import compute_cluster_centroids_per_class
+            from utils.clusters import compute_cluster_centroids_per_class
             
             # Always compute centroids on training data for initial anchor points
             # (eval_on_test_data only affects which data is used for evaluation metrics)

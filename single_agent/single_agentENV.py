@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Any, List
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from trainers.device_utils import get_device
+from utils.device_utils import get_device
 import logging
 logger = logging.getLogger(__name__)
 
@@ -1020,11 +1020,11 @@ def main():
     X_unit = np.clip(X_unit, 0.0, 1.0).astype(np.float32)
     
     try:
-        from trainers.networks import SimpleClassifier
+        from utils.networks import SimpleClassifier
         classifier = SimpleClassifier(input_dim=n_features, num_classes=n_classes, dropout_rate=0.3, use_batch_norm=True)
     except (ImportError, TypeError):
         try:
-            from trainers.multiagent_networks import SimpleClassifier
+            from utils.multiagent_networks import SimpleClassifier
             classifier = SimpleClassifier(input_size=n_features, hidden_size=128, output_size=n_classes)
         except ImportError:
             class TestClassifier(torch.nn.Module):

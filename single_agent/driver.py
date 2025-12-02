@@ -230,10 +230,10 @@ def main():
         # Use dataset-specific patience: higher for complex datasets like housing
         # Housing dataset needs more patience to reach good accuracy
         dataset_patience = {
-            "housing": 100,
-            "breast_cancer": 50,
-            "wine": 50,
-            "iris": 30,
+            "housing": 200,
+            "breast_cancer": 100,
+            "wine": 100,
+            "iris": 50,
         }.get(args.dataset.lower(), 50)  # Default: 50
         
         trained_classifier, test_acc, history = dataset_loader.train_classifier(
