@@ -73,7 +73,7 @@ class AnchorTrainer:
         self.model_config = None
         self.critic_model_config = None
         self.task = None
-        self._anchor_env_config = None  # Cache for loaded env_config from YAML
+        self._anchor_env_config = None
         
         os.makedirs(self.output_dir, exist_ok=True)
     
@@ -166,17 +166,17 @@ class AnchorTrainer:
         # Compute k-means centroids for diversity across episodes
         # This ensures each episode can start from a different cluster centroid
         # For agents_per_class > 1: use agents_per_class * 10 centroids (10 per agent for diversity)
-        # For agents_per_class == 1: use 10 centroids per class (for diversity, matching single-agent behavior)
+        # For agents_per_class == 1: use 10 centroids per class
         agents_per_class = env_config.get("agents_per_class", 1)
         
         # Determine number of centroids to compute
         if agents_per_class > 1:
-            # Use 10 centroids per agent for diversity (each agent can sample from multiple centroids)
+            # Use 10 centroids per agent for diversity
             n_clusters_per_class = agents_per_class * 10
             logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class...")
             logger.info(f"  Note: agents_per_class={agents_per_class}, using {n_clusters_per_class} centroids ({n_clusters_per_class // agents_per_class} per agent) for episode diversity")
         else:
-            # For single agent per class, use 10 centroids for diversity (matching single-agent behavior)
+            # For single agent per class, use 10 centroids for diversity
             n_clusters_per_class = 10
             logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class for diversity...")
             logger.info(f"  Note: agents_per_class={agents_per_class}, using {n_clusters_per_class} centroids for episode diversity")
@@ -184,8 +184,7 @@ class AnchorTrainer:
         try:
             from utils.clusters import compute_cluster_centroids_per_class
             
-            # Always compute centroids on training data for initial anchor points
-            # (eval_on_test_data only affects which data is used for evaluation metrics)
+            # Always compute centroids on training data
             X_data = env_data["X_unit"]
             y_data = env_data["y"]
             
@@ -310,7 +309,10 @@ class AnchorTrainer:
                     logger.warning(f"   Warning: Could not save callback data: {e}")
         
         return self.experiment
-    
+    ######## This is what we need for traning ########
+
+    # SS: Post training evaluation is optional. wanted confirmation of training. 
+    # Code is nasty and needs to be cleaned up.
     def evaluate(
         self,
         n_eval_episodes: Optional[int] = None,
@@ -937,6 +939,7 @@ class AnchorTrainer:
         
         return experiment_folder
     
+    # This is needed for easier inference. Inference with BenchMARL is complicated and couldn't get it to work
     def extract_and_save_individual_models(
         self,
         output_dir: Optional[str] = None,
@@ -2083,7 +2086,7 @@ class AnchorTrainer:
         
         return results
     
-    # SS: This method is needed for the metrics and I forgot if i am using it in the reward function.
+    # SS: This method is needed for the metrics and older implemenatation
     def _check_class_overlaps(
         self, 
         target_class: int, 
@@ -2180,7 +2183,7 @@ class AnchorTrainer:
             return int(obj)
         elif isinstance(obj, np.floating):
             return float(obj)
-        elif isinstance(obj, (float, np.float64, np.float32)):  # Handle NumPy 2.0 compatibility
+        elif isinstance(obj, (float, np.float64, np.float32)):
             return float(obj)
         elif isinstance(obj, np.bool_):
             return bool(obj)
@@ -2258,12 +2261,11 @@ class AnchorTrainer:
             "max_action_scale": 0.1,
             "min_absolute_step": 0.001,
             "inter_class_overlap_weight": 0.1,
-            "shared_reward_weight": 0.2,  # Weight for shared cooperative reward
-            "use_class_centroids": True,  # Use class centroids for initial window (default: True)
-            # Termination reason counters: disable overused reasons
-            "max_termination_count_excellent_precision": 500,  # Disable after 10 uses
-            "max_termination_count_both_targets": 500,         # Unlimited (default)
-            "max_termination_count_high_precision": 500,       # Unlimited (default)
-            "max_termination_count_both_close": 500,           # Unlimited (default)
+            "shared_reward_weight": 0.2,
+            "use_class_centroids": True,
+            "max_termination_count_excellent_precision": 500,
+            "max_termination_count_both_targets": 500,
+            "max_termination_count_high_precision": 500,
+            "max_termination_count_both_close": 500,
         }
 
