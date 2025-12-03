@@ -721,7 +721,7 @@ class TabularDatasetLoader:
                         }
             except Exception as e:
                 if verbose:
-                    logger.warning(f"  ⚠ Warning: Could not load existing EDA results: {e}")
+                    logger.warning(f"   Warning: Could not load existing EDA results: {e}")
                     logger.warning("  Continuing with fresh EDA generation...")
                 eda_already_done = False
         
@@ -740,7 +740,7 @@ class TabularDatasetLoader:
                     )
                 except ImportError:
                     if verbose:
-                        logger.warning("\n⚠ ydata-profiling not installed. Falling back to custom EDA.")
+                        logger.warning("\n ydata-profiling not installed. Falling back to custom EDA.")
                         logger.warning("  Install with: pip install ydata-profiling")
                     use_ydata_profiling = False
             
@@ -820,7 +820,7 @@ class TabularDatasetLoader:
         results["training_report_path"] = train_report_path
         
         if verbose:
-            logger.info(f"   ✓ Saved training data profile to {train_report_path}")
+            logger.info(f"    Saved training data profile to {train_report_path}")
         
         if verbose:
             logger.info("\n2. Generating test data profile...")
@@ -853,7 +853,7 @@ class TabularDatasetLoader:
         results["test_report_path"] = test_report_path
         
         if verbose:
-            logger.info(f"   ✓ Saved test data profile to {test_report_path}")
+            logger.info(f"    Saved test data profile to {test_report_path}")
         
         if verbose:
             logger.info("\n3. Extracting key metrics for XAI...")
@@ -1020,7 +1020,7 @@ class TabularDatasetLoader:
         results["summary_json_path"] = summary_path
         
         if verbose:
-            logger.info(f"   ✓ Saved summary to {summary_path}")
+            logger.info(f"    Saved summary to {summary_path}")
         
         return results
     
@@ -1198,10 +1198,10 @@ class TabularDatasetLoader:
             plt.savefig(f'{output_dir}correlation_heatmap.png', dpi=150, bbox_inches='tight')
             plt.close()
             if verbose:
-                logger.info(f"  ✓ Saved correlation heatmap to {output_dir}correlation_heatmap.png")
+                logger.info(f"   Saved correlation heatmap to {output_dir}correlation_heatmap.png")
         except Exception as e:
             if verbose:
-                logger.warning(f"  ⚠ Could not save correlation heatmap: {e}")
+                logger.warning(f"   Could not save correlation heatmap: {e}")
         
         return correlations
     
@@ -1322,6 +1322,6 @@ class TabularDatasetLoader:
                 for feat, pct in sorted(high_outlier_features, key=lambda x: x[1], reverse=True)[:5]:
                     logger.info(f"  {feat}: {pct:.1f}%")
             else:
-                logger.info("\n✓ No significant outliers detected (>5%)")
+                logger.info("\n No significant outliers detected (>5%)")
         
         return quality
