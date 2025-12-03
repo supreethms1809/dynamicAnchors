@@ -1,3 +1,6 @@
+"""
+This code was created by following the tutorial in the BenchMARL documentation.
+"""
 import copy
 from typing import Callable, Dict, List, Optional, Any
 import numpy as np
