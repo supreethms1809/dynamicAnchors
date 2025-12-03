@@ -170,14 +170,14 @@ def main():
     parser.add_argument(
         "--total_timesteps",
         type=int,
-        default=144_000,
+        default=288_000,
         help="Total training timesteps"
     )
     
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-5,
+        default=5e-4,
         help="Learning rate for the algorithm"
     )
     
@@ -277,7 +277,7 @@ def main():
     n_train_samples = len(dataset_loader.y_train) if hasattr(dataset_loader, 'y_train') else 0
     if n_train_samples > 10000:
         # Large datasets (housing, etc.): use larger policy network
-        policy_net_arch = [512, 512]
+        policy_net_arch = [512, 512, 256]
         logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger policy network: {policy_net_arch}")
     elif n_train_samples > 5000:
         # Medium-large datasets: slightly larger
@@ -292,7 +292,7 @@ def main():
         "learning_rate": args.learning_rate,
         "buffer_size": 1_000_000,
         "learning_starts": 1000,
-        "batch_size": 512,
+        "batch_size": 1024,
         "tau": 0.005,
         "gamma": 0.99,
         "train_freq": (1, "step"),

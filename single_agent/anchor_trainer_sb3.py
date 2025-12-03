@@ -249,7 +249,7 @@ class AnchorTrainerSB3:
         return {
             "precision_target": 0.8,
             "coverage_target": 0.02,
-            "use_perturbation": False,
+            "use_perturbation": True,
             "perturbation_mode": "adaptive",
             "n_perturb": 4096,
             "step_fracs": [0.005, 0.01, 0.02],
