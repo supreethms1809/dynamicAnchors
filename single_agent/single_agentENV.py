@@ -486,10 +486,10 @@ class SingleAgentAnchorEnv(Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         
-        # Reset termination counters for evaluation/inference modes
-        # This ensures fair evaluation without disabled termination reasons
-        if self.mode in ["evaluation", "inference"]:
-            self._reset_termination_counters()
+        # Note: Termination counters are NOT reset here to allow them to accumulate
+        # across episodes. They are initialized in __init__ and accumulate throughout
+        # the session. In inference/evaluation mode, counters start fresh from __init__,
+        # but accumulate across episodes to track usage and disable overused reasons.
         
         self.timestep = 0
         

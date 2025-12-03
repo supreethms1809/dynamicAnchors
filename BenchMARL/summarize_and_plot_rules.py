@@ -166,7 +166,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     return summary
 
 
-def plot_metrics_comparison(summary: Dict, output_dir: str):
+def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = ""):
     """Plot precision and coverage metrics comparison."""
     if not HAS_PLOTTING:
         return
@@ -186,12 +186,15 @@ def plot_metrics_comparison(summary: Dict, output_dir: str):
     x = np.arange(len(class_nums))
     width = 0.35
     
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
     # Instance-level: precision and coverage in one plot
     axes[0].bar(x - width/2, instance_prec, width, label='Precision', alpha=0.7, color='steelblue')
     axes[0].bar(x + width/2, instance_cov, width, label='Coverage', alpha=0.7, color='coral')
     axes[0].set_xlabel('Class', fontsize=12)
     axes[0].set_ylabel('Value', fontsize=12)
-    axes[0].set_title('Instance-Level: Precision and Coverage per Class', fontsize=14)
+    axes[0].set_title(f'{title_prefix}: Instance-Level Precision and Coverage per Class', fontsize=14)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(class_nums)
     axes[0].set_ylim([0, 1.1])
@@ -207,7 +210,7 @@ def plot_metrics_comparison(summary: Dict, output_dir: str):
     axes[1].bar(x + width/2, class_cov, width, label='Coverage', alpha=0.7, color='purple')
     axes[1].set_xlabel('Class', fontsize=12)
     axes[1].set_ylabel('Value', fontsize=12)
-    axes[1].set_title('Class-Level: Precision and Coverage per Class', fontsize=14)
+    axes[1].set_title(f'{title_prefix}: Class-Level Precision and Coverage per Class', fontsize=14)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(class_nums)
     axes[1].set_ylim([0, 1.1])
@@ -224,7 +227,7 @@ def plot_metrics_comparison(summary: Dict, output_dir: str):
     logger.info(f"Saved metrics comparison plot to {output_dir}/metrics_comparison.png")
 
 
-def plot_precision_vs_coverage(summary: Dict, output_dir: str):
+def plot_precision_vs_coverage(summary: Dict, output_dir: str, dataset_name: str = ""):
     """Plot precision vs coverage scatter plot."""
     if not HAS_PLOTTING:
         return
@@ -236,6 +239,9 @@ def plot_precision_vs_coverage(summary: Dict, output_dir: str):
     # Get colors for classes - sort by class number for consistent coloring
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     colors = plt.cm.tab10(np.linspace(0, 1, len(classes)))
+    
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
     # Instance-level
     for idx, class_key in enumerate(classes):
@@ -263,7 +269,7 @@ def plot_precision_vs_coverage(summary: Dict, output_dir: str):
     
     ax.set_xlabel('Coverage', fontsize=12)
     ax.set_ylabel('Precision', fontsize=12)
-    ax.set_title('Precision vs Coverage: Instance-Level and Class-Level', fontsize=14)
+    ax.set_title(f'{title_prefix}: Precision vs Coverage (Instance-Level and Class-Level)', fontsize=14)
     ax.set_xlim([-0.05, 1.05])
     ax.set_ylim([0.7, 1.05])
     ax.grid(True, alpha=0.3)
@@ -275,7 +281,7 @@ def plot_precision_vs_coverage(summary: Dict, output_dir: str):
     logger.info(f"Saved precision vs coverage plot to {output_dir}/precision_vs_coverage.png")
 
 
-def plot_rule_counts(summary: Dict, output_dir: str):
+def plot_rule_counts(summary: Dict, output_dir: str, dataset_name: str = ""):
     """Plot rule counts per class."""
     if not HAS_PLOTTING:
         return
@@ -290,13 +296,16 @@ def plot_rule_counts(summary: Dict, output_dir: str):
     x = np.arange(len(class_nums))
     width = 0.35
     
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
     fig, ax = plt.subplots(figsize=(10, 6))
     bars1 = ax.bar(x - width/2, unique_counts, width, label='Unique Rules', alpha=0.8, color='steelblue')
     bars2 = ax.bar(x + width/2, total_counts, width, label='Total Rules', alpha=0.8, color='coral')
     
     ax.set_xlabel('Class', fontsize=12)
     ax.set_ylabel('Number of Rules', fontsize=12)
-    ax.set_title('Rule Counts per Class', fontsize=14)
+    ax.set_title(f'{title_prefix}: Rule Counts per Class', fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels(class_nums)
     ax.legend()
@@ -316,7 +325,7 @@ def plot_rule_counts(summary: Dict, output_dir: str):
     logger.info(f"Saved rule counts plot to {output_dir}/rule_counts.png")
 
 
-def plot_feature_frequency(summary: Dict, output_dir: str, top_n: int = 15):
+def plot_feature_frequency(summary: Dict, output_dir: str, dataset_name: str = "", top_n: int = 15):
     """Plot most frequently used features in rules."""
     if not HAS_PLOTTING:
         return
@@ -333,6 +342,9 @@ def plot_feature_frequency(summary: Dict, output_dir: str, top_n: int = 15):
     if not features:
         return
     
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
     fig, ax = plt.subplots(figsize=(12, 8))
     y_pos = np.arange(len(features))
     
@@ -340,7 +352,7 @@ def plot_feature_frequency(summary: Dict, output_dir: str, top_n: int = 15):
     ax.set_yticks(y_pos)
     ax.set_yticklabels(features)
     ax.set_xlabel('Frequency (Number of Rules)', fontsize=12)
-    ax.set_title(f'Top {top_n} Most Frequently Used Features in Rules', fontsize=14)
+    ax.set_title(f'{title_prefix}: Top {top_n} Most Frequently Used Features in Rules', fontsize=14)
     ax.grid(True, alpha=0.3, axis='x')
     
     # Add value labels
@@ -353,7 +365,7 @@ def plot_feature_frequency(summary: Dict, output_dir: str, top_n: int = 15):
     logger.info(f"Saved feature frequency plot to {output_dir}/feature_frequency.png")
 
 
-def plot_test_results_overlap(test_results: Dict, output_dir: str):
+def plot_test_results_overlap(test_results: Dict, output_dir: str, dataset_name: str = ""):
     """Plot overlap analysis from test results."""
     if not HAS_PLOTTING:
         return
@@ -383,6 +395,9 @@ def plot_test_results_overlap(test_results: Dict, output_dir: str):
         overlap_matrix[idx1, idx2] = n_overlaps
         overlap_matrix[idx2, idx1] = n_overlaps
     
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
     fig, ax = plt.subplots(figsize=(10, 8))
     im = ax.imshow(overlap_matrix, cmap='YlOrRd', aspect='auto')
     
@@ -400,7 +415,7 @@ def plot_test_results_overlap(test_results: Dict, output_dir: str):
     
     ax.set_xlabel('Class', fontsize=12)
     ax.set_ylabel('Class', fontsize=12)
-    ax.set_title('Rule Overlap Between Classes', fontsize=14)
+    ax.set_title(f'{title_prefix}: Rule Overlap Between Classes', fontsize=14)
     plt.colorbar(im, ax=ax, label='Number of Overlapping Rules')
     
     plt.tight_layout()
@@ -409,7 +424,7 @@ def plot_test_results_overlap(test_results: Dict, output_dir: str):
     logger.info(f"Saved overlap matrix plot to {output_dir}/rule_overlap_matrix.png")
 
 
-def plot_test_results_coverage(test_results: Dict, output_dir: str):
+def plot_test_results_coverage(test_results: Dict, output_dir: str, dataset_name: str = ""):
     """Plot coverage analysis from test results."""
     if not HAS_PLOTTING:
         return
@@ -436,13 +451,16 @@ def plot_test_results_coverage(test_results: Dict, output_dir: str):
             missed_counts.append(analysis.get("n_missed_samples", 0))
             total_counts.append(analysis.get("n_class_samples", 0))
     
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
     
     # Coverage ratio
     axes[0].bar(classes, coverage_ratios, alpha=0.7, color='green')
     axes[0].set_xlabel('Class', fontsize=12)
     axes[0].set_ylabel('Coverage Ratio', fontsize=12)
-    axes[0].set_title('Test Data Coverage Ratio per Class', fontsize=14)
+    axes[0].set_title(f'{title_prefix}: Test Data Coverage Ratio per Class', fontsize=14)
     axes[0].set_ylim([0, 1.1])
     axes[0].grid(True, alpha=0.3, axis='y')
     for cls, ratio in zip(classes, coverage_ratios):
@@ -452,7 +470,7 @@ def plot_test_results_coverage(test_results: Dict, output_dir: str):
     axes[1].bar(classes, missed_counts, alpha=0.7, color='red')
     axes[1].set_xlabel('Class', fontsize=12)
     axes[1].set_ylabel('Number of Missed Samples', fontsize=12)
-    axes[1].set_title('Missed Samples per Class (Test Data)', fontsize=14)
+    axes[1].set_title(f'{title_prefix}: Missed Samples per Class (Test Data)', fontsize=14)
     axes[1].grid(True, alpha=0.3, axis='y')
     for cls, missed, total in zip(classes, missed_counts, total_counts):
         axes[1].text(cls, missed + max(missed_counts) * 0.02, f'{missed}/{total}', ha='center', va='bottom')
@@ -463,7 +481,7 @@ def plot_test_results_coverage(test_results: Dict, output_dir: str):
     logger.info(f"Saved test coverage analysis plot to {output_dir}/test_coverage_analysis.png")
 
 
-def plot_rule_precision_vs_coverage_test(test_results: Dict, output_dir: str):
+def plot_rule_precision_vs_coverage_test(test_results: Dict, output_dir: str, dataset_name: str = ""):
     """Plot rule-level precision vs coverage from test results."""
     if not HAS_PLOTTING:
         return
@@ -474,6 +492,9 @@ def plot_rule_precision_vs_coverage_test(test_results: Dict, output_dir: str):
         return
     
     classes = sorted(test_results.get("classes", []))
+    
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
@@ -500,7 +521,7 @@ def plot_rule_precision_vs_coverage_test(test_results: Dict, output_dir: str):
     
     ax.set_xlabel('Rule Coverage', fontsize=12)
     ax.set_ylabel('Rule Precision', fontsize=12)
-    ax.set_title('Rule-Level Precision vs Coverage (Test Data)', fontsize=14)
+    ax.set_title(f'{title_prefix}: Rule-Level Precision vs Coverage (Test Data)', fontsize=14)
     ax.set_xlim([-0.05, 1.05])
     ax.set_ylim([-0.05, 1.05])
     ax.grid(True, alpha=0.3)
@@ -743,15 +764,15 @@ Examples:
     # Generate plots
     if not args.no_plots and HAS_PLOTTING:
         logger.info("Generating plots...")
-        plot_metrics_comparison(summary, str(output_dir))
-        plot_precision_vs_coverage(summary, str(output_dir))
-        plot_rule_counts(summary, str(output_dir))
-        plot_feature_frequency(summary, str(output_dir))
+        plot_metrics_comparison(summary, str(output_dir), args.dataset)
+        plot_precision_vs_coverage(summary, str(output_dir), args.dataset)
+        plot_rule_counts(summary, str(output_dir), args.dataset)
+        plot_feature_frequency(summary, str(output_dir), args.dataset)
         
         if test_results:
-            plot_test_results_overlap(test_results, str(output_dir))
-            plot_test_results_coverage(test_results, str(output_dir))
-            plot_rule_precision_vs_coverage_test(test_results, str(output_dir))
+            plot_test_results_overlap(test_results, str(output_dir), args.dataset)
+            plot_test_results_coverage(test_results, str(output_dir), args.dataset)
+            plot_rule_precision_vs_coverage_test(test_results, str(output_dir), args.dataset)
     
     # Generate summary report
     logger.info("Generating summary report...")

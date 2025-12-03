@@ -22,6 +22,7 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+from datetime import datetime
 import json
 
 # Set up logging
@@ -1032,7 +1033,9 @@ Examples:
     
     # Set up output directories
     if args.output_dir is None:
-        args.output_dir = str(PROJECT_ROOT / "comparison_results" / f"{args.dataset}_{args.algorithm}")
+        # Add datetime stamp to prevent overwriting previous results
+        datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = str(PROJECT_ROOT / "comparison_results" / f"{args.dataset}_{args.algorithm}_{datetime_str}")
     else:
         # Resolve relative paths relative to project root
         args.output_dir = str(Path(args.output_dir).resolve())

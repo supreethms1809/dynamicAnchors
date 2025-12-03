@@ -1218,7 +1218,11 @@ def extract_rules_from_policies(
             
             # Create raw AnchorEnv directly (bypass BenchMARL/TorchRL wrapper)
             # Set mode to "inference" so termination counters are reset in reset()
-            single_agent_config["mode"] = "inference"
+            # mode must be inside env_config, not as a direct parameter
+            if "env_config" not in single_agent_config:
+                single_agent_config["env_config"] = {}
+            single_agent_config["env_config"] = single_agent_config["env_config"].copy()
+            single_agent_config["env_config"]["mode"] = "inference"
             env = AnchorEnv(**single_agent_config)
             
             # Get the actual agent name from the environment
