@@ -872,11 +872,40 @@ class AnchorEnv(ParallelEnv):
                 precision >= self.precision_target
                 and coverage >= 0.3 * self.coverage_target
             )
+            
+            # Validate rule validity before allowing termination
+            # Check that bounds are valid: lower < upper for all features, bounds in [0, 1], and finite
+            bounds_valid = True
+            agent_lower = self.lower[agent]
+            agent_upper = self.upper[agent]
+            if np.any(agent_lower >= agent_upper):
+                bounds_valid = False
+                invalid_features = np.where(agent_lower >= agent_upper)[0]
+                logger.warning(
+                    f"Agent {agent}: Invalid bounds detected: lower >= upper for features {invalid_features[:5]}. "
+                    f"Preventing termination until bounds are fixed."
+                )
+            if np.any(agent_lower < 0) or np.any(agent_upper > 1):
+                bounds_valid = False
+                logger.warning(
+                    f"Agent {agent}: Invalid bounds detected: bounds outside [0, 1] range. "
+                    f"Preventing termination until bounds are fixed."
+                )
+            if not np.all(np.isfinite(agent_lower)) or not np.all(np.isfinite(agent_upper)):
+                bounds_valid = False
+                logger.warning(
+                    f"Agent {agent}: Invalid bounds detected: NaN or Inf values in bounds. "
+                    f"Preventing termination until bounds are fixed."
+                )
+            
+            # Only allow termination if bounds are valid AND targets are met
             done = bool(
-                both_targets_met
-                or high_precision_with_reasonable_coverage
-                or both_reasonably_close
-                or excellent_precision
+                bounds_valid and (
+                    both_targets_met
+                    or high_precision_with_reasonable_coverage
+                    or both_reasonably_close
+                    or excellent_precision
+                )
             )
             
             termination_reason = None

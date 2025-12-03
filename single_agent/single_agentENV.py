@@ -496,9 +496,18 @@ class SingleAgentAnchorEnv(Env):
         self.coverage_floor_hits = 0
         
         precision, coverage, _ = self._current_metrics()
+        
+        # Prevent immediate termination: require at least 2 steps before allowing termination
+        # This prevents episodes from terminating on the first step due to initial box meeting targets
+        self.step_count = 0
+        self.min_steps_before_termination = 2  # Require at least 2 steps
+        
         observation = np.concatenate([self.lower, self.upper, np.array([precision, coverage], dtype=np.float32)])
         
-        info = {}
+        info = {
+            "initial_precision": float(precision),
+            "initial_coverage": float(coverage),
+        }
         
         return observation, info
 
@@ -738,7 +747,42 @@ class SingleAgentAnchorEnv(Env):
             precision >= self.precision_target and 
             coverage >= 0.3 * self.coverage_target
         )
-        done = bool(both_targets_met or high_precision_with_reasonable_coverage or both_reasonably_close or excellent_precision)
+        # Increment step count
+        self.step_count += 1
+        
+        # Validate rule validity before allowing termination
+        # Check that bounds are valid: lower < upper for all features, bounds in [0, 1], and finite
+        bounds_valid = True
+        if np.any(self.lower >= self.upper):
+            bounds_valid = False
+            invalid_features = np.where(self.lower >= self.upper)[0]
+            logger.warning(
+                f"Invalid bounds detected: lower >= upper for features {invalid_features[:5]}. "
+                f"Preventing termination until bounds are fixed."
+            )
+        if np.any(self.lower < 0) or np.any(self.upper > 1):
+            bounds_valid = False
+            logger.warning(
+                f"Invalid bounds detected: bounds outside [0, 1] range. "
+                f"Preventing termination until bounds are fixed."
+            )
+        if not np.all(np.isfinite(self.lower)) or not np.all(np.isfinite(self.upper)):
+            bounds_valid = False
+            logger.warning(
+                f"Invalid bounds detected: NaN or Inf values in bounds. "
+                f"Preventing termination until bounds are fixed."
+            )
+        
+        # Prevent immediate termination: require minimum steps before allowing termination
+        # This prevents episodes from terminating too early due to initial box configuration
+        can_terminate = self.step_count >= self.min_steps_before_termination
+        
+        # Only allow termination if bounds are valid AND targets are met
+        done = bool(
+            bounds_valid and 
+            can_terminate and 
+            (both_targets_met or high_precision_with_reasonable_coverage or both_reasonably_close or excellent_precision)
+        )
         
         termination_reason = None
         if done:
@@ -828,6 +872,15 @@ class SingleAgentAnchorEnv(Env):
         
         max_steps_reached = (self.timestep >= self.max_cycles)
         truncated = max_steps_reached and not done
+        
+        # Log warning if episode terminates immediately (step_count=1 after step)
+        if self.step_count == 1 and done:
+            logger.warning(
+                f"Episode terminated immediately (step 1) for class {self.target_class}. "
+                f"Precision: {precision:.4f}, coverage: {coverage:.4f}, "
+                f"Targets: precision>={self.precision_target:.2f}, coverage>={self.coverage_target:.4f}. "
+                f"This may indicate initial box is too good or termination conditions too lenient."
+            )
         
         return observation, float(reward), bool(done), truncated, info
     

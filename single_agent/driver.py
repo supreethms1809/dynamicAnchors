@@ -297,7 +297,7 @@ def main():
     
     if n_train_samples > 10000:
         # Large datasets (housing, etc.): use larger policy network
-        policy_net_arch = [256, 256, 256, 256]
+        policy_net_arch = [512, 512, 256]
         logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger policy network: {policy_net_arch}")
     elif n_train_samples > 5000:
         # Medium-large datasets: slightly larger
