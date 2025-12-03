@@ -1,5 +1,5 @@
 """
-Simplified inference script for extracting anchor rules using saved policy models.
+Inference script for extracting anchor rules using saved policy models.
 
 This script:
 1. Loads saved individual policy models from the experiment directory
@@ -27,7 +27,6 @@ from logging import INFO, WARNING, ERROR, CRITICAL
 
 # Configure logging to write to both console and file
 def setup_logging(log_file=None):
-    """Setup logging to write to both console and a log file."""
     if log_file is None:
         # Create a temporary log file with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -57,7 +56,7 @@ def setup_logging(log_file=None):
     
     return log_file
 
-# Initialize with default (will be reconfigured in main if needed)
+# Initialize with default
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -68,18 +67,6 @@ def load_policy_model(
     mlp_config_path: str,
     device: str = "cpu"
 ) -> torch.nn.Module:
-    """
-    Load a saved policy model.
-    
-    Args:
-        policy_path: Path to saved policy state_dict (.pth file)
-        metadata_path: Path to policy metadata JSON file
-        mlp_config_path: Path to MLP config YAML
-        device: Device to load model on
-    
-    Returns:
-        Loaded policy model (MLP network)
-    """
     # Load metadata to understand model structure
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
@@ -90,7 +77,7 @@ def load_policy_model(
     # Load state dict to infer input/output dimensions
     state_dict = torch.load(policy_path, map_location=device)
     
-    # Check if state_dict has nested structure (e.g., "0.mlp.params.0.weight")
+    # Check if state_dict has nested structure
     # If so, extract the MLP parameters
     nested_keys = [k for k in state_dict.keys() if '.mlp.params.' in k or '.params.' in k]
     
@@ -188,22 +175,6 @@ def run_rollout_with_policy(
     exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean"
     action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
 ) -> Dict[str, Any]:
-    """
-    Run a single rollout episode using a loaded policy on a raw PettingZoo environment.
-    
-    This bypasses BenchMARL/TorchRL complexity and works directly with the PettingZoo
-    ParallelEnv interface, treating policies as plain MLPs.
-    
-    Args:
-        env: Raw AnchorEnv (PettingZoo ParallelEnv) - NOT TorchRL-wrapped
-        policy: Loaded policy model (plain PyTorch nn.Module)
-        agent_id: Agent ID (e.g., "agent_0") - must match env's agent names
-        max_steps: Maximum steps per episode
-        device: Device for tensors
-    
-    Returns:
-        Dictionary with episode data (precision, coverage, observation, etc.)
-    """
     # Ensure policy is in eval mode
     policy.to(device)
     policy.eval()
@@ -223,7 +194,7 @@ def run_rollout_with_policy(
         else:
             raise ValueError(f"Agent '{agent_id}' not found in environment. Available agents: {list(obs_dict.keys())}")
     
-    # Debug: Check initial box state
+    # Debug: Check initial box state (TODO: Remove this)
     if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
         lower_init = env.lower[agent_id]
         upper_init = env.upper[agent_id]
@@ -253,21 +224,22 @@ def run_rollout_with_policy(
             logger.warning(f"  Agent '{agent_id}' not in observations at step {step_count}")
             break
         
-        # Get observation for this agent (raw numpy array from PettingZoo)
-        obs_vec = obs_dict[agent_id]  # shape: (2*n_features + 2,) - [lower, upper, precision, coverage]
+        # Get observation for this agent
+        # shape: (2*n_features + 2,) - [lower, upper, precision, coverage]
+        obs_vec = obs_dict[agent_id]
         
         # Convert to tensor for policy
-        obs_tensor = torch.as_tensor(obs_vec, dtype=torch.float32, device=device).unsqueeze(0)  # Add batch dim
+        obs_tensor = torch.as_tensor(obs_vec, dtype=torch.float32, device=device).unsqueeze(0)
         
-        # Debug: Log observation for first step
+        # Debug: Log observation for first step (TODO: Remove this)
         if step_count == 0:
             logger.info(f"  Observation shape: {obs_vec.shape}, first 5 values: {obs_vec[:5]}, last 5: {obs_vec[-5:]}")
             logger.info(f"  Observation stats: mean={obs_vec.mean():.4f}, std={obs_vec.std():.4f}, min={obs_vec.min():.4f}, max={obs_vec.max():.4f}")
         
-        # Get action from policy (with exploration for diversity)
-        action_has_noise = False  # Track if noise was already added to action
+        # Get action from policy
+        action_has_noise = False
         with torch.no_grad():
-            # Test if policy responds to different inputs (only once)
+            # Test if policy responds to different inputs
             if step_count == 0 and not hasattr(run_rollout_with_policy, '_tested_policy_response'):
                 zero_obs = torch.zeros_like(obs_tensor)
                 zero_output = policy(zero_obs)
@@ -279,15 +251,15 @@ def run_rollout_with_policy(
                     diff = np.abs(actual_output_np - zero_output_np).max()
                     logger.info(f"  Policy response test: max difference between zero obs and actual obs = {diff:.2f}")
                     if diff < 1e-6:
-                        logger.warning(f"  ⚠ Policy outputs IDENTICAL values for zero and actual observations!")
+                        logger.warning(f"  Policy outputs IDENTICAL values for zero and actual observations!")
                     else:
-                        logger.info(f"  ✓ Policy responds differently to different observations (good!)")
+                        logger.info(f"  Policy responds differently to different observations (good!)")
                 run_rollout_with_policy._tested_policy_response = True
                 fwd_outputs = actual_output
             else:
                 fwd_outputs = policy(obs_tensor)
             
-            # Debug: Log raw policy output before any processing
+            # Debug: Log raw policy output before any processing (TODO: Remove this)
             if step_count == 0:
                 if isinstance(fwd_outputs, torch.Tensor):
                     raw_output = fwd_outputs.cpu().numpy().flatten()
@@ -300,7 +272,7 @@ def run_rollout_with_policy(
                             logger.info(f"    {k}: shape={v_np.shape}, first 5: {v_np[:5]}, mean={v_np.mean():.4f}, std={v_np.std():.4f}")
             
             # Handle different policy output formats
-            # BenchMARL policies may output action_dist_inputs (logits) that need TanhNormal conversion
+            # BenchMARL policies outputs action_dist_inputs-logits that need TanhNormal conversion
             if isinstance(fwd_outputs, dict):
                 if "action_dist_inputs" in fwd_outputs:
                     # Policy outputs logits for TanhNormal distribution
@@ -318,45 +290,44 @@ def run_rollout_with_policy(
                         mean_action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
                         noise = torch.randn_like(mean_action) * action_noise_scale
                         action = torch.clamp(mean_action + noise, -1.0, 1.0)
-                        action_has_noise = True  # Noise already added
+                        action_has_noise = True
                     else:
-                        # Deterministic (mean) - original behavior
                         action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
-                        action_has_noise = False  # No noise yet, can add later
+                        action_has_noise = False
                 elif "action" in fwd_outputs:
                     action = fwd_outputs["action"]
-                    action_has_noise = False  # Direct action, no noise yet
+                    action_has_noise = False
                 else:
                     # Fallback: assume output is action directly
                     action = fwd_outputs
-                    action_has_noise = False  # Direct action, no noise yet
+                    action_has_noise = False
             else:
-                # Policy outputs action directly (might be raw logits that need normalization)
+                # Policy outputs action directly
                 action = fwd_outputs
-                action_has_noise = False  # Direct action, no noise yet
+                action_has_noise = False
                 # If values are out of [-1, 1] range, they're likely raw logits that need normalization
                 if isinstance(action, torch.Tensor):
                     action_vals = action.cpu().numpy().flatten()
                     if len(action_vals) > 0 and (action_vals.min() < -1.1 or action_vals.max() > 1.1):
                         # Values are raw logits that are too large
                         # Use a fixed scaling factor to preserve relative differences between episodes
-                        # This prevents identical actions when raw outputs are proportional
+                        # Prevents identical actions when raw outputs are proportional
                         max_abs = np.abs(action_vals).max()
                         # Use a fixed scaling factor that keeps values in a reasonable range for tanh
                         # Typical outputs are 20-30M, so divide by 30M to get values around 0.7-1.0
-                        # This keeps values in tanh's active range (not saturated) while preserving differences
-                        fixed_scale = 30000000.0  # 30M - keeps values in reasonable range for tanh
+                        # keeps values in tanh's active range (not saturated) while preserving differences
+                        fixed_scale = 30000000.0
                         # Define sample_idx for logging (used in multiple places)
-                        # Dynamically create sample indices based on actual action space size
+                        # create sample indices based on actual action space size
                         action_size = len(action_vals)
                         if step_count == 0 and action_size > 0:
-                            # Sample from beginning, middle, and end of action space
-                            sample_idx = [0, 1, 2]  # Always include first few
+                            # sample from beginning, middle, and end of action space
+                            sample_idx = [0, 1, 2]
                             if action_size > 6:
                                 mid = action_size // 2
                                 sample_idx.extend([mid - 1, mid, mid + 1])
                             if action_size > 10:
-                                sample_idx.append(action_size - 1)  # Last element
+                                sample_idx.append(action_size - 1)
                             # Ensure all indices are within bounds
                             sample_idx = [i for i in sample_idx if i < action_size]
                         else:
@@ -387,30 +358,30 @@ def run_rollout_with_policy(
                 logger.info(f"  Action shape: {action_np.shape}, mean: {action_flat.mean():.4f}, std: {action_flat.std():.4f}, min: {action_flat.min():.4f}, max: {action_flat.max():.4f}")
                 logger.info(f"  Action first 10 values: {action_flat[:10]}")
                 
-                # Store first action for comparison (to detect if actions are identical across episodes)
+                # Store first action for comparison (TODO: Remove this)
                 if not hasattr(run_rollout_with_policy, '_first_action'):
                     run_rollout_with_policy._first_action = action_flat.copy()
                     run_rollout_with_policy._action_count = 1
                     logger.info(f"  Stored first action for comparison")
                 else:
                     run_rollout_with_policy._action_count += 1
-                    # Compare with first action
+                    # Compare with first action (TODO: Remove this)
                     diff = np.abs(action_flat - run_rollout_with_policy._first_action)
                     max_diff = diff.max()
                     mean_diff = diff.mean()
                     logger.info(f"  Action comparison with first episode: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
                     if max_diff < 1e-6:
-                        logger.warning(f"  ⚠ Actions are IDENTICAL to first episode! Policy may not be responding to observations.")
+                        logger.warning(f"  Actions are IDENTICAL to first episode! Policy may not be responding to observations.")
                     else:
-                        logger.info(f"  ✓ Actions are DIFFERENT from first episode (good!)")
+                        logger.info(f"  Actions are DIFFERENT from first episode (good!)")
                     
-                    # Also compare with previous action to see if there's any variation
+                    # Also compare with previous action to see if there's any variation (TODO: Remove this)
                     if hasattr(run_rollout_with_policy, '_prev_action'):
                         prev_diff = np.abs(action_flat - run_rollout_with_policy._prev_action).max()
                         logger.info(f"  Action comparison with previous episode: max_diff={prev_diff:.6f}")
                     run_rollout_with_policy._prev_action = action_flat.copy()
                 
-                # Check if actions are in valid range
+                # Check if actions are in valid range (TODO: Remove this)
                 if action_flat.min() < -1.1 or action_flat.max() > 1.1:
                     logger.warning(f"  ⚠ Actions out of [-1, 1] range! Applying tanh normalization...")
                     action = torch.tanh(action) if isinstance(action, torch.Tensor) else np.tanh(action)
@@ -439,16 +410,16 @@ def run_rollout_with_policy(
         # Convert action to numpy and remove batch dimension
         action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
         if len(action_np.shape) > 1:
-            action_np = action_np.squeeze(0)  # Remove batch dimension: [1, 60] -> [60]
+            action_np = action_np.squeeze(0)
         
         # Check if action needs to be sliced (policy might output actions for multiple agents)
-        expected_action_dim = 2 * env.n_features  # Should be 16 for 8 features (2 * 8)
+        expected_action_dim = 2 * env.n_features
         agent_num = int(agent_id.split('_')[-1]) if '_' in agent_id else 0
         
         if action_np.shape[0] == 2 * expected_action_dim:
-            # Policy outputs actions for 2 agents concatenated (32 dims for 2 agents * 16 each)
+            # Policy outputs actions for 2 agents concatenated
             # Extract the appropriate slice based on agent_id
-            # If agent_num >= 2, wrap around to use agent_0 or agent_1 (since policy only supports 2 agents)
+            # If agent_num >= 2, wrap around to use agent_0 or agent_1
             num_agents_in_policy = 2
             mapped_agent_num = agent_num % num_agents_in_policy
             start_idx = mapped_agent_num * expected_action_dim
@@ -460,7 +431,7 @@ def run_rollout_with_policy(
                 else:
                     logger.info(f"  Extracted action slice for {agent_id}: indices [{start_idx}:{end_idx}] from policy output")
         elif action_np.shape[0] == 4 * expected_action_dim:
-            # Policy outputs actions for 4 agents concatenated (64 dims for 4 agents * 16 each)
+            # Policy outputs actions for 4 agents concatenated
             start_idx = agent_num * expected_action_dim
             end_idx = start_idx + expected_action_dim
             action_np = action_np[start_idx:end_idx]
@@ -468,7 +439,7 @@ def run_rollout_with_policy(
                 logger.info(f"  Extracted action slice for {agent_id}: indices [{start_idx}:{end_idx}] from policy output")
         elif action_np.shape[0] != expected_action_dim:
             # Unexpected action dimension
-            logger.warning(f"  ⚠ Unexpected action dimension: {action_np.shape[0]} (expected {expected_action_dim})")
+            logger.warning(f"  Unexpected action dimension: {action_np.shape[0]} (expected {expected_action_dim})")
             # Try to take first expected_action_dim elements
             if action_np.shape[0] > expected_action_dim:
                 action_np = action_np[:expected_action_dim]
@@ -479,13 +450,13 @@ def run_rollout_with_policy(
             original_action_shape = action.shape if hasattr(action, 'shape') else (action_np.shape[0] if hasattr(action_np, 'shape') else 'unknown')
             raise ValueError(f"Empty action extracted for {agent_id}. Original action shape: {original_action_shape}, agent_num: {agent_num}, expected_action_dim: {expected_action_dim}")
         
-        # Debug: Log action for first step
+        # Debug: Log action for first step (TODO: Remove this)
         if step_count == 0:
             logger.info(f"  Action before step: shape={action_np.shape}, sample values: {action_np[:5]}")
             logger.info(f"    Action lower_deltas (first {env.n_features}): mean={action_np[:env.n_features].mean():.4f}, std={action_np[:env.n_features].std():.4f}")
             logger.info(f"    Action upper_deltas (last {env.n_features}): mean={action_np[env.n_features:].mean():.4f}, std={action_np[env.n_features:].std():.4f}")
         
-        # Step environment directly (raw PettingZoo interface)
+        # Step environment directly
         action_dict = {agent_id: action_np}
         obs_dict, rewards_dict, terminations_dict, truncations_dict, infos_dict = env.step(action_dict)
         
@@ -496,7 +467,7 @@ def run_rollout_with_policy(
         # Check if done
         done = terminations_dict.get(agent_id, False) or truncations_dict.get(agent_id, False)
         
-        # Debug: Check if box changed after first action
+        # Debug: Check if box changed after first action (TODO: Remove this)
         if step_count == 0 and lower_before is not None and upper_before is not None:
             if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
                 lower_after = env.lower[agent_id].copy()
@@ -505,11 +476,11 @@ def run_rollout_with_policy(
                 upper_diff = np.abs(upper_after - upper_before).max()
                 logger.info(f"  Box change after step 0: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}")
                 if lower_diff < 1e-6 and upper_diff < 1e-6:
-                    logger.warning(f"  ⚠ Box did not change after action! Actions may not be applied correctly.")
+                    logger.warning(f"  Box did not change after action! Actions may not be applied correctly.")
         
         step_count += 1
     
-    # Extract final metrics directly from environment (raw PettingZoo interface)
+    # Extract final metrics directly from environment
     episode_data = {}
     
     try:
@@ -555,6 +526,7 @@ def run_rollout_with_policy(
             "final_observation": final_obs.tolist(),
         }
         
+        # Debug: Log metrics (TODO: Remove this)
         logger.debug(
             f"  Extracted metrics from environment: "
             f"instance_precision={instance_precision:.4f}, instance_coverage={instance_coverage:.4f}, "
@@ -562,7 +534,7 @@ def run_rollout_with_policy(
         )
         
     except Exception as e:
-        logger.warning(f"  ⚠ Error getting metrics from environment for {agent_id}: {e}")
+        logger.warning(f"  Error getting metrics from environment for {agent_id}: {e}")
         import traceback
         logger.debug(f"  Traceback: {traceback.format_exc()}")
         # Return empty episode data
@@ -586,31 +558,13 @@ def extract_rules_from_policies(
     max_features_in_rule: int = -1,
     steps_per_episode: int = 500,
     n_instances_per_class: int = 20,
-    eval_on_test_data: bool = True,  # Always use test data for inference by default
+    eval_on_test_data: bool = True,
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu",
-    exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean" for rule diversity
-    action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
+    exploration_mode: str = "sample",
+    action_noise_scale: float = 0.05,
 ) -> Dict[str, Any]:
-    """
-    Extract anchor rules using saved individual policy models.
-    
-    Args:
-        experiment_dir: Path to BenchMARL experiment directory (contains individual_models/)
-        dataset_name: Name of the dataset
-        mlp_config_path: Path to MLP config YAML
-        max_features_in_rule: Maximum features to include in rules
-        steps_per_episode: Maximum steps per rollout
-        n_instances_per_class: Number of instances to evaluate per class
-        eval_on_test_data: Whether to evaluate on test data (default: True - always uses test data for inference)
-        output_dir: Output directory for results (default: experiment_dir/inference/)
-        seed: Random seed
-        device: Device to use
-    
-    Returns:
-        Dictionary containing extracted rules and evaluation data
-    """
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
     logger.info("="*80)
@@ -627,7 +581,6 @@ def extract_rules_from_policies(
         )
     
     # Find all saved policy models
-    # First, try to use the policies_index.json if it exists (new format with class organization)
     policy_files = {}
     metadata_files = {}
     agents_per_class = 1
@@ -661,7 +614,7 @@ def extract_rules_from_policies(
         
         logger.info(f"  Loaded {len(policy_files)} policies from index (agents_per_class={agents_per_class})")
     else:
-        # Fallback: Search for policies in flat structure (backward compatibility)
+        # Fallback: Search for policies in flat structure - older version
         logger.info("No policies_index.json found, searching for policies in flat structure...")
         
         # Search in root directory
@@ -676,7 +629,7 @@ def extract_rules_from_policies(
                 if os.path.exists(metadata_path):
                     metadata_files[group] = metadata_path
         
-        # Also search in class subdirectories (for class-organized structure without index)
+        # Also search in class subdirectories
         for item in os.listdir(individual_models_dir):
             item_path = os.path.join(individual_models_dir, item)
             if os.path.isdir(item_path) and item.startswith("class_"):
@@ -743,12 +696,12 @@ def extract_rules_from_policies(
     # Load all policy models and extract individual agent policies
     logger.info(f"\nLoading policy models...")
     policies = {}
-    agent_policies = {}  # Individual agent policies extracted from combined policy
+    agent_policies = {}
     
     for group in sorted(policy_files.keys()):
         metadata_path = metadata_files.get(group)
         if metadata_path is None:
-            logger.warning(f"  ⚠ Warning: No metadata found for {group}, using defaults")
+            logger.warning(f"  Warning: No metadata found for {group}, using defaults")
         
         # Load the combined policy
         combined_policy = load_policy_model(
@@ -758,14 +711,14 @@ def extract_rules_from_policies(
             device=device
         )
         policies[group] = combined_policy
-        logger.info(f"  ✓ Loaded combined policy for {group}")
+        logger.info(f"  Loaded combined policy for {group}")
         
         # Try to extract individual agent policies from the combined policy
-        # Check if the state_dict has agent-specific keys (e.g., "0.mlp.params..." for agent_0)
+        # Check if the state_dict has agent-specific keys
         state_dict_path = policy_files[group]
         raw_state_dict = torch.load(state_dict_path, map_location=device)
         
-        # Debug: Print some keys to understand structure
+        # Debug: Print some keys to understand structure (TODO: Remove this)
         logger.info(f"  Debug: Total keys in state_dict: {len(raw_state_dict.keys())}")
         logger.info(f"  Debug: Sample state_dict keys (first 20): {list(raw_state_dict.keys())[:20]}")
         
@@ -832,7 +785,7 @@ def extract_rules_from_policies(
                             pass
         
         # If no agent indices found in raw state_dict, the policy might be shared
-        # In that case, we'll use the same policy for all agents
+        # In that case, we'll use the same policy for all agents (TODO: Remove this)
         if not agent_indices:
             logger.info(f"  Debug: No agent-specific indices found in raw state_dict")
             logger.info(f"  Debug: This might be a shared policy for all agents")
@@ -862,7 +815,7 @@ def extract_rules_from_policies(
                     if key.startswith('__'):
                         continue
                     
-                    # Pattern 1: Key starts with agent index
+                    # Key starts with agent index
                     # "0.mlp.params.0.weight" -> agent 0
                     if key.startswith(f"{agent_idx}."):
                         agent_keys_found.append(key)
@@ -882,7 +835,7 @@ def extract_rules_from_policies(
                         if not new_key.startswith('__'):
                             agent_state_dict[new_key] = value
                     
-                    # Pattern 2: Agent index in different position
+                    # Agent index in different position
                     # "policy_nets.0.weight" or similar
                     elif f".{agent_idx}." in key or key.startswith(f"{agent_idx}_"):
                         agent_keys_found.append(key)
@@ -897,13 +850,10 @@ def extract_rules_from_policies(
                         
                         if agent_pos is not None:
                             # Reconstruct key without agent identifier
-                            # This is heuristic - may need adjustment based on actual structure
                             if agent_pos == 0:
                                 # "0.mlp.params.0.weight" -> already handled above
                                 pass
                             else:
-                                # For other patterns, try to extract relevant parts
-                                # This might need customization based on actual structure
                                 new_key = '.'.join(parts[agent_pos+1:])
                                 if new_key and not new_key.startswith('__'):
                                     agent_state_dict[new_key] = value
@@ -944,13 +894,13 @@ def extract_rules_from_policies(
                             agent_mlp.load_state_dict(agent_state_dict)
                             agent_mlp.eval()
                             agent_policies[agent_name] = agent_mlp
-                            logger.info(f"  ✓ Extracted policy for {agent_name}")
+                            logger.info(f"  Extracted policy for {agent_name}")
                         else:
-                            logger.warning(f"  ⚠ Could not infer output dimension for {agent_name}")
+                            logger.warning(f"  Could not infer output dimension for {agent_name}")
                     else:
-                        logger.warning(f"  ⚠ Could not find weight parameters for {agent_name}")
+                        logger.warning(f"  Could not find weight parameters for {agent_name}")
                 else:
-                    logger.warning(f"  ⚠ Could not extract state_dict for {agent_name}")
+                    logger.warning(f"  Could not extract state_dict for {agent_name}")
         else:
             # No agent-specific keys found, policy might be shared
             # We'll handle this after we know the target_classes
@@ -962,7 +912,7 @@ def extract_rules_from_policies(
     missing_agents = [name for name in expected_agent_names if name not in agent_policies]
     
     if missing_agents:
-        logger.warning(f"\n  ⚠ Warning: Missing policies for agents: {missing_agents}")
+        logger.warning(f"\n  Warning: Missing policies for agents: {missing_agents}")
         logger.info(f"  Found policies for: {list(agent_policies.keys())}")
         logger.info(f"  Expected policies for: {expected_agent_names}")
         
@@ -979,15 +929,15 @@ def extract_rules_from_policies(
             logger.info(f"  Using combined policy for missing agents (assuming shared policy)")
             for missing_agent in missing_agents:
                 agent_policies[missing_agent] = combined_policy
-                logger.info(f"  ✓ Assigned combined policy to {missing_agent}")
+                logger.info(f"  Assigned combined policy to {missing_agent}")
         else:
-            logger.warning(f"  ⚠ Error: No combined policy available to assign to missing agents")
+            logger.warning(f"  Error: No combined policy available to assign to missing agents")
     
     # Create environment config (needed before we can determine if policy is shared)
     from anchor_trainer import AnchorTrainer
     trainer = AnchorTrainer(
         dataset_loader=dataset_loader,
-        algorithm="maddpg",  # Dummy, not used
+        algorithm="maddpg",
         output_dir=output_dir or os.path.join(experiment_dir, "inference"),
         seed=seed
     )
@@ -1000,22 +950,14 @@ def extract_rules_from_policies(
     })
     
     # For class-level inference, compute cluster centroids per class
-    # This ensures each episode starts from a representative cluster centroid
-    # (similar to training), rather than just the mean centroid
     logger.info("\nComputing cluster centroids per class for class-level inference...")
     try:
         from utils.clusters import compute_cluster_centroids_per_class
         
-        # Use agents_per_class for k-means if available (matches training setup)
-        # Otherwise, use 10 centroids per class (matching single-agent behavior and training)
         if agents_per_class > 1:
-            # Use 10 centroids per agent for diversity (matches training setup)
             n_clusters_per_class = agents_per_class * 10
-            logger.info(f"  Using {n_clusters_per_class} clusters per class ({n_clusters_per_class // agents_per_class} per agent) for k-means clustering (matches training)")
+            logger.info(f"  Using {n_clusters_per_class} clusters per class ({n_clusters_per_class // agents_per_class} per agent) for k-means clustering")
         else:
-            # For single agent per class, use 10 centroids per class for diversity
-            # This matches the training setup and single-agent behavior
-            # Cap at n_instances_per_class if it's smaller (for very small datasets)
             n_clusters_per_class = min(10, n_instances_per_class)
             logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity (matching training and single-agent behavior)")
         
@@ -1025,7 +967,7 @@ def extract_rules_from_policies(
             n_clusters_per_class=n_clusters_per_class,
             random_state=seed if seed is not None else 42
         )
-        logger.info(f"  ✓ Cluster centroids computed successfully!")
+        logger.info(f"  Cluster centroids computed successfully!")
         for cls in target_classes:
             if cls in cluster_centroids_per_class:
                 n_centroids = len(cluster_centroids_per_class[cls])
@@ -1035,13 +977,13 @@ def extract_rules_from_policies(
         
         # Set cluster centroids in env_config so environment uses them
         env_config["cluster_centroids_per_class"] = cluster_centroids_per_class
-        logger.info("  ✓ Cluster centroids set in environment config")
+        logger.info("  Cluster centroids set in environment config")
     except ImportError as e:
-        logger.warning(f"  ⚠ Could not compute cluster centroids: {e}")
+        logger.warning(f"  Could not compute cluster centroids: {e}")
         logger.warning(f"  Falling back to mean centroid per class. Install sklearn: pip install scikit-learn")
         env_config["cluster_centroids_per_class"] = None
     except Exception as e:
-        logger.warning(f"  ⚠ Error computing cluster centroids: {e}")
+        logger.warning(f"  Error computing cluster centroids: {e}")
         logger.warning(f"  Falling back to mean centroid per class")
         env_config["cluster_centroids_per_class"] = None
     
@@ -1055,12 +997,12 @@ def extract_rules_from_policies(
             "X_test_std": env_data["X_test_std"],
             "y_test": env_data["y_test"],
         })
-        logger.info("✓ Using test data for inference (default behavior)")
+        logger.info("Using test data for inference (default behavior)")
     else:
-        logger.warning("⚠ WARNING: Using training data for inference (not recommended!)")
+        logger.warning("WARNING: Using training data for inference (not recommended!)")
         logger.warning("  This may lead to overoptimistic results. Use test data for proper evaluation.")
     
-    # Create config for direct AnchorEnv creation (bypass BenchMARL/TorchRL)
+    # Create config for direct AnchorEnv creation
     anchor_config = {
         "X_unit": env_data["X_unit"],
         "X_std": env_data["X_std"],
@@ -1108,19 +1050,19 @@ def extract_rules_from_policies(
                         agent_name = f"agent_{target_class}_{k}"
                         if agent_name not in agent_policies:
                             agent_policies[agent_name] = combined_policy
-                            logger.info(f"  ✓ Using policy for {agent_name} (class {target_class})")
+                            logger.info(f"  Using policy for {agent_name} (class {target_class})")
                 else:
                     agent_name = f"agent_{target_class}"
                     if agent_name not in agent_policies:
                         agent_policies[agent_name] = combined_policy
-                        logger.info(f"  ✓ Using policy for {agent_name}")
+                        logger.info(f"  Using policy for {agent_name}")
             else:
                 # Fallback: map to all classes if we can't determine class
                 for cls in target_classes:
                     agent_name = f"agent_{cls}"
                     if agent_name not in agent_policies:
                         agent_policies[agent_name] = combined_policy
-                        logger.info(f"  ✓ Using shared policy for {agent_name}")
+                        logger.info(f"  Using shared policy for {agent_name}")
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
@@ -1254,7 +1196,7 @@ def extract_rules_from_policies(
                 else:
                     # For agents_per_class > 1, default to first agent pattern
                     actual_agent_name = f"agent_{target_class}_0"
-                logger.warning(f"  ⚠ Could not determine agent name from environment, using {actual_agent_name}")
+                logger.warning(f"  Could not determine agent name from environment, using {actual_agent_name}")
             
             # Run rollout with raw PettingZoo environment
             episode_data = run_rollout_with_policy(
@@ -1351,7 +1293,7 @@ def extract_rules_from_policies(
                         # Fallback to normalized if denormalization params not available
                         lower = lower_normalized
                         upper = upper_normalized
-                        logger.warning(f"  ⚠ X_min/X_range not available for denormalization. Using normalized bounds.")
+                        logger.warning(f"  X_min/X_range not available for denormalization. Using normalized bounds.")
                     
                     # Create temporary environment for rule extraction
                     # Set mode to "inference" so termination counters are reset in reset()
@@ -1402,8 +1344,8 @@ def extract_rules_from_policies(
             
             if lower is not None and upper is not None:
                 anchor_data.update({
-                    "lower_bounds": lower.tolist(),  # Denormalized bounds in original feature space
-                    "upper_bounds": upper.tolist(),  # Denormalized bounds in original feature space
+                    "lower_bounds": lower.tolist(),
+                    "upper_bounds": upper.tolist(),
                     "box_widths": (upper - lower).tolist(),
                     "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
                     # Also save normalized bounds for reference
@@ -1638,10 +1580,10 @@ def main():
     use_test_data = not args.eval_on_train_data
     
     if not use_test_data:
-        logger.warning("⚠ WARNING: Running inference on training data is not recommended!")
+        logger.warning("WARNING: Running inference on training data is not recommended!")
         logger.warning("  Inference should typically use test data to evaluate generalization.")
     else:
-        logger.info("✓ Using test data for inference (default behavior)")
+        logger.info("Using test data for inference (default behavior)")
     
     # Extract rules
     results = extract_rules_from_policies(
