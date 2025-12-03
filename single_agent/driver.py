@@ -267,7 +267,7 @@ def main():
     experiment_config = {
         "total_timesteps": args.total_timesteps,
         "eval_freq": 500,
-        "n_eval_episodes": 4,
+        "n_eval_episodes": 10,
         "checkpoint_freq": 12_000,
         "log_interval": 10,
         "tensorboard_log": True,

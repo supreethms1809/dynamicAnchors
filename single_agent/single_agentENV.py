@@ -156,25 +156,19 @@ class SingleAgentAnchorEnv(Env):
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
         
+        # Environment mode: "training", "evaluation", or "inference"
+        # Termination counters are reset in reset() for evaluation/inference modes
+        self.mode = env_config.get("mode", "training")  # Default to training
+        
         # Termination reason counters: track usage and disable overused reasons
-        self.termination_reason_counts = {
-            "both_targets_met": 0,
-            "excellent_precision": 0,
-            "high_precision_reasonable_coverage": 0,
-            "both_reasonably_close": 0
-        }
+        # These are reset for evaluation/inference to ensure fair evaluation
         self.termination_reason_max_counts = {
             "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
             "excellent_precision": env_config.get("max_termination_count_excellent_precision", 10),
             "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
             "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
         }
-        self.termination_reason_enabled = {
-            "both_targets_met": True,
-            "excellent_precision": True,
-            "high_precision_reasonable_coverage": True,
-            "both_reasonably_close": True
-        }
+        self._reset_termination_counters()
         
         # Multi-agent config options (kept for API compatibility, but not used in single-agent)
         # Single-agent environments are independent (one per class), so these don't apply
@@ -459,6 +453,21 @@ class SingleAgentAnchorEnv(Env):
             "data_source": data_source,
         }
 
+    def _reset_termination_counters(self):
+        """Reset termination reason counters and enable all reasons."""
+        self.termination_reason_counts = {
+            "both_targets_met": 0,
+            "excellent_precision": 0,
+            "high_precision_reasonable_coverage": 0,
+            "both_reasonably_close": 0
+        }
+        self.termination_reason_enabled = {
+            "both_targets_met": True,
+            "excellent_precision": True,
+            "high_precision_reasonable_coverage": True,
+            "both_reasonably_close": True
+        }
+    
     def reset(
         self, 
         seed: Optional[int] = None, 
@@ -476,6 +485,11 @@ class SingleAgentAnchorEnv(Env):
         
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+        
+        # Reset termination counters for evaluation/inference modes
+        # This ensures fair evaluation without disabled termination reasons
+        if self.mode in ["evaluation", "inference"]:
+            self._reset_termination_counters()
         
         self.timestep = 0
         

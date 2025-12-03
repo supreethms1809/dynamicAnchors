@@ -208,6 +208,10 @@ def run_rollout_with_policy(
     policy.to(device)
     policy.eval()
     
+    # Set mode to "inference" so termination counters are reset in reset()
+    if hasattr(env, 'mode'):
+        env.mode = "inference"
+    
     # Reset environment (returns dict, not TensorDict)
     obs_dict, infos_dict = env.reset(seed=seed)
     
@@ -1213,6 +1217,8 @@ def extract_rules_from_policies(
             single_agent_config["target_classes"] = [target_class]  # Only this class
             
             # Create raw AnchorEnv directly (bypass BenchMARL/TorchRL wrapper)
+            # Set mode to "inference" so termination counters are reset in reset()
+            single_agent_config["mode"] = "inference"
             env = AnchorEnv(**single_agent_config)
             
             # Get the actual agent name from the environment
@@ -1344,6 +1350,8 @@ def extract_rules_from_policies(
                         logger.warning(f"  ⚠ X_min/X_range not available for denormalization. Using normalized bounds.")
                     
                     # Create temporary environment for rule extraction
+                    # Set mode to "inference" so termination counters are reset in reset()
+                    inference_env_config = {**env_config, "mode": "inference"}
                     temp_env = AnchorEnv(
                         X_unit=env_data["X_unit"],
                         X_std=env_data["X_std"],
@@ -1352,8 +1360,9 @@ def extract_rules_from_policies(
                         classifier=dataset_loader.get_classifier(),
                         device="cpu",
                         target_classes=[target_class],
-                        env_config=env_config
+                        env_config=inference_env_config
                     )
+                    
                     # Use the agent name that matches the target_class
                     temp_agent_name = f"agent_{target_class}"
                     # Set normalized bounds in temp_env (extract_rule will denormalize internally)

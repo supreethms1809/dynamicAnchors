@@ -52,6 +52,26 @@ def _get_algorithm_configs():
     return algorithm_map
 
 
+class ResetTerminationCountersCallback(BaseCallback):
+    """
+    Callback to reset termination reason counters before evaluation.
+    This ensures evaluation isn't affected by counters accumulated during training.
+    """
+    def __init__(self, eval_env, verbose: int = 0):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+    
+    def _on_step(self) -> bool:
+        return True
+    
+    def on_evaluation_start(self) -> None:
+        """Called before EvalCallback runs evaluation."""
+        if hasattr(self.eval_env, '_reset_termination_counters'):
+            self.eval_env._reset_termination_counters()
+            if self.verbose > 0:
+                logger.debug("  Reset termination counters before evaluation")
+
+
 class LearningRateScheduleCallback(BaseCallback):
     """
     Callback to schedule learning rate during training.
@@ -302,7 +322,7 @@ class AnchorTrainerSB3:
         """Get default environment configuration."""
         return {
             "precision_target": 0.8,
-            "coverage_target": 0.1,
+            "coverage_target": 0.05,
             "use_perturbation": True,
             "perturbation_mode": "adaptive",
             "n_perturb": 4096,
@@ -320,10 +340,10 @@ class AnchorTrainerSB3:
             "min_absolute_step": 0.001,
             "use_class_centroids": True,
             # Termination reason counters: disable overused reasons
-            "max_termination_count_excellent_precision": 10,  # Disable after 10 uses
-            "max_termination_count_both_targets": -1,         # Unlimited (default)
-            "max_termination_count_high_precision": -1,       # Unlimited (default)
-            "max_termination_count_both_close": -1,           # Unlimited (default)
+            "max_termination_count_excellent_precision": 100,  # Disable after 10 uses
+            "max_termination_count_both_targets": 100,         # Unlimited (default)
+            "max_termination_count_high_precision": 100,       # Unlimited (default)
+            "max_termination_count_both_close": 100,           # Unlimited (default)
         }
     
     def _setup_environments(
@@ -339,19 +359,21 @@ class AnchorTrainerSB3:
             logger.info(f"  Setting up class {target_class}...")
             
             # Create training environment for this class
+            train_env_config = {**env_config_with_data, "mode": "training"}
             train_env = self._create_env_for_class(
                 env_data=env_data,
-                env_config=env_config_with_data,
+                env_config=train_env_config,
                 target_class=target_class,
                 device=device
             )
             train_env = Monitor(train_env, filename=None, allow_early_resets=True)
             self.envs[target_class] = train_env
             
-            # Create evaluation environment for this class
+            # Create evaluation environment for this class (with evaluation mode)
+            eval_env_config = {**env_config_with_data, "mode": "evaluation"}
             eval_env = self._create_env_for_class(
                 env_data=env_data,
-                env_config=env_config_with_data,
+                env_config=eval_env_config,
                 target_class=target_class,
                 device=device
             )
@@ -492,6 +514,8 @@ class AnchorTrainerSB3:
                 callbacks.append(checkpoint_callback)
             
             # Evaluation callback (per class)
+            # eval_env is already set to "evaluation" mode, so termination counters
+            # will be automatically reset in reset() method
             eval_callback = None
             if self.experiment_config.get("eval_freq", 0) > 0:
                 eval_callback = EvalCallback(
@@ -554,6 +578,8 @@ class AnchorTrainerSB3:
             model = self.models[target_class]
             eval_env = self.eval_envs[target_class]
             
+            # Evaluation environment is already set to "evaluation" mode
+            # Termination counters will be reset automatically in reset()
             logger.info(f"\nEvaluating policy for class {target_class}...")
             mean_reward, std_reward = evaluate_policy(
                 model,

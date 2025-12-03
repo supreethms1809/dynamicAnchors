@@ -380,7 +380,14 @@ class AnchorTrainer:
                     policy_device = torch.device("cpu")
                 
                 # Create environment instance on the same device as policy
+                # Set mode to "evaluation" so termination counters are reset in reset()
                 env = self._create_env_instance(device=str(policy_device))
+                if hasattr(env, 'env') or hasattr(env, '_env'):
+                    unwrapped = getattr(env, 'env', None) or getattr(env, '_env', None)
+                    if unwrapped is not None:
+                        unwrapped.mode = "evaluation"
+                elif hasattr(env, 'mode'):
+                    env.mode = "evaluation"
                 
                 # Debug: Check group_map structure (before episode loop) - SS: REMOVE THIS DEBUG LATER
                 logger.info(f"  Debug: algorithm.group_map = {algorithm.group_map}")
@@ -957,7 +964,15 @@ class AnchorTrainer:
         
         # Get environment to access agent-to-class mapping
         env = self._create_env_instance()
+        # Set mode to "inference" for rule extraction
         unwrapped_env = None
+        if hasattr(env, 'env') or hasattr(env, '_env'):
+            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+        if unwrapped_env is not None and hasattr(unwrapped_env, 'mode'):
+            unwrapped_env.mode = "inference"
+        elif hasattr(env, 'mode'):
+            env.mode = "inference"
+        
         if hasattr(env, 'env') or hasattr(env, '_env'):
             unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
         
@@ -1379,7 +1394,15 @@ class AnchorTrainer:
         
         # Get agents_per_class from environment to know how to group agents
         env = self._create_env_instance()
+        # Set mode to "evaluation" so termination counters are reset in reset()
         unwrapped_env = None
+        if hasattr(env, 'env') or hasattr(env, '_env'):
+            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
+        if unwrapped_env is not None and hasattr(unwrapped_env, 'mode'):
+            unwrapped_env.mode = "evaluation"
+        elif hasattr(env, 'mode'):
+            env.mode = "evaluation"
+        
         if hasattr(env, 'env') or hasattr(env, '_env'):
             unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
         
@@ -2239,8 +2262,8 @@ class AnchorTrainer:
             "use_class_centroids": True,  # Use class centroids for initial window (default: True)
             # Termination reason counters: disable overused reasons
             "max_termination_count_excellent_precision": 50,  # Disable after 10 uses
-            "max_termination_count_both_targets": -1,         # Unlimited (default)
-            "max_termination_count_high_precision": -1,       # Unlimited (default)
-            "max_termination_count_both_close": -1,           # Unlimited (default)
+            "max_termination_count_both_targets": 50,         # Unlimited (default)
+            "max_termination_count_high_precision": 50,       # Unlimited (default)
+            "max_termination_count_both_close": 50,           # Unlimited (default)
         }
 

@@ -121,24 +121,14 @@ class AnchorEnv(ParallelEnv):
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
         
         # Termination reason counters: track usage and disable overused reasons per agent
-        self.termination_reason_counts = {agent: {
-            "both_targets_met": 0,
-            "excellent_precision": 0,
-            "high_precision_reasonable_coverage": 0,
-            "both_reasonably_close": 0
-        } for agent in self.agents}
+        # These are reset for evaluation to ensure fair evaluation
         self.termination_reason_max_counts = {
             "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
             "excellent_precision": env_config.get("max_termination_count_excellent_precision", 10),
             "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
             "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
         }
-        self.termination_reason_enabled = {agent: {
-            "both_targets_met": True,
-            "excellent_precision": True,
-            "high_precision_reasonable_coverage": True,
-            "both_reasonably_close": True
-        } for agent in self.agents}
+        self._reset_termination_counters()
 
         self.use_perturbation = env_config.get("use_perturbation", False)
         self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
@@ -173,6 +163,11 @@ class AnchorEnv(ParallelEnv):
 
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
+        
+        # Environment mode: "training", "evaluation", or "inference"
+        # Termination counters are reset in reset() for evaluation/inference modes
+        self.mode = env_config.get("mode", "training")  # Default to training
+        
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
         # Shared reward weight for cooperative behavior (applied to all agents)
         self.shared_reward_weight = env_config.get("shared_reward_weight", 0.2)
@@ -501,6 +496,29 @@ class AnchorEnv(ParallelEnv):
             "data_source": data_source,
         }
 
+    def _reset_termination_counters(self):
+        """Reset termination reason counters and enable all reasons for all agents."""
+        # Use possible_agents (available in __init__) or agents (available after reset)
+        agents_list = getattr(self, 'agents', None) or getattr(self, 'possible_agents', [])
+        if not agents_list:
+            # Fallback: create empty dicts if no agents available yet
+            self.termination_reason_counts = {}
+            self.termination_reason_enabled = {}
+            return
+        
+        self.termination_reason_counts = {agent: {
+            "both_targets_met": 0,
+            "excellent_precision": 0,
+            "high_precision_reasonable_coverage": 0,
+            "both_reasonably_close": 0
+        } for agent in agents_list}
+        self.termination_reason_enabled = {agent: {
+            "both_targets_met": True,
+            "excellent_precision": True,
+            "high_precision_reasonable_coverage": True,
+            "both_reasonably_close": True
+        } for agent in agents_list}
+    
     def reset(
         self, 
         seed: Optional[int] = None, 
@@ -511,6 +529,11 @@ class AnchorEnv(ParallelEnv):
         
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+        
+        # Reset termination counters for evaluation/inference modes
+        # This ensures fair evaluation without disabled termination reasons
+        if self.mode in ["evaluation", "inference"]:
+            self._reset_termination_counters()
         
         self.agents = copy(self.possible_agents)
         self.timestep = 0

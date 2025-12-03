@@ -448,6 +448,8 @@ def extract_rules_single_agent(
                 env_X_std = env_data["X_std"]
                 env_y = env_data["y"]
             
+            # Set mode to "inference" for rule extraction
+            inference_env_config = {**env_config, "mode": "inference"}
             env = SingleAgentAnchorEnv(
                 X_unit=env_X_unit,
                 X_std=env_X_std,
@@ -456,7 +458,7 @@ def extract_rules_single_agent(
                 classifier=dataset_loader.get_classifier(),
                 device=device,
                 target_class=target_class,
-                env_config=env_config
+                env_config=inference_env_config
             )
             
             # Run rollout
