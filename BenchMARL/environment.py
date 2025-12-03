@@ -1147,6 +1147,14 @@ class AnchorEnv(ParallelEnv):
             for agent in self.agents:
                 if not terminations.get(agent, False):
                     truncations[agent] = True
+                    # Log truncation for debugging
+                    precision = infos.get(agent, {}).get("anchor_precision", 0.0)
+                    coverage = infos.get(agent, {}).get("anchor_coverage", 0.0)
+                    logger.info(
+                        f"Agent {agent} episode truncated at max_cycles={self.max_cycles} (step {self.timestep}). "
+                        f"Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
+                        f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
+                    )
         
         # Remove agents that are done (terminated or truncated) from the active list.
         # The episode for the environment ends once all agents are finished, but
