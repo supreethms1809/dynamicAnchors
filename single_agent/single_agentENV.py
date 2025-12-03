@@ -155,6 +155,27 @@ class SingleAgentAnchorEnv(Env):
 
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
+        
+        # Termination reason counters: track usage and disable overused reasons
+        self.termination_reason_counts = {
+            "both_targets_met": 0,
+            "excellent_precision": 0,
+            "high_precision_reasonable_coverage": 0,
+            "both_reasonably_close": 0
+        }
+        self.termination_reason_max_counts = {
+            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
+            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 10),
+            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
+            "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
+        }
+        self.termination_reason_enabled = {
+            "both_targets_met": True,
+            "excellent_precision": True,
+            "high_precision_reasonable_coverage": True,
+            "both_reasonably_close": True
+        }
+        
         # Multi-agent config options (kept for API compatibility, but not used in single-agent)
         # Single-agent environments are independent (one per class), so these don't apply
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
@@ -751,6 +772,18 @@ class SingleAgentAnchorEnv(Env):
         # Increment step count
         self.step_count += 1
         
+        # Check if termination reasons are enabled (not overused)
+        both_targets_met_enabled = self.termination_reason_enabled["both_targets_met"]
+        excellent_precision_enabled = self.termination_reason_enabled["excellent_precision"]
+        high_precision_enabled = self.termination_reason_enabled["high_precision_reasonable_coverage"]
+        both_close_enabled = self.termination_reason_enabled["both_reasonably_close"]
+        
+        # Only consider conditions that are enabled
+        both_targets_met = both_targets_met and both_targets_met_enabled
+        excellent_precision = excellent_precision and excellent_precision_enabled
+        high_precision_with_reasonable_coverage = high_precision_with_reasonable_coverage and high_precision_enabled
+        both_reasonably_close = both_reasonably_close and both_close_enabled
+        
         # Validate rule validity before allowing termination
         # Check that bounds are valid: lower < upper for all features, bounds in [0, 1], and finite
         bounds_valid = True
@@ -787,20 +820,35 @@ class SingleAgentAnchorEnv(Env):
         
         termination_reason = None
         if done:
-            if both_targets_met:
+            # Determine which condition was met (check in priority order)
+            if both_targets_met and both_targets_met_enabled:
                 termination_reason = "both_targets_met"
-            elif excellent_precision:
+            elif excellent_precision and excellent_precision_enabled:
                 termination_reason = "excellent_precision"
-            elif high_precision_with_reasonable_coverage:
+            elif high_precision_with_reasonable_coverage and high_precision_enabled:
                 termination_reason = "high_precision_reasonable_coverage"
-            elif both_reasonably_close:
+            elif both_reasonably_close and both_close_enabled:
                 termination_reason = "both_reasonably_close"
             
-            # Log which termination condition was met
+            # Increment counter and check if we should disable this reason
             if termination_reason:
+                self.termination_reason_counts[termination_reason] += 1
+                count = self.termination_reason_counts[termination_reason]
+                max_count = self.termination_reason_max_counts[termination_reason]
+                
+                # Disable reason if it exceeds max count (unless max_count is -1 for unlimited)
+                if max_count > 0 and count >= max_count and self.termination_reason_enabled[termination_reason]:
+                    self.termination_reason_enabled[termination_reason] = False
+                    logger.warning(
+                        f"Termination reason '{termination_reason}' disabled for class {self.target_class} "
+                        f"after {count} uses (max: {max_count}). Agent must now meet other conditions."
+                    )
+                
+                # Log which termination condition was met
                 logger.info(
                     f"Episode terminated for class {self.target_class} (step {self.step_count}): "
-                    f"{termination_reason}. Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
+                    f"{termination_reason} (count: {count}/{max_count if max_count > 0 else 'unlimited'}). "
+                    f"Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
                     f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
                 )
         

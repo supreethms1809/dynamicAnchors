@@ -2237,5 +2237,10 @@ class AnchorTrainer:
             "inter_class_overlap_weight": 0.1,
             "shared_reward_weight": 0.2,  # Weight for shared cooperative reward
             "use_class_centroids": True,  # Use class centroids for initial window (default: True)
+            # Termination reason counters: disable overused reasons
+            "max_termination_count_excellent_precision": 50,  # Disable after 10 uses
+            "max_termination_count_both_targets": -1,         # Unlimited (default)
+            "max_termination_count_high_precision": -1,       # Unlimited (default)
+            "max_termination_count_both_close": -1,           # Unlimited (default)
         }
 

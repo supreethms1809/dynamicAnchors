@@ -301,7 +301,7 @@ class AnchorTrainerSB3:
     def _get_default_env_config(self) -> Dict[str, Any]:
         """Get default environment configuration."""
         return {
-            "precision_target": 0.9,
+            "precision_target": 0.8,
             "coverage_target": 0.1,
             "use_perturbation": True,
             "perturbation_mode": "adaptive",
@@ -319,6 +319,11 @@ class AnchorTrainerSB3:
             "max_action_scale": 0.1,
             "min_absolute_step": 0.001,
             "use_class_centroids": True,
+            # Termination reason counters: disable overused reasons
+            "max_termination_count_excellent_precision": 10,  # Disable after 10 uses
+            "max_termination_count_both_targets": -1,         # Unlimited (default)
+            "max_termination_count_high_precision": -1,       # Unlimited (default)
+            "max_termination_count_both_close": -1,           # Unlimited (default)
         }
     
     def _setup_environments(
