@@ -1,3 +1,6 @@
+"""
+The outline of the file was created by following the Custom env tutorial in the PettingZoo documentation.
+"""
 import functools
 from copy import copy
 import numpy as np
@@ -70,15 +73,13 @@ class AnchorEnv(ParallelEnv):
         
         self.target_classes = target_classes
 
-        # Number of agents per class. When set to 1 (default), behavior matches
-        # the original implementation with exactly one agent per class.
         self.agents_per_class = env_config.get("agents_per_class", 1)
 
-        # Construct agent names and the mapping from agent to class.
+        # SS - Reference needed for policy extraction and inference
         # For agents_per_class == 1:
         #   class c -> "agent_c"
         # For agents_per_class > 1:
-        #   class c -> "agent_c_0", "agent_c_1", ..., "agent_c_{K-1}"
+        #   class c -> ["agent_c_0", "agent_c_1", ..., "agent_c_{K-1}"]
         self.possible_agents = []
         self.agent_to_class = {}
         for cls in target_classes:
@@ -92,7 +93,7 @@ class AnchorEnv(ParallelEnv):
                     self.possible_agents.append(name)
                     self.agent_to_class[name] = cls
         
-        # Mapping from class id to list of agents belonging to that class.
+        # SS - Reference needed for class-level metrics and within-class diversity penalties
         # This is used for class-level metrics (union coverage/precision) and
         # for within-class diversity penalties when multiple agents represent
         # the same class.
@@ -101,8 +102,7 @@ class AnchorEnv(ParallelEnv):
             self.class_to_agents[cls].append(agent)
         
         # Group mapping for BenchMARL: maps group names to lists of agent names.
-        # By default, each agent is its own group (independent policies).
-        # This can be customized if agents should share policies (e.g., group by class).
+        # By default, each agent is its own group.
         self._group_map = self._compute_group_map()
         
         step_fracs = env_config.get("step_fracs", (0.005, 0.01, 0.02))
@@ -120,8 +120,7 @@ class AnchorEnv(ParallelEnv):
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
         
-        # Termination reason counters: track usage and disable overused reasons per agent
-        # These are reset for evaluation to ensure fair evaluation
+        # SS - Termination reason counters: track usage and disable overused reasons per agent
         self.termination_reason_max_counts = {
             "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
             "excellent_precision": env_config.get("max_termination_count_excellent_precision", -1),
@@ -165,8 +164,7 @@ class AnchorEnv(ParallelEnv):
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
         
         # Environment mode: "training", "evaluation", or "inference"
-        # Termination counters are reset in reset() for evaluation/inference modes
-        self.mode = env_config.get("mode", "training")  # Default to training
+        self.mode = env_config.get("mode", "training")
         
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
         # Shared reward weight for cooperative behavior (applied to all agents)
@@ -233,13 +231,6 @@ class AnchorEnv(ParallelEnv):
         return (X_unit_samples * self.X_range) + self.X_min
     
     def _get_class_for_agent(self, agent: str) -> Optional[int]:
-        """
-        Robustly obtain the class id for a given agent.
-
-        Primary source is self.agent_to_class; if not present,
-        try to parse from the agent name (e.g., "agent_0_2" -> class 0).
-        Parsed results are cached back into agent_to_class and class_to_agents.
-        """
         if agent in self.agent_to_class:
             return self.agent_to_class[agent]
         
@@ -257,38 +248,19 @@ class AnchorEnv(ParallelEnv):
         return None
 
     def _get_class_centroid(self, agent: str) -> Optional[np.ndarray]:
-        """
-        Get the centroid for the agent's target class.
-        
-        Priority:
-        1. Use precomputed cluster_centroids_per_class if available
-           - If agents_per_class > 1, assign specific centroid based on agent index
-           - Otherwise, sample a random centroid
-        2. Use fixed_instances_per_class if available (sample from them)
-        3. Compute mean centroid from class data
-        
-        Args:
-            agent: Agent name (e.g., "agent_0" or "agent_0_1")
-            
-        Returns:
-            Centroid in unit space [0, 1], or None if no data available
-        """
         target_class = self._get_class_for_agent(agent)
         if target_class is None:
             return None
         
-        # Priority 1: Use precomputed cluster centroids if its class level
+        # Use precomputed cluster centroids if its class level
         if self.cluster_centroids_per_class is not None:
             if target_class in self.cluster_centroids_per_class:
                 centroids = self.cluster_centroids_per_class[target_class]
                 if len(centroids) > 0:
-                    # Always sample randomly from available centroids for diversity across episodes
-                    # This ensures each agent can explore from different starting points
-                    # even when agents_per_class > 1
                     centroid_idx = self.rng.integers(0, len(centroids))
                     return np.array(centroids[centroid_idx], dtype=np.float32)
         
-        # Priority 2: Use fixed instances (sample one as centroid) if its instance level
+        # Use fixed instances if its instance level
         if self.fixed_instances_per_class is not None:
             if target_class in self.fixed_instances_per_class:
                 instances = self.fixed_instances_per_class[target_class]
@@ -296,7 +268,7 @@ class AnchorEnv(ParallelEnv):
                     instance_idx = self.rng.integers(0, len(instances))
                     return np.array(instances[instance_idx], dtype=np.float32)
         
-        # Priority 3: Compute mean centroid from class data
+        # Fallback:Compute mean centroid from class data
         X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
         y_data = self.y_test if self.eval_on_test_data else self.y
         
@@ -310,20 +282,8 @@ class AnchorEnv(ParallelEnv):
         
         return centroid
     
+    # Initialize the box from the centroid
     def _compute_box_from_centroid(self, agent: str, centroid: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Compute box bounds from a centroid that are guaranteed to cover at least some points.
-        
-        This finds points in the class data that are closest to the centroid and computes
-        box bounds (min/max) that cover those points, ensuring the box has non-zero coverage.
-        
-        Args:
-            agent: Agent name
-            centroid: Centroid point in unit space [0, 1]
-            
-        Returns:
-            Tuple of (lower, upper) bounds, or None if no data available
-        """
         target_class = self._get_class_for_agent(agent)
         if target_class is None:
             return None
@@ -338,7 +298,7 @@ class AnchorEnv(ParallelEnv):
         
         class_data = X_data[class_mask]
         
-        # Find points closest to the centroid (use at least 10% of class points, or min 5 points)
+        # Find points closest to the centroid
         n_neighbors = max(5, int(0.1 * len(class_data)))
         n_neighbors = min(n_neighbors, len(class_data))
         
@@ -347,8 +307,7 @@ class AnchorEnv(ParallelEnv):
         nearest_indices = np.argsort(distances)[:n_neighbors]
         nearest_points = class_data[nearest_indices]
         
-        # Compute box bounds from nearest points (with some padding)
-        # Use min/max of nearest points, then add a small padding (5% of feature range)
+        # Compute box bounds from nearest points
         padding = 0.05
         lower = np.maximum(0.0, nearest_points.min(axis=0) - padding)
         upper = np.minimum(1.0, nearest_points.max(axis=0) + padding)
@@ -369,6 +328,7 @@ class AnchorEnv(ParallelEnv):
         
         return lower.astype(np.float32), upper.astype(np.float32)
 
+    # Reward calculation: Compute the current metrics for the agent
     def _current_metrics(self, agent: str) -> tuple:
         target_class = self._get_class_for_agent(agent)
         if target_class is None:
@@ -500,12 +460,10 @@ class AnchorEnv(ParallelEnv):
             "data_source": data_source,
         }
 
+    # SS: Added as part of the termination reason counters
     def _reset_termination_counters(self):
-        """Reset termination reason counters and enable all reasons for all agents."""
-        # Use possible_agents (available in __init__) or agents (available after reset)
         agents_list = getattr(self, 'agents', None) or getattr(self, 'possible_agents', [])
         if not agents_list:
-            # Fallback: create empty dicts if no agents available yet
             self.termination_reason_counts = {}
             self.termination_reason_enabled = {}
             return
@@ -534,11 +492,6 @@ class AnchorEnv(ParallelEnv):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         
-        # Note: Termination counters are NOT reset here to allow them to accumulate
-        # across episodes. They are initialized in __init__ and accumulate throughout
-        # the session. In inference/evaluation mode, counters start fresh from __init__,
-        # but accumulate across episodes to track usage and disable overused reasons.
-        
         self.agents = copy(self.possible_agents)
         self.timestep = 0
         
@@ -546,31 +499,26 @@ class AnchorEnv(ParallelEnv):
         infos = {}
         
         for agent in self.agents:
-            # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
             if self.x_star_unit.get(agent) is not None:
                 w = self.initial_window
                 centroid = self.x_star_unit[agent]
                 self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
                 self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
-            # Priority 2: Use class centroid if enabled (for class-based)
+            # Use class centroid if enabled
             elif self.use_class_centroids:
                 centroid = self._get_class_centroid(agent)
                 if centroid is not None:
-                    # Compute box bounds that cover points near the centroid
-                    # This ensures the box covers at least some points from the cluster
                     box_bounds = self._compute_box_from_centroid(agent, centroid)
                     if box_bounds is not None:
                         self.lower[agent], self.upper[agent] = box_bounds
                     else:
-                        # Fallback: Use fixed window around centroid
                         w = self.initial_window
                         self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
                         self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
                 else:
-                    # Fallback: Full space initialization
                     self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
                     self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
-            # Priority 3: Full space initialization (original behavior)
+            # Fallback: Full space initialization
             else:
                 self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
                 self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
@@ -588,6 +536,7 @@ class AnchorEnv(ParallelEnv):
         
         return observations, infos
 
+    # Discrete action: Older version (not used anymore)
     def _apply_action(self, agent: str, action: int):
         f = action // (len(self.directions) * len(self.step_fracs))
         rem = action % (len(self.directions) * len(self.step_fracs))
@@ -613,6 +562,7 @@ class AnchorEnv(ParallelEnv):
             self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
             self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
 
+    # SS: Currently used 
     def _apply_continuous_action(self, agent: str, action: np.ndarray):
         action = np.clip(action, -1.0, 1.0)
         
@@ -639,6 +589,7 @@ class AnchorEnv(ParallelEnv):
                 self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
                 self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
         
+        # SS: Debugging (disable later)
         # Debug: Log if action was applied (only for first call per agent)
         if not hasattr(self, '_action_debug_logged'):
             self._action_debug_logged = set()
@@ -667,13 +618,10 @@ class AnchorEnv(ParallelEnv):
         truncations: Dict[str, bool] = {}
         infos: Dict[str, Dict] = {}
         
-        # Cache post-action metrics for all agents so that shared reward can be computed
-        # based on the *post-action* state without re-evaluating the classifier.
-        # metrics_cache[agent] = (precision, coverage, details_dict)
         metrics_cache: Dict[str, Tuple[float, float, Dict[str, Any]]] = {}
         
-        # We first compute all local rewards (without the shared component),
-        # and only after all agents have moved do we compute the shared reward
+        # SS: R_local: We first compute all local rewards (without the shared component),
+        # and only after all agents have moved do we compute the R_shared
         # and add it to each agent's reward.
         reward_without_shared: Dict[str, float] = {}
         
@@ -693,6 +641,7 @@ class AnchorEnv(ParallelEnv):
                 terminations[agent] = False
                 truncations[agent] = False
                 
+                # SS: This is part of the metrics callback of BenchMARL. (currently not working BUG: Need to fix this)
                 infos[agent] = {
                     "anchor_precision": float(precision),
                     "anchor_coverage": float(coverage),
@@ -722,7 +671,6 @@ class AnchorEnv(ParallelEnv):
                     "global_coverage": 0.0,
                     "total_reward": 0.0,
                 }
-                # We do not add classifier-level details here, since no action was taken
                 continue
             
             action = actions[agent]
@@ -736,7 +684,7 @@ class AnchorEnv(ParallelEnv):
             prev_widths = np.maximum(prev_upper - prev_lower, 1e-9)
             prev_vol = float(np.prod(prev_widths))
             
-            # Apply either continuous or discrete action
+            #SS: Apply either continuous or discrete action (currently only continuous is used)
             if isinstance(action, np.ndarray) and action.shape[0] == 2 * self.n_features:
                 self._apply_continuous_action(agent, action)
             else:
@@ -810,6 +758,7 @@ class AnchorEnv(ParallelEnv):
             same_class_overlap_penalty = self._compute_same_class_overlap_penalty(agent)
             
             # JS-like proxy for change in box volume / overlap with previous box
+            # This is something that I am not sure about. (maybe we can remove this)
             inter_lower = np.maximum(self.lower[agent], prev_lower)
             inter_upper = np.minimum(self.upper[agent], prev_upper)
             inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
@@ -852,22 +801,21 @@ class AnchorEnv(ParallelEnv):
             )
             
             # When action is reverted (coverage_clipped), reduce penalties significantly
-            # since no actual change occurred, but still give a small negative signal
             coverage_floor_penalty = 0.0
             if coverage_clipped:
                 # Reduce all penalties since action didn't actually take effect
-                penalty_reduction_factor = 0.1  # Reduce penalties by 90%
+                penalty_reduction_factor = 0.1
                 overlap_penalty *= penalty_reduction_factor
                 anchor_drift_penalty *= penalty_reduction_factor
                 js_penalty *= penalty_reduction_factor
                 inter_class_overlap_penalty *= penalty_reduction_factor
                 same_class_overlap_penalty *= penalty_reduction_factor
                 # Give a small negative reward for attempting invalid action
-                coverage_floor_penalty = -0.05  # Small penalty for violating coverage floor
+                coverage_floor_penalty = -0.05
             
             # Add small survival bonus to prevent excessive penalty for longer episodes
-            # This encourages exploration while still rewarding early termination
-            survival_bonus = 0.01  # Small positive reward per step to offset penalties
+            # SS: Noticed episodes are very short, so added this. (FUTURE: Remove this)
+            survival_bonus = 0.01
             
             # Scale penalties based on progress: reduce penalties when making progress
             progress_factor = 1.0
@@ -878,14 +826,14 @@ class AnchorEnv(ParallelEnv):
                 # Reduce penalties when close to target
                 progress_factor = 0.7
             
-            # Local reward component (without shared reward)
+            # SS: R_local: Local reward component
             reward_local = (
                 self.alpha * precision_weight * precision_gain
                 + coverage_weight * coverage_gain_for_reward
                 + coverage_bonus
                 + target_class_bonus
-                + survival_bonus  # Add survival bonus
-                - progress_factor * overlap_penalty  # Scale penalties
+                + survival_bonus
+                - progress_factor * overlap_penalty
                 - progress_factor * drift_penalty
                 - progress_factor * anchor_drift_penalty
                 - progress_factor * js_penalty
@@ -969,6 +917,7 @@ class AnchorEnv(ParallelEnv):
                 )
             )
             
+            # SS: Need some kind of priority order for the termination reasons. (currently not implemented)
             termination_reason = None
             if done:
                 # Determine which condition was met (check in priority order)
@@ -995,7 +944,7 @@ class AnchorEnv(ParallelEnv):
                             f"after {count} uses (max: {max_count}). Agent must now meet other conditions."
                         )
                     
-                    # Log which termination condition was met
+                    # Log which termination condition was met (SS: Debugging (disable later))
                     logger.info(
                         f"Agent {agent} episode terminated (step {self.timestep}): "
                         f"{termination_reason} (count: {count}/{max_count if max_count > 0 else 'unlimited'}). "
@@ -1069,11 +1018,9 @@ class AnchorEnv(ParallelEnv):
             truncations[agent] = False
             infos[agent] = info
         
-        # Now that all agents have been processed and metrics_cache is populated
-        # with post-action metrics, compute the shared reward based on the
-        # post-action state.
+        # SS: R_shared: compute the shared reward based on the post-action state.
         if len(self.agents) > 1:
-            # Compute global coverage first (needed for shared reward)
+            # Compute global coverage - This was not part of the original design.
             global_coverage = self._compute_global_coverage()
             shared_reward = self._compute_shared_reward(metrics_cache=metrics_cache, global_coverage=global_coverage)
         else:
@@ -1168,8 +1115,6 @@ class AnchorEnv(ParallelEnv):
         
         # Remove agents that are done (terminated or truncated) from the active list.
         # The episode for the environment ends once all agents are finished, but
-        # agents can now terminate independently rather than ending the episode
-        # as soon as the first agent finishes.
         self.agents = [
             agent for agent in self.agents
             if not (terminations.get(agent, False) or truncations.get(agent, False))
@@ -1177,6 +1122,7 @@ class AnchorEnv(ParallelEnv):
         
         return observations, rewards, terminations, truncations, infos
     
+    # SS: Competative part of the game
     def _compute_inter_class_overlap_penalty(self, agent: str) -> float:
         if len(self.agents) <= 1:
             return 0.0
@@ -1221,12 +1167,6 @@ class AnchorEnv(ParallelEnv):
         return float(np.clip(penalty, 0.0, 1.0))
 
     def _compute_same_class_overlap_penalty(self, agent: str) -> float:
-        """
-        Encourage diversity among anchors belonging to the same class.
-
-        Uses a Jaccard-style overlap between the agent's box and other
-        boxes of the same class. Higher overlap -> higher penalty.
-        """
         if self.same_class_diversity_weight <= 0.0:
             return 0.0
         
@@ -1234,7 +1174,7 @@ class AnchorEnv(ParallelEnv):
         if cls is None:
             return 0.0
         
-        # Same-class agents currently active (excluding self)
+        # Same-class agents currently active
         same_class_agents = [
             a for a in self.agents
             if a != agent and self._get_class_for_agent(a) == cls
@@ -1281,21 +1221,6 @@ class AnchorEnv(ParallelEnv):
         return float(np.clip(penalty, 0.0, 1.0))
 
     def _compute_class_union_metrics(self) -> Dict[int, Dict[str, float]]:
-        """
-        Compute class-level union coverage and union precision for each class.
-
-        - Union coverage: fraction of points of class c that fall in the union
-          of all anchors belonging to class c.
-        - Union precision: among all points in the union of anchors for class c,
-          fraction whose true label is c.
-
-        These metrics are computed w.r.t. the underlying dataset (train or test,
-        depending on eval_on_test_data).
-        
-        Note: Uses all agents that have boxes defined (in self.lower/self.upper),
-        not just currently active agents, to ensure metrics are computed even
-        after agents have terminated.
-        """
         if self.eval_on_test_data:
             X_data = self.X_test_unit
             y_data = self.y_test
@@ -1308,8 +1233,7 @@ class AnchorEnv(ParallelEnv):
         
         n_samples = X_data.shape[0]
         class_ids = set()
-        # Use all agents that have boxes defined, not just active agents
-        # This ensures we can compute metrics even after agents have terminated
+
         agents_with_boxes = set(self.lower.keys()) | set(self.upper.keys())
         for agent in agents_with_boxes:
             cls = self._get_class_for_agent(agent)
@@ -1319,14 +1243,12 @@ class AnchorEnv(ParallelEnv):
         metrics: Dict[int, Dict[str, float]] = {}
         
         for cls in sorted(class_ids):
-            # All agents of this class that have boxes defined
             agents_c = [a for a in agents_with_boxes if self._get_class_for_agent(a) == cls]
             if not agents_c:
                 continue
             
             union_mask = np.zeros(n_samples, dtype=bool)
             for agent in agents_c:
-                # _mask_in_box already selects the appropriate dataset (train/test)
                 mask_agent = self._mask_in_box(agent)
                 if mask_agent.shape[0] == union_mask.shape[0]:
                     union_mask |= mask_agent
@@ -1352,22 +1274,11 @@ class AnchorEnv(ParallelEnv):
         
         return metrics
     
+    # Added as part of debugging multiagent after presentation
     def _compute_global_coverage(self) -> float:
-        """
-        Compute global coverage: fraction of the entire dataset covered by the union
-        of all agents' anchors (across all classes).
-        
-        This metric measures how well the collective set of agents explains the
-        distribution. Higher values indicate that together, all agents cover
-        more of the dataset.
-        
-        Returns:
-            Global coverage value in [0, 1], where 1.0 means all samples are covered
-        """
         if len(self.agents) == 0:
             return 0.0
         
-        # Select appropriate dataset (train or test)
         if self.eval_on_test_data:
             X_data = self.X_test_unit
             y_data = self.y_test
@@ -1380,20 +1291,20 @@ class AnchorEnv(ParallelEnv):
         
         n_samples = X_data.shape[0]
         
-        # Build union mask: points covered by ANY agent
+        # Build union mask
         union_mask = np.zeros(n_samples, dtype=bool)
         
         for agent in self.agents:
-            # Get mask for points in this agent's box
             mask_agent = self._mask_in_box(agent)
             if mask_agent.shape[0] == union_mask.shape[0]:
                 union_mask |= mask_agent
         
-        # Global coverage: fraction of all samples covered by the union
+        # Global coverage
         global_coverage = float(union_mask.mean()) if n_samples > 0 else 0.0
         
         return global_coverage
     
+    # SS: Drift penalty
     def _compute_anchor_drift_penalty(self, agent: str, prev_lower: np.ndarray, prev_upper: np.ndarray) -> float:
         anchor_drift_penalty = 0.0
         if self.x_star_unit.get(agent) is not None:
@@ -1405,6 +1316,7 @@ class AnchorEnv(ParallelEnv):
                 anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5
         return anchor_drift_penalty
     
+    # SS: Reward weights and penalties
     def _compute_reward_weights_and_penalties(
         self, precision: float, precision_gain: float, coverage_gain: float, 
         js_proxy: float, precision_threshold: float, eps: float
@@ -1427,6 +1339,7 @@ class AnchorEnv(ParallelEnv):
         
         return precision_weight, coverage_weight, js_penalty
     
+    # SS: Coverage bonus
     def _compute_coverage_bonus(
         self, precision: float, coverage: float, coverage_gain: float, 
         precision_threshold: float, eps: float
@@ -1446,6 +1359,7 @@ class AnchorEnv(ParallelEnv):
         
         return coverage_bonus
     
+    # SS: Target class bonus
     def _compute_target_class_bonus(
         self, details: dict, precision: float, precision_threshold: float, eps: float
     ) -> float:
@@ -1459,27 +1373,12 @@ class AnchorEnv(ParallelEnv):
         
         return target_class_bonus
     
+    # SS: Shared reward
     def _compute_shared_reward(
         self,
         metrics_cache: Optional[Dict[str, Tuple[float, float, Dict[str, Any]]]] = None,
         global_coverage: Optional[float] = None,
     ) -> float:
-        """
-        Compute shared reward component for cooperative MARL.
-
-        All agents receive the same shared reward to encourage:
-        1. All agents meeting their targets (cooperative success)
-        2. Low overall overlap between all agents' rules
-        3. Good average performance across all agents
-
-        If ``metrics_cache`` is provided, it should map agent names to
-        (precision, coverage, details) tuples computed for the current step.
-        This avoids redundant classifier evaluations and ensures that the
-        shared reward is based on post-action metrics.
-        
-        Returns:
-            Shared reward value (same for all agents)
-        """
         if len(self.agents) <= 1:
             return 0.0
         
@@ -1505,17 +1404,16 @@ class AnchorEnv(ParallelEnv):
         shared_reward = 0.0
         shared_reward_weight = getattr(self, "shared_reward_weight", 0.2)
         
-        # 1. Bonus when ALL agents meet their targets (strong cooperative signal)
+        # Bonus when ALL agents meet their targets (strong cooperative signal)
         if all(all_targets_met):
-            shared_reward += shared_reward_weight * 1.0  # Large bonus for full cooperation
+            shared_reward += shared_reward_weight * 1.0
         
-        # 2. Bonus for fraction of agents meeting targets (partial cooperation)
+        # Bonus for fraction of agents meeting targets (partial cooperation)
         fraction_meeting_targets = sum(all_targets_met) / len(self.agents)
         if fraction_meeting_targets > 0:
             shared_reward += shared_reward_weight * 0.5 * fraction_meeting_targets
         
-        # 3. Bonus for low overall overlap (complement to inter_class_overlap_penalty)
-        # Compute average overlap across all agent pairs
+        # Bonus for low overall overlap (complement to inter_class_overlap_penalty)
         total_overlap = 0.0
         n_pairs = 0
         
@@ -1553,7 +1451,7 @@ class AnchorEnv(ParallelEnv):
             overlap_bonus = shared_reward_weight * 0.3 * (1.0 - min(1.0, avg_overlap))
             shared_reward += overlap_bonus
         
-        # 4. Bonus for good average precision/coverage across all agents
+        # Bonus for good average precision/coverage across all agents
         avg_precision = float(np.mean(all_precisions)) if all_precisions else 0.0
         avg_coverage = float(np.mean(all_coverages)) if all_coverages else 0.0
         
@@ -1567,21 +1465,15 @@ class AnchorEnv(ParallelEnv):
         if avg_coverage >= self.coverage_target * 0.5:
             shared_reward += shared_reward_weight * 0.2 * coverage_progress
         
-        # 5. Global coverage bonus: reward when union of all agents covers the dataset well
-        # This encourages agents to collectively explain the distribution
-        # Target is 1.0 (all samples covered)
+        # Global coverage bonus: reward when union of all agents covers the dataset well
         if self.global_coverage_weight > 0:
             if global_coverage is None:
                 global_coverage = self._compute_global_coverage()
             # Only reward if global coverage exceeds threshold
             if global_coverage >= self.global_coverage_threshold:
-                # Reward progress toward 1.0 (full coverage)
-                # Use squared term to emphasize values closer to 1.0
                 global_coverage_target = 1.0
                 global_coverage_progress = min(1.0, global_coverage / (global_coverage_target + eps))
-                # Squared progress emphasizes getting closer to 1.0
                 global_coverage_bonus = self.global_coverage_weight * (global_coverage_progress ** 2)
-                # Extra bonus when very close to full coverage (> 0.9)
                 if global_coverage >= 0.9:
                     global_coverage_bonus += self.global_coverage_weight * 0.2 * (global_coverage - 0.9) / 0.1
                 shared_reward += global_coverage_bonus
@@ -1589,20 +1481,8 @@ class AnchorEnv(ParallelEnv):
         return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.5))
 
     def _compute_group_map(self) -> Dict[str, List[str]]:
-        """
-        Compute the group mapping for BenchMARL.
-        
-        By default, each agent is its own group (independent policies).
-        This means each agent learns its own policy/network.
-        
-        Returns:
-            Dictionary mapping group names to lists of agent names.
-            Format: {group_name: [agent1, agent2, ...]}
-        """
         group_map = {}
         
-        # Default: one group per agent (each agent has its own policy)
-        # This is the most common case for independent learning
         for agent in self.possible_agents:
             group_map[agent] = [agent]
         
@@ -1610,15 +1490,6 @@ class AnchorEnv(ParallelEnv):
     
     @property
     def group_map(self) -> Dict[str, List[str]]:
-        """
-        Get the group mapping for BenchMARL.
-        
-        Returns a dictionary mapping group names to lists of agent names.
-        This is used by BenchMARL to organize agents into groups that share policies.
-        
-        Returns:
-            Dictionary mapping group names to lists of agent names.
-        """
         return self._group_map.copy()
 
     @functools.lru_cache(maxsize=None)
@@ -1653,31 +1524,25 @@ class AnchorEnv(ParallelEnv):
         lower = self.lower[agent].copy()
         upper = self.upper[agent].copy()
         
-        # Denormalize bounds if requested (convert from [0, 1] to original feature space)
+        # Denormalize bounds if requested
         if denormalize:
             if self.X_min is None or self.X_range is None:
                 logger.warning("Cannot denormalize: X_min or X_range not available. Using normalized bounds.")
-                denormalize = False  # Disable denormalization if params not available
+                denormalize = False
             else:
                 lower = self._unit_to_std(lower)
                 upper = self._unit_to_std(upper)
         
         if initial_lower is None or initial_upper is None:
-            # Default initial width is full normalized space [0, 1]
             initial_width_normalized = np.ones(self.n_features, dtype=np.float32)
             if denormalize and self.X_min is not None and self.X_range is not None:
-                # Denormalize initial width to match current width scale
                 initial_width = initial_width_normalized * self.X_range
             else:
                 initial_width = initial_width_normalized
         else:
-            # If initial bounds are provided, they should already be in the same space as current bounds
-            # But if we're denormalizing current bounds, we need to check if initial bounds are normalized
             initial_width = initial_upper - initial_lower
-            # If denormalizing and initial bounds look normalized (all in [0, 1]), denormalize them too
             if denormalize and self.X_min is not None and self.X_range is not None:
                 if np.all(initial_lower >= 0) and np.all(initial_lower <= 1) and np.all(initial_upper >= 0) and np.all(initial_upper <= 1):
-                    # Initial bounds appear to be normalized, denormalize them
                     initial_lower_denorm = self._unit_to_std(initial_lower)
                     initial_upper_denorm = self._unit_to_std(initial_upper)
                     initial_width = initial_upper_denorm - initial_lower_denorm
@@ -1692,41 +1557,32 @@ class AnchorEnv(ParallelEnv):
         if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
             tightened = np.array([], dtype=int)
         else:
-            # Relative thresholds (work in any scale)
-            # More lenient thresholds for multi-agent: start with 0.97 (3% reduction) instead of 0.98
             tightened = np.where(current_width < initial_width_ref * 0.97)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.98)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.99)[0]
             
-            # Absolute thresholds (need to be scale-aware)
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    # In denormalized space, use 0.96 * feature range as threshold
                     threshold_96 = 0.96 * self.X_range
                     tightened = np.where(current_width < threshold_96)[0]
                 else:
-                    # In normalized space, use 0.96 directly
                     tightened = np.where(current_width < 0.96)[0]
             
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    # In denormalized space, use 0.95 * feature range as threshold
                     threshold_95 = 0.95 * self.X_range
                     tightened = np.where(current_width < threshold_95)[0]
                 else:
-                    # In normalized space, use 0.95 directly
                     tightened = np.where(current_width < 0.95)[0]
             
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    # In denormalized space, use 0.9 * feature range as threshold
                     threshold_90 = 0.9 * self.X_range
                     if np.all(initial_width_ref >= threshold_90):
                         tightened = np.where(current_width < threshold_90)[0]
                 else:
-                    # In normalized space, use 0.9 directly
                     if np.all(initial_width_ref >= 0.9):
                         tightened = np.where(current_width < 0.9)[0]
             
