@@ -17,8 +17,8 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 
 # Environment configuration dictionary
 env_config:
-  precision_target: 0.9
-  coverage_target: 0.3
+  precision_target: 0.95
+  coverage_target: 0.5
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
@@ -36,6 +36,12 @@ env_config:
   min_absolute_step: 0.001
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
   shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
+  # Class union metrics weights: reward agents based on union of all agents' anchors for their class
+  class_union_cov_weight: 0.1   # Weight for class-union coverage bonus (fraction of class samples covered by union)
+  class_union_prec_weight: 0.1  # Weight for class-union precision bonus (precision of union for the class)
+  # Global coverage reward: reward when all agents together cover the dataset well
+  global_coverage_weight: 0.1    # Weight for global coverage bonus (fraction of entire dataset covered by union of all agents)
+  global_coverage_threshold: 0.1 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
   agents_per_class: 3        # Number of agents per class (set >1 to learn multiple anchors per class)
   # Use class centroids to initialize the initial window (default: true)
   # If true: initial window is set around class centroid (mean of class instances)
@@ -53,4 +59,8 @@ env_config:
 
 # Maximum number of steps per episode
 max_cycles: 500
+max_termination_count_excellent_precision: 500
+max_termination_count_both_targets: 500
+max_termination_count_high_precision: 500
+max_termination_count_both_close: 500
 

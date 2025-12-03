@@ -124,7 +124,7 @@ class AnchorEnv(ParallelEnv):
         # These are reset for evaluation to ensure fair evaluation
         self.termination_reason_max_counts = {
             "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
-            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 10),
+            "excellent_precision": env_config.get("max_termination_count_excellent_precision", -1),
             "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
             "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
         }
@@ -178,6 +178,10 @@ class AnchorEnv(ParallelEnv):
         self.class_union_cov_weight = env_config.get("class_union_cov_weight", 0.0)
         self.class_union_prec_weight = env_config.get("class_union_prec_weight", 0.0)
         self.same_class_diversity_weight = env_config.get("same_class_diversity_weight", 0.0)
+        
+        # Global coverage reward: weight and threshold for rewarding when all agents together cover the dataset
+        self.global_coverage_weight = env_config.get("global_coverage_weight", 0.0)
+        self.global_coverage_threshold = env_config.get("global_coverage_threshold", 0.0)
         
         x_star_unit_config = env_config.get("x_star_unit", None)
         if isinstance(x_star_unit_config, dict):
@@ -713,8 +717,9 @@ class AnchorEnv(ParallelEnv):
                     "inter_class_overlap_penalty": 0.0,
                     "same_class_overlap_penalty": 0.0,
                     "coverage_floor_penalty": 0.0,
-                    # Shared reward is added after all agents have been processed
+                    # Shared reward and global coverage are added after all agents have been processed
                     "shared_reward": 0.0,
+                    "global_coverage": 0.0,
                     "total_reward": 0.0,
                 }
                 # We do not add classifier-level details here, since no action was taken
@@ -1068,9 +1073,12 @@ class AnchorEnv(ParallelEnv):
         # with post-action metrics, compute the shared reward based on the
         # post-action state.
         if len(self.agents) > 1:
-            shared_reward = self._compute_shared_reward(metrics_cache=metrics_cache)
+            # Compute global coverage first (needed for shared reward)
+            global_coverage = self._compute_global_coverage()
+            shared_reward = self._compute_shared_reward(metrics_cache=metrics_cache, global_coverage=global_coverage)
         else:
             shared_reward = 0.0
+            global_coverage = 0.0
         
         # Optional: compute per-class union coverage/precision if enabled.
         class_union_metrics: Dict[int, Dict[str, float]] = {}
@@ -1104,6 +1112,7 @@ class AnchorEnv(ParallelEnv):
                 infos[agent]["class_union_coverage"] = float(union_cov)
                 infos[agent]["class_union_precision"] = float(union_prec)
                 infos[agent]["class_union_bonus"] = float(class_bonus)
+                infos[agent]["global_coverage"] = float(global_coverage)
                 infos[agent]["total_reward"] = float(final_reward)
             else:
                 # In principle this should not happen, but guard just in case
@@ -1135,6 +1144,7 @@ class AnchorEnv(ParallelEnv):
                     "class_union_precision": float(union_prec),
                     "class_union_bonus": float(class_bonus),
                     "shared_reward": float(shared_reward),
+                    "global_coverage": float(global_coverage),
                     "total_reward": float(final_reward),
                 }
         
@@ -1342,6 +1352,48 @@ class AnchorEnv(ParallelEnv):
         
         return metrics
     
+    def _compute_global_coverage(self) -> float:
+        """
+        Compute global coverage: fraction of the entire dataset covered by the union
+        of all agents' anchors (across all classes).
+        
+        This metric measures how well the collective set of agents explains the
+        distribution. Higher values indicate that together, all agents cover
+        more of the dataset.
+        
+        Returns:
+            Global coverage value in [0, 1], where 1.0 means all samples are covered
+        """
+        if len(self.agents) == 0:
+            return 0.0
+        
+        # Select appropriate dataset (train or test)
+        if self.eval_on_test_data:
+            X_data = self.X_test_unit
+            y_data = self.y_test
+        else:
+            X_data = self.X_unit
+            y_data = self.y
+        
+        if X_data is None or y_data is None or X_data.shape[0] == 0:
+            return 0.0
+        
+        n_samples = X_data.shape[0]
+        
+        # Build union mask: points covered by ANY agent
+        union_mask = np.zeros(n_samples, dtype=bool)
+        
+        for agent in self.agents:
+            # Get mask for points in this agent's box
+            mask_agent = self._mask_in_box(agent)
+            if mask_agent.shape[0] == union_mask.shape[0]:
+                union_mask |= mask_agent
+        
+        # Global coverage: fraction of all samples covered by the union
+        global_coverage = float(union_mask.mean()) if n_samples > 0 else 0.0
+        
+        return global_coverage
+    
     def _compute_anchor_drift_penalty(self, agent: str, prev_lower: np.ndarray, prev_upper: np.ndarray) -> float:
         anchor_drift_penalty = 0.0
         if self.x_star_unit.get(agent) is not None:
@@ -1410,6 +1462,7 @@ class AnchorEnv(ParallelEnv):
     def _compute_shared_reward(
         self,
         metrics_cache: Optional[Dict[str, Tuple[float, float, Dict[str, Any]]]] = None,
+        global_coverage: Optional[float] = None,
     ) -> float:
         """
         Compute shared reward component for cooperative MARL.
@@ -1514,7 +1567,26 @@ class AnchorEnv(ParallelEnv):
         if avg_coverage >= self.coverage_target * 0.5:
             shared_reward += shared_reward_weight * 0.2 * coverage_progress
         
-        return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.0))
+        # 5. Global coverage bonus: reward when union of all agents covers the dataset well
+        # This encourages agents to collectively explain the distribution
+        # Target is 1.0 (all samples covered)
+        if self.global_coverage_weight > 0:
+            if global_coverage is None:
+                global_coverage = self._compute_global_coverage()
+            # Only reward if global coverage exceeds threshold
+            if global_coverage >= self.global_coverage_threshold:
+                # Reward progress toward 1.0 (full coverage)
+                # Use squared term to emphasize values closer to 1.0
+                global_coverage_target = 1.0
+                global_coverage_progress = min(1.0, global_coverage / (global_coverage_target + eps))
+                # Squared progress emphasizes getting closer to 1.0
+                global_coverage_bonus = self.global_coverage_weight * (global_coverage_progress ** 2)
+                # Extra bonus when very close to full coverage (> 0.9)
+                if global_coverage >= 0.9:
+                    global_coverage_bonus += self.global_coverage_weight * 0.2 * (global_coverage - 0.9) / 0.1
+                shared_reward += global_coverage_bonus
+        
+        return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.5))
 
     def _compute_group_map(self) -> Dict[str, List[str]]:
         """
