@@ -301,8 +301,8 @@ class AnchorTrainerSB3:
     def _get_default_env_config(self) -> Dict[str, Any]:
         """Get default environment configuration."""
         return {
-            "precision_target": 0.8,
-            "coverage_target": 0.02,
+            "precision_target": 0.9,
+            "coverage_target": 0.1,
             "use_perturbation": True,
             "perturbation_mode": "adaptive",
             "n_perturb": 4096,

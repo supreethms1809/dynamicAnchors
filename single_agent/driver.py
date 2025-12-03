@@ -170,7 +170,7 @@ def main():
     parser.add_argument(
         "--total_timesteps",
         type=int,
-        default=288_000,
+        default=24_000,
         help="Total training timesteps"
     )
     
@@ -266,9 +266,9 @@ def main():
     # Create trainer
     experiment_config = {
         "total_timesteps": args.total_timesteps,
-        "eval_freq": 12_000,
+        "eval_freq": 500,
         "n_eval_episodes": 4,
-        "checkpoint_freq": 48_000,
+        "checkpoint_freq": 12_000,
         "log_interval": 10,
         "tensorboard_log": True,
     }

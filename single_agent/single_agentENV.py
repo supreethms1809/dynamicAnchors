@@ -733,6 +733,7 @@ class SingleAgentAnchorEnv(Env):
         self.prev_upper = prev_upper
         state = np.concatenate([self.lower, self.upper, np.array([precision, coverage], dtype=np.float32)])
         
+        ## SS: Target change here: 
         eps = 1e-12
         both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
         high_precision_with_reasonable_coverage = (
@@ -794,6 +795,14 @@ class SingleAgentAnchorEnv(Env):
                 termination_reason = "high_precision_reasonable_coverage"
             elif both_reasonably_close:
                 termination_reason = "both_reasonably_close"
+            
+            # Log which termination condition was met
+            if termination_reason:
+                logger.info(
+                    f"Episode terminated for class {self.target_class} (step {self.step_count}): "
+                    f"{termination_reason}. Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
+                    f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
+                )
         
         precision_gain_component = self.alpha * precision_weight * precision_gain
         coverage_gain_component = coverage_weight * coverage_gain_for_reward
