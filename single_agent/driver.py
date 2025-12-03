@@ -177,8 +177,8 @@ def main():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-4,
-        help="Learning rate for the algorithm"
+        default=None,  # Will be set based on dataset if None
+        help="Learning rate for the algorithm (default: dataset-specific)"
     )
     
     args = parser.parse_args()
@@ -266,18 +266,38 @@ def main():
     # Create trainer
     experiment_config = {
         "total_timesteps": args.total_timesteps,
-        "eval_freq": 48_000,
+        "eval_freq": 12_000,
         "n_eval_episodes": 4,
         "checkpoint_freq": 48_000,
         "log_interval": 10,
         "tensorboard_log": True,
     }
     
-    # Use dataset-specific policy network sizes for larger datasets
+    # Use dataset-specific policy network sizes and learning rates for larger datasets
     n_train_samples = len(dataset_loader.y_train) if hasattr(dataset_loader, 'y_train') else 0
+    
+    # Dataset-specific learning rates (larger datasets may need different rates)
+    if args.learning_rate is None:
+        # Determine learning rate based on dataset size and complexity
+        if n_train_samples > 10000:
+            # Large datasets (housing, etc.): use moderate learning rate
+            learning_rate = 3e-4
+            logger.info(f"  Large dataset detected ({n_train_samples} samples), using learning rate: {learning_rate}")
+        elif n_train_samples > 5000:
+            # Medium-large datasets: slightly higher learning rate
+            learning_rate = 5e-4
+            logger.info(f"  Medium-large dataset detected ({n_train_samples} samples), using learning rate: {learning_rate}")
+        else:
+            # Small datasets: default learning rate
+            learning_rate = 5e-4
+            logger.info(f"  Small dataset detected ({n_train_samples} samples), using learning rate: {learning_rate}")
+    else:
+        learning_rate = args.learning_rate
+        logger.info(f"  Using user-specified learning rate: {learning_rate}")
+    
     if n_train_samples > 10000:
         # Large datasets (housing, etc.): use larger policy network
-        policy_net_arch = [512, 512, 256]
+        policy_net_arch = [256, 256, 256, 256]
         logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger policy network: {policy_net_arch}")
     elif n_train_samples > 5000:
         # Medium-large datasets: slightly larger
@@ -289,7 +309,7 @@ def main():
         logger.info(f"  Small dataset detected ({n_train_samples} samples), using default policy network: {policy_net_arch}")
     
     algorithm_config = {
-        "learning_rate": args.learning_rate,
+        "learning_rate": learning_rate,
         "buffer_size": 1_000_000,
         "learning_starts": 1000,
         "batch_size": 1024,

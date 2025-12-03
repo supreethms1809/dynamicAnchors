@@ -52,6 +52,60 @@ def _get_algorithm_configs():
     return algorithm_map
 
 
+class LearningRateScheduleCallback(BaseCallback):
+    """
+    Callback to schedule learning rate during training.
+    Reduces learning rate by a factor when evaluation performance plateaus.
+    """
+    def __init__(self, initial_lr: float, reduction_factor: float = 0.5, min_lr: float = 1e-6, 
+                 patience: int = 3, verbose: int = 0):
+        super().__init__(verbose)
+        self.initial_lr = initial_lr
+        self.current_lr = initial_lr
+        self.reduction_factor = reduction_factor
+        self.min_lr = min_lr
+        self.patience = patience
+        self.best_mean_reward = -float('inf')
+        self.patience_counter = 0
+        
+    def _on_step(self) -> bool:
+        return True
+    
+    def _on_rollout_end(self) -> None:
+        # Check if we should reduce learning rate based on evaluation
+        # This is called after each rollout
+        pass
+    
+    def on_evaluation_end(self, eval_callback: EvalCallback) -> None:
+        """
+        Called by EvalCallback when evaluation completes.
+        Reduces learning rate if performance hasn't improved.
+        """
+        if hasattr(eval_callback, 'best_mean_reward'):
+            current_reward = eval_callback.best_mean_reward
+            
+            if current_reward > self.best_mean_reward:
+                self.best_mean_reward = current_reward
+                self.patience_counter = 0
+            else:
+                self.patience_counter += 1
+                
+                if self.patience_counter >= self.patience:
+                    # Reduce learning rate
+                    new_lr = max(self.current_lr * self.reduction_factor, self.min_lr)
+                    if new_lr < self.current_lr:
+                        self.current_lr = new_lr
+                        # Update learning rate in the model
+                        if hasattr(self.model, 'actor') and hasattr(self.model.actor, 'optimizer'):
+                            for param_group in self.model.actor.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+                        if hasattr(self.model, 'critic') and hasattr(self.model.critic, 'optimizer'):
+                            for param_group in self.model.critic.optimizer.param_groups:
+                                param_group['lr'] = new_lr
+                        logger.info(f"  Learning rate reduced to: {new_lr:.2e} (patience: {self.patience_counter}/{self.patience})")
+                        self.patience_counter = 0
+
+
 class AnchorTrainerSB3:
     """
     Stable-Baselines3 trainer for single-agent dynamic anchors.
@@ -123,7 +177,7 @@ class AnchorTrainerSB3:
     def _get_default_algorithm_config(self) -> Dict[str, Any]:
         """Get default algorithm configuration."""
         base_config = {
-            "learning_rate": 5e-5,
+            "learning_rate": 5e-4,  # Updated to match driver.py default (was 5e-5)
             "buffer_size": 1_000_000,
             "learning_starts": 1000,
             "batch_size": 512,
@@ -433,6 +487,7 @@ class AnchorTrainerSB3:
                 callbacks.append(checkpoint_callback)
             
             # Evaluation callback (per class)
+            eval_callback = None
             if self.experiment_config.get("eval_freq", 0) > 0:
                 eval_callback = EvalCallback(
                     eval_env,
@@ -444,6 +499,22 @@ class AnchorTrainerSB3:
                     render=False
                 )
                 callbacks.append(eval_callback)
+            
+            # Learning rate scheduling callback (optional, reduces LR on plateau)
+            use_lr_schedule = self.algorithm_config.get("use_lr_schedule", False)
+            if use_lr_schedule and eval_callback is not None:
+                initial_lr = self.algorithm_config.get("learning_rate", 5e-4)
+                lr_schedule_callback = LearningRateScheduleCallback(
+                    initial_lr=initial_lr,
+                    reduction_factor=0.5,
+                    min_lr=1e-6,
+                    patience=3
+                )
+                # Link LR schedule to eval callback
+                lr_schedule_callback.model = model
+                # Note: This is a simplified version. For full implementation, 
+                # you'd need to properly integrate with EvalCallback's evaluation results
+                # callbacks.append(lr_schedule_callback)
 
             # Train this model
             model.learn(
