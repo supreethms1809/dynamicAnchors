@@ -894,6 +894,72 @@ def test_rules_from_json(
         
         results["rule_results"].append(rule_result)
     
+    # Rank rules per class based on precision and coverage
+    logger.info(f"\n{'='*80}")
+    logger.info("RANKING RULES PER CLASS")
+    logger.info(f"{'='*80}")
+    
+    # For each class, collect all rules with their precision and coverage, then rank them
+    ranked_rules_per_class = {}
+    for target_class in unique_classes:
+        class_rules_with_metrics = []
+        
+        for rule_result in results["rule_results"]:
+            class_key = f"class_{target_class}"
+            if class_key in rule_result["per_class_results"]:
+                class_res = rule_result["per_class_results"][class_key]
+                rule_str = rule_result["rule"]
+                
+                # Get rule-level precision and coverage (from testing)
+                rule_precision = class_res.get("rule_precision", 0.0)
+                rule_coverage = class_res.get("rule_coverage", 0.0)
+                
+                # Calculate a combined score for ranking (weighted: precision more important)
+                # Using F1-like score: 2 * (precision * coverage) / (precision + coverage)
+                # But we'll prioritize precision, so use: precision * (1 + coverage)
+                if rule_precision > 0:
+                    combined_score = rule_precision * (1.0 + rule_coverage)
+                else:
+                    combined_score = 0.0
+                
+                class_rules_with_metrics.append({
+                    "rule": rule_str,
+                    "rule_precision": rule_precision,
+                    "rule_coverage": rule_coverage,
+                    "combined_score": combined_score,
+                    "rule_index": rule_result.get("rule_index", -1)
+                })
+        
+        # Sort by combined score (descending), then by precision, then by coverage
+        class_rules_with_metrics.sort(
+            key=lambda x: (x["combined_score"], x["rule_precision"], x["rule_coverage"]),
+            reverse=True
+        )
+        
+        ranked_rules_per_class[target_class] = class_rules_with_metrics
+        
+        logger.info(f"Class {target_class}: Ranked {len(class_rules_with_metrics)} rules")
+        if class_rules_with_metrics:
+            logger.info(f"  Top 5 rules:")
+            for rank, rule_info in enumerate(class_rules_with_metrics[:5], 1):
+                logger.info(f"    Rank {rank}: precision={rule_info['rule_precision']:.4f}, "
+                          f"coverage={rule_info['rule_coverage']:.4f}, "
+                          f"score={rule_info['combined_score']:.4f}")
+                logger.info(f"      Rule: {rule_info['rule'][:80]}...")
+    
+    # Store ranked rules in results
+    results["ranked_rules_per_class"] = ranked_rules_per_class
+    
+    # Update per_class_results to include ranked rules with metrics
+    for class_key, class_data in results["per_class_results"].items():
+        target_class = class_data.get("class", -1)
+        if target_class in ranked_rules_per_class:
+            ranked_rules = ranked_rules_per_class[target_class]
+            # Store ranked rules with their metrics
+            class_data["ranked_rules"] = ranked_rules
+            # Also update unique_rules to be in ranked order (top rules first)
+            class_data["ranked_unique_rules"] = [r["rule"] for r in ranked_rules]
+    
     # Summary
     results["summary"] = {
         "total_rules": len(all_unique_rules),

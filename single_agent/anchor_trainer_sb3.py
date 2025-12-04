@@ -340,10 +340,11 @@ class AnchorTrainerSB3:
             "min_absolute_step": 0.001,
             "use_class_centroids": True,
             # Termination reason counters: disable overused reasons
-            "max_termination_count_excellent_precision": 100,  # Disable after 10 uses
-            "max_termination_count_both_targets": 100,         # Unlimited (default)
-            "max_termination_count_high_precision": 100,       # Unlimited (default)
-            "max_termination_count_both_close": 100,           # Unlimited (default)
+            # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
+            "max_termination_count_both_targets": -1,
+            "max_termination_count_high_precision": 200,
+            "max_termination_count_both_close": 50,
+            "max_termination_count_excellent_precision": 30,
         }
     
     def _setup_environments(

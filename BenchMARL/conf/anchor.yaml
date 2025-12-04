@@ -60,8 +60,11 @@ env_config:
 # Maximum number of steps per episode
 # Increased to 500 for better convergence (allows agents more time to refine anchors)
 max_cycles: 500
-max_termination_count_excellent_precision: 500
-max_termination_count_both_targets: 500
-max_termination_count_high_precision: 500
-max_termination_count_both_close: 500
+
+# Termination reason counters: disable overused reasons
+# Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
+max_termination_count_both_targets: -1
+max_termination_count_high_precision: 200
+max_termination_count_both_close: 50
+max_termination_count_excellent_precision: 30
 

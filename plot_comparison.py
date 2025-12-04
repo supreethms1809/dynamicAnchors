@@ -242,61 +242,155 @@ def plot_precision_coverage_comparison(
 
 
 def plot_feature_importance_subplot(ax, summary: Dict, title: str, top_n: int = 10):
-    """Plot feature importance on a given axis."""
+    """
+    Plot feature importance on a given axis with class-wise breakdown.
+    
+    Importance Score = frequency / (average_interval_width + ε)
+    Normalized to percentages (sum to 100%) for easy interpretation.
+    Shows overall importance with stacked bars indicating per-class contributions.
+    """
     per_class = summary.get("per_class_summary", {})
     
-    # Collect all feature intervals from all rules
-    feature_intervals: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    feature_frequency = Counter()
+    # Collect feature intervals per class and globally
+    feature_intervals_global: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    feature_intervals_per_class: Dict[int, Dict[str, List[Tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    feature_frequency_global = Counter()
+    feature_frequency_per_class: Dict[int, Counter] = defaultdict(Counter)
     
-    for class_data in per_class.values():
+    for class_key, class_data in per_class.items():
+        target_class = class_data.get("class", -1)
         unique_rules = class_data.get("unique_rules", [])
+        
         for rule_str in unique_rules:
             intervals = extract_feature_intervals_from_rule(rule_str)
             for feature_name, lower, upper in intervals:
-                feature_intervals[feature_name].append((lower, upper))
-                feature_frequency[feature_name] += 1
+                # Global collection
+                feature_intervals_global[feature_name].append((lower, upper))
+                feature_frequency_global[feature_name] += 1
+                
+                # Per-class collection
+                feature_intervals_per_class[target_class][feature_name].append((lower, upper))
+                feature_frequency_per_class[target_class][feature_name] += 1
     
-    if not feature_intervals:
+    if not feature_intervals_global:
         ax.text(0.5, 0.5, 'No feature data available', ha='center', va='center', transform=ax.transAxes)
         ax.set_title(title, fontsize=11, fontweight='bold')
         return
     
-    # Calculate importance score
-    feature_importance = {}
-    for feature_name, intervals_list in feature_intervals.items():
+    # Calculate global importance scores
+    feature_importance_global = {}
+    for feature_name, intervals_list in feature_intervals_global.items():
         interval_widths = [upper - lower for lower, upper in intervals_list]
         avg_width = np.mean(interval_widths) if interval_widths else 1.0
-        frequency = feature_frequency[feature_name]
+        frequency = feature_frequency_global[feature_name]
         importance_score = frequency / (avg_width + 1e-6)
-        feature_importance[feature_name] = {
+        feature_importance_global[feature_name] = {
             "importance": importance_score,
             "frequency": frequency,
             "avg_interval_width": avg_width
         }
     
-    # Get top N features
-    top_features = sorted(feature_importance.items(), key=lambda x: x[1]["importance"], reverse=True)[:top_n]
+    # Calculate per-class importance scores
+    feature_importance_per_class: Dict[int, Dict[str, Dict]] = {}
+    for target_class, class_intervals in feature_intervals_per_class.items():
+        class_importance = {}
+        for feature_name, intervals_list in class_intervals.items():
+            interval_widths = [upper - lower for lower, upper in intervals_list]
+            avg_width = np.mean(interval_widths) if interval_widths else 1.0
+            frequency = feature_frequency_per_class[target_class][feature_name]
+            importance_score = frequency / (avg_width + 1e-6)
+            class_importance[feature_name] = {
+                "importance": importance_score,
+                "frequency": frequency,
+                "avg_interval_width": avg_width
+            }
+        feature_importance_per_class[target_class] = class_importance
+    
+    # Get all features sorted by importance, then take top N (or all if fewer than top_n)
+    all_features_sorted = sorted(feature_importance_global.items(), key=lambda x: x[1]["importance"], reverse=True)
+    n_available = len(all_features_sorted)
+    n_to_show = min(top_n, n_available)  # Show top N, or all if fewer than N
+    top_features = all_features_sorted[:n_to_show]
     
     if not top_features:
         ax.text(0.5, 0.5, 'No features found', ha='center', va='center', transform=ax.transAxes)
         ax.set_title(title, fontsize=11, fontweight='bold')
         return
     
+    # Normalize importance scores to percentages (sum to 100%)
+    total_importance = sum(f["importance"] for f in feature_importance_global.values())
+    
     features = [f[0] for f in top_features]
-    importances = [f[1]["importance"] for f in top_features]
+    importances_raw = [f[1]["importance"] for f in top_features]
+    importances_pct = [(imp / total_importance * 100) if total_importance > 0 else 0.0 for imp in importances_raw]
     
-    y_pos = np.arange(len(features))
-    ax.barh(y_pos, importances, alpha=0.8, color='teal', edgecolor='black', linewidth=1)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(features, fontsize=8)
-    ax.set_xlabel('Importance Score', fontsize=9, fontweight='bold')
-    ax.set_title(title, fontsize=11, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='x', linestyle='--')
+    # Also normalize per-class importance scores to percentages
+    feature_importance_per_class_pct: Dict[int, Dict[str, float]] = {}
+    for target_class, class_importance in feature_importance_per_class.items():
+        class_total = sum(imp["importance"] for imp in class_importance.values())
+        class_pct = {}
+        for feat_name, feat_data in class_importance.items():
+            raw_imp = feat_data["importance"]
+            pct_imp = (raw_imp / class_total * 100) if class_total > 0 else 0.0
+            class_pct[feat_name] = pct_imp
+        feature_importance_per_class_pct[target_class] = class_pct
     
-    # Add value labels
-    for i, imp in enumerate(importances):
-        ax.text(imp + max(importances) * 0.02, i, f'{imp:.2f}', va='center', fontsize=7)
+    # Get all classes
+    classes = sorted(feature_importance_per_class_pct.keys())
+    n_classes = len(classes)
+    
+    if n_classes == 0:
+        # If no class-wise data, show overall bars
+        y_pos = np.arange(len(features))
+        ax.barh(y_pos, importances_pct, alpha=0.8, color='teal', edgecolor='black', linewidth=1, height=0.7)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(features, fontsize=7)
+        ax.set_xlabel('Importance (%)', fontsize=9, fontweight='bold')
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='x', linestyle='--')
+        ax.set_xlim([0, max(importances_pct) * 1.1 if importances_pct else 100])
+        for i, imp_pct in enumerate(importances_pct):
+            ax.text(imp_pct + max(importances_pct) * 0.02 if importances_pct else 0, i, f'{imp_pct:.1f}%', va='center', fontsize=6)
+    else:
+        # Prepare data for heatmap: feature (rows) x class (columns)
+        heatmap_data = []
+        for feat in features:
+            row = []
+            for cls in classes:
+                class_imp_pct = feature_importance_per_class_pct[cls].get(feat, 0.0)
+                row.append(class_imp_pct)
+            heatmap_data.append(row)
+        
+        heatmap_array = np.array(heatmap_data)
+        
+        # Create heatmap
+        im = ax.imshow(heatmap_array, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+        
+        # Set ticks and labels
+        ax.set_xticks(np.arange(len(classes)))
+        ax.set_xticklabels([f'C{cls}' for cls in classes], fontsize=6)
+        ax.set_yticks(np.arange(len(features)))
+        ax.set_yticklabels(features, fontsize=6)
+        
+        # Add text annotations with percentages for all cells
+        for i in range(len(features)):
+            for j in range(len(classes)):
+                value = heatmap_array[i, j]
+                if value > 0:  # Only show non-zero values
+                    # Adjust font size based on grid size
+                    max_dim = max(len(features), len(classes))
+                    font_size = 6 if max_dim <= 5 else 5 if max_dim <= 8 else 4
+                    text_color = 'white' if value > np.max(heatmap_array) * 0.5 else 'black'
+                    ax.text(j, i, f'{value:.0f}%', ha='center', va='center', 
+                            color=text_color, fontsize=font_size, fontweight='bold')
+        
+        ax.set_xlabel('Class', fontsize=8, fontweight='bold')
+        ax.set_ylabel('Feature', fontsize=8, fontweight='bold')
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Importance (%)', fontsize=7, fontweight='bold')
 
 
 def plot_global_metrics_subplot(ax, summary: Dict, title: str):
@@ -354,37 +448,361 @@ def plot_global_metrics_subplot(ax, summary: Dict, title: str):
         ax.text(i, val + std + 0.05, label, ha='center', va='bottom', fontsize=8, fontweight='bold')
 
 
+def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5):
+    """
+    Plot rule overlap heatmap for a given summary on a subplot axis.
+    
+    Shows rule-to-rule overlap for the class with the most rules.
+    """
+    per_class = summary.get("per_class_summary", {})
+    
+    if not per_class:
+        ax.text(0.5, 0.5, 'No class data available', ha='center', va='center', transform=ax.transAxes, fontsize=9)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        return
+    
+    # Calculate rule overlap for each class
+    def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
+                               rule2_intervals: List[Tuple[str, float, float]]) -> float:
+        """Calculate overlap score between two rules based on their intervals."""
+        if not rule1_intervals or not rule2_intervals:
+            return 0.0
+        
+        # Create feature to interval mapping
+        rule1_dict = {feat: (lower, upper) for feat, lower, upper in rule1_intervals}
+        rule2_dict = {feat: (lower, upper) for feat, lower, upper in rule2_intervals}
+        
+        # Find common features
+        common_features = set(rule1_dict.keys()) & set(rule2_dict.keys())
+        if not common_features:
+            return 0.0
+        
+        # Calculate overlap for each common feature
+        total_overlap = 0.0
+        for feat in common_features:
+            lower1, upper1 = rule1_dict[feat]
+            lower2, upper2 = rule2_dict[feat]
+            
+            # Calculate intersection
+            intersect_lower = max(lower1, lower2)
+            intersect_upper = min(upper1, upper2)
+            
+            if intersect_lower <= intersect_upper:
+                # Calculate Jaccard-like overlap: intersection / union
+                intersection = intersect_upper - intersect_lower
+                union_lower = min(lower1, lower2)
+                union_upper = max(upper1, upper2)
+                union = union_upper - union_lower
+                
+                if union > 0:
+                    total_overlap += intersection / union
+        
+        # Normalize by number of common features
+        return total_overlap / len(common_features) if common_features else 0.0
+    
+    # Find class with most rules
+    # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
+    class_with_most_rules = None
+    max_rules_count = 0
+    
+    for class_key, class_data in per_class.items():
+        target_class = class_data.get("class", -1)
+        # Check for ranked rules first (from test_extracted_rules ranking)
+        ranked_rules = class_data.get("ranked_unique_rules", [])
+        if not ranked_rules:
+            # Fallback to unique_rules if ranked rules not available
+            ranked_rules = class_data.get("unique_rules", [])
+        
+        if len(ranked_rules) > max_rules_count:
+            max_rules_count = len(ranked_rules)
+            class_with_most_rules = target_class
+    
+    if class_with_most_rules is None or max_rules_count <= 1:
+        ax.text(0.5, 0.5, 'No rules found for overlap analysis', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=9)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        return
+    
+    # Get rules for this class
+    class_data = None
+    for class_key, cd in per_class.items():
+        if cd.get("class", -1) == class_with_most_rules:
+            class_data = cd
+            break
+    
+    if class_data is None:
+        ax.text(0.5, 0.5, f'Could not find data for class {class_with_most_rules}', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=9)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        return
+    
+    # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
+    class_rules = class_data.get("ranked_unique_rules", [])
+    if not class_rules:
+        class_rules = class_data.get("unique_rules", [])
+    
+    if len(class_rules) <= 1:
+        ax.text(0.5, 0.5, f'Class {class_with_most_rules} has only 1 rule\n(no overlap to show)', 
+                ha='center', va='center', transform=ax.transAxes, fontsize=9)
+        ax.set_title(title, fontsize=10, fontweight='bold')
+        return
+    
+    # Always show top 5 rules for overlap analysis
+    # Always show top 5 rules for overlap analysis (already ranked if available)
+    n_rules_to_show = min(5, len(class_rules))
+    class_rules_subset = class_rules[:n_rules_to_show]
+    
+    # Calculate overlap matrix
+    overlap_matrix = np.zeros((n_rules_to_show, n_rules_to_show))
+    rule_intervals = [extract_feature_intervals_from_rule(rule) for rule in class_rules_subset]
+    
+    for i in range(n_rules_to_show):
+        for j in range(n_rules_to_show):
+            if i == j:
+                overlap_matrix[i, j] = 1.0  # Self-overlap
+            else:
+                overlap_matrix[i, j] = calculate_rule_overlap(rule_intervals[i], rule_intervals[j])
+    
+    # Create heatmap
+    im = ax.imshow(overlap_matrix, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0, vmax=1)
+    
+    # Set ticks and labels
+    ax.set_xticks(np.arange(n_rules_to_show))
+    ax.set_yticks(np.arange(n_rules_to_show))
+    ax.set_xticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6, rotation=45, ha='right')
+    ax.set_yticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6)
+    
+    # Add text annotations for all cells
+    for i in range(n_rules_to_show):
+        for j in range(n_rules_to_show):
+            value = overlap_matrix[i, j]
+            # Adjust font size based on number of rules
+            font_size = 6 if n_rules_to_show <= 6 else 5 if n_rules_to_show <= 8 else 4
+            text_color = 'white' if value > 0.5 else 'black'
+            # For diagonal (self-overlap = 1.0), show as "1.0", otherwise show 2 decimals
+            if i == j:
+                text = '1.0'
+            else:
+                text = f'{value:.2f}' if value > 0.01 else ''  # Skip very small values
+            if text:
+                ax.text(j, i, text, ha='center', va='center', 
+                        color=text_color, fontsize=font_size, fontweight='bold')
+    
+    ax.set_xlabel('Rule', fontsize=8, fontweight='bold')
+    ax.set_ylabel('Rule', fontsize=8, fontweight='bold')
+    ax.set_title(f'{title}\n(Class {class_with_most_rules}, {max_rules_count} rules, showing {n_rules_to_show})', 
+                 fontsize=9, fontweight='bold')
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Overlap', fontsize=7, fontweight='bold')
+
+
+def plot_rule_overlap_comparison_per_class(
+    single_agent_summary: Dict,
+    multi_agent_summary: Dict,
+    output_dir: str,
+    dataset_name: str = "",
+    max_rules: int = 5
+):
+    """Plot rule overlap comparison class-by-class (single vs multi)."""
+    if not HAS_PLOTTING:
+        return
+    
+    # Calculate rule overlap helper function
+    def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
+                               rule2_intervals: List[Tuple[str, float, float]]) -> float:
+        """Calculate overlap score between two rules based on their intervals."""
+        if not rule1_intervals or not rule2_intervals:
+            return 0.0
+        
+        rule1_dict = {feat: (lower, upper) for feat, lower, upper in rule1_intervals}
+        rule2_dict = {feat: (lower, upper) for feat, lower, upper in rule2_intervals}
+        
+        common_features = set(rule1_dict.keys()) & set(rule2_dict.keys())
+        if not common_features:
+            return 0.0
+        
+        total_overlap = 0.0
+        for feat in common_features:
+            lower1, upper1 = rule1_dict[feat]
+            lower2, upper2 = rule2_dict[feat]
+            
+            intersect_lower = max(lower1, lower2)
+            intersect_upper = min(upper1, upper2)
+            
+            if intersect_lower <= intersect_upper:
+                intersection = intersect_upper - intersect_lower
+                union_lower = min(lower1, lower2)
+                union_upper = max(upper1, upper2)
+                union = union_upper - union_lower
+                
+                if union > 0:
+                    total_overlap += intersection / union
+        
+        return total_overlap / len(common_features) if common_features else 0.0
+    
+    def plot_overlap_for_class(ax, class_rules: List[str], class_num: int, title: str, per_class_data: Optional[Dict] = None):
+        """Plot overlap heatmap for a class on given axis."""
+        if len(class_rules) <= 1:
+            ax.text(0.5, 0.5, f'Class {class_num} has only 1 rule\n(no overlap to show)', 
+                    ha='center', va='center', transform=ax.transAxes, fontsize=9)
+            ax.set_title(title, fontsize=10, fontweight='bold')
+            return
+        
+        # Always show top 5 rules for overlap analysis (already ranked if per_class_data has ranked_rules)
+        n_rules_to_show = min(5, len(class_rules))
+        class_rules_subset = class_rules[:n_rules_to_show]
+        
+        # Calculate overlap matrix
+        overlap_matrix = np.zeros((n_rules_to_show, n_rules_to_show))
+        rule_intervals = [extract_feature_intervals_from_rule(rule) for rule in class_rules_subset]
+        
+        for i in range(n_rules_to_show):
+            for j in range(n_rules_to_show):
+                if i == j:
+                    overlap_matrix[i, j] = 1.0
+                else:
+                    overlap_matrix[i, j] = calculate_rule_overlap(rule_intervals[i], rule_intervals[j])
+        
+        # Create heatmap
+        im = ax.imshow(overlap_matrix, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0, vmax=1)
+        
+        # Set ticks and labels
+        ax.set_xticks(np.arange(n_rules_to_show))
+        ax.set_yticks(np.arange(n_rules_to_show))
+        ax.set_xticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6, rotation=45, ha='right')
+        ax.set_yticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6)
+        
+        # Add text annotations for all cells
+        for i in range(n_rules_to_show):
+            for j in range(n_rules_to_show):
+                value = overlap_matrix[i, j]
+                # Adjust font size based on number of rules
+                font_size = 6 if n_rules_to_show <= 6 else 5 if n_rules_to_show <= 8 else 4
+                text_color = 'white' if value > 0.5 else 'black'
+                # For diagonal (self-overlap = 1.0), show as "1.0", otherwise show 2 decimals
+                if i == j:
+                    text = '1.0'
+                else:
+                    text = f'{value:.2f}' if value > 0.01 else ''  # Skip very small values
+                if text:
+                    ax.text(j, i, text, ha='center', va='center', 
+                            color=text_color, fontsize=font_size, fontweight='bold')
+        
+        ax.set_xlabel('Rule', fontsize=8, fontweight='bold')
+        ax.set_ylabel('Rule', fontsize=8, fontweight='bold')
+        ax.set_title(title, fontsize=9, fontweight='bold')
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Overlap', fontsize=7, fontweight='bold')
+    
+    # Get classes with multiple rules from both summaries
+    sa_per_class = single_agent_summary.get("per_class_summary", {})
+    ma_per_class = multi_agent_summary.get("per_class_summary", {})
+    
+    # Find all classes that have multiple rules in either summary
+    all_classes = set()
+    for class_data in sa_per_class.values():
+        target_class = class_data.get("class", -1)
+        if len(class_data.get("unique_rules", [])) > 1:
+            all_classes.add(target_class)
+    for class_data in ma_per_class.values():
+        target_class = class_data.get("class", -1)
+        if len(class_data.get("unique_rules", [])) > 1:
+            all_classes.add(target_class)
+    
+    if not all_classes:
+        logger.warning("No classes with multiple rules found for overlap comparison.")
+        return
+    
+    classes_sorted = sorted(all_classes)
+    n_classes = len(classes_sorted)
+    
+    # Format title with dataset name
+    title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
+    
+    # Create figure: 2 columns (single vs multi), n_classes rows
+    fig, axes = plt.subplots(n_classes, 2, figsize=(16, 4 * n_classes))
+    if n_classes == 1:
+        axes = axes.reshape(1, -1)
+    
+    for row_idx, target_class in enumerate(classes_sorted):
+        # Get rules for this class from both summaries (prefer ranked rules)
+        sa_class_rules = []
+        sa_class_data = None
+        ma_class_rules = []
+        ma_class_data = None
+        
+        for class_data in sa_per_class.values():
+            if class_data.get("class", -1) == target_class:
+                sa_class_data = class_data
+                # Prefer ranked rules if available
+                sa_class_rules = class_data.get("ranked_unique_rules", [])
+                if not sa_class_rules:
+                    sa_class_rules = class_data.get("unique_rules", [])
+                break
+        
+        for class_data in ma_per_class.values():
+            if class_data.get("class", -1) == target_class:
+                ma_class_data = class_data
+                # Prefer ranked rules if available
+                ma_class_rules = class_data.get("ranked_unique_rules", [])
+                if not ma_class_rules:
+                    ma_class_rules = class_data.get("unique_rules", [])
+                break
+        
+        # Plot single-agent overlap
+        ax_sa = axes[row_idx, 0]
+        plot_overlap_for_class(ax_sa, sa_class_rules, target_class, 
+                              f'{title_prefix}: Single-Agent - Class {target_class}',
+                              per_class_data=sa_class_data)
+        
+        # Plot multi-agent overlap
+        ax_ma = axes[row_idx, 1]
+        plot_overlap_for_class(ax_ma, ma_class_rules, target_class, 
+                              f'{title_prefix}: Multi-Agent - Class {target_class}',
+                              per_class_data=ma_class_data)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'rule_overlap_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved rule overlap comparison plot to {output_dir}/rule_overlap_comparison.png")
+
+
 def plot_comprehensive_comparison(
     single_agent_summary: Dict,
     multi_agent_summary: Dict,
     output_dir: str,
     dataset_name: str = ""
 ):
-    """Plot comprehensive comparison with 4 subplots."""
+    """Plot comprehensive comparison with 4 subplots (2x2 grid)."""
     if not HAS_PLOTTING:
         return
     
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 14))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+    ax1, ax2 = axes[0, 0], axes[0, 1]  # Row 1: Feature importance
+    ax3, ax4 = axes[1, 0], axes[1, 1]  # Row 2: Global metrics
     
-    # Subplot 1: Single-agent feature importance
+    # Row 1: Feature importance
     plot_feature_importance_subplot(ax1, single_agent_summary, f'{title_prefix}: Single-Agent Feature Importance', top_n=10)
-    
-    # Subplot 2: Multi-agent feature importance
     plot_feature_importance_subplot(ax2, multi_agent_summary, f'{title_prefix}: Multi-Agent Feature Importance', top_n=10)
     
-    # Subplot 3: Single-agent global metrics
+    # Row 2: Global metrics
     plot_global_metrics_subplot(ax3, single_agent_summary, f'{title_prefix}: Single-Agent Global Metrics')
-    
-    # Subplot 4: Multi-agent global metrics
     plot_global_metrics_subplot(ax4, multi_agent_summary, f'{title_prefix}: Multi-Agent Global Metrics')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'comprehensive_comparison.png'), dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved comprehensive comparison plot to {output_dir}/comprehensive_comparison.png")
+    
+    # Also create separate rule overlap comparison plot
+    plot_rule_overlap_comparison_per_class(single_agent_summary, multi_agent_summary, output_dir, dataset_name)
 
 
 def main():

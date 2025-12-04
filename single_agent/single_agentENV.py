@@ -163,10 +163,10 @@ class SingleAgentAnchorEnv(Env):
         # Termination reason counters: track usage and disable overused reasons
         # These are reset for evaluation/inference to ensure fair evaluation
         self.termination_reason_max_counts = {
-            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
-            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 10),
-            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
-            "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
+            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),
+            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 30),
+            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", 200),
+            "both_reasonably_close": env_config.get("max_termination_count_both_close", 50)
         }
         self._reset_termination_counters()
         
@@ -773,7 +773,7 @@ class SingleAgentAnchorEnv(Env):
         both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
         high_precision_with_reasonable_coverage = (
             precision >= 0.95 * self.precision_target and 
-            coverage >= 0.5 * self.coverage_target
+            coverage >= 0.7 * self.coverage_target
         )
         both_reasonably_close = (
             precision >= 0.90 * self.precision_target and 
@@ -781,7 +781,7 @@ class SingleAgentAnchorEnv(Env):
         )
         excellent_precision = (
             precision >= self.precision_target and 
-            coverage >= 0.3 * self.coverage_target
+            coverage >= 0.5 * self.coverage_target
         )
         # Increment step count
         self.step_count += 1

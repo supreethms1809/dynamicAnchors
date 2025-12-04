@@ -402,94 +402,369 @@ def plot_global_metrics(summary: Dict, output_dir: str, dataset_name: str = ""):
 
 
 def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = "", top_n: int = 15):
-    """Plot feature importance based on frequency and interval selectivity (narrower intervals = more important)."""
+    """
+    Plot feature importance based on frequency and interval selectivity.
+    
+    Importance Score Formula: 
+    - Raw Importance = frequency / (average_interval_width + ε)
+    - Percentage = (Raw Importance / Total Importance) × 100%
+    
+    Interpretation:
+    - Higher frequency = feature appears in more rules (more commonly used)
+    - Narrower intervals (lower avg_width) = more selective/precise feature usage
+    - Raw importance combines both: features that are frequently used AND selective score higher
+    - Percentage: Normalized to sum to 100% across all features for easy interpretation
+      (e.g., "Feature X accounts for 25% of total importance")
+    
+    Example:
+    - Feature A: freq=10, width=0.05 → raw=200 → 25%
+    - Feature B: freq=20, width=0.20 → raw=100 → 12.5%
+    - Feature A is more important (more selective) and accounts for 25% of total importance
+    """
     if not HAS_PLOTTING:
         return
     
     per_class = summary["per_class_summary"]
     
-    # Collect all feature intervals from all rules
-    feature_intervals: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    feature_frequency = Counter()
+    # Collect feature intervals per class and globally
+    feature_intervals_global: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    feature_intervals_per_class: Dict[int, Dict[str, List[Tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    feature_frequency_global = Counter()
+    feature_frequency_per_class: Dict[int, Counter] = defaultdict(Counter)
     
-    for class_data in per_class.values():
+    for class_key, class_data in per_class.items():
+        target_class = class_data.get("class", -1)
         unique_rules = class_data.get("unique_rules", [])
+        
         for rule_str in unique_rules:
             intervals = extract_feature_intervals_from_rule(rule_str)
             for feature_name, lower, upper in intervals:
-                feature_intervals[feature_name].append((lower, upper))
-                feature_frequency[feature_name] += 1
+                # Global collection
+                feature_intervals_global[feature_name].append((lower, upper))
+                feature_frequency_global[feature_name] += 1
+                
+                # Per-class collection
+                feature_intervals_per_class[target_class][feature_name].append((lower, upper))
+                feature_frequency_per_class[target_class][feature_name] += 1
     
-    if not feature_intervals:
+    if not feature_intervals_global:
         logger.warning("No feature intervals found for importance analysis.")
         return
     
-    # Calculate importance score: frequency * (1 / average_interval_width)
-    # Narrower intervals indicate more selective/important features
-    feature_importance = {}
-    for feature_name, intervals_list in feature_intervals.items():
+    # Calculate global importance scores
+    feature_importance_global = {}
+    for feature_name, intervals_list in feature_intervals_global.items():
         interval_widths = [upper - lower for lower, upper in intervals_list]
         avg_width = np.mean(interval_widths) if interval_widths else 1.0
-        frequency = feature_frequency[feature_name]
+        frequency = feature_frequency_global[feature_name]
         # Importance = frequency / avg_width (higher frequency and narrower intervals = more important)
-        # Normalize by max width to avoid division issues
         importance_score = frequency / (avg_width + 1e-6)
-        feature_importance[feature_name] = {
+        feature_importance_global[feature_name] = {
             "importance": importance_score,
             "frequency": frequency,
             "avg_interval_width": avg_width,
-            "intervals": intervals_list
         }
     
-    # Get top N features by importance
-    top_features = sorted(feature_importance.items(), key=lambda x: x[1]["importance"], reverse=True)[:top_n]
+    # Calculate per-class importance scores
+    feature_importance_per_class: Dict[int, Dict[str, Dict]] = {}
+    for target_class, class_intervals in feature_intervals_per_class.items():
+        class_importance = {}
+        for feature_name, intervals_list in class_intervals.items():
+            interval_widths = [upper - lower for lower, upper in intervals_list]
+            avg_width = np.mean(interval_widths) if interval_widths else 1.0
+            frequency = feature_frequency_per_class[target_class][feature_name]
+            importance_score = frequency / (avg_width + 1e-6)
+            class_importance[feature_name] = {
+                "importance": importance_score,
+                "frequency": frequency,
+                "avg_interval_width": avg_width,
+            }
+        feature_importance_per_class[target_class] = class_importance
+    
+    # Get all features sorted by importance, then take top N (or all if fewer than top_n)
+    all_features_sorted = sorted(feature_importance_global.items(), key=lambda x: x[1]["importance"], reverse=True)
+    n_available = len(all_features_sorted)
+    n_to_show = min(top_n, n_available)  # Show top N, or all if fewer than N
+    top_features = all_features_sorted[:n_to_show]
     
     if not top_features:
         return
     
-    # Format title with dataset name
-    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    # Log how many features we're showing
+    if n_available <= top_n:
+        logger.info(f"Showing all {n_available} available features in feature importance plot")
+    else:
+        logger.info(f"Showing top {top_n} of {n_available} available features in feature importance plot")
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    # Normalize importance scores to percentages (sum to 100%)
+    # Calculate sum of all importance scores (not just top N, for proper normalization)
+    total_importance = sum(f["importance"] for f in feature_importance_global.values())
     
-    # Left plot: Feature importance (frequency vs interval width)
+    # Normalize top features to percentages
     features = [f[0] for f in top_features]
-    importances = [f[1]["importance"] for f in top_features]
+    importances_raw = [f[1]["importance"] for f in top_features]
+    importances_pct = [(imp / total_importance * 100) if total_importance > 0 else 0.0 for imp in importances_raw]
     frequencies = [f[1]["frequency"] for f in top_features]
     avg_widths = [f[1]["avg_interval_width"] for f in top_features]
     
+    # Also normalize per-class importance scores to percentages
+    feature_importance_per_class_pct: Dict[int, Dict[str, float]] = {}
+    for target_class, class_importance in feature_importance_per_class.items():
+        class_total = sum(imp["importance"] for imp in class_importance.values())
+        class_pct = {}
+        for feat_name, feat_data in class_importance.items():
+            raw_imp = feat_data["importance"]
+            pct_imp = (raw_imp / class_total * 100) if class_total > 0 else 0.0
+            class_pct[feat_name] = pct_imp
+        feature_importance_per_class_pct[target_class] = class_pct
+    
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
+    # Get classes with multiple rules for overlap visualization
+    classes_with_rules = []
+    for class_key, class_data in per_class.items():
+        target_class = class_data.get("class", -1)
+        unique_rules = class_data.get("unique_rules", [])
+        if len(unique_rules) > 1:
+            classes_with_rules.append((target_class, unique_rules))
+    
+    n_overlap_classes = len(classes_with_rules)
+    
+    # Create figure: 2x2 for main plots, then additional rows for rule overlap per class
+    if n_overlap_classes == 0:
+        fig = plt.figure(figsize=(24, 12))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    elif n_overlap_classes <= 2:
+        fig = plt.figure(figsize=(24, 12))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+    else:
+        # Add extra rows for additional classes
+        n_extra_rows = (n_overlap_classes - 2 + 1) // 2  # How many extra 2-class rows needed
+        fig = plt.figure(figsize=(24, 12 + 6 * n_extra_rows))
+        gs = fig.add_gridspec(2 + n_extra_rows, 2, hspace=0.3, wspace=0.3)
+    
+    # Subplot 1: Overall feature importance (scatter + bar)
+    ax1 = fig.add_subplot(gs[0, 0])
     y_pos = np.arange(len(features))
     
-    # Create scatter plot: x = frequency, y = 1/avg_width (inverse of width, so higher = narrower = better)
-    # Size represents importance score
+    # Scatter plot: frequency vs selectivity (use raw importance for color/size)
     scatter = ax1.scatter(frequencies, [1.0/(w + 1e-6) for w in avg_widths], 
-                          s=[imp * 50 for imp in importances], alpha=0.6, c=importances, 
+                          s=[imp * 50 for imp in importances_raw], alpha=0.6, c=importances_pct, 
                           cmap='viridis', edgecolors='black', linewidths=1)
     
     # Add feature labels
     for i, (feat, freq, inv_width) in enumerate(zip(features, frequencies, [1.0/(w + 1e-6) for w in avg_widths])):
-        ax1.annotate(feat, (freq, inv_width), fontsize=8, ha='left', va='center')
+        ax1.annotate(feat, (freq, inv_width), fontsize=7, ha='left', va='center')
     
-    ax1.set_xlabel('Frequency (Number of Rules)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Interval Selectivity (1/Avg Width)', fontsize=12, fontweight='bold')
-    ax1.set_title(f'{title_prefix}: Feature Importance (Frequency vs Selectivity)', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Frequency (Number of Rules)', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Interval Selectivity (1/Avg Width)', fontsize=11, fontweight='bold')
+    ax1.set_title(f'{title_prefix}: Overall Feature Importance\n(Frequency vs Selectivity)', fontsize=12, fontweight='bold')
     ax1.grid(True, alpha=0.3, linestyle='--')
-    plt.colorbar(scatter, ax=ax1, label='Importance Score')
+    plt.colorbar(scatter, ax=ax1, label='Importance (%)')
     
-    # Right plot: Bar chart of importance scores
-    ax2.barh(y_pos, importances, alpha=0.8, color='teal', edgecolor='black', linewidth=1)
-    ax2.set_yticks(y_pos)
-    ax2.set_yticklabels(features)
-    ax2.set_xlabel('Importance Score', fontsize=12, fontweight='bold')
-    ax2.set_title(f'{title_prefix}: Top {top_n} Most Important Features', fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3, axis='x', linestyle='--')
+    # Subplot 2: Per-class importance breakdown (heatmap) - in percentages
+    ax2 = fig.add_subplot(gs[0, 1])
     
-    # Add value labels with frequency and width info
-    for i, (imp, freq, width) in enumerate(zip(importances, frequencies, avg_widths)):
-        label = f'{imp:.2f}\n(freq:{freq}, w:{width:.3f})'
-        ax2.text(imp + max(importances) * 0.02, i, label, va='center', fontsize=8)
+    # Get all classes
+    classes = sorted(feature_importance_per_class_pct.keys())
+    n_classes = len(classes)
     
-    plt.tight_layout()
+    if n_classes == 0:
+        ax2.text(0.5, 0.5, 'No class-wise data available', ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title(f'{title_prefix}: Class-Wise Feature Importance', fontsize=12, fontweight='bold')
+    else:
+        # Prepare data for heatmap: feature (rows) x class (columns)
+        # Each cell shows the importance % of that feature for that class
+        heatmap_data = []
+        for feat in features:
+            row = []
+            for cls in classes:
+                class_imp_pct = feature_importance_per_class_pct[cls].get(feat, 0.0)
+                row.append(class_imp_pct)
+            heatmap_data.append(row)
+        
+        heatmap_array = np.array(heatmap_data)
+        
+        # Create heatmap
+        im = ax2.imshow(heatmap_array, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+        
+        # Set ticks and labels
+        ax2.set_xticks(np.arange(len(classes)))
+        ax2.set_xticklabels([f'Class {cls}' for cls in classes], fontsize=9)
+        ax2.set_yticks(np.arange(len(features)))
+        ax2.set_yticklabels(features, fontsize=8)
+        
+        # Add text annotations with percentages
+        for i in range(len(features)):
+            for j in range(len(classes)):
+                value = heatmap_array[i, j]
+                text_color = 'white' if value > np.max(heatmap_array) * 0.5 else 'black'
+                ax2.text(j, i, f'{value:.1f}%', ha='center', va='center', 
+                        color=text_color, fontsize=7, fontweight='bold')
+        
+        ax2.set_xlabel('Class', fontsize=11, fontweight='bold')
+        ax2.set_ylabel('Feature', fontsize=11, fontweight='bold')
+        ax2.set_title(f'{title_prefix}: Class-Wise Feature Importance\n(% per Class)', fontsize=12, fontweight='bold')
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax2)
+        cbar.set_label('Importance (%)', fontsize=10, fontweight='bold')
+    
+    # Subplot 3: Overall importance bar chart with details (percentages)
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.barh(y_pos, importances_pct, alpha=0.8, color='teal', edgecolor='black', linewidth=1)
+    ax3.set_yticks(y_pos)
+    ax3.set_yticklabels(features, fontsize=9)
+    ax3.set_xlabel('Global Importance (%)', fontsize=11, fontweight='bold')
+    if n_available <= top_n:
+        ax3.set_title(f'{title_prefix}: All {n_available} Features (Overall, %)', fontsize=12, fontweight='bold')
+    else:
+        ax3.set_title(f'{title_prefix}: Top {top_n} Features (Overall, %)', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3, axis='x', linestyle='--')
+    ax3.set_xlim([0, max(importances_pct) * 1.1 if importances_pct else 100])
+    
+    # Add value labels with percentage
+    for i, (imp_pct, freq, width) in enumerate(zip(importances_pct, frequencies, avg_widths)):
+        label = f'{imp_pct:.1f}%\n(f:{freq}, w:{width:.3f})'
+        ax3.text(imp_pct + max(importances_pct) * 0.02 if importances_pct else 0, i, label, va='center', fontsize=7)
+    
+    # Subplot 4: Rule overlap per class - create a grid for all classes
+    # Calculate rule overlap helper function
+    def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
+                               rule2_intervals: List[Tuple[str, float, float]]) -> float:
+        """Calculate overlap score between two rules based on their intervals."""
+        if not rule1_intervals or not rule2_intervals:
+            return 0.0
+        
+        # Create feature to interval mapping
+        rule1_dict = {feat: (lower, upper) for feat, lower, upper in rule1_intervals}
+        rule2_dict = {feat: (lower, upper) for feat, lower, upper in rule2_intervals}
+        
+        # Find common features
+        common_features = set(rule1_dict.keys()) & set(rule2_dict.keys())
+        if not common_features:
+            return 0.0
+        
+        # Calculate overlap for each common feature
+        total_overlap = 0.0
+        for feat in common_features:
+            lower1, upper1 = rule1_dict[feat]
+            lower2, upper2 = rule2_dict[feat]
+            
+            # Calculate intersection
+            intersect_lower = max(lower1, lower2)
+            intersect_upper = min(upper1, upper2)
+            
+            if intersect_lower <= intersect_upper:
+                # Calculate Jaccard-like overlap: intersection / union
+                intersection = intersect_upper - intersect_lower
+                union_lower = min(lower1, lower2)
+                union_upper = max(upper1, upper2)
+                union = union_upper - union_lower
+                
+                if union > 0:
+                    total_overlap += intersection / union
+        
+        # Normalize by number of common features
+        return total_overlap / len(common_features) if common_features else 0.0
+    
+    # Get classes with multiple rules
+    # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
+    classes_with_rules = []
+    for class_key, class_data in per_class.items():
+        target_class = class_data.get("class", -1)
+        # Check for ranked rules first (from test_extracted_rules ranking)
+        ranked_rules = class_data.get("ranked_unique_rules", [])
+        if not ranked_rules:
+            # Fallback to unique_rules if ranked rules not available
+            ranked_rules = class_data.get("unique_rules", [])
+        
+        if len(ranked_rules) > 1:
+            classes_with_rules.append((target_class, ranked_rules))
+    
+    # Plot rule overlap for each class
+    if n_overlap_classes == 0:
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.text(0.5, 0.5, 'No classes with multiple rules\n(no overlap to show)', 
+                ha='center', va='center', transform=ax4.transAxes, fontsize=10)
+        ax4.set_title(f'{title_prefix}: Rule Overlap', fontsize=11, fontweight='bold')
+    else:
+        # Create overlap axes: first 2 classes in bottom right, rest in additional rows
+        overlap_axes = []
+        if n_overlap_classes >= 1:
+            if n_overlap_classes == 1:
+                overlap_axes.append(fig.add_subplot(gs[1, 1]))
+            else:
+                # First 2 classes in bottom right (split vertically)
+                gs_overlap1 = gs[1, 1].subgridspec(2, 1, hspace=0.4)
+                overlap_axes.append(fig.add_subplot(gs_overlap1[0]))
+                overlap_axes.append(fig.add_subplot(gs_overlap1[1]))
+        
+        # Additional classes in new rows (2 per row)
+        for extra_idx in range(2, n_overlap_classes):
+            row = 2 + (extra_idx - 2) // 2
+            col = (extra_idx - 2) % 2
+            overlap_axes.append(fig.add_subplot(gs[row, col]))
+        
+        # Plot overlap for each class
+        for idx, (target_class, class_rules) in enumerate(classes_with_rules):
+            if idx >= len(overlap_axes):
+                break
+            ax_overlap = overlap_axes[idx]
+            
+            # Always show top 5 rules for overlap analysis
+            n_rules_to_show = min(5, len(class_rules))
+            class_rules_subset = class_rules[:n_rules_to_show]
+            
+            # Calculate overlap matrix
+            overlap_matrix = np.zeros((n_rules_to_show, n_rules_to_show))
+            rule_intervals = [extract_feature_intervals_from_rule(rule) for rule in class_rules_subset]
+            
+            for i in range(n_rules_to_show):
+                for j in range(n_rules_to_show):
+                    if i == j:
+                        overlap_matrix[i, j] = 1.0  # Self-overlap
+                    else:
+                        overlap_matrix[i, j] = calculate_rule_overlap(rule_intervals[i], rule_intervals[j])
+            
+            # Create heatmap
+            im = ax_overlap.imshow(overlap_matrix, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0, vmax=1)
+            
+            # Set ticks and labels
+            ax_overlap.set_xticks(np.arange(n_rules_to_show))
+            ax_overlap.set_yticks(np.arange(n_rules_to_show))
+            ax_overlap.set_xticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6, rotation=45, ha='right')
+            ax_overlap.set_yticklabels([f"R{i+1}" for i in range(n_rules_to_show)], fontsize=6)
+            
+            # Add text annotations for all cells
+            for i in range(n_rules_to_show):
+                for j in range(n_rules_to_show):
+                    value = overlap_matrix[i, j]
+                    # Adjust font size based on number of rules
+                    font_size = 6 if n_rules_to_show <= 6 else 5 if n_rules_to_show <= 8 else 4
+                    text_color = 'white' if value > 0.5 else 'black'
+                    # For diagonal (self-overlap = 1.0), show as "1.0", otherwise show 2 decimals
+                    if i == j:
+                        text = '1.0'
+                    else:
+                        text = f'{value:.2f}' if value > 0.01 else ''  # Skip very small values
+                    if text:
+                        ax_overlap.text(j, i, text, ha='center', va='center', 
+                                color=text_color, fontsize=font_size, fontweight='bold')
+            
+            ax_overlap.set_xlabel('Rule', fontsize=8, fontweight='bold')
+            ax_overlap.set_ylabel('Rule', fontsize=8, fontweight='bold')
+            ax_overlap.set_title(f'Class {target_class} ({len(class_rules)} rules, showing {n_rules_to_show})', 
+                             fontsize=9, fontweight='bold')
+            
+            # Add colorbar only for first subplot
+            if idx == 0:
+                cbar = plt.colorbar(im, ax=ax_overlap)
+                cbar.set_label('Overlap', fontsize=7, fontweight='bold')
+    
+    plt.suptitle(f'{title_prefix}: Feature Importance Analysis', fontsize=14, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
     plt.savefig(os.path.join(output_dir, 'feature_importance.png'), dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved feature importance plot to {output_dir}/feature_importance.png")

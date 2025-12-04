@@ -122,10 +122,10 @@ class AnchorEnv(ParallelEnv):
         
         # SS - Termination reason counters: track usage and disable overused reasons per agent
         self.termination_reason_max_counts = {
-            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),  # -1 = unlimited
-            "excellent_precision": env_config.get("max_termination_count_excellent_precision", -1),
-            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", -1),
-            "both_reasonably_close": env_config.get("max_termination_count_both_close", -1)
+            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),
+            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 30),
+            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", 200),
+            "both_reasonably_close": env_config.get("max_termination_count_both_close", 50)
         }
         self._reset_termination_counters()
 
@@ -859,7 +859,7 @@ class AnchorEnv(ParallelEnv):
             both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
             high_precision_with_reasonable_coverage = (
                 precision >= 0.95 * self.precision_target
-                and coverage >= 0.5 * self.coverage_target
+                and coverage >= 0.7 * self.coverage_target
             )
             both_reasonably_close = (
                 precision >= 0.90 * self.precision_target
@@ -867,7 +867,7 @@ class AnchorEnv(ParallelEnv):
             )
             excellent_precision = (
                 precision >= self.precision_target
-                and coverage >= 0.3 * self.coverage_target
+                and coverage >= 0.5 * self.coverage_target
             )
             
             # Check if termination reasons are enabled (not overused) for this agent
