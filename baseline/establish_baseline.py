@@ -24,23 +24,38 @@ import argparse
 import sys
 import os
 import json
+import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
-from sklearn.datasets import load_breast_cancer, fetch_covtype, load_wine, fetch_california_housing
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.datasets import load_breast_cancer, fetch_covtype, load_wine, load_iris, fetch_california_housing
 from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
+
+# Handle optional imports for UCI and Folktables
+try:
+    from ucimlrepo import fetch_ucirepo
+    UCIML_AVAILABLE = True
+except ImportError:
+    UCIML_AVAILABLE = False
+
+try:
+    from folktables import ACSDataSource, ACSIncome, ACSPublicCoverage, ACSMobility, ACSEmployment, ACSTravelTime
+    FOLKTABLES_AVAILABLE = True
+except ImportError:
+    FOLKTABLES_AVAILABLE = False
 
 # Handle imports when running as script vs module
 try:
-    from trainers.networks import SimpleClassifier
-    from trainers.device_utils import get_device_pair
+    from utils.networks import SimpleClassifier
+    from utils.device_utils import get_device_pair
 except ImportError:
     # Add parent directory to path if running directly
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from trainers.networks import SimpleClassifier
-    from trainers.device_utils import get_device_pair
+    from utils.networks import SimpleClassifier
+    from utils.device_utils import get_device_pair
 
 
 def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
@@ -48,7 +63,9 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
     Load a sklearn dataset (same function as in sklearn_datasets_anchors.py).
     
     Args:
-        dataset_name: Name of dataset ("breast_cancer", "covtype", "wine", or "housing")
+        dataset_name: Name of dataset ("breast_cancer", "covtype", "wine", "iris", "housing", 
+                      "uci_<id_or_name>" (e.g., "uci_adult", "uci_credit"), or 
+                      "folktables_<task>_<state>_<year>" (e.g., "folktables_income_CA_2018"))
         sample_size: Optional size to sample (for large datasets like covtype or housing)
         seed: Random seed for sampling
         
@@ -73,6 +90,12 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         y = data.target.astype(int)
         feature_names = list(data.feature_names)
         class_names = list(data.target_names)
+    elif dataset_name == "iris":
+        data = load_iris()
+        X = data.data.astype(np.float32)
+        y = data.target.astype(int)
+        feature_names = list(data.feature_names)
+        class_names = list(data.target_names)
     elif dataset_name == "housing":
         # California Housing dataset - convert regression to classification by binning prices
         data = fetch_california_housing()
@@ -91,10 +114,205 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
         print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
         print(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
+    elif dataset_name.startswith("uci_"):
+        # UCIML Repository dataset
+        if not UCIML_AVAILABLE:
+            raise ImportError(
+                "ucimlrepo package is required for UCIML datasets. "
+                "Install with: pip install ucimlrepo"
+            )
+        
+        # Parse dataset identifier (can be ID or name)
+        dataset_id_str = dataset_name.replace("uci_", "")
+        
+        # Common UCIML dataset IDs
+        uci_dataset_map = {
+            "adult": 2,
+            "car": 19,
+            "credit": 27,
+            "nursery": 76,
+            "mushroom": 73,
+            "tic-tac-toe": 101,
+            "vote": 56,
+            "zoo": 111,
+        }
+        
+        # Try to get ID from map or parse as integer
+        try:
+            if dataset_id_str in uci_dataset_map:
+                dataset_id = uci_dataset_map[dataset_id_str]
+            else:
+                dataset_id = int(dataset_id_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid UCIML dataset identifier: {dataset_id_str}. "
+                f"Use format 'uci_<id>' or 'uci_<name>'. "
+                f"Supported names: {list(uci_dataset_map.keys())}"
+            )
+        
+        print(f"Fetching UCIML dataset (ID: {dataset_id})...")
+        dataset = fetch_ucirepo(id=dataset_id)
+        
+        # Extract features and targets
+        X_df = dataset.data.features
+        y_df = dataset.data.targets
+        
+        # Get feature names before processing
+        if hasattr(X_df, 'columns'):
+            feature_names = list(X_df.columns)
+        else:
+            feature_names = [f"feature_{i}" for i in range(X_df.shape[1])]
+        
+        # Convert to DataFrame if not already
+        if not isinstance(X_df, pd.DataFrame):
+            X_df = pd.DataFrame(X_df, columns=feature_names)
+        
+        # Handle missing values
+        if X_df.isnull().any().any():
+            missing_count = X_df.isnull().sum().sum()
+            print(f"  Found {missing_count} missing values, filling with median/mode...")
+            # Fill numeric columns with median, categorical with mode
+            for col in X_df.columns:
+                if X_df[col].dtype in ['int64', 'float64']:
+                    X_df[col].fillna(X_df[col].median(), inplace=True)
+                else:
+                    mode_val = X_df[col].mode()
+                    X_df[col].fillna(mode_val[0] if len(mode_val) > 0 else 0, inplace=True)
+        
+        # Encode categorical features
+        label_encoders = {}
+        for col in X_df.columns:
+            if X_df[col].dtype == 'object' or X_df[col].dtype.name == 'category':
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+                label_encoders[col] = le
+        
+        # Convert to numpy array
+        X = X_df.values.astype(np.float32)
+        
+        # Handle target
+        y = y_df.values if hasattr(y_df, 'values') else y_df
+        
+        # Handle target shape (may be 1D or 2D)
+        if y.ndim > 1:
+            if y.shape[1] == 1:
+                y = y.flatten()
+            else:
+                # Multi-label case - use first column
+                print(f"  Warning: Multi-column target detected, using first column")
+                y = y[:, 0]
+        
+        # Convert target to integer labels if needed
+        if isinstance(y, pd.Series):
+            y = y.values
+        
+        if y.dtype == 'object' or not np.issubdtype(y.dtype, np.integer):
+            le = LabelEncoder()
+            y = le.fit_transform(y.astype(str)).astype(int)
+            class_names = le.classes_.tolist()
+        else:
+            y = y.astype(int)
+            unique_classes = np.unique(y)
+            class_names = [f"class_{i}" for i in unique_classes]
+        
+        print(f"  Loaded UCIML dataset: {dataset.metadata.name if hasattr(dataset, 'metadata') else 'Unknown'}")
+        print(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
+        if label_encoders:
+            print(f"  Encoded {len(label_encoders)} categorical features")
+    
+    elif dataset_name.startswith("folktables_"):
+        # Folktables dataset
+        if not FOLKTABLES_AVAILABLE:
+            raise ImportError(
+                "folktables package is required for Folktables datasets. "
+                "Install with: pip install folktables"
+            )
+        
+        # Parse dataset specification: folktables_<task>_<state>_<year>
+        # Example: folktables_income_CA_2018
+        parts = dataset_name.replace("folktables_", "").split("_")
+        
+        if len(parts) < 3:
+            raise ValueError(
+                f"Invalid Folktables dataset format: {dataset_name}. "
+                f"Use format: folktables_<task>_<state>_<year>\n"
+                f"Example: folktables_income_CA_2018\n"
+                f"Available tasks: income, coverage, mobility, employment, travel"
+            )
+        
+        task_name = parts[0].lower()
+        state = parts[1].upper()
+        year = parts[2]
+        
+        # Map task names to Folktables tasks
+        task_map = {
+            "income": ACSIncome,
+            "coverage": ACSPublicCoverage,
+            "mobility": ACSMobility,
+            "employment": ACSEmployment,
+            "travel": ACSTravelTime,
+        }
+        
+        if task_name not in task_map:
+            raise ValueError(
+                f"Unknown Folktables task: {task_name}. "
+                f"Available tasks: {list(task_map.keys())}"
+            )
+        
+        task_class = task_map[task_name]
+        
+        print(f"Loading Folktables dataset: {task_name} for {state} ({year})...")
+        
+        # Create data source
+        data_source = ACSDataSource(
+            survey_year=year,
+            horizon='1-Year',
+            survey='person'
+        )
+        
+        # Download and extract data
+        acs_data = data_source.get_data(states=[state], download=True)
+        
+        # Extract features and labels using the task
+        task = task_class()
+        X, y = task.df_to_numpy(acs_data)
+        
+        # Convert to float32
+        X = X.astype(np.float32)
+        y = y.astype(int)
+        
+        # Get feature names from task
+        feature_names = task.features
+        if feature_names is None:
+            feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        
+        # Get class names
+        unique_classes = np.unique(y)
+        if task_name == "income":
+            class_names = ["income_<=50K", "income_>50K"]
+        elif task_name == "coverage":
+            class_names = ["no_coverage", "has_coverage"]
+        elif task_name == "mobility":
+            class_names = ["not_moved", "moved"]
+        elif task_name == "employment":
+            class_names = ["not_employed", "employed"]
+        elif task_name == "travel":
+            class_names = ["travel_<=30min", "travel_>30min"]
+        else:
+            class_names = [f"class_{i}" for i in unique_classes]
+        
+        print(f"  Loaded Folktables dataset: {task_name} ({state}, {year})")
+        print(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
+    
     else:
+        supported = ['breast_cancer', 'covtype', 'wine', 'iris', 'housing']
+        if UCIML_AVAILABLE:
+            supported.append('uci_<id_or_name> (e.g., uci_adult, uci_2)')
+        if FOLKTABLES_AVAILABLE:
+            supported.append('folktables_<task>_<state>_<year> (e.g., folktables_income_CA_2018)')
         raise ValueError(
             f"Unknown dataset '{dataset_name}'. "
-            f"Choose from: 'breast_cancer', 'covtype', 'wine', or 'housing'."
+            f"Supported datasets: {', '.join(supported)}"
         )
     
     # Sample subset if requested (for faster execution on large datasets)
@@ -194,6 +412,213 @@ def predict_proba_wrapper(classifier, device):
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
         return probs
     return predict_fn
+
+
+def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[str, float, float]]:
+    """
+    Parse an anchor rule from anchor-exp library into feature ranges.
+    
+    Args:
+        anchor_rule: Anchor rule from anchor-exp (can be string, list, or other format)
+        feature_names: List of feature names
+    
+    Returns:
+        List of (feature_name, lower_bound, upper_bound) tuples
+    """
+    conditions = []
+    
+    # Handle different formats from anchor-exp
+    if isinstance(anchor_rule, str):
+        rule_str = anchor_rule
+    elif isinstance(anchor_rule, list):
+        # anchor-exp sometimes returns list of strings or tuples
+        if len(anchor_rule) == 0:
+            return []
+        # Check if it's a list of strings
+        if isinstance(anchor_rule[0], str):
+            rule_str = " and ".join(str(item) for item in anchor_rule)
+        else:
+            # Might be list of tuples or other format - convert to string
+            rule_str = " and ".join(str(item) for item in anchor_rule)
+    else:
+        # Try to convert to string
+        rule_str = str(anchor_rule)
+    
+    if not rule_str or rule_str.strip() == "":
+        return []
+    
+    # Pattern to match: "feature_name ∈ [lower, upper]" or "feature_name <= value" or "feature_name >= value"
+    # Also handle "feature_name > value" and "feature_name < value"
+    # Also handle formats like "feature_name <= value <= feature_name" (range)
+    pattern_range = r'(.+?)\s*∈\s*\[([-\d.]+),\s*([-\d.]+)\]'
+    pattern_range_alt = r'(.+?)\s*<=\s*([-\d.]+)\s*<=\s*(.+)'  # "feature <= val <= feature" (same feature)
+    pattern_le = r'(.+?)\s*<=\s*([-\d.]+)'
+    pattern_ge = r'(.+?)\s*>=\s*([-\d.]+)'
+    pattern_lt = r'(.+?)\s*<\s*([-\d.]+)'
+    pattern_gt = r'(.+?)\s*>\s*([-\d.]+)'
+    
+    # Split by " and " to get individual conditions
+    condition_strings = rule_str.split(" and ")
+    
+    for condition_str in condition_strings:
+        condition_str = condition_str.strip()
+        if not condition_str:
+            continue
+        
+        # Try range pattern first (∈ [lower, upper])
+        match = re.search(pattern_range, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            lower = float(match.group(2))
+            upper = float(match.group(3))
+            conditions.append((feature_name, lower, upper))
+            continue
+        
+        # Try alternative range pattern (feature <= val <= feature)
+        match = re.search(pattern_range_alt, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            lower_str = match.group(2).strip()
+            upper_str = match.group(3).strip()
+            # Check if upper_str is a number or same feature name
+            try:
+                lower = float(lower_str)
+                upper = float(upper_str)
+                conditions.append((feature_name, lower, upper))
+                continue
+            except ValueError:
+                pass
+        
+        # Try <= pattern
+        match = re.search(pattern_le, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            upper = float(match.group(2))
+            # For <=, we use -inf as lower bound (will be replaced with feature min later)
+            conditions.append((feature_name, float('-inf'), upper))
+            continue
+        
+        # Try >= pattern
+        match = re.search(pattern_ge, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            lower = float(match.group(2))
+            # For >=, we use +inf as upper bound (will be replaced with feature max later)
+            conditions.append((feature_name, lower, float('inf')))
+            continue
+        
+        # Try < pattern
+        match = re.search(pattern_lt, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            upper = float(match.group(2))
+            conditions.append((feature_name, float('-inf'), upper))
+            continue
+        
+        # Try > pattern
+        match = re.search(pattern_gt, condition_str)
+        if match:
+            feature_name = match.group(1).strip()
+            lower = float(match.group(2))
+            conditions.append((feature_name, lower, float('inf')))
+            continue
+    
+    return conditions
+
+
+def compute_class_union_metrics(
+    anchor_rules: List[Any],
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    target_class: int,
+    feature_names: List[str],
+    X_train: np.ndarray
+) -> Tuple[float, float]:
+    """
+    Compute class-level union metrics from a list of anchor rules.
+    
+    For each feature, takes the union of all ranges across all anchors:
+    - Lower bound: minimum of all lower bounds (or -inf if any anchor has no lower bound)
+    - Upper bound: maximum of all upper bounds (or +inf if any anchor has no upper bound)
+    
+    Then computes precision and coverage on the union.
+    
+    Args:
+        anchor_rules: List of anchor rules (from anchor-exp)
+        X_data: Data matrix (n_samples, n_features) in original feature space
+        y_data: Labels (n_samples,)
+        target_class: Target class to compute metrics for
+        feature_names: List of feature names
+        X_train: Training data to get feature ranges for handling -inf/+inf
+    
+    Returns:
+        Tuple of (class_precision, class_coverage)
+    """
+    if len(anchor_rules) == 0:
+        return 0.0, 0.0
+    
+    # Parse all anchor rules
+    all_conditions = []
+    for anchor_rule in anchor_rules:
+        conditions = parse_anchor_rule(anchor_rule, feature_names)
+        if conditions:
+            all_conditions.append(conditions)
+    
+    if len(all_conditions) == 0:
+        # No valid conditions found - union covers everything
+        return 0.0, 0.0
+    
+    # Compute feature ranges from training data
+    feature_mins = X_train.min(axis=0)
+    feature_maxs = X_train.max(axis=0)
+    
+    # Build union: for each feature, take min of all lower bounds and max of all upper bounds
+    feature_to_idx = {name: idx for idx, name in enumerate(feature_names)}
+    union_lower = np.full(len(feature_names), float('-inf'))
+    union_upper = np.full(len(feature_names), float('inf'))
+    
+    for conditions in all_conditions:
+        for feature_name, lower, upper in conditions:
+            if feature_name in feature_to_idx:
+                feat_idx = feature_to_idx[feature_name]
+                # Update union bounds
+                if lower != float('-inf'):
+                    if union_lower[feat_idx] == float('-inf'):
+                        union_lower[feat_idx] = lower
+                    else:
+                        union_lower[feat_idx] = min(union_lower[feat_idx], lower)
+                if upper != float('inf'):
+                    if union_upper[feat_idx] == float('inf'):
+                        union_upper[feat_idx] = upper
+                    else:
+                        union_upper[feat_idx] = max(union_upper[feat_idx], upper)
+    
+    # Replace -inf with feature min and +inf with feature max
+    for feat_idx in range(len(feature_names)):
+        if union_lower[feat_idx] == float('-inf'):
+            union_lower[feat_idx] = feature_mins[feat_idx]
+        if union_upper[feat_idx] == float('inf'):
+            union_upper[feat_idx] = feature_maxs[feat_idx]
+    
+    # Check which samples satisfy the union
+    in_union = np.all((X_data >= union_lower) & (X_data <= union_upper), axis=1)
+    is_class = (y_data == target_class)
+    
+    # Coverage: fraction of class samples in union
+    n_class_samples = is_class.sum()
+    if n_class_samples == 0:
+        coverage = 0.0
+    else:
+        coverage = float((in_union & is_class).sum() / n_class_samples)
+    
+    # Precision: fraction of union samples that belong to class
+    n_union_samples = in_union.sum()
+    if n_union_samples == 0:
+        precision = 0.0
+    else:
+        precision = float((in_union & is_class).sum() / n_union_samples)
+    
+    return precision, coverage
 
 
 def run_lime(
@@ -539,7 +964,8 @@ def run_static_anchors(
         X_train,
         categorical_names,
     )
-    explainer.fit(X_train, y_train, X_test, y_test)
+    # Note: anchor-exp's AnchorTabularExplainer doesn't have a fit() method
+    # The data is passed directly to the constructor
     
     results = {}
     unique_classes = np.unique(y_test)
@@ -594,10 +1020,29 @@ def run_static_anchors(
             })
         
         if len(class_results) > 0:
+            # Instance-level metrics (average across all instances)
             avg_prec = float(np.mean([r["precision"] for r in class_results]))
             avg_cov = float(np.mean([r["coverage"] for r in class_results]))
             
+            # Class-level metrics (union of all anchors for this class)
+            anchor_rules = [r["anchor"] for r in class_results if r.get("anchor")]
+            class_prec, class_cov = compute_class_union_metrics(
+                anchor_rules=anchor_rules,
+                X_data=X_test,
+                y_data=y_test,
+                target_class=cls,
+                feature_names=feature_names,
+                X_train=X_train
+            )
+            
             results[int(cls)] = {
+                # Instance-level metrics (averaged across instances)
+                "instance_precision": avg_prec,
+                "instance_coverage": avg_cov,
+                # Class-level metrics (union of all anchors)
+                "class_precision": class_prec,
+                "class_coverage": class_cov,
+                # Legacy fields for backward compatibility
                 "avg_precision": avg_prec,
                 "avg_coverage": avg_cov,
                 "n_instances": len(class_results),
@@ -605,9 +1050,12 @@ def run_static_anchors(
             }
             
             print(f"\nClass {cls} ({class_names[cls] if cls < len(class_names) else cls}):")
-            print(f"  Avg Precision: {avg_prec:.3f}")
-            print(f"  Avg Coverage:  {avg_cov:.3f}")
-            print(f"  N instances:   {len(class_results)}")
+            print(f"  Instance-level (avg across {len(class_results)} instances):")
+            print(f"    Avg Precision: {avg_prec:.3f}")
+            print(f"    Avg Coverage:  {avg_cov:.3f}")
+            print(f"  Class-level (union of all {len(anchor_rules)} anchors):")
+            print(f"    Union Precision: {class_prec:.3f}")
+            print(f"    Union Coverage:  {class_cov:.3f}")
     
     return {
         "method": "Static Anchors",
@@ -1070,9 +1518,15 @@ def main(
                 "breast_cancer": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
                 "covtype": {"anchor_threshold": 0.95, "disc_perc": [10, 25, 50, 75, 90]},
                 "wine": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
+                "iris": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
                 "housing": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
             }
-            preset = presets.get(dataset_name, {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]})
+            # For UCI and Folktables datasets, use default presets
+            # Check if dataset_name starts with uci_ or folktables_
+            if dataset_name.startswith("uci_") or dataset_name.startswith("folktables_"):
+                preset = {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]}
+            else:
+                preset = presets.get(dataset_name, {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]})
             
             anchor_results = run_static_anchors(
                 classifier, X_train_scaled, X_test_scaled, y_train, y_test,
@@ -1172,6 +1626,8 @@ def main(
     print("\nIMPORTANT NOTE:")
     print("  - LIME, Static Anchors, and SHAP are INSTANCE-LEVEL methods")
     print("    (each instance gets its own explanation, then aggregated by class)")
+    print("  - Static Anchors now also computes CLASS-LEVEL union metrics")
+    print("    (union of all anchors for each class, similar to Dynamic Anchors)")
     print("  - Feature Importance is a GLOBAL method (one importance score per feature)")
     print("  - Dynamic Anchors produce CLASS-LEVEL explanations")
     print("    (ONE unified explanation per class that applies to all instances)")
@@ -1189,10 +1645,19 @@ def main(
             # Print precision/coverage summary
             per_class = method_results.get("per_class_results", {})
             if per_class:
-                precisions = [r.get("avg_precision", 0.0) for r in per_class.values()]
-                coverages = [r.get("avg_coverage", 0.0) for r in per_class.values()]
-                print(f"  Overall Avg Precision: {np.mean(precisions):.3f}")
-                print(f"  Overall Avg Coverage:  {np.mean(coverages):.3f}")
+                # Instance-level metrics
+                instance_precisions = [r.get("instance_precision", r.get("avg_precision", 0.0)) for r in per_class.values()]
+                instance_coverages = [r.get("instance_coverage", r.get("avg_coverage", 0.0)) for r in per_class.values()]
+                print(f"  Instance-level (avg across instances):")
+                print(f"    Overall Avg Precision: {np.mean(instance_precisions):.3f}")
+                print(f"    Overall Avg Coverage:  {np.mean(instance_coverages):.3f}")
+                # Class-level metrics
+                class_precisions = [r.get("class_precision", 0.0) for r in per_class.values()]
+                class_coverages = [r.get("class_coverage", 0.0) for r in per_class.values()]
+                if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                    print(f"  Class-level (union of all anchors):")
+                    print(f"    Overall Union Precision: {np.mean(class_precisions):.3f}")
+                    print(f"    Overall Union Coverage:  {np.mean(class_coverages):.3f}")
         
         elif method_name in ["lime", "shap"]:
             # Print top features summary
@@ -1242,7 +1707,9 @@ Examples:
         "--dataset",
         type=str,
         default="breast_cancer",
-        choices=["breast_cancer", "covtype", "wine", "housing"],
+        # Note: choices list doesn't include uci_* and folktables_* patterns
+        # as they have dynamic formats, but they are supported
+        choices=["breast_cancer", "covtype", "wine", "iris", "housing"],
         help="Dataset to use (default: breast_cancer)"
     )
     parser.add_argument(

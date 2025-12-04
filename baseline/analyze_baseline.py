@@ -109,25 +109,43 @@ def analyze_baseline(json_path):
         per_class = anchor_results.get('per_class_results', {})
         
         if per_class:
-            precisions = []
-            coverages = []
+            instance_precisions = []
+            instance_coverages = []
+            class_precisions = []
+            class_coverages = []
             for cls_key in sorted(per_class.keys()):
                 cls_data = per_class[cls_key]
-                avg_prec = cls_data.get('avg_precision', 0.0)
-                avg_cov = cls_data.get('avg_coverage', 0.0)
+                # Instance-level metrics
+                instance_prec = cls_data.get('instance_precision', cls_data.get('avg_precision', 0.0))
+                instance_cov = cls_data.get('instance_coverage', cls_data.get('avg_coverage', 0.0))
+                # Class-level metrics
+                class_prec = cls_data.get('class_precision', 0.0)
+                class_cov = cls_data.get('class_coverage', 0.0)
                 n_instances = cls_data.get('n_instances', 0)
                 
-                precisions.append(avg_prec)
-                coverages.append(avg_cov)
+                instance_precisions.append(instance_prec)
+                instance_coverages.append(instance_cov)
+                if class_prec > 0 or class_cov > 0:
+                    class_precisions.append(class_prec)
+                    class_coverages.append(class_cov)
                 
                 print(f"\nClass {cls_key} ({class_names[int(cls_key)] if int(cls_key) < len(class_names) else cls_key}):")
-                print(f"  Avg Precision: {avg_prec:.4f}")
-                print(f"  Avg Coverage:  {avg_cov:.4f}")
-                print(f"  N instances:   {n_instances}")
+                print(f"  Instance-level (avg across {n_instances} instances):")
+                print(f"    Avg Precision: {instance_prec:.4f}")
+                print(f"    Avg Coverage:  {instance_cov:.4f}")
+                if class_prec > 0 or class_cov > 0:
+                    print(f"  Class-level (union of all anchors):")
+                    print(f"    Union Precision: {class_prec:.4f}")
+                    print(f"    Union Coverage:  {class_cov:.4f}")
             
             print(f"\nOverall Statistics:")
-            print(f"  Mean Precision: {np.mean(precisions):.4f} (+/- {np.std(precisions):.4f})")
-            print(f"  Mean Coverage:  {np.mean(coverages):.4f} (+/- {np.std(coverages):.4f})")
+            print(f"  Instance-level (avg across instances):")
+            print(f"    Mean Precision: {np.mean(instance_precisions):.4f} (+/- {np.std(instance_precisions):.4f})")
+            print(f"    Mean Coverage:  {np.mean(instance_coverages):.4f} (+/- {np.std(instance_coverages):.4f})")
+            if class_precisions:
+                print(f"  Class-level (union of all anchors):")
+                print(f"    Mean Union Precision: {np.mean(class_precisions):.4f} (+/- {np.std(class_precisions):.4f})")
+                print(f"    Mean Union Coverage:  {np.mean(class_coverages):.4f} (+/- {np.std(class_coverages):.4f})")
         else:
             print("No Static Anchors results available")
     
@@ -287,27 +305,33 @@ def analyze_baseline(json_path):
         anchor_per_class = methods['static_anchors'].get('per_class_results', {})
         if anchor_per_class:
             classes = sorted(anchor_per_class.keys())
-            precisions = [anchor_per_class[cls].get('avg_precision', 0.0) for cls in classes]
-            coverages = [anchor_per_class[cls].get('avg_coverage', 0.0) for cls in classes]
+            # Instance-level metrics
+            instance_precisions = [anchor_per_class[cls].get('instance_precision', anchor_per_class[cls].get('avg_precision', 0.0)) for cls in classes]
+            instance_coverages = [anchor_per_class[cls].get('instance_coverage', anchor_per_class[cls].get('avg_coverage', 0.0)) for cls in classes]
+            # Class-level metrics
+            class_precisions = [anchor_per_class[cls].get('class_precision', 0.0) for cls in classes]
+            class_coverages = [anchor_per_class[cls].get('class_coverage', 0.0) for cls in classes]
             
             x = np.arange(len(classes))
-            width = 0.35
-            ax2.bar(x - width/2, precisions, width, label='Precision', alpha=0.8, color='blue')
-            ax2_twin = ax2.twinx()
-            ax2_twin.bar(x + width/2, coverages, width, label='Coverage', alpha=0.8, color='orange')
+            width = 0.2
+            
+            # Plot instance-level metrics
+            ax2.bar(x - 1.5*width, instance_precisions, width, label='Instance Precision', alpha=0.8, color='blue')
+            ax2.bar(x - 0.5*width, instance_coverages, width, label='Instance Coverage', alpha=0.8, color='lightblue')
+            
+            # Plot class-level metrics if available
+            if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                ax2.bar(x + 0.5*width, class_precisions, width, label='Class Union Precision', alpha=0.8, color='orange')
+                ax2.bar(x + 1.5*width, class_coverages, width, label='Class Union Coverage', alpha=0.8, color='red')
             
             ax2.set_xlabel('Class')
-            ax2.set_ylabel('Precision', color='blue')
-            ax2_twin.set_ylabel('Coverage', color='orange')
-            ax2.set_title('Static Anchors: Precision & Coverage by Class')
+            ax2.set_ylabel('Precision / Coverage')
+            ax2.set_title('Static Anchors: Metrics by Class')
             ax2.set_xticks(x)
             ax2.set_xticklabels([class_names[int(c)] if int(c) < len(class_names) else c for c in classes], 
                                rotation=45, ha='right')
-            ax2.tick_params(axis='y', labelcolor='blue')
-            ax2_twin.tick_params(axis='y', labelcolor='orange')
             ax2.grid(True, alpha=0.3, axis='y')
-            ax2.legend(loc='upper left')
-            ax2_twin.legend(loc='upper right')
+            ax2.legend(loc='best', fontsize=8)
     else:
         ax2.text(0.5, 0.5, 'No Static Anchors data', ha='center', va='center', transform=ax2.transAxes)
         ax2.set_title('Static Anchors Results (N/A)')
@@ -441,11 +465,18 @@ def analyze_baseline(json_path):
     if 'static_anchors' in methods and 'error' not in methods['static_anchors']:
         anchor_per_class = methods['static_anchors'].get('per_class_results', {})
         if anchor_per_class:
-            precisions = [anchor_per_class[cls].get('avg_precision', 0.0) for cls in anchor_per_class.keys()]
-            coverages = [anchor_per_class[cls].get('avg_coverage', 0.0) for cls in anchor_per_class.keys()]
+            instance_precisions = [anchor_per_class[cls].get('instance_precision', anchor_per_class[cls].get('avg_precision', 0.0)) for cls in anchor_per_class.keys()]
+            instance_coverages = [anchor_per_class[cls].get('instance_coverage', anchor_per_class[cls].get('avg_coverage', 0.0)) for cls in anchor_per_class.keys()]
+            class_precisions = [anchor_per_class[cls].get('class_precision', 0.0) for cls in anchor_per_class.keys()]
+            class_coverages = [anchor_per_class[cls].get('class_coverage', 0.0) for cls in anchor_per_class.keys()]
             summary_text += f"\nStatic Anchors:\n"
-            summary_text += f"  Avg Precision: {np.mean(precisions):.3f}\n"
-            summary_text += f"  Avg Coverage: {np.mean(coverages):.3f}\n"
+            summary_text += f"  Instance-level:\n"
+            summary_text += f"    Avg Precision: {np.mean(instance_precisions):.3f}\n"
+            summary_text += f"    Avg Coverage: {np.mean(instance_coverages):.3f}\n"
+            if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                summary_text += f"  Class-level (union):\n"
+                summary_text += f"    Union Precision: {np.mean(class_precisions):.3f}\n"
+                summary_text += f"    Union Coverage: {np.mean(class_coverages):.3f}\n"
     
     ax6.text(0.1, 0.5, summary_text, transform=ax6.transAxes, 
              fontsize=10, verticalalignment='center', family='monospace')
@@ -548,10 +579,17 @@ def analyze_baseline(json_path):
                 
                 # Add method-specific stats
                 if method_name == 'static_anchors' and per_class:
-                    precisions = [per_class[cls].get('avg_precision', 0.0) for cls in per_class.keys()]
-                    coverages = [per_class[cls].get('avg_coverage', 0.0) for cls in per_class.keys()]
-                    summary_data['methods_summary'][method_name]['avg_precision'] = float(np.mean(precisions))
-                    summary_data['methods_summary'][method_name]['avg_coverage'] = float(np.mean(coverages))
+                    instance_precisions = [per_class[cls].get('instance_precision', per_class[cls].get('avg_precision', 0.0)) for cls in per_class.keys()]
+                    instance_coverages = [per_class[cls].get('instance_coverage', per_class[cls].get('avg_coverage', 0.0)) for cls in per_class.keys()]
+                    class_precisions = [per_class[cls].get('class_precision', 0.0) for cls in per_class.keys()]
+                    class_coverages = [per_class[cls].get('class_coverage', 0.0) for cls in per_class.keys()]
+                    summary_data['methods_summary'][method_name]['instance_avg_precision'] = float(np.mean(instance_precisions))
+                    summary_data['methods_summary'][method_name]['instance_avg_coverage'] = float(np.mean(instance_coverages))
+                    summary_data['methods_summary'][method_name]['avg_precision'] = float(np.mean(instance_precisions))  # Legacy
+                    summary_data['methods_summary'][method_name]['avg_coverage'] = float(np.mean(instance_coverages))  # Legacy
+                    if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                        summary_data['methods_summary'][method_name]['class_union_precision'] = float(np.mean(class_precisions))
+                        summary_data['methods_summary'][method_name]['class_union_coverage'] = float(np.mean(class_coverages))
     
     with open(summary_output, 'w') as f:
         json.dump(summary_data, f, indent=2)
