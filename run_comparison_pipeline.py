@@ -21,7 +21,7 @@ import subprocess
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime
 import json
 
@@ -687,6 +687,131 @@ def run_multi_agent_test(
     return success
 
 
+def run_baseline_establishment(
+    dataset: str,
+    seed: int = 42,
+    n_instances_per_class: int = 20,
+    methods: Optional[List[str]] = None,
+    output_dir: Optional[str] = None,
+    force_rerun: bool = False,
+    **kwargs
+) -> Optional[str]:
+    """
+    Run baseline explainability methods.
+    
+    Args:
+        dataset: Dataset name
+        seed: Random seed
+        n_instances_per_class: Number of instances per class to explain
+        methods: List of methods to run (None = all methods)
+        output_dir: Output directory for results
+        force_rerun: If True, rerun even if results exist
+        **kwargs: Additional arguments
+    
+    Returns:
+        Path to baseline_results JSON file if successful, None otherwise
+    """
+    # Resolve paths relative to project root
+    baseline_script = PROJECT_ROOT / "baseline" / "establish_baseline.py"
+    if not baseline_script.exists():
+        logger.error(f"✗ Baseline script not found: {baseline_script}")
+        return None
+    
+    # Default output directory
+    if output_dir is None:
+        output_dir = str(PROJECT_ROOT / "output" / f"{dataset}_baseline")
+    else:
+        output_dir = str(Path(output_dir).resolve())
+    
+    # Check if baseline results already exist
+    if not force_rerun:
+        output_path = Path(output_dir)
+        if output_path.exists():
+            # Look for baseline_results JSON files
+            baseline_files = list(output_path.glob("baseline_results_*.json"))
+            if baseline_files:
+                # Use most recent
+                latest_file = max(baseline_files, key=lambda p: p.stat().st_mtime)
+                logger.info(f"✓ Found existing baseline results: {latest_file}")
+                logger.info(f"  Skipping baseline establishment. Use --force_rerun to rerun anyway.")
+                return str(latest_file)
+    
+    # Default methods if not specified
+    if methods is None:
+        methods = ["static_anchors"]  # Focus on static anchors for comparison
+    
+    cmd = [
+        sys.executable,
+        "-m", "baseline.establish_baseline",
+        "--dataset", dataset,
+        "--seed", str(seed),
+        "--n_instances_per_class", str(n_instances_per_class),
+        "--output_dir", output_dir,
+        "--methods"
+    ] + methods
+    
+    # Add additional arguments
+    for key, value in kwargs.items():
+        if value is not None:
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{key}")
+            else:
+                cmd.extend([f"--{key}", str(value)])
+    
+    success, _ = run_command(cmd, f"Baseline Establishment: {dataset}")
+    
+    if success:
+        # Find the baseline results file
+        output_path = Path(output_dir)
+        baseline_files = list(output_path.glob("baseline_results_*.json"))
+        if baseline_files:
+            latest_file = max(baseline_files, key=lambda p: p.stat().st_mtime)
+            logger.info(f"✓ Found baseline results: {latest_file}")
+            return str(latest_file)
+        else:
+            logger.warning(f"⚠ Baseline results file not found in {output_dir}")
+            return None
+    
+    return None
+
+
+def run_baseline_analysis(
+    baseline_results_file: str,
+    output_dir: Optional[str] = None
+) -> bool:
+    """
+    Run baseline analysis and generate plots.
+    
+    Args:
+        baseline_results_file: Path to baseline_results JSON file
+        output_dir: Output directory for analysis plots (defaults to same as results file)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    # Resolve paths relative to project root
+    analysis_script = PROJECT_ROOT / "baseline" / "analyze_baseline.py"
+    if not analysis_script.exists():
+        logger.error(f"✗ Baseline analysis script not found: {analysis_script}")
+        return False
+    
+    # Default output directory is same as results file directory
+    if output_dir is None:
+        output_dir = str(Path(baseline_results_file).parent)
+    else:
+        output_dir = str(Path(output_dir).resolve())
+    
+    cmd = [
+        sys.executable,
+        "-m", "baseline.analyze_baseline",
+        baseline_results_file
+    ]
+    
+    success, _ = run_command(cmd, f"Baseline Analysis: {Path(baseline_results_file).name}")
+    return success
+
+
 def run_summarize_and_plot(
     rules_file: str,
     dataset: str,
@@ -952,6 +1077,27 @@ Examples:
     )
     
     parser.add_argument(
+        "--skip_baseline",
+        action="store_true",
+        help="Skip baseline establishment (use existing baseline results)"
+    )
+    
+    parser.add_argument(
+        "--force_rerun_baseline",
+        action="store_true",
+        help="Force rerun baseline even if results exist"
+    )
+    
+    parser.add_argument(
+        "--baseline_methods",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["lime", "static_anchors", "shap", "feature_importance"],
+        help="Baseline methods to run (default: static_anchors only)"
+    )
+    
+    parser.add_argument(
         "--max_features_in_rule",
         type=int,
         default=-1,
@@ -1051,6 +1197,38 @@ Examples:
     multi_agent_experiment_dir = None
     multi_agent_rules_file = None
     multi_agent_summary_file = None
+    
+    baseline_results_file = None
+    
+    # Run baseline pipeline first (it's independent and typically faster)
+    if not args.skip_baseline:
+        logger.info(f"\n{'='*80}")
+        logger.info("BASELINE PIPELINE")
+        logger.info(f"{'='*80}\n")
+        
+        baseline_results_file = run_baseline_establishment(
+            dataset=args.dataset,
+            seed=args.seed,
+            n_instances_per_class=args.n_instances_per_class,
+            methods=args.baseline_methods,
+            output_dir=str(output_path / "baseline"),
+            force_rerun=args.force_rerun_baseline
+        )
+        
+        # Run baseline analysis to generate plots
+        if baseline_results_file:
+            run_baseline_analysis(
+                baseline_results_file=baseline_results_file,
+                output_dir=str(output_path / "baseline")
+            )
+    else:
+        # Try to find existing baseline results
+        baseline_dir = output_path / "baseline"
+        if baseline_dir.exists():
+            baseline_files = list(baseline_dir.glob("baseline_results_*.json"))
+            if baseline_files:
+                baseline_results_file = str(max(baseline_files, key=lambda p: p.stat().st_mtime))
+                logger.info(f"Found existing baseline results: {baseline_results_file}")
     
     # Run single-agent pipeline
     if not args.skip_single_agent:
@@ -1219,8 +1397,8 @@ Examples:
             dataset=args.dataset
         )
     
-    # Generate comparison plots if both summaries are available
-    if single_agent_summary_file and multi_agent_summary_file:
+    # Generate comparison plots if summaries are available
+    if single_agent_summary_file or multi_agent_summary_file:
         logger.info(f"\n{'='*80}")
         logger.info("GENERATING COMPARISON PLOTS")
         logger.info(f"{'='*80}")
@@ -1230,11 +1408,17 @@ Examples:
             cmd = [
                 sys.executable,
                 str(plot_comparison_script),
-                "--single_agent_summary", single_agent_summary_file,
-                "--multi_agent_summary", multi_agent_summary_file,
                 "--dataset", args.dataset,
                 "--output_dir", str(output_path)
             ]
+            
+            if single_agent_summary_file:
+                cmd.extend(["--single_agent_summary", single_agent_summary_file])
+            if multi_agent_summary_file:
+                cmd.extend(["--multi_agent_summary", multi_agent_summary_file])
+            if baseline_results_file:
+                cmd.extend(["--baseline_results", baseline_results_file])
+            
             success, output = run_command(
                 cmd,
                 description="Generate comparison plots",

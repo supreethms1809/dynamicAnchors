@@ -77,19 +77,100 @@ def load_summary_file(summary_file: str) -> Dict:
         return data
 
 
+def extract_baseline_metrics(baseline_results_file: str) -> Optional[Dict]:
+    """
+    Extract baseline metrics from baseline results JSON in a format compatible with comparison plots.
+    
+    Args:
+        baseline_results_file: Path to baseline_results JSON file
+    
+    Returns:
+        Dictionary with baseline metrics in summary format, or None if not available
+    """
+    try:
+        with open(baseline_results_file, 'r') as f:
+            baseline_data = json.load(f)
+        
+        # Extract static anchors results
+        methods = baseline_data.get("methods", {})
+        static_anchors = methods.get("static_anchors", {})
+        
+        if "error" in static_anchors or not static_anchors:
+            logger.warning("No static anchors results in baseline data")
+            return None
+        
+        per_class_results = static_anchors.get("per_class_results", {})
+        if not per_class_results:
+            logger.warning("No per-class results in static anchors")
+            return None
+        
+        # Convert to summary format
+        per_class_summary = {}
+        for class_key, class_data in per_class_results.items():
+            # Extract instance-level and class-level metrics
+            instance_precision = class_data.get("instance_precision", class_data.get("avg_precision", 0.0))
+            instance_coverage = class_data.get("instance_coverage", class_data.get("avg_coverage", 0.0))
+            class_precision = class_data.get("class_precision", 0.0)
+            class_coverage = class_data.get("class_coverage", 0.0)
+            
+            per_class_summary[class_key] = {
+                "class": int(class_key),
+                "instance_precision": float(instance_precision),
+                "instance_coverage": float(instance_coverage),
+                "class_precision": float(class_precision),
+                "class_coverage": float(class_coverage),
+                # Legacy fields
+                "precision": float(instance_precision),
+                "coverage": float(instance_coverage),
+            }
+        
+        # Calculate overall stats
+        instance_precisions = [v["instance_precision"] for v in per_class_summary.values()]
+        instance_coverages = [v["instance_coverage"] for v in per_class_summary.values()]
+        class_precisions = [v["class_precision"] for v in per_class_summary.values() if v["class_precision"] > 0]
+        class_coverages = [v["class_coverage"] for v in per_class_summary.values() if v["class_coverage"] > 0]
+        
+        overall_stats = {
+            "mean_instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+            "mean_instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+            "mean_class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,
+            "mean_class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,
+            "std_instance_precision": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
+            "std_instance_coverage": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
+            "std_class_precision": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
+            "std_class_coverage": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
+            # Legacy fields
+            "mean_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+            "mean_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+        }
+        
+        return {
+            "per_class_summary": per_class_summary,
+            "overall_stats": overall_stats,
+            "method": "Static Anchors (Baseline)"
+        }
+    except Exception as e:
+        logger.error(f"Error extracting baseline metrics: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def plot_precision_coverage_comparison(
-    single_agent_summary: Dict,
-    multi_agent_summary: Dict,
+    single_agent_summary: Optional[Dict],
+    multi_agent_summary: Optional[Dict],
     output_dir: str,
-    dataset_name: str = ""
+    dataset_name: str = "",
+    baseline_summary: Optional[Dict] = None
 ):
     """Plot precision and coverage comparison using grouped bar charts for clarity."""
     if not HAS_PLOTTING:
         return
     
     # Get data
-    single_per_class = single_agent_summary.get("per_class_summary", {})
-    multi_per_class = multi_agent_summary.get("per_class_summary", {})
+    single_per_class = single_agent_summary.get("per_class_summary", {}) if single_agent_summary else {}
+    multi_per_class = multi_agent_summary.get("per_class_summary", {}) if multi_agent_summary else {}
+    baseline_per_class = baseline_summary.get("per_class_summary", {}) if baseline_summary else {}
     
     # Debug: Log structure
     if single_per_class:
@@ -120,6 +201,8 @@ def plot_precision_coverage_comparison(
         all_classes.add(class_data.get("class"))
     for class_data in multi_per_class.values():
         all_classes.add(class_data.get("class"))
+    for class_data in baseline_per_class.values():
+        all_classes.add(class_data.get("class"))
     
     if not all_classes:
         logger.warning("No classes found in summaries. Plots will be empty.")
@@ -138,17 +221,20 @@ def plot_precision_coverage_comparison(
     single_coverages = []
     multi_precisions = []
     multi_coverages = []
+    baseline_precisions = []
+    baseline_coverages = []
     
     logger.info(f"Extracting data for classes: {classes}")
     
     for cls in classes:
         # Find single-agent data for this class
         single_data = None
-        for class_key, class_data in single_per_class.items():
-            if class_data.get("class") == cls:
-                single_data = class_data
-                logger.debug(f"Single-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
-                break
+        if single_per_class:
+            for class_key, class_data in single_per_class.items():
+                if class_data.get("class") == cls:
+                    single_data = class_data
+                    logger.debug(f"Single-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
+                    break
         if single_data:
             single_prec = single_data.get("class_precision", 0.0)
             single_cov = single_data.get("class_coverage", 0.0)
@@ -162,11 +248,12 @@ def plot_precision_coverage_comparison(
         
         # Find multi-agent data for this class
         multi_data = None
-        for class_key, class_data in multi_per_class.items():
-            if class_data.get("class") == cls:
-                multi_data = class_data
-                logger.debug(f"Multi-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
-                break
+        if multi_per_class:
+            for class_key, class_data in multi_per_class.items():
+                if class_data.get("class") == cls:
+                    multi_data = class_data
+                    logger.debug(f"Multi-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
+                    break
         if multi_data:
             multi_prec = multi_data.get("class_precision", 0.0)
             multi_cov = multi_data.get("class_coverage", 0.0)
@@ -177,6 +264,23 @@ def plot_precision_coverage_comparison(
             logger.warning(f"Multi-agent: No data found for class {cls}")
             multi_precisions.append(0.0)
             multi_coverages.append(0.0)
+        
+        # Find baseline data for this class
+        baseline_data = None
+        if baseline_per_class:
+            for class_key, class_data in baseline_per_class.items():
+                if class_data.get("class") == cls:
+                    baseline_data = class_data
+                    break
+        if baseline_data:
+            baseline_prec = baseline_data.get("class_precision", 0.0)
+            baseline_cov = baseline_data.get("class_coverage", 0.0)
+            baseline_precisions.append(baseline_prec)
+            baseline_coverages.append(baseline_cov)
+            logger.info(f"Baseline C{cls}: precision={baseline_prec:.3f}, coverage={baseline_cov:.3f}")
+        else:
+            baseline_precisions.append(0.0)
+            baseline_coverages.append(0.0)
     
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
@@ -185,13 +289,24 @@ def plot_precision_coverage_comparison(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     
     x = np.arange(len(classes))
-    width = 0.35
+    # Adjust width based on number of methods
+    n_methods = sum([bool(single_agent_summary), bool(multi_agent_summary), bool(baseline_summary)])
+    width = 0.8 / n_methods if n_methods > 0 else 0.35
+    offset = -0.4 + width/2
     
     # Left plot: Precision comparison
-    bars1 = ax1.bar(x - width/2, single_precisions, width, label='Single-Agent', 
-                    alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
-    bars2 = ax1.bar(x + width/2, multi_precisions, width, label='Multi-Agent', 
-                    alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+    bar_idx = 0
+    if single_agent_summary:
+        ax1.bar(x + offset + bar_idx*width, single_precisions, width, label='Single-Agent', 
+                alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        bar_idx += 1
+    if multi_agent_summary:
+        ax1.bar(x + offset + bar_idx*width, multi_precisions, width, label='Multi-Agent', 
+                alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        bar_idx += 1
+    if baseline_summary:
+        ax1.bar(x + offset + bar_idx*width, baseline_precisions, width, label='Baseline (Static Anchors)', 
+                alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
     
     ax1.set_xlabel('Class', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Precision', fontsize=12, fontweight='bold')
@@ -203,19 +318,41 @@ def plot_precision_coverage_comparison(
     ax1.legend(fontsize=11, framealpha=0.9)
     
     # Add value labels on bars
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0.01:  # Only label if bar is tall enough
-                ax1.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                        f'{height:.3f}',
+    bar_idx = 0
+    if single_agent_summary:
+        for i, val in enumerate(single_precisions):
+            if val > 0.01:  # Only label if bar is tall enough
+                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        bar_idx += 1
+    if multi_agent_summary:
+        for i, val in enumerate(multi_precisions):
+            if val > 0.01:
+                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        bar_idx += 1
+    if baseline_summary:
+        for i, val in enumerate(baseline_precisions):
+            if val > 0.01:
+                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
                         ha='center', va='bottom', fontsize=9, fontweight='bold')
     
     # Right plot: Coverage comparison
-    bars3 = ax2.bar(x - width/2, single_coverages, width, label='Single-Agent', 
-                    alpha=0.8, color='darkgreen', edgecolor='black', linewidth=1.5)
-    bars4 = ax2.bar(x + width/2, multi_coverages, width, label='Multi-Agent', 
-                    alpha=0.8, color='purple', edgecolor='black', linewidth=1.5)
+    bar_idx = 0
+    if single_agent_summary:
+        ax2.bar(x + offset + bar_idx*width, single_coverages, width, label='Single-Agent', 
+                alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        bar_idx += 1
+    if multi_agent_summary:
+        ax2.bar(x + offset + bar_idx*width, multi_coverages, width, label='Multi-Agent', 
+                alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        bar_idx += 1
+    if baseline_summary:
+        ax2.bar(x + offset + bar_idx*width, baseline_coverages, width, label='Baseline (Static Anchors)', 
+                alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
     
     ax2.set_xlabel('Class', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Coverage', fontsize=12, fontweight='bold')
@@ -227,12 +364,26 @@ def plot_precision_coverage_comparison(
     ax2.legend(fontsize=11, framealpha=0.9)
     
     # Add value labels on bars
-    for bars in [bars3, bars4]:
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0.01:  # Only label if bar is tall enough
-                ax2.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                        f'{height:.3f}',
+    bar_idx = 0
+    if single_agent_summary:
+        for i, val in enumerate(single_coverages):
+            if val > 0.01:  # Only label if bar is tall enough
+                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        bar_idx += 1
+    if multi_agent_summary:
+        for i, val in enumerate(multi_coverages):
+            if val > 0.01:
+                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        bar_idx += 1
+    if baseline_summary:
+        for i, val in enumerate(baseline_coverages):
+            if val > 0.01:
+                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
+                        f'{val:.3f}',
                         ha='center', va='bottom', fontsize=9, fontweight='bold')
     
     plt.tight_layout()
@@ -772,10 +923,11 @@ def plot_rule_overlap_comparison_per_class(
 
 
 def plot_comprehensive_comparison(
-    single_agent_summary: Dict,
-    multi_agent_summary: Dict,
+    single_agent_summary: Optional[Dict],
+    multi_agent_summary: Optional[Dict],
     output_dir: str,
-    dataset_name: str = ""
+    dataset_name: str = "",
+    baseline_summary: Optional[Dict] = None
 ):
     """Plot comprehensive comparison with 4 subplots (2x2 grid)."""
     if not HAS_PLOTTING:
@@ -819,15 +971,22 @@ Examples:
     parser.add_argument(
         "--single_agent_summary",
         type=str,
-        required=True,
+        default=None,
         help="Path to single-agent summary JSON file"
     )
     
     parser.add_argument(
         "--multi_agent_summary",
         type=str,
-        required=True,
+        default=None,
         help="Path to multi-agent summary JSON file"
+    )
+    
+    parser.add_argument(
+        "--baseline_results",
+        type=str,
+        default=None,
+        help="Path to baseline results JSON file"
     )
     
     parser.add_argument(
@@ -850,21 +1009,45 @@ Examples:
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load summaries
-    logger.info(f"Loading single-agent summary from {args.single_agent_summary}")
-    single_agent_summary = load_summary_file(args.single_agent_summary)
-    logger.info(f"Single-agent summary keys: {list(single_agent_summary.keys())}")
-    logger.info(f"Single-agent per_class_summary entries: {len(single_agent_summary.get('per_class_summary', {}))}")
+    single_agent_summary = None
+    multi_agent_summary = None
+    baseline_summary = None
     
-    logger.info(f"Loading multi-agent summary from {args.multi_agent_summary}")
-    multi_agent_summary = load_summary_file(args.multi_agent_summary)
-    logger.info(f"Multi-agent summary keys: {list(multi_agent_summary.keys())}")
-    logger.info(f"Multi-agent per_class_summary entries: {len(multi_agent_summary.get('per_class_summary', {}))}")
+    if args.single_agent_summary:
+        logger.info(f"Loading single-agent summary from {args.single_agent_summary}")
+        single_agent_summary = load_summary_file(args.single_agent_summary)
+        logger.info(f"Single-agent summary keys: {list(single_agent_summary.keys())}")
+        logger.info(f"Single-agent per_class_summary entries: {len(single_agent_summary.get('per_class_summary', {}))}")
+    
+    if args.multi_agent_summary:
+        logger.info(f"Loading multi-agent summary from {args.multi_agent_summary}")
+        multi_agent_summary = load_summary_file(args.multi_agent_summary)
+        logger.info(f"Multi-agent summary keys: {list(multi_agent_summary.keys())}")
+        logger.info(f"Multi-agent per_class_summary entries: {len(multi_agent_summary.get('per_class_summary', {}))}")
+    
+    if args.baseline_results:
+        logger.info(f"Loading baseline results from {args.baseline_results}")
+        baseline_summary = extract_baseline_metrics(args.baseline_results)
+        if baseline_summary:
+            logger.info(f"Baseline summary keys: {list(baseline_summary.keys())}")
+            logger.info(f"Baseline per_class_summary entries: {len(baseline_summary.get('per_class_summary', {}))}")
+        else:
+            logger.warning("Could not extract baseline metrics")
+    
+    # Check that we have at least one summary
+    if not any([single_agent_summary, multi_agent_summary, baseline_summary]):
+        logger.error("At least one summary file (single-agent, multi-agent, or baseline) must be provided")
+        sys.exit(1)
     
     # Generate plots
     if HAS_PLOTTING:
         logger.info("Generating comparison plots...")
-        plot_precision_coverage_comparison(single_agent_summary, multi_agent_summary, args.output_dir, args.dataset)
-        plot_comprehensive_comparison(single_agent_summary, multi_agent_summary, args.output_dir, args.dataset)
+        plot_precision_coverage_comparison(
+            single_agent_summary, multi_agent_summary, args.output_dir, args.dataset, baseline_summary
+        )
+        plot_comprehensive_comparison(
+            single_agent_summary, multi_agent_summary, args.output_dir, args.dataset, baseline_summary
+        )
         logger.info(f"Plots saved to {args.output_dir}")
     else:
         logger.warning("Matplotlib not available. Skipping plot generation.")

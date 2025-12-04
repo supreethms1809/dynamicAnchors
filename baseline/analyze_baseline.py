@@ -270,6 +270,7 @@ def analyze_baseline(json_path):
     fig = plt.figure(figsize=(20, 12))
     
     # Plot 1: Feature Importance Comparison (LIME, SHAP, Permutation)
+    # Or Static Anchors summary if only static anchors available
     ax1 = plt.subplot(2, 3, 1)
     if method_feature_importance:
         top_n = 15
@@ -295,8 +296,36 @@ def analyze_baseline(json_path):
         ax1.set_xticklabels([feature_names[i] for i in top_indices], rotation=45, ha='right', fontsize=8)
         ax1.legend()
         ax1.grid(True, alpha=0.3, axis='y')
+    elif 'static_anchors' in methods and 'error' not in methods['static_anchors']:
+        # Show static anchors summary when only static anchors is available
+        anchor_per_class = methods['static_anchors'].get('per_class_results', {})
+        if anchor_per_class:
+            classes = sorted(anchor_per_class.keys())
+            instance_precisions = [anchor_per_class[cls].get('instance_precision', anchor_per_class[cls].get('avg_precision', 0.0)) for cls in classes]
+            instance_coverages = [anchor_per_class[cls].get('instance_coverage', anchor_per_class[cls].get('avg_coverage', 0.0)) for cls in classes]
+            class_precisions = [anchor_per_class[cls].get('class_precision', 0.0) for cls in classes]
+            class_coverages = [anchor_per_class[cls].get('class_coverage', 0.0) for cls in classes]
+            
+            x = np.arange(len(classes))
+            width = 0.35
+            
+            ax1.bar(x - width/2, instance_precisions, width, label='Instance Precision', alpha=0.8, color='blue')
+            ax1.bar(x + width/2, instance_coverages, width, label='Instance Coverage', alpha=0.8, color='lightblue')
+            
+            ax1.set_xlabel('Class')
+            ax1.set_ylabel('Precision / Coverage')
+            ax1.set_title('Static Anchors: Instance-Level Metrics')
+            ax1.set_xticks(x)
+            ax1.set_xticklabels([class_names[int(c)] if int(c) < len(class_names) else c for c in classes], 
+                               rotation=45, ha='right')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3, axis='y')
+        else:
+            ax1.text(0.5, 0.5, 'No static anchors data', ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_title('Feature Importance Comparison (N/A)')
     else:
-        ax1.text(0.5, 0.5, 'No feature importance data', ha='center', va='center', transform=ax1.transAxes)
+        ax1.text(0.5, 0.5, 'No feature importance data\n(Run LIME, SHAP, or Feature Importance)', 
+                ha='center', va='center', transform=ax1.transAxes, fontsize=10)
         ax1.set_title('Feature Importance Comparison (N/A)')
     
     # Plot 2: Static Anchors Precision/Coverage by Class
@@ -336,7 +365,7 @@ def analyze_baseline(json_path):
         ax2.text(0.5, 0.5, 'No Static Anchors data', ha='center', va='center', transform=ax2.transAxes)
         ax2.set_title('Static Anchors Results (N/A)')
     
-    # Plot 3: Feature Importance Heatmap (LIME vs SHAP)
+    # Plot 3: Feature Importance Heatmap (LIME vs SHAP) or Static Anchors Class-Level Metrics
     ax3 = plt.subplot(2, 3, 3)
     if 'lime' in method_feature_importance and 'shap' in method_feature_importance:
         top_n = 20
@@ -365,8 +394,39 @@ def analyze_baseline(json_path):
         ax3.set_xticklabels([feature_names[i] for i in top_features], rotation=45, ha='right', fontsize=7)
         ax3.set_title('Feature Importance: LIME vs SHAP')
         plt.colorbar(im, ax=ax3, label='Normalized Importance')
+    elif 'static_anchors' in methods and 'error' not in methods['static_anchors']:
+        # Show class-level metrics when only static anchors available
+        anchor_per_class = methods['static_anchors'].get('per_class_results', {})
+        if anchor_per_class:
+            classes = sorted(anchor_per_class.keys())
+            class_precisions = [anchor_per_class[cls].get('class_precision', 0.0) for cls in classes]
+            class_coverages = [anchor_per_class[cls].get('class_coverage', 0.0) for cls in classes]
+            
+            if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                x = np.arange(len(classes))
+                width = 0.35
+                
+                ax3.bar(x - width/2, class_precisions, width, label='Class Union Precision', alpha=0.8, color='orange')
+                ax3.bar(x + width/2, class_coverages, width, label='Class Union Coverage', alpha=0.8, color='red')
+                
+                ax3.set_xlabel('Class')
+                ax3.set_ylabel('Precision / Coverage')
+                ax3.set_title('Static Anchors: Class-Level (Union) Metrics')
+                ax3.set_xticks(x)
+                ax3.set_xticklabels([class_names[int(c)] if int(c) < len(class_names) else c for c in classes], 
+                                   rotation=45, ha='right')
+                ax3.legend()
+                ax3.grid(True, alpha=0.3, axis='y')
+            else:
+                ax3.text(0.5, 0.5, 'Class-level metrics not computed\n(Run with class union enabled)', 
+                        ha='center', va='center', transform=ax3.transAxes, fontsize=9)
+                ax3.set_title('Class-Level Metrics (N/A)')
+        else:
+            ax3.text(0.5, 0.5, 'No static anchors data', ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title('LIME vs SHAP Comparison (N/A)')
     else:
-        ax3.text(0.5, 0.5, 'Need both LIME and SHAP data', ha='center', va='center', transform=ax3.transAxes)
+        ax3.text(0.5, 0.5, 'Need both LIME and SHAP data\nor Static Anchors with class metrics', 
+                ha='center', va='center', transform=ax3.transAxes, fontsize=9)
         ax3.set_title('LIME vs SHAP Comparison (N/A)')
     
     # Plot 4: Method Success Rate
@@ -401,7 +461,7 @@ def analyze_baseline(json_path):
         for i, (name, rate) in enumerate(zip(method_names_list, success_rates)):
             ax4.text(rate + 0.02, i, f'{rate:.2f}', va='center', fontsize=9)
     
-    # Plot 5: Feature Importance Rankings Comparison
+    # Plot 5: Feature Importance Rankings Comparison or Static Anchors Coverage Analysis
     ax5 = plt.subplot(2, 3, 5)
     if len(method_feature_importance) >= 2:
         # Get top 10 features from each method and compare rankings
@@ -437,8 +497,42 @@ def analyze_baseline(json_path):
         ax5.set_xticklabels(method_labels, rotation=45, ha='right')
         ax5.set_title('Feature Ranking Comparison\n(Lower rank = more important)')
         plt.colorbar(im, ax=ax5, label='Rank')
+    elif 'static_anchors' in methods and 'error' not in methods['static_anchors']:
+        # Show precision vs coverage scatter when only static anchors available
+        anchor_per_class = methods['static_anchors'].get('per_class_results', {})
+        if anchor_per_class:
+            classes = sorted(anchor_per_class.keys())
+            instance_precisions = [anchor_per_class[cls].get('instance_precision', anchor_per_class[cls].get('avg_precision', 0.0)) for cls in classes]
+            instance_coverages = [anchor_per_class[cls].get('instance_coverage', anchor_per_class[cls].get('avg_coverage', 0.0)) for cls in classes]
+            class_precisions = [anchor_per_class[cls].get('class_precision', 0.0) for cls in classes]
+            class_coverages = [anchor_per_class[cls].get('class_coverage', 0.0) for cls in classes]
+            
+            # Plot instance-level scatter
+            ax5.scatter(instance_coverages, instance_precisions, s=100, alpha=0.6, color='blue', label='Instance-Level', marker='o')
+            
+            # Plot class-level scatter if available
+            if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
+                ax5.scatter(class_coverages, class_precisions, s=100, alpha=0.6, color='orange', label='Class-Level (Union)', marker='s')
+            
+            # Add class labels
+            for i, cls in enumerate(classes):
+                class_label = class_names[int(cls)] if int(cls) < len(class_names) else f'C{cls}'
+                ax5.annotate(class_label, (instance_coverages[i], instance_precisions[i]), 
+                           fontsize=8, alpha=0.7)
+            
+            ax5.set_xlabel('Coverage')
+            ax5.set_ylabel('Precision')
+            ax5.set_title('Static Anchors: Precision vs Coverage')
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
+            ax5.set_xlim(-0.05, 1.05)
+            ax5.set_ylim(-0.05, 1.05)
+        else:
+            ax5.text(0.5, 0.5, 'No static anchors data', ha='center', va='center', transform=ax5.transAxes)
+            ax5.set_title('Ranking Comparison (N/A)')
     else:
-        ax5.text(0.5, 0.5, 'Need at least 2 methods', ha='center', va='center', transform=ax5.transAxes)
+        ax5.text(0.5, 0.5, 'Need at least 2 methods\nor Static Anchors data', 
+                ha='center', va='center', transform=ax5.transAxes, fontsize=9)
         ax5.set_title('Ranking Comparison (N/A)')
     
     # Plot 6: Summary Statistics
