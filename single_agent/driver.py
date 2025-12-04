@@ -170,8 +170,8 @@ def main():
     parser.add_argument(
         "--total_timesteps",
         type=int,
-        default=24_000,
-        help="Total training timesteps"
+        default=60_000,
+        help="Total training timesteps (increased from 24k to 60k for better convergence with max_cycles=500)"
     )
     
     parser.add_argument(

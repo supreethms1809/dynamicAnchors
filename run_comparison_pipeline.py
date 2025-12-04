@@ -1219,6 +1219,35 @@ Examples:
             dataset=args.dataset
         )
     
+    # Generate comparison plots if both summaries are available
+    if single_agent_summary_file and multi_agent_summary_file:
+        logger.info(f"\n{'='*80}")
+        logger.info("GENERATING COMPARISON PLOTS")
+        logger.info(f"{'='*80}")
+        
+        plot_comparison_script = PROJECT_ROOT / "plot_comparison.py"
+        if plot_comparison_script.exists():
+            cmd = [
+                sys.executable,
+                str(plot_comparison_script),
+                "--single_agent_summary", single_agent_summary_file,
+                "--multi_agent_summary", multi_agent_summary_file,
+                "--dataset", args.dataset,
+                "--output_dir", str(output_path)
+            ]
+            success, output = run_command(
+                cmd,
+                description="Generate comparison plots",
+                cwd=str(PROJECT_ROOT),
+                capture_output=False
+            )
+            if success:
+                logger.info("✓ Comparison plots generated successfully")
+            else:
+                logger.warning(f"⚠ Failed to generate comparison plots: {output}")
+        else:
+            logger.warning(f"⚠ plot_comparison.py not found at {plot_comparison_script}")
+    
     logger.info(f"\n{'='*80}")
     logger.info("PIPELINE COMPLETE!")
     logger.info(f"{'='*80}")

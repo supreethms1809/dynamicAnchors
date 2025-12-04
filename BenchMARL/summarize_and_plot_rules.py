@@ -71,6 +71,30 @@ def extract_features_from_rule(rule_str: str) -> List[str]:
     return features
 
 
+def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float, float]]:
+    """Extract feature names and intervals (lower, upper) from a rule string."""
+    if rule_str == "any values (no tightened features)":
+        return []
+    
+    intervals = []
+    # Pattern to match: "feature_name ∈ [lower, upper]"
+    pattern = r'(.+?)\s*∈\s*\[([-\d.]+),\s*([-\d.]+)\]'
+    
+    # Split by " and " to get individual conditions
+    conditions = rule_str.split(" and ")
+    
+    for condition in conditions:
+        condition = condition.strip()
+        match = re.search(pattern, condition)
+        if match:
+            feature_name = match.group(1).strip()
+            lower = float(match.group(2))
+            upper = float(match.group(3))
+            intervals.append((feature_name, lower, upper))
+    
+    return intervals
+
+
 def load_rules_file(rules_file: str) -> Dict:
     """Load extracted rules from JSON file."""
     with open(rules_file, 'r') as f:
@@ -167,14 +191,16 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
 
 
 def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = ""):
-    """Plot precision and coverage metrics comparison."""
+    """Plot all metrics (precision and coverage, instance and class-level) in a single grouped bar chart."""
     if not HAS_PLOTTING:
         return
     
     per_class = summary["per_class_summary"]
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    if not classes:
+        logger.warning("No class data available for metrics comparison.")
+        return
     
     # Extract data
     class_nums = [per_class[c]["class"] for c in classes]
@@ -183,43 +209,41 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     class_prec = [per_class[c]["class_precision"] for c in classes]
     class_cov = [per_class[c]["class_coverage"] for c in classes]
     
-    x = np.arange(len(class_nums))
-    width = 0.35
-    
     # Format title with dataset name
     title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
-    # Instance-level: precision and coverage in one plot
-    axes[0].bar(x - width/2, instance_prec, width, label='Precision', alpha=0.7, color='steelblue')
-    axes[0].bar(x + width/2, instance_cov, width, label='Coverage', alpha=0.7, color='coral')
-    axes[0].set_xlabel('Class', fontsize=12)
-    axes[0].set_ylabel('Value', fontsize=12)
-    axes[0].set_title(f'{title_prefix}: Instance-Level Precision and Coverage per Class', fontsize=14)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(class_nums)
-    axes[0].set_ylim([0, 1.1])
-    axes[0].grid(True, alpha=0.3, axis='y')
-    axes[0].legend(fontsize=11)
-    # Add value labels
-    for i, (prec, cov) in enumerate(zip(instance_prec, instance_cov)):
-        axes[0].text(i - width/2, prec + 0.02, f'{prec:.3f}', ha='center', va='bottom', fontsize=9)
-        axes[0].text(i + width/2, cov + 0.02, f'{cov:.3f}', ha='center', va='bottom', fontsize=9)
+    fig, ax = plt.subplots(figsize=(14, 7))
     
-    # Class-level: precision and coverage in one plot
-    axes[1].bar(x - width/2, class_prec, width, label='Precision', alpha=0.7, color='darkgreen')
-    axes[1].bar(x + width/2, class_cov, width, label='Coverage', alpha=0.7, color='purple')
-    axes[1].set_xlabel('Class', fontsize=12)
-    axes[1].set_ylabel('Value', fontsize=12)
-    axes[1].set_title(f'{title_prefix}: Class-Level Precision and Coverage per Class', fontsize=14)
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(class_nums)
-    axes[1].set_ylim([0, 1.1])
-    axes[1].grid(True, alpha=0.3, axis='y')
-    axes[1].legend(fontsize=11)
-    # Add value labels
-    for i, (prec, cov) in enumerate(zip(class_prec, class_cov)):
-        axes[1].text(i - width/2, prec + 0.02, f'{prec:.3f}', ha='center', va='bottom', fontsize=9)
-        axes[1].text(i + width/2, cov + 0.02, f'{cov:.3f}', ha='center', va='bottom', fontsize=9)
+    x = np.arange(len(class_nums))
+    width = 0.2  # Thin bars for 4 metrics per class
+    
+    # Plot all 4 metrics side by side for each class
+    bars1 = ax.bar(x - 1.5*width, instance_prec, width, label='Instance Precision', 
+                   alpha=0.8, color='steelblue', edgecolor='black', linewidth=1)
+    bars2 = ax.bar(x - 0.5*width, instance_cov, width, label='Instance Coverage', 
+                   alpha=0.8, color='coral', edgecolor='black', linewidth=1)
+    bars3 = ax.bar(x + 0.5*width, class_prec, width, label='Class Precision (Union)', 
+                   alpha=0.8, color='darkgreen', edgecolor='black', linewidth=1)
+    bars4 = ax.bar(x + 1.5*width, class_cov, width, label='Class Coverage (Union)', 
+                   alpha=0.8, color='purple', edgecolor='black', linewidth=1)
+    
+    ax.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Value', fontsize=12, fontweight='bold')
+    ax.set_title(f'{title_prefix}: Metrics Comparison per Class', fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_nums)
+    ax.set_ylim([0, 1.1])
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.legend(fontsize=10, loc='best', framealpha=0.9, ncol=2)
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2, bars3, bars4]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0.05:  # Only label if bar is tall enough
+                ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                       f'{height:.3f}',
+                       ha='center', va='bottom', fontsize=8, fontweight='bold')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'metrics_comparison.png'), dpi=300, bbox_inches='tight')
@@ -227,142 +251,248 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     logger.info(f"Saved metrics comparison plot to {output_dir}/metrics_comparison.png")
 
 
-def plot_precision_vs_coverage(summary: Dict, output_dir: str, dataset_name: str = ""):
-    """Plot precision vs coverage scatter plot."""
+def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_name: str = ""):
+    """Plot precision vs coverage trade-off scatter plot for all classes."""
     if not HAS_PLOTTING:
         return
     
     per_class = summary["per_class_summary"]
-    
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    # Get colors for classes - sort by class number for consistent coloring
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
+    
+    if not classes:
+        logger.warning("No class data available for precision-coverage trade-off plot.")
+        return
+    
+    # Format title with dataset name
+    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Get colors for classes
     colors = plt.cm.tab10(np.linspace(0, 1, len(classes)))
     
-    # Format title with dataset name
-    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
-    
-    # Instance-level
+    # Left plot: Instance-level precision vs coverage
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
-        ax.scatter(
+        ax1.scatter(
             class_data["instance_coverage"],
             class_data["instance_precision"],
-            s=200, alpha=0.7, color=colors[idx], 
-            marker='o', label=f'Instance-Level Class {cls}',
-            edgecolors='black', linewidths=1.5
+            s=300, alpha=0.8, color=colors[idx], 
+            marker='o', label=f'Class {cls}',
+            edgecolors='black', linewidths=2, zorder=3
         )
+        # Add class label
+        ax1.annotate(f'C{cls}', 
+                    (class_data["instance_coverage"], class_data["instance_precision"]),
+                    xytext=(5, 5), textcoords='offset points', fontsize=11, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='black'))
     
-    # Class-level
+    ax1.set_xlabel('Coverage', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax1.set_title(f'{title_prefix}: Instance-Level Precision vs Coverage Trade-off', fontsize=14, fontweight='bold')
+    ax1.set_xlim([-0.05, 1.05])
+    ax1.set_ylim([0.7, 1.05])
+    ax1.grid(True, alpha=0.3, linestyle='--', zorder=0)
+    ax1.legend(fontsize=10, loc='best', framealpha=0.9)
+    # Add diagonal reference line (ideal: high precision, high coverage)
+    ax1.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
+    ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
+    
+    # Right plot: Class-level (union) precision vs coverage
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
-        ax.scatter(
+        ax2.scatter(
             class_data["class_coverage"],
             class_data["class_precision"],
-            s=200, alpha=0.7, color=colors[idx],
-            marker='s', label=f'Class-Level Class {cls}',
-            edgecolors='black', linewidths=1.5
+            s=300, alpha=0.8, color=colors[idx],
+            marker='s', label=f'Class {cls}',
+            edgecolors='black', linewidths=2, zorder=3
         )
+        # Add class label
+        ax2.annotate(f'C{cls}', 
+                    (class_data["class_coverage"], class_data["class_precision"]),
+                    xytext=(5, 5), textcoords='offset points', fontsize=11, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='black'))
     
-    ax.set_xlabel('Coverage', fontsize=12)
-    ax.set_ylabel('Precision', fontsize=12)
-    ax.set_title(f'{title_prefix}: Precision vs Coverage (Instance-Level and Class-Level)', fontsize=14)
-    ax.set_xlim([-0.05, 1.05])
-    ax.set_ylim([0.7, 1.05])
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=10, loc='best', ncol=2)
+    ax2.set_xlabel('Coverage', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax2.set_title(f'{title_prefix}: Class-Level (Union) Precision vs Coverage Trade-off', fontsize=14, fontweight='bold')
+    ax2.set_xlim([-0.05, 1.05])
+    ax2.set_ylim([0.7, 1.05])
+    ax2.grid(True, alpha=0.3, linestyle='--', zorder=0)
+    ax2.legend(fontsize=10, loc='best', framealpha=0.9)
+    # Add diagonal reference line (ideal: high precision, high coverage)
+    ax2.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
+    ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'precision_vs_coverage.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'precision_coverage_tradeoff.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved precision vs coverage plot to {output_dir}/precision_vs_coverage.png")
+    logger.info(f"Saved precision-coverage trade-off plot to {output_dir}/precision_coverage_tradeoff.png")
 
 
-def plot_rule_counts(summary: Dict, output_dir: str, dataset_name: str = ""):
-    """Plot rule counts per class."""
+def plot_global_metrics(summary: Dict, output_dir: str, dataset_name: str = ""):
+    """Plot all global metrics (precision and coverage, instance and class-level) in a single plot."""
     if not HAS_PLOTTING:
         return
     
     per_class = summary["per_class_summary"]
-    classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
+    overall_stats = summary.get("overall_stats", {})
     
-    class_nums = [per_class[c]["class"] for c in classes]
-    unique_counts = [per_class[c]["n_unique_rules"] for c in classes]
-    total_counts = [per_class[c]["n_total_rules"] for c in classes]
-    
-    x = np.arange(len(class_nums))
-    width = 0.35
+    if not per_class:
+        logger.warning("No class data available for global metrics.")
+        return
     
     # Format title with dataset name
     title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars1 = ax.bar(x - width/2, unique_counts, width, label='Unique Rules', alpha=0.8, color='steelblue')
-    bars2 = ax.bar(x + width/2, total_counts, width, label='Total Rules', alpha=0.8, color='coral')
+    # Calculate global metrics (mean across classes)
+    global_instance_precision = overall_stats.get("mean_instance_precision", 
+        np.mean([per_class[c]["instance_precision"] for c in per_class]))
+    global_instance_coverage = overall_stats.get("mean_instance_coverage",
+        np.mean([per_class[c]["instance_coverage"] for c in per_class]))
+    global_class_precision = overall_stats.get("mean_class_precision",
+        np.mean([per_class[c]["class_precision"] for c in per_class]))
+    global_class_coverage = overall_stats.get("mean_class_coverage",
+        np.mean([per_class[c]["class_coverage"] for c in per_class]))
     
-    ax.set_xlabel('Class', fontsize=12)
-    ax.set_ylabel('Number of Rules', fontsize=12)
-    ax.set_title(f'{title_prefix}: Rule Counts per Class', fontsize=14)
+    # Calculate standard deviations
+    instance_precisions = [per_class[c]["instance_precision"] for c in per_class]
+    instance_coverages = [per_class[c]["instance_coverage"] for c in per_class]
+    class_precisions = [per_class[c]["class_precision"] for c in per_class]
+    class_coverages = [per_class[c]["class_coverage"] for c in per_class]
+    
+    std_instance_precision = np.std(instance_precisions) if len(instance_precisions) > 1 else 0.0
+    std_instance_coverage = np.std(instance_coverages) if len(instance_coverages) > 1 else 0.0
+    std_class_precision = np.std(class_precisions) if len(class_precisions) > 1 else 0.0
+    std_class_coverage = np.std(class_coverages) if len(class_coverages) > 1 else 0.0
+    
+    # Single plot with all 4 metrics
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    metrics = ['Instance\nPrecision', 'Instance\nCoverage', 'Class\nPrecision\n(Union)', 'Class\nCoverage\n(Union)']
+    values = [global_instance_precision, global_instance_coverage, global_class_precision, global_class_coverage]
+    stds = [std_instance_precision, std_instance_coverage, std_class_precision, std_class_coverage]
+    colors = ['steelblue', 'coral', 'darkgreen', 'purple']
+    
+    x = np.arange(len(metrics))
+    bars = ax.bar(x, values, alpha=0.8, color=colors, edgecolor='black', linewidth=1.5,
+                  yerr=stds, capsize=10, error_kw={'elinewidth': 2, 'capthick': 2})
+    
+    ax.set_ylabel('Value', fontsize=12, fontweight='bold')
+    ax.set_title(f'{title_prefix}: Global Metrics Summary', fontsize=14, fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(class_nums)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xticklabels(metrics, fontsize=10)
+    ax.set_ylim([0, 1.1])
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
     
     # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height,
-                   f'{int(height)}',
-                   ha='center', va='bottom')
+    for i, (val, std) in enumerate(zip(values, stds)):
+        label = f'{val:.3f}'
+        if std > 0:
+            label += f'\n±{std:.3f}'
+        ax.text(i, val + std + 0.05, label, ha='center', va='bottom', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'rule_counts.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'global_metrics.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved rule counts plot to {output_dir}/rule_counts.png")
+    logger.info(f"Saved global metrics plot to {output_dir}/global_metrics.png")
 
 
-def plot_feature_frequency(summary: Dict, output_dir: str, dataset_name: str = "", top_n: int = 15):
-    """Plot most frequently used features in rules."""
+def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = "", top_n: int = 15):
+    """Plot feature importance based on frequency and interval selectivity (narrower intervals = more important)."""
     if not HAS_PLOTTING:
         return
     
-    feature_freq = summary["overall_stats"]["feature_frequency"]
-    if not feature_freq:
-        logger.warning("No feature frequency data available.")
+    per_class = summary["per_class_summary"]
+    
+    # Collect all feature intervals from all rules
+    feature_intervals: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+    feature_frequency = Counter()
+    
+    for class_data in per_class.values():
+        unique_rules = class_data.get("unique_rules", [])
+        for rule_str in unique_rules:
+            intervals = extract_feature_intervals_from_rule(rule_str)
+            for feature_name, lower, upper in intervals:
+                feature_intervals[feature_name].append((lower, upper))
+                feature_frequency[feature_name] += 1
+    
+    if not feature_intervals:
+        logger.warning("No feature intervals found for importance analysis.")
         return
     
-    # Get top N features
-    top_features = sorted(feature_freq.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    features, counts = zip(*top_features) if top_features else ([], [])
+    # Calculate importance score: frequency * (1 / average_interval_width)
+    # Narrower intervals indicate more selective/important features
+    feature_importance = {}
+    for feature_name, intervals_list in feature_intervals.items():
+        interval_widths = [upper - lower for lower, upper in intervals_list]
+        avg_width = np.mean(interval_widths) if interval_widths else 1.0
+        frequency = feature_frequency[feature_name]
+        # Importance = frequency / avg_width (higher frequency and narrower intervals = more important)
+        # Normalize by max width to avoid division issues
+        importance_score = frequency / (avg_width + 1e-6)
+        feature_importance[feature_name] = {
+            "importance": importance_score,
+            "frequency": frequency,
+            "avg_interval_width": avg_width,
+            "intervals": intervals_list
+        }
     
-    if not features:
+    # Get top N features by importance
+    top_features = sorted(feature_importance.items(), key=lambda x: x[1]["importance"], reverse=True)[:top_n]
+    
+    if not top_features:
         return
     
     # Format title with dataset name
     title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+    
+    # Left plot: Feature importance (frequency vs interval width)
+    features = [f[0] for f in top_features]
+    importances = [f[1]["importance"] for f in top_features]
+    frequencies = [f[1]["frequency"] for f in top_features]
+    avg_widths = [f[1]["avg_interval_width"] for f in top_features]
+    
     y_pos = np.arange(len(features))
     
-    ax.barh(y_pos, counts, alpha=0.7, color='teal')
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(features)
-    ax.set_xlabel('Frequency (Number of Rules)', fontsize=12)
-    ax.set_title(f'{title_prefix}: Top {top_n} Most Frequently Used Features in Rules', fontsize=14)
-    ax.grid(True, alpha=0.3, axis='x')
+    # Create scatter plot: x = frequency, y = 1/avg_width (inverse of width, so higher = narrower = better)
+    # Size represents importance score
+    scatter = ax1.scatter(frequencies, [1.0/(w + 1e-6) for w in avg_widths], 
+                          s=[imp * 50 for imp in importances], alpha=0.6, c=importances, 
+                          cmap='viridis', edgecolors='black', linewidths=1)
     
-    # Add value labels
-    for i, count in enumerate(counts):
-        ax.text(count + 0.5, i, f'{count}', va='center')
+    # Add feature labels
+    for i, (feat, freq, inv_width) in enumerate(zip(features, frequencies, [1.0/(w + 1e-6) for w in avg_widths])):
+        ax1.annotate(feat, (freq, inv_width), fontsize=8, ha='left', va='center')
+    
+    ax1.set_xlabel('Frequency (Number of Rules)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Interval Selectivity (1/Avg Width)', fontsize=12, fontweight='bold')
+    ax1.set_title(f'{title_prefix}: Feature Importance (Frequency vs Selectivity)', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    plt.colorbar(scatter, ax=ax1, label='Importance Score')
+    
+    # Right plot: Bar chart of importance scores
+    ax2.barh(y_pos, importances, alpha=0.8, color='teal', edgecolor='black', linewidth=1)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(features)
+    ax2.set_xlabel('Importance Score', fontsize=12, fontweight='bold')
+    ax2.set_title(f'{title_prefix}: Top {top_n} Most Important Features', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3, axis='x', linestyle='--')
+    
+    # Add value labels with frequency and width info
+    for i, (imp, freq, width) in enumerate(zip(importances, frequencies, avg_widths)):
+        label = f'{imp:.2f}\n(freq:{freq}, w:{width:.3f})'
+        ax2.text(imp + max(importances) * 0.02, i, label, va='center', fontsize=8)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'feature_frequency.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'feature_importance.png'), dpi=300, bbox_inches='tight')
     plt.close()
-    logger.info(f"Saved feature frequency plot to {output_dir}/feature_frequency.png")
+    logger.info(f"Saved feature importance plot to {output_dir}/feature_importance.png")
 
 
 def plot_test_results_overlap(test_results: Dict, output_dir: str, dataset_name: str = ""):
@@ -765,9 +895,9 @@ Examples:
     if not args.no_plots and HAS_PLOTTING:
         logger.info("Generating plots...")
         plot_metrics_comparison(summary, str(output_dir), args.dataset)
-        plot_precision_vs_coverage(summary, str(output_dir), args.dataset)
-        plot_rule_counts(summary, str(output_dir), args.dataset)
-        plot_feature_frequency(summary, str(output_dir), args.dataset)
+        plot_precision_coverage_tradeoff(summary, str(output_dir), args.dataset)
+        plot_global_metrics(summary, str(output_dir), args.dataset)
+        plot_feature_importance(summary, str(output_dir), args.dataset)
         
         if test_results:
             plot_test_results_overlap(test_results, str(output_dir), args.dataset)

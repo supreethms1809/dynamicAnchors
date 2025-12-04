@@ -58,7 +58,8 @@ env_config:
   fixed_instances_per_class: null
 
 # Maximum number of steps per episode
-max_cycles: 100
+# Increased to 500 for better convergence (allows agents more time to refine anchors)
+max_cycles: 500
 max_termination_count_excellent_precision: 500
 max_termination_count_both_targets: 500
 max_termination_count_high_precision: 500

@@ -196,7 +196,7 @@ class SingleAgentAnchorEnv(Env):
         self.box_history = []
         self.coverage_floor_hits = 0
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 100)
+        self.max_cycles = env_config.get("max_cycles", 500)
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
