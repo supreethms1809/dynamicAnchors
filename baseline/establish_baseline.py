@@ -324,7 +324,7 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
                 f"Available tasks: {list(task_map.keys())}"
             )
         
-        task_class = task_map[task_name]
+        task = task_map[task_name]  # Task is already an instance, not a class
         
         print(f"Loading Folktables dataset: {task_name} for {state} ({year})...")
         
@@ -338,8 +338,7 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         # Download and extract data
         acs_data = data_source.get_data(states=[state], download=True)
         
-        # Extract features and labels using the task
-        task = task_class()
+        # Extract features and labels using the task (task is already an instance)
         X, y = task.df_to_numpy(acs_data)
         
         # Convert to float32

@@ -282,7 +282,8 @@ class TabularDatasetLoader:
                     f"Available tasks: {list(task_map.keys())}"
                 )
             
-            task_class = task_map[task_name]
+            # Task classes from folktables are already instances, not classes
+            task = task_map[task_name]
             
             logger.info(f"Loading Folktables dataset: {task_name} for {state} ({year})...")
             
@@ -296,8 +297,7 @@ class TabularDatasetLoader:
             # Download and extract data
             acs_data = data_source.get_data(states=[state], download=True)
             
-            # Extract features and labels using the task
-            task = task_class()
+            # Extract features and labels using the task (task is already an instance)
             X, y = task.df_to_numpy(acs_data)
             
             # Convert to float32
