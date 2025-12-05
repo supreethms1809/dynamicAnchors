@@ -34,6 +34,42 @@ SCRIPT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = SCRIPT_DIR
 
 
+def build_dataset_choices() -> list:
+    """
+    Build dataset choices dynamically, including UCIML and Folktables datasets if available.
+    
+    Returns:
+        List of available dataset names
+    """
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    
+    # Add UCIML datasets if available
+    try:
+        from ucimlrepo import fetch_ucirepo
+        dataset_choices.extend([
+            "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+        ])
+    except ImportError:
+        pass
+    
+    # Add Folktables datasets if available
+    try:
+        from folktables import ACSDataSource
+        # Add common Folktables combinations
+        states = ["CA", "NY", "TX", "FL", "IL"]
+        years = ["2018", "2019", "2020"]
+        tasks = ["income", "coverage", "mobility", "employment", "travel"]
+        for task in tasks:
+            for state in states[:2]:  # Limit to first 2 states to avoid too many choices
+                for year in years[:1]:  # Limit to first year
+                    dataset_choices.append(f"folktables_{task}_{state}_{year}")
+    except ImportError:
+        pass
+    
+    return dataset_choices
+
+
 def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_output: bool = False) -> Tuple[bool, Optional[str]]:
     """
     Run a command and return True if successful, False otherwise.
@@ -1010,12 +1046,15 @@ Examples:
         """
     )
     
+    # Build dataset choices dynamically
+    dataset_choices = build_dataset_choices()
+    
     parser.add_argument(
         "--dataset",
         type=str,
         required=True,
-        choices=["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "uci_adult", "uci_credit"],
-        help="Dataset name"
+        choices=dataset_choices,
+        help="Dataset name. For UCIML: uci_<name_or_id>. For Folktables: folktables_<task>_<state>_<year>"
     )
     
     parser.add_argument(
