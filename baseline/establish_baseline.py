@@ -30,7 +30,10 @@ from typing import Dict, List, Tuple, Any, Optional
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.datasets import load_breast_cancer, fetch_covtype, load_wine, load_iris, fetch_california_housing
+from sklearn.datasets import (
+    load_breast_cancer, fetch_covtype, load_wine, load_iris, 
+    fetch_california_housing, make_classification, make_moons, make_circles
+)
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 
@@ -114,6 +117,31 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         print(f"  Class 1 (low): ${quartiles[0]*100:.0f}K - ${quartiles[1]*100:.0f}K (25th-50th percentile)")
         print(f"  Class 2 (medium): ${quartiles[1]*100:.0f}K - ${quartiles[2]*100:.0f}K (50th-75th percentile)")
         print(f"  Class 3 (high): >= ${quartiles[2]*100:.0f}K (75th percentile+)")
+    elif dataset_name == "synthetic":
+        X, y = make_classification(
+            n_samples=1000,
+            n_features=10,
+            n_informative=5,
+            n_redundant=2,
+            n_classes=2,
+            random_state=seed
+        )
+        X = X.astype(np.float32)
+        y = y.astype(int)
+        feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        class_names = [f"class_{i}" for i in range(len(np.unique(y)))]
+    elif dataset_name == "moons":
+        X, y = make_moons(n_samples=1000, noise=0.1, random_state=seed)
+        X = X.astype(np.float32)
+        y = y.astype(int)
+        feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        class_names = [f"class_{i}" for i in range(len(np.unique(y)))]
+    elif dataset_name == "circles":
+        X, y = make_circles(n_samples=1000, noise=0.1, factor=0.5, random_state=seed)
+        X = X.astype(np.float32)
+        y = y.astype(int)
+        feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        class_names = [f"class_{i}" for i in range(len(np.unique(y)))]
     elif dataset_name.startswith("uci_"):
         # UCIML Repository dataset
         if not UCIML_AVAILABLE:
@@ -305,7 +333,7 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         print(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
     
     else:
-        supported = ['breast_cancer', 'covtype', 'wine', 'iris', 'housing']
+        supported = ['breast_cancer', 'covtype', 'wine', 'iris', 'housing', 'synthetic', 'moons', 'circles']
         if UCIML_AVAILABLE:
             supported.append('uci_<id_or_name> (e.g., uci_adult, uci_2)')
         if FOLKTABLES_AVAILABLE:
@@ -1520,6 +1548,9 @@ def main(
                 "wine": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
                 "iris": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
                 "housing": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
+                "synthetic": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
+                "moons": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
+                "circles": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
             }
             # For UCI and Folktables datasets, use default presets
             # Check if dataset_name starts with uci_ or folktables_
@@ -1700,6 +1731,9 @@ Examples:
   python -m baseline.establish_baseline --dataset covtype --sample_size 10000
   python -m baseline.establish_baseline --dataset wine
   python -m baseline.establish_baseline --dataset housing --sample_size 10000
+  python -m baseline.establish_baseline --dataset circles
+  python -m baseline.establish_baseline --dataset moons
+  python -m baseline.establish_baseline --dataset synthetic
   python -m baseline.establish_baseline --dataset breast_cancer --methods lime shap
         """
     )
@@ -1709,7 +1743,7 @@ Examples:
         default="breast_cancer",
         # Note: choices list doesn't include uci_* and folktables_* patterns
         # as they have dynamic formats, but they are supported
-        choices=["breast_cancer", "covtype", "wine", "iris", "housing"],
+        choices=["breast_cancer", "covtype", "wine", "iris", "housing", "synthetic", "moons", "circles"],
         help="Dataset to use (default: breast_cancer)"
     )
     parser.add_argument(
