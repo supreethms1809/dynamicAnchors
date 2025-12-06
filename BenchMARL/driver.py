@@ -337,6 +337,31 @@ def main():
         logger.info(f"\nBenchMARL checkpoint location: {checkpoint_path}")
         logger.info(f"  Use this path to load checkpoints later for evaluation or continued training")
         
+        # Save wandb run URL for later reference (if available)
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
+                if wandb_run_url is None:
+                    try:
+                        entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
+                        project = wandb.run.project if hasattr(wandb.run, 'project') else None
+                        run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
+                        if entity and project and run_id:
+                            wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+                    except Exception:
+                        pass
+                
+                if wandb_run_url:
+                    wandb_url_file = os.path.join(checkpoint_path, "wandb_run_url.txt")
+                    os.makedirs(os.path.dirname(wandb_url_file), exist_ok=True)
+                    with open(wandb_url_file, 'w') as f:
+                        f.write(wandb_run_url)
+                    logger.info(f"✓ Wandb run URL saved to: {wandb_url_file}")
+                    logger.info(f"  URL: {wandb_run_url}")
+        except Exception as e:
+            logger.debug(f"Could not save wandb run URL: {e}")
+        
         # Copy classifier to checkpoint directory for easy access during inference
         if hasattr(dataset_loader, 'classifier') and dataset_loader.classifier is not None:
             import shutil

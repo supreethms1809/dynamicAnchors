@@ -909,18 +909,253 @@ def run_summarize_and_plot(
     return success
 
 
-def create_comparison_summary(
+def create_consolidated_metrics_json(
+    baseline_results_file: Optional[str],
     single_agent_summary_file: Optional[str],
     multi_agent_summary_file: Optional[str],
     output_dir: str,
     dataset: str
 ) -> None:
     """
-    Create a comparison summary between single-agent and multi-agent results.
+    Create a consolidated metrics JSON file with all three methods (baseline, single-agent, multi-agent)
+    including their wandb URLs for easy access and comparison.
+    
+    Args:
+        baseline_results_file: Path to baseline results JSON file
+        single_agent_summary_file: Path to single-agent summary.json
+        multi_agent_summary_file: Path to multi-agent summary.json
+        output_dir: Output directory for consolidated metrics JSON
+        dataset: Dataset name
+    """
+    logger.info(f"\n{'='*80}")
+    logger.info("CREATING CONSOLIDATED METRICS JSON")
+    logger.info(f"{'='*80}")
+    
+    output_path = Path(output_dir)
+    consolidated = {
+        "dataset": dataset,
+        "baseline": {},
+        "single_agent": {},
+        "multi_agent": {}
+    }
+    
+    # Load baseline metrics
+    if baseline_results_file and Path(baseline_results_file).exists():
+        try:
+            with open(baseline_results_file, 'r') as f:
+                baseline_data = json.load(f)
+            
+            # Extract static_anchors metrics (baseline doesn't use wandb, so no URL)
+            static_anchors = baseline_data.get("static_anchors", {})
+            if static_anchors:
+                baseline_stats = static_anchors.get("overall_stats", {})
+                baseline_per_class = static_anchors.get("per_class_results", {})
+                
+                consolidated["baseline"] = {
+                    "wandb_run_url": None,  # Baseline doesn't use wandb
+                    "metrics": {
+                        "instance_level": {
+                            "mean_precision": baseline_stats.get("mean_precision", 0.0),
+                            "mean_coverage": baseline_stats.get("mean_coverage", 0.0),
+                            "std_precision": baseline_stats.get("std_precision", 0.0),
+                            "std_coverage": baseline_stats.get("std_coverage", 0.0),
+                        }
+                    },
+                    "per_class": {}
+                }
+                
+                # Add per-class baseline metrics (instance-level only)
+                for class_key, class_data in baseline_per_class.items():
+                    cls = class_data.get("class", -1)
+                    consolidated["baseline"]["per_class"][f"class_{cls}"] = {
+                        "instance_precision": class_data.get("mean_precision", 0.0),
+                        "instance_coverage": class_data.get("mean_coverage", 0.0),
+                    }
+                
+                logger.info("✓ Loaded baseline metrics")
+        except Exception as e:
+            logger.warning(f"⚠ Could not load baseline metrics: {e}")
+    
+    # Load single-agent consolidated metrics (preferred) or summary
+    if single_agent_summary_file:
+        sa_summary_path = Path(single_agent_summary_file)
+        sa_consolidated_file = sa_summary_path.parent / "consolidated_metrics.json"
+        
+        if sa_consolidated_file.exists():
+            try:
+                with open(sa_consolidated_file, 'r') as f:
+                    sa_consolidated = json.load(f)
+                consolidated["single_agent"] = {
+                    "wandb_run_url": sa_consolidated.get("wandb_run_url"),
+                    "metrics": sa_consolidated.get("metrics", {}),
+                    "per_class": sa_consolidated.get("per_class", {})
+                }
+                logger.info("✓ Loaded single-agent consolidated metrics")
+            except Exception as e:
+                logger.warning(f"⚠ Could not load single-agent consolidated metrics: {e}")
+        else:
+            # Fallback to summary.json
+            try:
+                with open(single_agent_summary_file, 'r') as f:
+                    sa_data = json.load(f)
+                sa_summary = sa_data.get("summary", {})
+                sa_stats = sa_summary.get("overall_stats", {})
+                
+                consolidated["single_agent"] = {
+                    "wandb_run_url": None,  # Try to get from wandb_run_url.txt if available
+                    "metrics": {
+                        "instance_level": {
+                            "mean_precision": sa_stats.get("mean_precision", sa_stats.get("mean_instance_precision", 0.0)),
+                            "mean_coverage": sa_stats.get("mean_coverage", sa_stats.get("mean_instance_coverage", 0.0)),
+                            "std_precision": sa_stats.get("std_precision", sa_stats.get("std_instance_precision", 0.0)),
+                            "std_coverage": sa_stats.get("std_coverage", sa_stats.get("std_instance_coverage", 0.0)),
+                        },
+                        "class_level": {
+                            "mean_precision": sa_stats.get("mean_class_precision", 0.0),
+                            "mean_coverage": sa_stats.get("mean_class_coverage", 0.0),
+                            "std_precision": sa_stats.get("std_class_precision", 0.0),
+                            "std_coverage": sa_stats.get("std_class_coverage", 0.0),
+                        },
+                        "global": {
+                            "total_unique_rules": sa_stats.get("total_unique_rules", 0),
+                            "mean_unique_rules_per_class": sa_stats.get("mean_unique_rules_per_class", 0.0),
+                        }
+                    },
+                    "per_class": {}
+                }
+                
+                # Add per-class metrics
+                per_class_summary = sa_summary.get("per_class_summary", {})
+                for class_key, class_data in per_class_summary.items():
+                    cls = class_data.get("class", -1)
+                    consolidated["single_agent"]["per_class"][f"class_{cls}"] = {
+                        "instance_precision": class_data.get("instance_precision", 0.0),
+                        "instance_coverage": class_data.get("instance_coverage", 0.0),
+                        "class_precision": class_data.get("class_precision", 0.0),
+                        "class_coverage": class_data.get("class_coverage", 0.0),
+                        "n_unique_rules": class_data.get("n_unique_rules", 0),
+                    }
+                
+                # Try to get wandb URL from file
+                wandb_url_file = sa_summary_path.parent.parent / "wandb_run_url.txt"
+                if not wandb_url_file.exists():
+                    # Also check in training directory
+                    wandb_url_file = sa_summary_path.parent.parent.parent / "wandb_run_url.txt"
+                if wandb_url_file.exists():
+                    try:
+                        with open(wandb_url_file, 'r') as f:
+                            consolidated["single_agent"]["wandb_run_url"] = f.read().strip()
+                    except Exception:
+                        pass
+                
+                logger.info("✓ Loaded single-agent metrics from summary")
+            except Exception as e:
+                logger.warning(f"⚠ Could not load single-agent summary: {e}")
+    
+    # Load multi-agent consolidated metrics (preferred) or summary
+    if multi_agent_summary_file:
+        ma_summary_path = Path(multi_agent_summary_file)
+        ma_consolidated_file = ma_summary_path.parent / "consolidated_metrics.json"
+        
+        if ma_consolidated_file.exists():
+            try:
+                with open(ma_consolidated_file, 'r') as f:
+                    ma_consolidated = json.load(f)
+                consolidated["multi_agent"] = {
+                    "wandb_run_url": ma_consolidated.get("wandb_run_url"),
+                    "metrics": ma_consolidated.get("metrics", {}),
+                    "per_class": ma_consolidated.get("per_class", {})
+                }
+                logger.info("✓ Loaded multi-agent consolidated metrics")
+            except Exception as e:
+                logger.warning(f"⚠ Could not load multi-agent consolidated metrics: {e}")
+        else:
+            # Fallback to summary.json
+            try:
+                with open(multi_agent_summary_file, 'r') as f:
+                    ma_data = json.load(f)
+                ma_summary = ma_data.get("summary", {})
+                ma_stats = ma_summary.get("overall_stats", {})
+                
+                consolidated["multi_agent"] = {
+                    "wandb_run_url": None,  # Try to get from wandb_run_url.txt if available
+                    "metrics": {
+                        "instance_level": {
+                            "mean_precision": ma_stats.get("mean_instance_precision", 0.0),
+                            "mean_coverage": ma_stats.get("mean_instance_coverage", 0.0),
+                            "std_precision": ma_stats.get("std_instance_precision", 0.0),
+                            "std_coverage": ma_stats.get("std_instance_coverage", 0.0),
+                        },
+                        "class_level": {
+                            "mean_precision": ma_stats.get("mean_class_precision", 0.0),
+                            "mean_coverage": ma_stats.get("mean_class_coverage", 0.0),
+                            "std_precision": ma_stats.get("std_class_precision", 0.0),
+                            "std_coverage": ma_stats.get("std_class_coverage", 0.0),
+                        },
+                        "global": {
+                            "total_unique_rules": ma_stats.get("total_unique_rules", 0),
+                            "mean_unique_rules_per_class": ma_stats.get("mean_unique_rules_per_class", 0.0),
+                        }
+                    },
+                    "per_class": {}
+                }
+                
+                # Add per-class metrics
+                per_class_summary = ma_summary.get("per_class_summary", {})
+                for class_key, class_data in per_class_summary.items():
+                    cls = class_data.get("class", -1)
+                    consolidated["multi_agent"]["per_class"][f"class_{cls}"] = {
+                        "instance_precision": class_data.get("instance_precision", 0.0),
+                        "instance_coverage": class_data.get("instance_coverage", 0.0),
+                        "class_precision": class_data.get("class_precision", 0.0),
+                        "class_coverage": class_data.get("class_coverage", 0.0),
+                        "n_unique_rules": class_data.get("n_unique_rules", 0),
+                    }
+                
+                # Try to get wandb URL from file
+                wandb_url_file = ma_summary_path.parent / "wandb_run_url.txt"
+                if not wandb_url_file.exists():
+                    # Check parent directories (BenchMARL experiment structure)
+                    for parent in [ma_summary_path.parent.parent, ma_summary_path.parent.parent.parent]:
+                        potential_file = parent / "wandb_run_url.txt"
+                        if potential_file.exists():
+                            wandb_url_file = potential_file
+                            break
+                if wandb_url_file.exists():
+                    try:
+                        with open(wandb_url_file, 'r') as f:
+                            consolidated["multi_agent"]["wandb_run_url"] = f.read().strip()
+                    except Exception:
+                        pass
+                
+                logger.info("✓ Loaded multi-agent metrics from summary")
+            except Exception as e:
+                logger.warning(f"⚠ Could not load multi-agent summary: {e}")
+    
+    # Save consolidated metrics JSON
+    consolidated_file = output_path / "consolidated_metrics_all_methods.json"
+    with open(consolidated_file, 'w') as f:
+        json.dump(consolidated, f, indent=2)
+    
+    logger.info(f"✓ Consolidated metrics JSON saved to: {consolidated_file}")
+    logger.info(f"  This file contains all metrics and wandb URLs for easy copying and comparison")
+
+
+def create_comparison_summary(
+    single_agent_summary_file: Optional[str],
+    multi_agent_summary_file: Optional[str],
+    baseline_results_file: Optional[str],
+    output_dir: str,
+    dataset: str
+) -> None:
+    """
+    Create a comparison summary between baseline, single-agent, and multi-agent results.
+    Also creates a consolidated metrics JSON with all metrics and wandb URLs.
     
     Args:
         single_agent_summary_file: Path to single-agent summary.json
         multi_agent_summary_file: Path to multi-agent summary.json
+        baseline_results_file: Path to baseline results JSON file
         output_dir: Output directory for comparison
         dataset: Dataset name
     """
@@ -930,10 +1165,21 @@ def create_comparison_summary(
     
     comparison = {
         "dataset": dataset,
+        "baseline": {},
         "single_agent": {},
         "multi_agent": {},
         "comparison": {}
     }
+    
+    # Load baseline results if available
+    if baseline_results_file and Path(baseline_results_file).exists():
+        try:
+            with open(baseline_results_file, 'r') as f:
+                baseline_data = json.load(f)
+            comparison["baseline"] = baseline_data
+            logger.info("✓ Loaded baseline results")
+        except Exception as e:
+            logger.warning(f"⚠ Could not load baseline results: {e}")
     
     # Load single-agent summary if available
     if single_agent_summary_file and Path(single_agent_summary_file).exists():
@@ -956,6 +1202,7 @@ def create_comparison_summary(
             logger.warning(f"⚠ Could not load multi-agent summary: {e}")
     
     # Create comparison metrics
+    baseline_stats = comparison["baseline"].get("static_anchors", {}).get("overall_stats", {}) if comparison.get("baseline") else {}
     sa_stats = comparison["single_agent"].get("overall_stats", {})
     ma_stats = comparison["multi_agent"].get("overall_stats", {})
     
@@ -996,10 +1243,24 @@ def create_comparison_summary(
     
     logger.info(f"✓ Comparison summary saved to: {comparison_file}")
     
+    # Create consolidated metrics JSON with all methods and wandb URLs
+    create_consolidated_metrics_json(
+        baseline_results_file=baseline_results_file,
+        single_agent_summary_file=single_agent_summary_file,
+        multi_agent_summary_file=multi_agent_summary_file,
+        output_dir=str(output_path),
+        dataset=dataset
+    )
+    
     # Print summary
     logger.info(f"\n{'='*80}")
     logger.info("COMPARISON SUMMARY")
     logger.info(f"{'='*80}")
+    if baseline_stats:
+        baseline_instance_precision = baseline_stats.get("mean_precision", 0.0)
+        baseline_instance_coverage = baseline_stats.get("mean_coverage", 0.0)
+        logger.info(f"Baseline (Static Anchors):")
+        logger.info(f"  Instance-Level - Precision: {baseline_instance_precision:.4f}, Coverage: {baseline_instance_coverage:.4f}")
     if sa_stats:
         sa_instance_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
         sa_instance_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
@@ -1432,6 +1693,7 @@ Examples:
         create_comparison_summary(
             single_agent_summary_file=single_agent_summary_file,
             multi_agent_summary_file=multi_agent_summary_file,
+            baseline_results_file=baseline_results_file,
             output_dir=str(output_path),
             dataset=args.dataset
         )

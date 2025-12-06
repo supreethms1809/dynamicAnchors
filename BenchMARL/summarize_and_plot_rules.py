@@ -109,8 +109,14 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         "n_classes": len(per_class_results),
         "classes": [],
         "per_class_summary": {},
-        "overall_stats": {}
+        "overall_stats": {},
+        "model_type": "multi_agent_benchmarl"
     }
+    
+    # Get metadata if available
+    metadata = rules_data.get("metadata", {})
+    if metadata:
+        summary["algorithm"] = metadata.get("algorithm", "unknown")
     
     all_precisions = []
     all_coverages = []
@@ -130,11 +136,22 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         class_precision = class_data.get("class_precision", 0.0)
         class_coverage = class_data.get("class_coverage", 0.0)
         
-        # For single-agent, if class-level metrics are missing, use instance-level as fallback
-        if class_precision == 0.0 and instance_precision > 0.0:
-            class_precision = instance_precision
-        if class_coverage == 0.0 and instance_coverage > 0.0:
-            class_coverage = instance_coverage
+        # CRITICAL: Do NOT fallback class-level metrics to instance-level metrics!
+        # These are fundamentally different:
+        # - Instance-level: average precision/coverage across individual anchors
+        # - Class-level: precision/coverage of the UNION of all anchors
+        # If class-level metrics are 0.0, it means the union covers no samples or has issues,
+        # and we should report this accurately, not hide it with instance-level values.
+        
+        # Warn if class-level metrics are 0.0 but instance-level are > 0.0 (potential bug)
+        if (class_precision == 0.0 or class_coverage == 0.0) and (instance_precision > 0.0 or instance_coverage > 0.0):
+            n_anchors = class_data.get("n_episodes", class_data.get("n_instances", 0))
+            logger.warning(
+                f"  ⚠ Class {target_class}: Class-level metrics are 0.0 but instance-level are > 0.0. "
+                f"This may indicate the union computation has issues. "
+                f"(instance_prec={instance_precision:.3f}, instance_cov={instance_coverage:.3f}, "
+                f"class_prec={class_precision:.3f}, class_cov={class_coverage:.3f}, n_anchors={n_anchors})"
+            )
         
         # Extract rules
         unique_rules = class_data.get("unique_rules", [])
@@ -1029,6 +1046,94 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
     logger.info(f"Saved summary report to {output_file}")
 
 
+def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str, experiment_dir: Optional[str] = None):
+    """
+    Save consolidated metrics JSON for easy copying.
+    Includes: dataset name, instance metrics, class metrics, global metrics, and wandb run link.
+    """
+    overall_stats = summary.get("overall_stats", {})
+    
+    # Try to get wandb run link
+    wandb_run_url = None
+    
+    # First try: Check if wandb.run is active
+    try:
+        import wandb
+        if wandb.run is not None:
+            # Get wandb run URL
+            wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
+            if wandb_run_url is None:
+                # Alternative method to get URL
+                try:
+                    entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
+                    project = wandb.run.project if hasattr(wandb.run, 'project') else None
+                    run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
+                    if entity and project and run_id:
+                        wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+                except Exception:
+                    pass
+    except (ImportError, AttributeError):
+        pass
+    
+    # Second try: Read from saved file if experiment_dir is provided
+    if wandb_run_url is None and experiment_dir:
+        try:
+            wandb_url_file = os.path.join(experiment_dir, "wandb_run_url.txt")
+            if os.path.exists(wandb_url_file):
+                with open(wandb_url_file, 'r') as f:
+                    wandb_run_url = f.read().strip()
+                logger.debug(f"Read wandb URL from file: {wandb_url_file}")
+        except Exception:
+            pass
+    
+    # Build consolidated metrics
+    consolidated = {
+        "dataset": dataset_name,
+        "wandb_run_url": wandb_run_url,
+        "model_type": summary.get("model_type", "multi_agent_benchmarl"),
+        "algorithm": summary.get("algorithm", "unknown"),
+        "n_classes": summary.get("n_classes", 0),
+        "classes": summary.get("classes", []),
+        "metrics": {
+            "instance_level": {
+                "mean_precision": overall_stats.get("mean_instance_precision", overall_stats.get("mean_precision", 0.0)),
+                "mean_coverage": overall_stats.get("mean_instance_coverage", overall_stats.get("mean_coverage", 0.0)),
+                "std_precision": overall_stats.get("std_instance_precision", overall_stats.get("std_precision", 0.0)),
+                "std_coverage": overall_stats.get("std_instance_coverage", overall_stats.get("std_coverage", 0.0)),
+            },
+            "class_level": {
+                "mean_precision": overall_stats.get("mean_class_precision", 0.0),
+                "mean_coverage": overall_stats.get("mean_class_coverage", 0.0),
+                "std_precision": overall_stats.get("std_class_precision", 0.0),
+                "std_coverage": overall_stats.get("std_class_coverage", 0.0),
+            },
+            "global": {
+                "total_unique_rules": overall_stats.get("total_unique_rules", 0),
+                "mean_unique_rules_per_class": overall_stats.get("mean_unique_rules_per_class", 0.0),
+            }
+        },
+        "per_class": {}
+    }
+    
+    # Add per-class metrics
+    per_class_summary = summary.get("per_class_summary", {})
+    for class_key, class_data in per_class_summary.items():
+        cls = class_data.get("class", -1)
+        consolidated["per_class"][f"class_{cls}"] = {
+            "instance_precision": class_data.get("instance_precision", 0.0),
+            "instance_coverage": class_data.get("instance_coverage", 0.0),
+            "class_precision": class_data.get("class_precision", 0.0),
+            "class_coverage": class_data.get("class_coverage", 0.0),
+            "n_unique_rules": class_data.get("n_unique_rules", 0),
+        }
+    
+    # Save to file
+    with open(output_file, 'w') as f:
+        json.dump(consolidated, f, indent=2)
+    
+    logger.info(f"Saved consolidated metrics to {output_file}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Summarize and plot multi-agent rule results",
@@ -1135,6 +1240,10 @@ Examples:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Store experiment_dir as string for later use (if available)
+    # experiment_dir is defined in both code paths above
+    experiment_dir_str = str(experiment_dir) if 'experiment_dir' in locals() and experiment_dir else None
+    
     logger.info(f"Rules file: {rules_file}")
     logger.info(f"Output directory: {output_dir}")
     
@@ -1145,6 +1254,8 @@ Examples:
     # Summarize rules
     logger.info("Summarizing rules...")
     summary = summarize_rules_from_json(rules_data)
+    # Add dataset name to summary
+    summary["dataset"] = args.dataset
     
     # Optionally run tests
     test_results = None
@@ -1192,6 +1303,11 @@ Examples:
             "test_results": test_results
         }, f, indent=2)
     logger.info(f"Saved summary JSON to {summary_file}")
+    
+    # Save consolidated metrics JSON (easy to copy)
+    consolidated_metrics_file = output_dir / "consolidated_metrics.json"
+    save_consolidated_metrics(summary, args.dataset, str(consolidated_metrics_file), experiment_dir_str)
+    logger.info(f"Saved consolidated metrics to {consolidated_metrics_file}")
     
     logger.info(f"\n{'='*80}")
     logger.info("Analysis complete!")

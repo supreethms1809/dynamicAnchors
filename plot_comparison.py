@@ -217,12 +217,19 @@ def plot_precision_coverage_comparison(
     classes = sorted(all_classes)
     
     # Extract data for each class
-    single_precisions = []
-    single_coverages = []
-    multi_precisions = []
-    multi_coverages = []
-    baseline_precisions = []
-    baseline_coverages = []
+    # Instance-level metrics (all three methods)
+    single_instance_precisions = []
+    single_instance_coverages = []
+    multi_instance_precisions = []
+    multi_instance_coverages = []
+    baseline_instance_precisions = []
+    baseline_instance_coverages = []
+    
+    # Class-level metrics (only single-agent and multi-agent, NOT baseline)
+    single_class_precisions = []
+    single_class_coverages = []
+    multi_class_precisions = []
+    multi_class_coverages = []
     
     logger.info(f"Extracting data for classes: {classes}")
     
@@ -233,18 +240,25 @@ def plot_precision_coverage_comparison(
             for class_key, class_data in single_per_class.items():
                 if class_data.get("class") == cls:
                     single_data = class_data
-                    logger.debug(f"Single-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
                     break
         if single_data:
-            single_prec = single_data.get("class_precision", 0.0)
-            single_cov = single_data.get("class_coverage", 0.0)
-            single_precisions.append(single_prec)
-            single_coverages.append(single_cov)
-            logger.info(f"Single-agent C{cls}: precision={single_prec:.3f}, coverage={single_cov:.3f}")
+            # Instance-level
+            single_inst_prec = single_data.get("instance_precision", 0.0)
+            single_inst_cov = single_data.get("instance_coverage", 0.0)
+            single_instance_precisions.append(single_inst_prec)
+            single_instance_coverages.append(single_inst_cov)
+            # Class-level
+            single_cls_prec = single_data.get("class_precision", 0.0)
+            single_cls_cov = single_data.get("class_coverage", 0.0)
+            single_class_precisions.append(single_cls_prec)
+            single_class_coverages.append(single_cls_cov)
+            logger.info(f"Single-agent C{cls}: inst_prec={single_inst_prec:.3f}, inst_cov={single_inst_cov:.3f}, class_prec={single_cls_prec:.3f}, class_cov={single_cls_cov:.3f}")
         else:
             logger.warning(f"Single-agent: No data found for class {cls}")
-            single_precisions.append(0.0)
-            single_coverages.append(0.0)
+            single_instance_precisions.append(0.0)
+            single_instance_coverages.append(0.0)
+            single_class_precisions.append(0.0)
+            single_class_coverages.append(0.0)
         
         # Find multi-agent data for this class
         multi_data = None
@@ -252,20 +266,27 @@ def plot_precision_coverage_comparison(
             for class_key, class_data in multi_per_class.items():
                 if class_data.get("class") == cls:
                     multi_data = class_data
-                    logger.debug(f"Multi-agent class {cls}: found in key {class_key}, class_precision={class_data.get('class_precision')}, class_coverage={class_data.get('class_coverage')}")
                     break
         if multi_data:
-            multi_prec = multi_data.get("class_precision", 0.0)
-            multi_cov = multi_data.get("class_coverage", 0.0)
-            multi_precisions.append(multi_prec)
-            multi_coverages.append(multi_cov)
-            logger.info(f"Multi-agent C{cls}: precision={multi_prec:.3f}, coverage={multi_cov:.3f}")
+            # Instance-level
+            multi_inst_prec = multi_data.get("instance_precision", 0.0)
+            multi_inst_cov = multi_data.get("instance_coverage", 0.0)
+            multi_instance_precisions.append(multi_inst_prec)
+            multi_instance_coverages.append(multi_inst_cov)
+            # Class-level
+            multi_cls_prec = multi_data.get("class_precision", 0.0)
+            multi_cls_cov = multi_data.get("class_coverage", 0.0)
+            multi_class_precisions.append(multi_cls_prec)
+            multi_class_coverages.append(multi_cls_cov)
+            logger.info(f"Multi-agent C{cls}: inst_prec={multi_inst_prec:.3f}, inst_cov={multi_inst_cov:.3f}, class_prec={multi_cls_prec:.3f}, class_cov={multi_cls_cov:.3f}")
         else:
             logger.warning(f"Multi-agent: No data found for class {cls}")
-            multi_precisions.append(0.0)
-            multi_coverages.append(0.0)
+            multi_instance_precisions.append(0.0)
+            multi_instance_coverages.append(0.0)
+            multi_class_precisions.append(0.0)
+            multi_class_coverages.append(0.0)
         
-        # Find baseline data for this class
+        # Find baseline data for this class (INSTANCE-LEVEL ONLY)
         baseline_data = None
         if baseline_per_class:
             for class_key, class_data in baseline_per_class.items():
@@ -273,118 +294,158 @@ def plot_precision_coverage_comparison(
                     baseline_data = class_data
                     break
         if baseline_data:
-            baseline_prec = baseline_data.get("class_precision", 0.0)
-            baseline_cov = baseline_data.get("class_coverage", 0.0)
-            baseline_precisions.append(baseline_prec)
-            baseline_coverages.append(baseline_cov)
-            logger.info(f"Baseline C{cls}: precision={baseline_prec:.3f}, coverage={baseline_cov:.3f}")
+            # Instance-level only (baseline class-level is union of 20 anchors - not fair comparison)
+            baseline_inst_prec = baseline_data.get("instance_precision", baseline_data.get("avg_precision", 0.0))
+            baseline_inst_cov = baseline_data.get("instance_coverage", baseline_data.get("avg_coverage", 0.0))
+            baseline_instance_precisions.append(baseline_inst_prec)
+            baseline_instance_coverages.append(baseline_inst_cov)
+            logger.info(f"Baseline C{cls}: inst_prec={baseline_inst_prec:.3f}, inst_cov={baseline_inst_cov:.3f} (class-level excluded - union not fair)")
         else:
-            baseline_precisions.append(0.0)
-            baseline_coverages.append(0.0)
+            baseline_instance_precisions.append(0.0)
+            baseline_instance_coverages.append(0.0)
     
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    # Create two subplots side by side
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    # Create four subplots: instance-level (top row), class-level (bottom row)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    ax1_inst, ax2_inst, ax1_cls, ax2_cls = axes.flatten()
     
     x = np.arange(len(classes))
-    # Adjust width based on number of methods
-    n_methods = sum([bool(single_agent_summary), bool(multi_agent_summary), bool(baseline_summary)])
-    width = 0.8 / n_methods if n_methods > 0 else 0.35
-    offset = -0.4 + width/2
     
-    # Left plot: Precision comparison
+    # Top row: Instance-level comparison (all three methods)
+    n_methods_inst = sum([bool(single_agent_summary), bool(multi_agent_summary), bool(baseline_summary)])
+    width_inst = 0.8 / n_methods_inst if n_methods_inst > 0 else 0.35
+    offset_inst = -0.4 + width_inst/2
+    
+    # Bottom row: Class-level comparison (only single-agent and multi-agent)
+    n_methods_cls = sum([bool(single_agent_summary), bool(multi_agent_summary)])
+    width_cls = 0.8 / n_methods_cls if n_methods_cls > 0 else 0.35
+    offset_cls = -0.4 + width_cls/2
+    
+    # Top-left: Instance-level Precision
     bar_idx = 0
     if single_agent_summary:
-        ax1.bar(x + offset + bar_idx*width, single_precisions, width, label='Single-Agent', 
-                alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        ax1_inst.bar(x + offset_inst + bar_idx*width_inst, single_instance_precisions, width_inst, 
+                    label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(single_instance_precisions):
+            if val > 0.01:
+                ax1_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        ax1.bar(x + offset + bar_idx*width, multi_precisions, width, label='Multi-Agent', 
-                alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        ax1_inst.bar(x + offset_inst + bar_idx*width_inst, multi_instance_precisions, width_inst, 
+                    label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(multi_instance_precisions):
+            if val > 0.01:
+                ax1_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if baseline_summary:
-        ax1.bar(x + offset + bar_idx*width, baseline_precisions, width, label='Baseline (Static Anchors)', 
-                alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
+        ax1_inst.bar(x + offset_inst + bar_idx*width_inst, baseline_instance_precisions, width_inst, 
+                    label='Baseline (Static Anchors)', alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(baseline_instance_precisions):
+            if val > 0.01:
+                ax1_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    ax1.set_xlabel('Class', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax1.set_title(f'{title_prefix}: Class-Level Precision Comparison', fontsize=13, fontweight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([f'C{cls}' for cls in classes])
-    ax1.set_ylim([0, 1.1])
-    ax1.grid(True, alpha=0.3, axis='y', linestyle='--')
-    ax1.legend(fontsize=11, framealpha=0.9)
+    ax1_inst.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax1_inst.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax1_inst.set_title(f'{title_prefix}: Instance-Level Precision (All Methods)', fontsize=13, fontweight='bold')
+    ax1_inst.set_xticks(x)
+    ax1_inst.set_xticklabels([f'C{cls}' for cls in classes])
+    ax1_inst.set_ylim([0, 1.1])
+    ax1_inst.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax1_inst.legend(fontsize=10, framealpha=0.9)
     
-    # Add value labels on bars
+    # Top-right: Instance-level Coverage
     bar_idx = 0
     if single_agent_summary:
-        for i, val in enumerate(single_precisions):
-            if val > 0.01:  # Only label if bar is tall enough
-                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax2_inst.bar(x + offset_inst + bar_idx*width_inst, single_instance_coverages, width_inst, 
+                    label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(single_instance_coverages):
+            if val > 0.01:
+                ax2_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        for i, val in enumerate(multi_precisions):
+        ax2_inst.bar(x + offset_inst + bar_idx*width_inst, multi_instance_coverages, width_inst, 
+                    label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(multi_instance_coverages):
             if val > 0.01:
-                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+                ax2_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if baseline_summary:
-        for i, val in enumerate(baseline_precisions):
+        ax2_inst.bar(x + offset_inst + bar_idx*width_inst, baseline_instance_coverages, width_inst, 
+                    label='Baseline (Static Anchors)', alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(baseline_instance_coverages):
             if val > 0.01:
-                ax1.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+                ax2_inst.text(x[i] + offset_inst + bar_idx*width_inst + width_inst/2, val + 0.02,
+                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    # Right plot: Coverage comparison
+    ax2_inst.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax2_inst.set_ylabel('Coverage', fontsize=12, fontweight='bold')
+    ax2_inst.set_title(f'{title_prefix}: Instance-Level Coverage (All Methods)', fontsize=13, fontweight='bold')
+    ax2_inst.set_xticks(x)
+    ax2_inst.set_xticklabels([f'C{cls}' for cls in classes])
+    ax2_inst.set_ylim([0, 1.1])
+    ax2_inst.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax2_inst.legend(fontsize=10, framealpha=0.9)
+    
+    # Bottom-left: Class-level Precision (only single-agent and multi-agent)
     bar_idx = 0
     if single_agent_summary:
-        ax2.bar(x + offset + bar_idx*width, single_coverages, width, label='Single-Agent', 
-                alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        ax1_cls.bar(x + offset_cls + bar_idx*width_cls, single_class_precisions, width_cls, 
+                   label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(single_class_precisions):
+            if val > 0.01:
+                ax1_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        ax2.bar(x + offset + bar_idx*width, multi_coverages, width, label='Multi-Agent', 
-                alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
-        bar_idx += 1
-    if baseline_summary:
-        ax2.bar(x + offset + bar_idx*width, baseline_coverages, width, label='Baseline (Static Anchors)', 
-                alpha=0.8, color='green', edgecolor='black', linewidth=1.5)
+        ax1_cls.bar(x + offset_cls + bar_idx*width_cls, multi_class_precisions, width_cls, 
+                   label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(multi_class_precisions):
+            if val > 0.01:
+                ax1_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    ax2.set_xlabel('Class', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('Coverage', fontsize=12, fontweight='bold')
-    ax2.set_title(f'{title_prefix}: Class-Level Coverage Comparison', fontsize=13, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([f'C{cls}' for cls in classes])
-    ax2.set_ylim([0, 1.1])
-    ax2.grid(True, alpha=0.3, axis='y', linestyle='--')
-    ax2.legend(fontsize=11, framealpha=0.9)
+    ax1_cls.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax1_cls.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax1_cls.set_title(f'{title_prefix}: Class-Level Precision (Dynamic Anchors Only)', fontsize=13, fontweight='bold')
+    ax1_cls.set_xticks(x)
+    ax1_cls.set_xticklabels([f'C{cls}' for cls in classes])
+    ax1_cls.set_ylim([0, 1.1])
+    ax1_cls.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax1_cls.legend(fontsize=10, framealpha=0.9)
     
-    # Add value labels on bars
+    # Bottom-right: Class-level Coverage (only single-agent and multi-agent)
     bar_idx = 0
     if single_agent_summary:
-        for i, val in enumerate(single_coverages):
-            if val > 0.01:  # Only label if bar is tall enough
-                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax2_cls.bar(x + offset_cls + bar_idx*width_cls, single_class_coverages, width_cls, 
+                   label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(single_class_coverages):
+            if val > 0.01:
+                ax2_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        for i, val in enumerate(multi_coverages):
+        ax2_cls.bar(x + offset_cls + bar_idx*width_cls, multi_class_coverages, width_cls, 
+                   label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+        for i, val in enumerate(multi_class_coverages):
             if val > 0.01:
-                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
-        bar_idx += 1
-    if baseline_summary:
-        for i, val in enumerate(baseline_coverages):
-            if val > 0.01:
-                ax2.text(x[i] + offset + bar_idx*width + width/2, val + 0.02,
-                        f'{val:.3f}',
-                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+                ax2_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    ax2_cls.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax2_cls.set_ylabel('Coverage', fontsize=12, fontweight='bold')
+    ax2_cls.set_title(f'{title_prefix}: Class-Level Coverage (Dynamic Anchors Only)', fontsize=13, fontweight='bold')
+    ax2_cls.set_xticks(x)
+    ax2_cls.set_xticklabels([f'C{cls}' for cls in classes])
+    ax2_cls.set_ylim([0, 1.1])
+    ax2_cls.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax2_cls.legend(fontsize=10, framealpha=0.9)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'precision_coverage_comparison.png'), dpi=300, bbox_inches='tight')

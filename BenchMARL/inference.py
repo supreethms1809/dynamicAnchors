@@ -1319,7 +1319,7 @@ def extract_rules_from_policies(
                     rule = temp_env.extract_rule(
                         temp_agent_name,
                         max_features_in_rule=max_features_in_rule,
-                        denormalize=True  # Denormalize to original feature space
+                        denormalize=True  # Denormalize to standardized feature space (mean=0, std=1)
                     )
             
             # Extract metrics for anchor_data (variables are already defined above)

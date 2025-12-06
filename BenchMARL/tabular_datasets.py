@@ -170,8 +170,13 @@ class TabularDatasetLoader:
             logger.info(f"Fetching UCIML dataset (ID: {dataset_id})...")
             dataset = fetch_ucirepo(id=dataset_id)
             
-            # Extract features and targets
-            X_df = dataset.data.features
+            # Extract features and targets - ensure we have a copy, not a view
+            import pandas as pd
+            X_df_orig = dataset.data.features
+            if isinstance(X_df_orig, pd.DataFrame):
+                X_df = X_df_orig.copy()
+            else:
+                X_df = pd.DataFrame(X_df_orig)
             y_df = dataset.data.targets
             
             # Get feature names before processing
@@ -182,22 +187,32 @@ class TabularDatasetLoader:
             
             # Handle missing values and non-numeric features
             from sklearn.preprocessing import LabelEncoder
-            import pandas as pd
             
-            # Convert to DataFrame if not already
-            if not isinstance(X_df, pd.DataFrame):
-                X_df = pd.DataFrame(X_df, columns=feature_names)
-            
-            # Handle missing values
+            # Handle missing values - use a more robust approach
             if X_df.isnull().any().any():
                 missing_count = X_df.isnull().sum().sum()
                 logger.info(f"  Found {missing_count} missing values, filling with median/mode...")
                 # Fill numeric columns with median, categorical with mode
+                # Build fill values dict first, then apply all at once to avoid SettingWithCopyWarning
+                fill_values = {}
                 for col in X_df.columns:
                     if X_df[col].dtype in ['int64', 'float64']:
-                        X_df[col].fillna(X_df[col].median(), inplace=True)
+                        median_val = X_df[col].median()
+                        fill_values[col] = median_val if not np.isnan(median_val) else 0.0
                     else:
-                        X_df[col].fillna(X_df[col].mode()[0] if len(X_df[col].mode()) > 0 else 0, inplace=True)
+                        mode_val = X_df[col].mode()
+                        fill_values[col] = mode_val[0] if len(mode_val) > 0 else 0
+                
+                # Apply all fillna operations at once
+                for col, fill_val in fill_values.items():
+                    X_df[col] = X_df[col].fillna(fill_val)
+                
+                # Verify all missing values are filled
+                remaining_missing = X_df.isnull().sum().sum()
+                if remaining_missing > 0:
+                    logger.warning(f"  Warning: {remaining_missing} missing values remain after filling. This may cause issues.")
+                else:
+                    logger.info(f"  ✓ All missing values successfully filled")
             
             # Encode categorical features
             label_encoders = {}
@@ -205,7 +220,7 @@ class TabularDatasetLoader:
             for col in X_df.columns:
                 if X_df[col].dtype == 'object' or X_df[col].dtype.name == 'category':
                     le = LabelEncoder()
-                    X_df[col] = le.fit_transform(X_df[col].astype(str))
+                    X_df.loc[:, col] = le.fit_transform(X_df[col].astype(str))
                     label_encoders[col] = le
                 else:
                     numeric_cols.append(col)
@@ -298,7 +313,17 @@ class TabularDatasetLoader:
             acs_data = data_source.get_data(states=[state], download=True)
             
             # Extract features and labels using the task (task is already an instance)
-            X, y = task.df_to_numpy(acs_data)
+            # Note: df_to_numpy may return 2 or 3 values depending on folktables version:
+            # - Older versions: (X, y)
+            # - Newer versions: (X, y, group) where group is demographic information
+            result = task.df_to_numpy(acs_data)
+            if len(result) == 2:
+                X, y = result
+            elif len(result) == 3:
+                X, y, group = result  # group contains demographic info (e.g., RAC1P, SEX, etc.)
+                logger.debug(f"Note: Group information available but not used")
+            else:
+                raise ValueError(f"Unexpected return value from df_to_numpy: expected 2 or 3 values, got {len(result)}")
             
             # Convert to float32
             X = X.astype(np.float32)

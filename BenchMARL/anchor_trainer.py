@@ -287,6 +287,32 @@ class AnchorTrainer:
         logger.info("="*80)
         logger.info(f"Results saved to: {self.experiment.folder_name}")
         
+        # Save wandb run URL for later reference (if available)
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
+                if wandb_run_url is None:
+                    try:
+                        entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
+                        project = wandb.run.project if hasattr(wandb.run, 'project') else None
+                        run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
+                        if entity and project and run_id:
+                            wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+                    except Exception:
+                        pass
+                
+                if wandb_run_url:
+                    import os
+                    wandb_url_file = os.path.join(str(self.experiment.folder_name), "wandb_run_url.txt")
+                    os.makedirs(os.path.dirname(wandb_url_file), exist_ok=True)
+                    with open(wandb_url_file, 'w') as f:
+                        f.write(wandb_run_url)
+                    logger.info(f"✓ Wandb run URL saved to: {wandb_url_file}")
+                    logger.info(f"  URL: {wandb_run_url}")
+        except Exception as e:
+            logger.debug(f"Could not save wandb run URL: {e}")
+        
         # Flush any remaining training metrics before final save
         if hasattr(self, 'callback') and self.callback is not None:
             if hasattr(self.callback, '_flush_remaining_metrics'):

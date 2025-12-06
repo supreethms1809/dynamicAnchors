@@ -33,8 +33,10 @@ try:
     from stable_baselines3.common.evaluation import evaluate_policy
     from stable_baselines3.common.monitor import Monitor
     SB3_AVAILABLE = True
+    WANDB_AVAILABLE = True
 except ImportError:
     SB3_AVAILABLE = False
+    WANDB_AVAILABLE = False
     logger.error("Stable-Baselines3 not available. Please install: pip install stable-baselines3")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -480,15 +482,37 @@ class AnchorTrainerSB3:
         logger.info(f"Timesteps per class: {timesteps_per_class}")
         logger.info(f"Algorithm: {self.algorithm.upper()}\n")
 
-        wandb.init(project="single-agent-anchor-rl", name=f"single-agent-anchor-rl_{self.dataset_loader.dataset_name}", 
-        config=self.algorithm_config, sync_tensorboard=True)
-        wandb.config.update({
-            "total_timesteps": total_timesteps,
-            "timesteps_per_class": timesteps_per_class,
-            "algorithm": self.algorithm,
-            "learning_rate": self.algorithm_config["learning_rate"],
-            "buffer_size": self.algorithm_config["buffer_size"],
-        })
+        # Fix wandb warning: patch tensorboard before init when using multiple event log directories
+        # Get the root tensorboard log directory (parent of all class-specific logs)
+        if not WANDB_AVAILABLE:
+            logger.warning("wandb not available, skipping tensorboard patch")
+        elif self.experiment_config.get("tensorboard_log", True):
+            root_tensorboard_log = os.path.join(self.experiment_folder, "tensorboard")
+            try:
+                # Import wandb module to ensure it's in local scope
+                import wandb as wandb_module
+                # Patch tensorboard before wandb.init() to avoid warning about multiple event log directories
+                if hasattr(wandb_module, 'tensorboard') and hasattr(wandb_module.tensorboard, 'patch'):
+                    wandb_module.tensorboard.patch(root_logdir=root_tensorboard_log)
+                    logger.debug(f"Patched wandb tensorboard with root_logdir={root_tensorboard_log}")
+                else:
+                    # Fallback for older wandb versions
+                    import wandb.integration.tensorboard as wandb_tb
+                    wandb_tb.patch(root_logdir=root_tensorboard_log)
+                    logger.debug(f"Patched wandb tensorboard (using integration) with root_logdir={root_tensorboard_log}")
+            except Exception as e:
+                logger.warning(f"Could not patch wandb tensorboard: {e}")
+
+        if WANDB_AVAILABLE:
+            wandb.init(project="single-agent-anchor-rl", name=f"single-agent-anchor-rl_{self.dataset_loader.dataset_name}", 
+            config=self.algorithm_config, sync_tensorboard=True)
+            wandb.config.update({
+                "total_timesteps": total_timesteps,
+                "timesteps_per_class": timesteps_per_class,
+                "algorithm": self.algorithm,
+                "learning_rate": self.algorithm_config["learning_rate"],
+                "buffer_size": self.algorithm_config["buffer_size"],
+            })
         
         # Train each model separately
         for target_class in self.target_classes:
@@ -547,9 +571,12 @@ class AnchorTrainerSB3:
                 # callbacks.append(lr_schedule_callback)
 
             # Train this model
+            train_callbacks = callbacks.copy() if callbacks else []
+            if WANDB_AVAILABLE:
+                train_callbacks = [WandbCallback(gradient_save_freq=100)] + train_callbacks
             model.learn(
                 total_timesteps=timesteps_per_class,
-                callback=[WandbCallback(gradient_save_freq=100)] + callbacks if callbacks else None,
+                callback=train_callbacks if train_callbacks else None,
                 log_interval=self.experiment_config.get("log_interval", 10),
                 progress_bar=True
             )
@@ -564,6 +591,30 @@ class AnchorTrainerSB3:
         logger.info("TRAINING COMPLETE!")
         logger.info("="*80)
         logger.info(f"Results saved to: {self.experiment_folder}")
+        
+        # Save wandb run URL for later reference
+        if WANDB_AVAILABLE:
+            try:
+                if wandb.run is not None:
+                    wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
+                    if wandb_run_url is None:
+                        try:
+                            entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
+                            project = wandb.run.project if hasattr(wandb.run, 'project') else None
+                            run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
+                            if entity and project and run_id:
+                                wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+                        except Exception:
+                            pass
+                    
+                    if wandb_run_url:
+                        wandb_url_file = os.path.join(self.experiment_folder, "wandb_run_url.txt")
+                        with open(wandb_url_file, 'w') as f:
+                            f.write(wandb_run_url)
+                        logger.info(f"✓ Wandb run URL saved to: {wandb_url_file}")
+                        logger.info(f"  URL: {wandb_run_url}")
+            except Exception as e:
+                logger.debug(f"Could not save wandb run URL: {e}")
     
     def evaluate(self, n_episodes: int = 10) -> Dict[str, Any]:
         """Evaluate all trained models (one per class)."""

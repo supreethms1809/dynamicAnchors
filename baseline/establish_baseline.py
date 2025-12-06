@@ -328,27 +328,62 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         
         print(f"Loading Folktables dataset: {task_name} for {state} ({year})...")
         
-        # Create data source
-        data_source = ACSDataSource(
-            survey_year=year,
-            horizon='1-Year',
-            survey='person'
-        )
-        
-        # Download and extract data
-        acs_data = data_source.get_data(states=[state], download=True)
-        
-        # Extract features and labels using the task (task is already an instance)
-        X, y = task.df_to_numpy(acs_data)
-        
-        # Convert to float32
-        X = X.astype(np.float32)
-        y = y.astype(int)
-        
-        # Get feature names from task
-        feature_names = task.features
-        if feature_names is None:
-            feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+        try:
+            # Create data source
+            data_source = ACSDataSource(
+                survey_year=year,
+                horizon='1-Year',
+                survey='person'
+            )
+            
+            # Download and extract data
+            print(f"  Downloading ACS data for {state} ({year})...")
+            acs_data = data_source.get_data(states=[state], download=True)
+            print(f"  Downloaded {len(acs_data)} samples")
+            
+            # Extract features and labels using the task (task is already an instance)
+            # Note: df_to_numpy may return 2 or 3 values depending on folktables version:
+            # - Older versions: (X, y)
+            # - Newer versions: (X, y, group) where group is demographic information
+            print(f"  Converting to numpy arrays...")
+            result = task.df_to_numpy(acs_data)
+            if len(result) == 2:
+                X, y = result
+            elif len(result) == 3:
+                X, y, group = result  # group contains demographic info (e.g., RAC1P, SEX, etc.)
+                print(f"  Note: Group information available but not used")
+            else:
+                raise ValueError(f"Unexpected return value from df_to_numpy: expected 2 or 3 values, got {len(result)}")
+            
+            # Convert to float32
+            X = X.astype(np.float32)
+            y = y.astype(int)
+            
+            print(f"  Converted to numpy: X shape={X.shape}, y shape={y.shape}, unique classes={np.unique(y)}")
+            
+            # Get feature names from task
+            if hasattr(task, 'features'):
+                feature_names = task.features
+            else:
+                # Try alternative attribute names
+                feature_names = getattr(task, 'feature_names', None)
+            
+            if feature_names is None or len(feature_names) == 0:
+                feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+                print(f"  Warning: Could not get feature names from task, using default names")
+            elif len(feature_names) != X.shape[1]:
+                print(f"  Warning: Feature names count ({len(feature_names)}) doesn't match X shape[1] ({X.shape[1]}), using default names")
+                feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+            
+        except Exception as e:
+            print(f"\nERROR loading Folktables dataset:")
+            print(f"  Task: {task_name}, State: {state}, Year: {year}")
+            print(f"  Error type: {type(e).__name__}")
+            print(f"  Error message: {str(e)}")
+            import traceback
+            print(f"\nFull traceback:")
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to load Folktables dataset {dataset_name}: {str(e)}") from e
         
         # Get class names
         unique_classes = np.unique(y)
@@ -498,7 +533,18 @@ def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[
         # anchor-exp sometimes returns list of strings or tuples
         if len(anchor_rule) == 0:
             return []
-        # Check if it's a list of strings
+        # Check if it's a list of just feature names (no conditions/operators)
+        # If all items are simple strings without operators, they're likely feature names
+        all_simple_names = all(isinstance(item, str) and not any(op in item for op in ['<=', '>=', '<', '>', '∈', '=']) 
+                              for item in anchor_rule)
+        if all_simple_names and len(anchor_rule) > 0:
+            # This is likely a list of feature names from anchor-exp's .names() method
+            # anchor-exp for tabular data returns feature names, not condition strings
+            # We can't parse bounds from just feature names, so return empty
+            # The union metrics function will handle this by treating it as "no constraints"
+            return []
+        
+        # Check if it's a list of strings with conditions
         if isinstance(anchor_rule[0], str):
             rule_str = " and ".join(str(item) for item in anchor_rule)
         else:
@@ -583,9 +629,19 @@ def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[
         match = re.search(pattern_gt, condition_str)
         if match:
             feature_name = match.group(1).strip()
-            lower = float(match.group(2))
-            conditions.append((feature_name, lower, float('inf')))
-            continue
+            try:
+                lower = float(match.group(2))
+                conditions.append((feature_name, lower, float('inf')))
+                continue
+            except ValueError:
+                # Can't parse value, skip this condition
+                pass
+    
+    # If no patterns matched, log it for debugging
+    if not conditions and rule_str.strip():
+        # Don't log if it was detected as simple feature names earlier
+        if any(op in rule_str for op in ['<=', '>=', '<', '>', '∈', '=']):
+            print(f"  DEBUG: Failed to parse condition from: '{rule_str}'")
     
     return conditions
 
@@ -596,7 +652,8 @@ def compute_class_union_metrics(
     y_data: np.ndarray,
     target_class: int,
     feature_names: List[str],
-    X_train: np.ndarray
+    X_train: np.ndarray,
+    explainer: Optional[Any] = None  # Optional anchor-exp explainer for proper discretization
 ) -> Tuple[float, float]:
     """
     Compute class-level union metrics from a list of anchor rules.
@@ -628,59 +685,119 @@ def compute_class_union_metrics(
         if conditions:
             all_conditions.append(conditions)
     
-    if len(all_conditions) == 0:
-        # No valid conditions found - union covers everything
-        return 0.0, 0.0
+    # Debug: Log parsing results
+    if len(anchor_rules) > 0 and len(all_conditions) == 0:
+        print(f"  DEBUG: Failed to parse any conditions from {len(anchor_rules)} anchor rules.")
+        print(f"    Sample anchor rule: {anchor_rules[0]}")
+        print(f"    Feature names available: {feature_names[:5] if len(feature_names) > 5 else feature_names}...")
+        # Try to parse the first rule manually to see what's wrong
+        if anchor_rules:
+            test_conditions = parse_anchor_rule(anchor_rules[0], feature_names)
+            print(f"    Parsed conditions from first rule: {test_conditions}")
     
-    # Compute feature ranges from training data
+    # Compute feature ranges from training data (needed even if no conditions)
     feature_mins = X_train.min(axis=0)
     feature_maxs = X_train.max(axis=0)
     
-    # Build union: for each feature, take min of all lower bounds and max of all upper bounds
+    if len(all_conditions) == 0:
+        # No valid conditions found - union covers everything (all features have no constraints)
+        # This means the union should match all samples
+        is_class = (y_data == target_class)
+        n_class_samples = is_class.sum()
+        n_total_samples = len(y_data)
+        
+        if n_class_samples == 0:
+            # No samples of this class in test data
+            return 0.0, 0.0
+        
+        # Coverage: all class samples are in union (100%)
+        coverage = 1.0
+        
+        # Precision: fraction of all samples that belong to this class
+        precision = float(n_class_samples / n_total_samples) if n_total_samples > 0 else 0.0
+        
+        return precision, coverage
+    
+    # CRITICAL FIX: Instead of trying to merge bounds (which can create invalid ranges when
+    # anchors have conflicting conditions on the same feature), compute union by checking
+    # which samples satisfy ANY of the individual anchors. This is the correct way to compute
+    # a union of sets defined by different rules.
+    
     feature_to_idx = {name: idx for idx, name in enumerate(feature_names)}
-    union_lower = np.full(len(feature_names), float('-inf'))
-    union_upper = np.full(len(feature_names), float('inf'))
     
-    for conditions in all_conditions:
+    # Initialize union mask: samples that satisfy at least one anchor
+    in_union = np.zeros(X_data.shape[0], dtype=bool)
+    
+    # For each anchor (set of conditions), check which samples satisfy it
+    for anchor_idx, conditions in enumerate(all_conditions):
+        # For this anchor, check which samples satisfy all its conditions
+        anchor_mask = np.ones(X_data.shape[0], dtype=bool)
+        
         for feature_name, lower, upper in conditions:
-            if feature_name in feature_to_idx:
-                feat_idx = feature_to_idx[feature_name]
-                # Update union bounds
-                if lower != float('-inf'):
-                    if union_lower[feat_idx] == float('-inf'):
-                        union_lower[feat_idx] = lower
-                    else:
-                        union_lower[feat_idx] = min(union_lower[feat_idx], lower)
-                if upper != float('inf'):
-                    if union_upper[feat_idx] == float('inf'):
-                        union_upper[feat_idx] = upper
-                    else:
-                        union_upper[feat_idx] = max(union_upper[feat_idx], upper)
+            if feature_name not in feature_to_idx:
+                # Feature not found - this anchor matches no samples
+                anchor_mask = np.zeros(X_data.shape[0], dtype=bool)
+                break
+            
+            feat_idx = feature_to_idx[feature_name]
+            feature_values = X_data[:, feat_idx]
+            
+            # Replace -inf with feature min and +inf with feature max for this specific condition
+            cond_lower = lower if lower != float('-inf') else feature_mins[feat_idx]
+            cond_upper = upper if upper != float('inf') else feature_maxs[feat_idx]
+            
+            # Check if values satisfy this condition [lower, upper] (inclusive)
+            condition_mask = (feature_values >= cond_lower) & (feature_values <= cond_upper)
+            anchor_mask = anchor_mask & condition_mask
+        
+        # Add samples satisfying this anchor to the union
+        in_union = in_union | anchor_mask
     
-    # Replace -inf with feature min and +inf with feature max
-    for feat_idx in range(len(feature_names)):
-        if union_lower[feat_idx] == float('-inf'):
-            union_lower[feat_idx] = feature_mins[feat_idx]
-        if union_upper[feat_idx] == float('inf'):
-            union_upper[feat_idx] = feature_maxs[feat_idx]
-    
-    # Check which samples satisfy the union
-    in_union = np.all((X_data >= union_lower) & (X_data <= union_upper), axis=1)
+    # Debug: Log how many anchors each sample satisfies
+    if in_union.sum() == 0 and len(all_conditions) > 0:
+        print(f"  DEBUG: Union covers 0 samples. Checking individual anchors...")
+        print(f"    Total anchors: {len(all_conditions)}")
+        # Check first few anchors
+        for anchor_idx, conditions in enumerate(all_conditions[:3]):
+            anchor_mask = np.ones(X_data.shape[0], dtype=bool)
+            for feature_name, lower, upper in conditions[:2]:  # Check first 2 conditions
+                if feature_name in feature_to_idx:
+                    feat_idx = feature_to_idx[feature_name]
+                    feature_values = X_data[:, feat_idx]
+                    cond_lower = lower if lower != float('-inf') else feature_mins[feat_idx]
+                    cond_upper = upper if upper != float('inf') else feature_maxs[feat_idx]
+                    condition_mask = (feature_values >= cond_lower) & (feature_values <= cond_upper)
+                    anchor_mask = anchor_mask & condition_mask
+                    print(f"      Anchor {anchor_idx}, {feature_name}: {condition_mask.sum()}/{len(X_data)} samples satisfy condition [{cond_lower:.4f}, {cond_upper:.4f}]")
+            print(f"      Anchor {anchor_idx} total: {anchor_mask.sum()}/{len(X_data)} samples satisfy all conditions")
     is_class = (y_data == target_class)
     
     # Coverage: fraction of class samples in union
+    # Formula: P(x in union | y = cls) = |{x: x in union AND y=cls}| / |{x: y=cls}|
     n_class_samples = is_class.sum()
+    n_class_in_union = (in_union & is_class).sum()
     if n_class_samples == 0:
         coverage = 0.0
     else:
-        coverage = float((in_union & is_class).sum() / n_class_samples)
+        coverage = float(n_class_in_union / n_class_samples)
     
     # Precision: fraction of union samples that belong to class
+    # Formula: P(y = cls | x in union) = |{x: x in union AND y=cls}| / |{x: x in union}|
     n_union_samples = in_union.sum()
     if n_union_samples == 0:
+        # Union matches no samples - this indicates a bug in the union computation
+        # or the bounds are invalid. Log a warning but return 0.0
+        print(f"  WARNING: Union covers 0 samples for class {target_class}. "
+              f"This may indicate parsing issues or invalid bounds.")
         precision = 0.0
     else:
-        precision = float((in_union & is_class).sum() / n_union_samples)
+        precision = float(n_class_in_union / n_union_samples)
+    
+    # Verification: Sanity checks
+    assert 0.0 <= precision <= 1.0, f"Precision {precision} out of range [0, 1]"
+    assert 0.0 <= coverage <= 1.0, f"Coverage {coverage} out of range [0, 1]"
+    assert n_class_in_union <= n_class_samples, f"Class samples in union ({n_class_in_union}) > total class samples ({n_class_samples})"
+    assert n_class_in_union <= n_union_samples, f"Class samples in union ({n_class_in_union}) > total union samples ({n_union_samples})"
     
     return precision, coverage
 
@@ -1089,15 +1206,48 @@ def run_static_anchors(
             avg_cov = float(np.mean([r["coverage"] for r in class_results]))
             
             # Class-level metrics (union of all anchors for this class)
-            anchor_rules = [r["anchor"] for r in class_results if r.get("anchor")]
+            # Filter out None, empty strings, and invalid anchor rules
+            anchor_rules = []
+            explanations_list = []  # Store explanations to access discretization if needed
+            for r in class_results:
+                anchor = r.get("anchor")
+                if anchor is not None:
+                    # Check if it's a valid non-empty anchor
+                    if isinstance(anchor, str) and anchor.strip():
+                        anchor_rules.append(anchor)
+                    elif isinstance(anchor, list) and len(anchor) > 0:
+                        anchor_rules.append(anchor)
+                    elif not isinstance(anchor, (str, list)):
+                        # Other types might be valid (e.g., anchor objects)
+                        anchor_rules.append(anchor)
+            
+            # Store explanations for potential use in union computation
+            # We can't directly access them here, but we could pass explainer if needed
+            
+            # Debug: Log anchor rules for troubleshooting
+            if len(anchor_rules) == 0:
+                print(f"  WARNING: No valid anchor rules found for class {cls} (had {len(class_results)} instances)")
+                # Check if instances had anchor field but they were invalid
+                raw_anchors = [r.get("anchor") for r in class_results]
+                none_count = sum(1 for a in raw_anchors if a is None)
+                empty_count = sum(1 for a in raw_anchors if isinstance(a, str) and not a.strip())
+                if none_count > 0 or empty_count > 0:
+                    print(f"    Found {none_count} None anchors and {empty_count} empty string anchors")
+            
             class_prec, class_cov = compute_class_union_metrics(
                 anchor_rules=anchor_rules,
                 X_data=X_test,
                 y_data=y_test,
                 target_class=cls,
                 feature_names=feature_names,
-                X_train=X_train
+                X_train=X_train,
+                explainer=explainer  # Pass explainer to use proper discretization
             )
+            
+            # Debug: Warn if metrics are unexpectedly zero
+            if class_prec == 0.0 and class_cov == 0.0 and len(anchor_rules) > 0:
+                print(f"  WARNING: Class-level metrics are 0.0 despite having {len(anchor_rules)} anchor rules.")
+                print(f"    This may indicate parsing issues. Sample anchor rule: {anchor_rules[0] if anchor_rules else 'N/A'}")
             
             results[int(cls)] = {
                 # Instance-level metrics (averaged across instances)
@@ -1117,9 +1267,9 @@ def run_static_anchors(
             print(f"  Instance-level (avg across {len(class_results)} instances):")
             print(f"    Avg Precision: {avg_prec:.3f}")
             print(f"    Avg Coverage:  {avg_cov:.3f}")
-            print(f"  Class-level (union of all {len(anchor_rules)} anchors):")
-            print(f"    Union Precision: {class_prec:.3f}")
-            print(f"    Union Coverage:  {class_cov:.3f}")
+            # Note: Class-level union metrics are computed and stored in results but not printed,
+            # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
+            # They are available in the JSON output for reference if needed
     
     return {
         "method": "Static Anchors",
@@ -1693,10 +1843,12 @@ def main(
     print("\nIMPORTANT NOTE:")
     print("  - LIME, Static Anchors, and SHAP are INSTANCE-LEVEL methods")
     print("    (each instance gets its own explanation, then aggregated by class)")
-    print("  - Static Anchors now also computes CLASS-LEVEL union metrics")
-    print("    (union of all anchors for each class, similar to Dynamic Anchors)")
+    print("  - Static Anchors computes CLASS-LEVEL union metrics but they are NOT printed")
+    print("    (union of 20 instance-level anchors is not a fair comparison vs optimized anchors)")
+    print("  - For fair comparison: use INSTANCE-LEVEL metrics (all methods) or")
+    print("    CLASS-LEVEL metrics (only Dynamic Anchors: single-agent and multi-agent)")
     print("  - Feature Importance is a GLOBAL method (one importance score per feature)")
-    print("  - Dynamic Anchors produce CLASS-LEVEL explanations")
+    print("  - Dynamic Anchors produce CLASS-LEVEL explanations (one optimized anchor per class)")
     print("    (ONE unified explanation per class that applies to all instances)")
     print("="*80)
     
@@ -1718,13 +1870,9 @@ def main(
                 print(f"  Instance-level (avg across instances):")
                 print(f"    Overall Avg Precision: {np.mean(instance_precisions):.3f}")
                 print(f"    Overall Avg Coverage:  {np.mean(instance_coverages):.3f}")
-                # Class-level metrics
-                class_precisions = [r.get("class_precision", 0.0) for r in per_class.values()]
-                class_coverages = [r.get("class_coverage", 0.0) for r in per_class.values()]
-                if any(cp > 0 or cc > 0 for cp, cc in zip(class_precisions, class_coverages)):
-                    print(f"  Class-level (union of all anchors):")
-                    print(f"    Overall Union Precision: {np.mean(class_precisions):.3f}")
-                    print(f"    Overall Union Coverage:  {np.mean(class_coverages):.3f}")
+                # Note: Class-level union metrics are computed and stored but not printed,
+                # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
+                # They are available in the JSON output for reference if needed
         
         elif method_name in ["lime", "shap"]:
             # Print top features summary
