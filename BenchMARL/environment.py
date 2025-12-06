@@ -181,6 +181,17 @@ class AnchorEnv(ParallelEnv):
         self.global_coverage_weight = env_config.get("global_coverage_weight", 0.0)
         self.global_coverage_threshold = env_config.get("global_coverage_threshold", 0.0)
         
+        # Coverage bonus weights (read from config, defaults match reduced values for fair comparison with single-agent)
+        self.coverage_bonus_weight_met = env_config.get("coverage_bonus_weight_met", 0.01)
+        self.coverage_bonus_weight_high_prec = env_config.get("coverage_bonus_weight_high_prec", 0.03)
+        self.coverage_bonus_weight_high_prec_progress = env_config.get("coverage_bonus_weight_high_prec_progress", 0.07)
+        self.coverage_bonus_weight_high_prec_distance = env_config.get("coverage_bonus_weight_high_prec_distance", 0.02)
+        self.coverage_bonus_weight_reasonable_prec = env_config.get("coverage_bonus_weight_reasonable_prec", 0.01)
+        self.coverage_bonus_weight_reasonable_prec_progress = env_config.get("coverage_bonus_weight_reasonable_prec_progress", 0.02)
+        
+        # Target class bonus weight (read from config, default matches reduced value for fair comparison)
+        self.target_class_bonus_weight = env_config.get("target_class_bonus_weight", 0.02)
+        
         x_star_unit_config = env_config.get("x_star_unit", None)
         if isinstance(x_star_unit_config, dict):
             self.x_star_unit = x_star_unit_config
@@ -735,6 +746,14 @@ class AnchorEnv(ParallelEnv):
             if not np.isfinite(coverage_gain):
                 coverage_gain = 0.0
             
+            # Clip precision_gain to prevent reward explosions, similar to coverage_gain
+            # Normalize by previous precision to make gains relative
+            min_denominator_prec = max(prev_precision, 1e-6)
+            precision_gain_normalized = precision_gain / min_denominator_prec
+            precision_gain_scaled = precision_gain_normalized * 0.5
+            precision_gain_scaled = np.clip(precision_gain_scaled, -0.5, 0.5)
+            precision_gain_for_reward = precision_gain_scaled
+            
             min_denominator = max(prev_coverage, 1e-6)
             coverage_gain_normalized = coverage_gain / min_denominator
             coverage_gain_scaled = coverage_gain_normalized * 0.5
@@ -779,7 +798,7 @@ class AnchorEnv(ParallelEnv):
                 js_penalty,
             ) = self._compute_reward_weights_and_penalties(
                 precision,
-                precision_gain,
+                precision_gain_for_reward,
                 coverage_gain_for_reward,
                 js_proxy,
                 precision_threshold,
@@ -813,13 +832,9 @@ class AnchorEnv(ParallelEnv):
                 # Give a small negative reward for attempting invalid action
                 coverage_floor_penalty = -0.05
             
-            # Add small survival bonus to prevent excessive penalty for longer episodes
-            # SS: Noticed episodes are very short, so added this. (FUTURE: Remove this)
-            survival_bonus = 0.01
-            
             # Scale penalties based on progress: reduce penalties when making progress
             progress_factor = 1.0
-            if precision_gain > 0 or coverage_gain > 0:
+            if precision_gain_for_reward > 0 or coverage_gain_for_reward > 0:
                 # Reduce penalties when making progress (encourage exploration)
                 progress_factor = 0.5
             elif precision >= precision_threshold * 0.8:
@@ -827,12 +842,13 @@ class AnchorEnv(ParallelEnv):
                 progress_factor = 0.7
             
             # SS: R_local: Local reward component
+            # Note: survival_bonus removed - it was causing positive rewards for long episodes
+            # without progress. Episodes should terminate early when targets are met.
             reward_local = (
-                self.alpha * precision_weight * precision_gain
+                self.alpha * precision_weight * precision_gain_for_reward
                 + coverage_weight * coverage_gain_for_reward
                 + coverage_bonus
                 + target_class_bonus
-                + survival_bonus
                 - progress_factor * overlap_penalty
                 - progress_factor * drift_penalty
                 - progress_factor * anchor_drift_penalty
@@ -1346,16 +1362,20 @@ class AnchorEnv(ParallelEnv):
     ) -> float:
         coverage_bonus = 0.0
         
+        # Read weights from config (defaults match reduced values for fair comparison with single-agent)
+        # This prevents high cumulative rewards over long episodes after survival bonus removal
         if precision >= precision_threshold and coverage >= self.coverage_target:
-            coverage_bonus = 0.1 * (coverage / self.coverage_target)
+            coverage_bonus = self.coverage_bonus_weight_met * (coverage / self.coverage_target)
         elif precision >= precision_threshold and coverage_gain > 0:
             progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            coverage_bonus = (0.3 + 0.7 * progress_to_target) * coverage_gain
+            coverage_bonus = (self.coverage_bonus_weight_high_prec + 
+                            self.coverage_bonus_weight_high_prec_progress * progress_to_target) * coverage_gain
             distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
-            coverage_bonus += 0.2 * coverage_gain * (1.0 - distance_to_target)
+            coverage_bonus += self.coverage_bonus_weight_high_prec_distance * coverage_gain * (1.0 - distance_to_target)
         elif precision >= precision_threshold * 0.8 and coverage_gain > 0:
             progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            coverage_bonus = (0.1 + 0.2 * progress_to_target) * coverage_gain
+            coverage_bonus = (self.coverage_bonus_weight_reasonable_prec + 
+                            self.coverage_bonus_weight_reasonable_prec_progress * progress_to_target) * coverage_gain
         
         return coverage_bonus
     
@@ -1366,9 +1386,10 @@ class AnchorEnv(ParallelEnv):
         target_class_bonus = 0.0
         target_class_fraction = details.get("target_class_fraction", 0.0)
         
+        # Read weight from config (default matches reduced value for fair comparison with single-agent)
         if target_class_fraction > 0.0 and precision < precision_threshold:
             precision_ratio = 1.0 - precision / (precision_threshold + eps)
-            target_class_bonus = 0.2 * target_class_fraction * precision_ratio
+            target_class_bonus = self.target_class_bonus_weight * target_class_fraction * precision_ratio
             target_class_bonus *= max(0.1, precision_ratio)
         
         return target_class_bonus

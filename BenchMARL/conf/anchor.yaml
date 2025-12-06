@@ -35,13 +35,23 @@ env_config:
   max_action_scale: 0.1
   min_absolute_step: 0.001
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
-  shared_reward_weight: 0.2  # Weight for shared cooperative reward (all agents get same bonus)
+  shared_reward_weight: 0.02  # Weight for shared cooperative reward (reduced from 0.2 to prevent high cumulative rewards)
   # Class union metrics weights: reward agents based on union of all agents' anchors for their class
-  class_union_cov_weight: 0.1   # Weight for class-union coverage bonus (fraction of class samples covered by union)
-  class_union_prec_weight: 0.1  # Weight for class-union precision bonus (precision of union for the class)
+  class_union_cov_weight: 0.01   # Weight for class-union coverage bonus (reduced from 0.1 to prevent high cumulative rewards)
+  class_union_prec_weight: 0.01  # Weight for class-union precision bonus (reduced from 0.1 to prevent high cumulative rewards)
   # Global coverage reward: reward when all agents together cover the dataset well
-  global_coverage_weight: 0.1    # Weight for global coverage bonus (fraction of entire dataset covered by union of all agents)
+  global_coverage_weight: 0.01    # Weight for global coverage bonus (reduced from 0.1 to prevent high cumulative rewards)
   global_coverage_threshold: 0.1 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
+  # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
+  # These bonuses reward good coverage behavior (same as single-agent for fair comparison)
+  coverage_bonus_weight_met: 0.01          # When targets are met: weight * (coverage / target)
+  coverage_bonus_weight_high_prec: 0.03    # When precision >= threshold and making progress: base weight
+  coverage_bonus_weight_high_prec_progress: 0.07  # Progress multiplier when precision >= threshold
+  coverage_bonus_weight_high_prec_distance: 0.02  # Distance to target multiplier when precision >= threshold
+  coverage_bonus_weight_reasonable_prec: 0.01     # When precision >= 0.8 * threshold and making progress: base weight
+  coverage_bonus_weight_reasonable_prec_progress: 0.02  # Progress multiplier when precision >= 0.8 * threshold
+  # Target class bonus weight (reduced from 0.2 to prevent high cumulative rewards, same as single-agent)
+  target_class_bonus_weight: 0.02  # Weight for target class fraction bonus
   agents_per_class: 3        # Number of agents per class (set >1 to learn multiple anchors per class)
   # Use class centroids to initialize the initial window (default: true)
   # If true: initial window is set around class centroid (mean of class instances)
@@ -56,6 +66,11 @@ env_config:
   # If provided, a random instance is sampled as centroid for each episode reset
   # If None, mean centroid is computed from class data
   fixed_instances_per_class: null
+
+# Logging verbosity control
+# Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs
+# Controls logging in training, inference, and environment during rollouts
+logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
 
 # Maximum number of steps per episode
 # Increased to 500 for better convergence (allows agents more time to refine anchors)

@@ -133,6 +133,24 @@ class AnchorTrainer:
         if env_config is None:
             env_config = self._load_env_config_from_yaml()
         
+        # Apply logging verbosity early based on config
+        verbosity = env_config.get("logging_verbosity", "normal")
+        level = logging.WARNING if verbosity == "quiet" else (logging.DEBUG if verbosity == "verbose" else logging.INFO)
+        
+        # Set root logger level
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+        for handler in root_logger.handlers:
+            handler.setLevel(level)
+        
+        # Set for all existing loggers
+        for name in logging.Logger.manager.loggerDict:
+            if isinstance(logging.Logger.manager.loggerDict[name], logging.Logger):
+                log = logging.getLogger(name)
+                log.setLevel(level)
+                for handler in log.handlers:
+                    handler.setLevel(level)
+        
         # Get the target classes.
         if target_classes is None:
             target_classes = list(np.unique(self.dataset_loader.y_train))
@@ -288,30 +306,32 @@ class AnchorTrainer:
         logger.info(f"Results saved to: {self.experiment.folder_name}")
         
         # Save wandb run URL for later reference (if available)
-        try:
-            import wandb
-            if wandb.run is not None:
-                wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
-                if wandb_run_url is None:
-                    try:
-                        entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
-                        project = wandb.run.project if hasattr(wandb.run, 'project') else None
-                        run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
-                        if entity and project and run_id:
-                            wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
-                    except Exception:
-                        pass
-                
-                if wandb_run_url:
-                    import os
-                    wandb_url_file = os.path.join(str(self.experiment.folder_name), "wandb_run_url.txt")
-                    os.makedirs(os.path.dirname(wandb_url_file), exist_ok=True)
-                    with open(wandb_url_file, 'w') as f:
-                        f.write(wandb_run_url)
-                    logger.info(f"✓ Wandb run URL saved to: {wandb_url_file}")
-                    logger.info(f"  URL: {wandb_run_url}")
-        except Exception as e:
-            logger.debug(f"Could not save wandb run URL: {e}")
+        if os.environ.get("DISABLE_WANDB", "0") == "1":
+            logger.debug("Wandb disabled via DISABLE_WANDB environment variable")
+        else:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None
+                    if wandb_run_url is None:
+                        try:
+                            entity = wandb.run.entity if hasattr(wandb.run, 'entity') else None
+                            project = wandb.run.project if hasattr(wandb.run, 'project') else None
+                            run_id = wandb.run.id if hasattr(wandb.run, 'id') else None
+                            if entity and project and run_id:
+                                wandb_run_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}"
+                        except Exception:
+                            pass
+                    
+                    if wandb_run_url:
+                        wandb_url_file = os.path.join(str(self.experiment.folder_name), "wandb_run_url.txt")
+                        os.makedirs(os.path.dirname(wandb_url_file), exist_ok=True)
+                        with open(wandb_url_file, 'w') as f:
+                            f.write(wandb_run_url)
+                        logger.info(f"✓ Wandb run URL saved to: {wandb_url_file}")
+                        logger.info(f"  URL: {wandb_run_url}")
+            except Exception as e:
+                logger.debug(f"Could not save wandb run URL: {e}")
         
         # Flush any remaining training metrics before final save
         if hasattr(self, 'callback') and self.callback is not None:
@@ -1030,11 +1050,24 @@ class AnchorTrainer:
         expected_num_groups = len(unwrapped_env.possible_agents) if unwrapped_env and hasattr(unwrapped_env, 'possible_agents') else None
         actual_num_groups = len(algorithm.group_map.keys())
         
+        # Determine agents_per_class to provide context
+        agents_per_class = 1
+        if unwrapped_env is not None and hasattr(unwrapped_env, 'agents_per_class'):
+            agents_per_class = unwrapped_env.agents_per_class
+        
         if expected_num_groups is not None and actual_num_groups < expected_num_groups:
-            logger.warning(f"\n Warning: Algorithm has {actual_num_groups} groups but environment has {expected_num_groups} agents.")
-            logger.warning(f"  This suggests agents may be grouped together. Each group may contain multiple agents.")
-            logger.warning(f"  Algorithm groups: {list(algorithm.group_map.keys())}")
-            logger.warning(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
+            # This is expected when agents_per_class > 1 (agents are grouped by class)
+            if agents_per_class > 1:
+                logger.info(f"\n Info: Algorithm groups agents by class (agents_per_class={agents_per_class}).")
+                logger.info(f"  Algorithm has {actual_num_groups} groups (one per class) but environment has {expected_num_groups} agents ({agents_per_class} per class).")
+                logger.info(f"  Algorithm groups: {list(algorithm.group_map.keys())}")
+                logger.info(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
+                logger.info(f"  This is expected - BenchMARL groups agents by class when agents_per_class > 1.")
+            else:
+                logger.warning(f"\n Warning: Algorithm has {actual_num_groups} groups but environment has {expected_num_groups} agents.")
+                logger.warning(f"  This suggests agents may be grouped together. Each group may contain multiple agents.")
+                logger.warning(f"  Algorithm groups: {list(algorithm.group_map.keys())}")
+                logger.warning(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
         
         for group in algorithm.group_map.keys():
             # Get all agents in this group
@@ -2252,6 +2285,10 @@ class AnchorTrainer:
                             elif value.lower() == "false":
                                 env_config[key] = False
                     
+                    # Also load logging_verbosity from top-level YAML if present
+                    if "logging_verbosity" in yaml_data:
+                        env_config["logging_verbosity"] = yaml_data["logging_verbosity"]
+                    
                     logger.info(f"  Loaded environment config from: {config_path}")
                     self._anchor_env_config = env_config.copy()
                     return env_config
@@ -2268,6 +2305,17 @@ class AnchorTrainer:
         return default_config
     
     def _get_default_env_config(self) -> Dict[str, Any]:
+        # Try to load from YAML first, then fall back to defaults
+        try:
+            config = self._load_env_config_from_yaml()
+            # Ensure logging_verbosity is set (default to "normal" if not in YAML)
+            if "logging_verbosity" not in config:
+                config["logging_verbosity"] = "normal"
+            return config
+        except Exception:
+            # Fallback to hardcoded defaults if loading fails
+            pass
+        
         return {
             "precision_target": 0.8,
             "coverage_target": 0.02,
@@ -2293,5 +2341,6 @@ class AnchorTrainer:
             "max_termination_count_both_targets": -1,
             "max_termination_count_high_precision": 200,
             "max_termination_count_both_close": 50,
+            "logging_verbosity": "normal",  # Default logging verbosity
         }
 

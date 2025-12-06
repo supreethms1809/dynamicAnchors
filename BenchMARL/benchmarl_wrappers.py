@@ -52,7 +52,8 @@ class AnchorTaskClass(TaskClass):
         if agents_per_class is not None:
             logger.info(f"  agents_per_class={agents_per_class} found in env_config")
         else:
-            logger.warning(f"  Warning: agents_per_class not found in env_config, will use default (1)")
+            # Using default value of 1 is expected and fine, so use info level instead of warning
+            logger.debug(f"  agents_per_class not found in env_config, using default (1)")
         
         def _make_env():
             anchor_env = AnchorEnv(**env_config)

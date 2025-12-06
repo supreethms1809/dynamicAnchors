@@ -227,14 +227,20 @@ def main():
             device=args.device
         )
         
-        # Use dataset-specific patience: higher for complex datasets like housing
-        # Housing dataset needs more patience to reach good accuracy
-        dataset_patience = {
-            "housing": 200,
-            "breast_cancer": 100,
-            "wine": 100,
-            "iris": 50,
-        }.get(args.dataset.lower(), 50)  # Default: 50
+        # Use dataset-specific patience: higher for complex/large datasets
+        # Folktables and UCI datasets are large and need more patience
+        dataset_lower = args.dataset.lower()
+        if dataset_lower.startswith("folktables_") or dataset_lower.startswith("uci_"):
+            # Large datasets (folktables, uci): use high patience
+            dataset_patience = 200
+            logger.info(f"Large dataset detected ({args.dataset}), using patience: {dataset_patience}")
+        else:
+            dataset_patience = {
+                "housing": 200,
+                "breast_cancer": 100,
+                "wine": 100,
+                "iris": 50,
+            }.get(dataset_lower, 50)  # Default: 50
         
         trained_classifier, test_acc, history = dataset_loader.train_classifier(
             classifier,

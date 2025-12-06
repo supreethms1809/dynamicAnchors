@@ -1,0 +1,68 @@
+defaults:
+  - _self_
+
+# Minimal configuration for unit tests
+sampling_device: "cpu"
+train_device: "cpu"
+buffer_device: "cpu"
+
+share_policy_params: True
+prefer_continuous_actions: True
+collect_with_grad: False
+parallel_collection: False  # Disable parallel collection for tests
+
+gamma: 0.99
+lr: 0.001
+adam_eps: 0.000001
+adam_extra_kwargs: {}
+clip_grad_norm: True
+clip_grad_val: 5
+
+soft_target_update: True
+polyak_tau: 0.005
+hard_target_update_frequency: 5
+
+exploration_eps_init: 0.8
+exploration_eps_end: 0.01
+exploration_anneal_frames: null
+
+# Minimal frames for fast testing
+max_n_iters: null
+max_n_frames: 1000
+
+# Minimal batch sizes for fast testing
+on_policy_collected_frames_per_batch: 50
+on_policy_n_envs_per_worker: 1
+on_policy_n_minibatch_iters: 1
+on_policy_minibatch_size: 32
+
+off_policy_collected_frames_per_batch: 50
+off_policy_n_envs_per_worker: 1
+off_policy_n_optimizer_steps: 10
+off_policy_train_batch_size: 32
+off_policy_memory_size: 10000
+off_policy_init_random_frames: 0
+off_policy_use_prioritized_replay_buffer: False
+off_policy_prb_alpha: 0.6
+off_policy_prb_beta: 0.4
+
+evaluation: False  # Disable evaluation for faster tests
+render: False
+evaluation_interval: 1000
+evaluation_episodes: 2
+evaluation_deterministic_actions: True
+evaluation_static: False
+
+# Only CSV logger for tests (no wandb/tensorboard)
+loggers: [csv]
+project_name: "test"
+wandb_extra_kwargs: {}
+create_json: False
+
+save_folder: null
+restore_file: null
+restore_map_location: null
+checkpoint_interval: 0  # Disable checkpointing for tests
+checkpoint_at_end: True  # Save at end for inference
+keep_checkpoints_num: 1
+exclude_buffer_from_checkpoint: True

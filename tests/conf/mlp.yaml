@@ -1,0 +1,13 @@
+# Minimal MLP configuration for unit tests
+name: mlp
+
+num_cells: [64, 64]  # Smaller network for faster tests
+layer_class: torch.nn.Linear
+
+activation_class: torch.nn.ReLU
+activation_kwargs: null
+
+norm_class: null
+norm_kwargs: null
+
+num_feature_dims: 1

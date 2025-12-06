@@ -165,6 +165,73 @@ def load_policy_model(
     return mlp
 
 
+def _should_log_verbose(env_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Check if verbose logging is enabled from env_config."""
+    if env_config is None:
+        return False
+    verbosity = env_config.get("logging_verbosity", "normal")
+    return verbosity == "verbose"
+
+
+def _should_log_info(env_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Check if info-level logging should be enabled from env_config."""
+    if env_config is None:
+        return True  # Default to logging info
+    verbosity = env_config.get("logging_verbosity", "normal")
+    # "quiet" = only warnings/errors, "normal" and "verbose" = info level logging
+    return verbosity != "quiet"
+
+
+def _get_logging_level(env_config: Optional[Dict[str, Any]] = None) -> int:
+    """Get the appropriate logging level based on verbosity setting."""
+    if env_config is None:
+        return logging.INFO
+    verbosity = env_config.get("logging_verbosity", "normal")
+    if verbosity == "quiet":
+        return logging.WARNING  # Only warnings and errors
+    elif verbosity == "verbose":
+        return logging.DEBUG  # All logs including debug
+    else:  # normal
+        return logging.INFO  # Standard info level
+
+
+def _apply_logging_verbosity(env_config: Optional[Dict[str, Any]] = None):
+    """Set logging level for all loggers based on verbosity setting."""
+    level = _get_logging_level(env_config)
+    # Set level for root logger - this affects all loggers unless they have their own level set
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    
+    # Update all existing handlers to use the new level
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+    
+    # Also set for common module loggers (both full names and short names)
+    logger_names = [
+        'BenchMARL', 'single_agent', 'tabular_datasets', 'anchor_trainer_sb3', 
+        'single_agent_inference', 'test_extracted_rules_single', 'inference',
+        'environment', 'benchmarl_wrappers', 'anchor_trainer', 'BenchMARL.environment',
+        'BenchMARL.benchmarl_wrappers', 'BenchMARL.anchor_trainer', 'BenchMARL.tabular_datasets',
+        'single_agent.anchor_trainer_sb3', 'single_agent.single_agent_inference',
+        'single_agent.test_extracted_rules_single'
+    ]
+    for logger_name in logger_names:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+        # Also update handlers for this logger
+        for handler in logger.handlers:
+            handler.setLevel(level)
+    
+    # Set level for all existing loggers (walk through the logger hierarchy)
+    # This ensures we catch any loggers that were already created
+    for name in logging.Logger.manager.loggerDict:
+        if isinstance(logging.Logger.manager.loggerDict[name], logging.Logger):
+            log = logging.getLogger(name)
+            log.setLevel(level)
+            for handler in log.handlers:
+                handler.setLevel(level)
+
+
 def run_rollout_with_policy(
     env: AnchorEnv,
     policy: torch.nn.Module,
@@ -174,6 +241,7 @@ def run_rollout_with_policy(
     seed: Optional[int] = None,
     exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean"
     action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
+    verbose_logging: bool = False,  # Enable verbose debug logging
 ) -> Dict[str, Any]:
     # Ensure policy is in eval mode
     policy.to(device)
@@ -194,8 +262,8 @@ def run_rollout_with_policy(
         else:
             raise ValueError(f"Agent '{agent_id}' not found in environment. Available agents: {list(obs_dict.keys())}")
     
-    # Debug: Check initial box state (TODO: Remove this)
-    if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
+    # Debug: Check initial box state
+    if verbose_logging and hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
         lower_init = env.lower[agent_id]
         upper_init = env.upper[agent_id]
         widths_init = upper_init - lower_init
@@ -231,8 +299,8 @@ def run_rollout_with_policy(
         # Convert to tensor for policy
         obs_tensor = torch.as_tensor(obs_vec, dtype=torch.float32, device=device).unsqueeze(0)
         
-        # Debug: Log observation for first step (TODO: Remove this)
-        if step_count == 0:
+        # Debug: Log observation for first step
+        if verbose_logging and step_count == 0:
             logger.info(f"  Observation shape: {obs_vec.shape}, first 5 values: {obs_vec[:5]}, last 5: {obs_vec[-5:]}")
             logger.info(f"  Observation stats: mean={obs_vec.mean():.4f}, std={obs_vec.std():.4f}, min={obs_vec.min():.4f}, max={obs_vec.max():.4f}")
         
@@ -249,18 +317,19 @@ def run_rollout_with_policy(
                     zero_output_np = zero_output.cpu().numpy().flatten()
                     actual_output_np = actual_output.cpu().numpy().flatten()
                     diff = np.abs(actual_output_np - zero_output_np).max()
-                    logger.info(f"  Policy response test: max difference between zero obs and actual obs = {diff:.2f}")
+                    if verbose_logging:
+                        logger.info(f"  Policy response test: max difference between zero obs and actual obs = {diff:.2f}")
                     if diff < 1e-6:
                         logger.warning(f"  Policy outputs IDENTICAL values for zero and actual observations!")
-                    else:
+                    elif verbose_logging:
                         logger.info(f"  Policy responds differently to different observations (good!)")
                 run_rollout_with_policy._tested_policy_response = True
                 fwd_outputs = actual_output
             else:
                 fwd_outputs = policy(obs_tensor)
             
-            # Debug: Log raw policy output before any processing (TODO: Remove this)
-            if step_count == 0:
+            # Debug: Log raw policy output before any processing
+            if verbose_logging and step_count == 0:
                 if isinstance(fwd_outputs, torch.Tensor):
                     raw_output = fwd_outputs.cpu().numpy().flatten()
                     logger.info(f"  Raw policy output (before processing): shape={raw_output.shape}, first 5: {raw_output[:5]}, mean={raw_output.mean():.4f}, std={raw_output.std():.4f}, min={raw_output.min():.4f}, max={raw_output.max():.4f}")
@@ -333,16 +402,16 @@ def run_rollout_with_policy(
                         else:
                             sample_idx = []
                         if max_abs > 10.0:
-                            if step_count == 0:
+                            if verbose_logging and step_count == 0:
                                 logger.info(f"  Scaling large logits by fixed factor {fixed_scale:.2f} (max_abs={max_abs:.2f})")
                                 logger.info(f"  Before scaling (sample): {[action_vals[i] for i in sample_idx]}")
                             action = action / fixed_scale
-                            if step_count == 0:
+                            if verbose_logging and step_count == 0:
                                 action_scaled_vals = action.cpu().numpy().flatten()
                                 logger.info(f"  After scaling (sample): {[action_scaled_vals[i] for i in sample_idx]}")
                         # Now apply tanh to get actions in [-1, 1]
                         action = torch.tanh(action)
-                        if step_count == 0 and len(sample_idx) > 0:
+                        if verbose_logging and step_count == 0 and len(sample_idx) > 0:
                             action_tanh_vals = action.cpu().numpy().flatten()
                             logger.info(f"  After tanh (sample): {[action_tanh_vals[i] for i in sample_idx]}")
             
@@ -352,20 +421,20 @@ def run_rollout_with_policy(
             
             # Convert to numpy for debugging and ensure it's the right shape
             action_np = action.cpu().numpy() if isinstance(action, torch.Tensor) else action
-            if step_count == 0:
+            if verbose_logging and step_count == 0:
                 # Flatten for comparison
                 action_flat = action_np.flatten()
                 logger.info(f"  Action shape: {action_np.shape}, mean: {action_flat.mean():.4f}, std: {action_flat.std():.4f}, min: {action_flat.min():.4f}, max: {action_flat.max():.4f}")
                 logger.info(f"  Action first 10 values: {action_flat[:10]}")
                 
-                # Store first action for comparison (TODO: Remove this)
+                # Store first action for comparison
                 if not hasattr(run_rollout_with_policy, '_first_action'):
                     run_rollout_with_policy._first_action = action_flat.copy()
                     run_rollout_with_policy._action_count = 1
                     logger.info(f"  Stored first action for comparison")
                 else:
                     run_rollout_with_policy._action_count += 1
-                    # Compare with first action (TODO: Remove this)
+                    # Compare with first action
                     diff = np.abs(action_flat - run_rollout_with_policy._first_action)
                     max_diff = diff.max()
                     mean_diff = diff.mean()
@@ -375,13 +444,13 @@ def run_rollout_with_policy(
                     else:
                         logger.info(f"  Actions are DIFFERENT from first episode (good!)")
                     
-                    # Also compare with previous action to see if there's any variation (TODO: Remove this)
+                    # Also compare with previous action to see if there's any variation
                     if hasattr(run_rollout_with_policy, '_prev_action'):
                         prev_diff = np.abs(action_flat - run_rollout_with_policy._prev_action).max()
                         logger.info(f"  Action comparison with previous episode: max_diff={prev_diff:.6f}")
                     run_rollout_with_policy._prev_action = action_flat.copy()
                 
-                # Check if actions are in valid range (TODO: Remove this)
+                # Check if actions are in valid range
                 if action_flat.min() < -1.1 or action_flat.max() > 1.1:
                     logger.warning(f"  ⚠ Actions out of [-1, 1] range! Applying tanh normalization...")
                     action = torch.tanh(action) if isinstance(action, torch.Tensor) else np.tanh(action)
@@ -425,7 +494,7 @@ def run_rollout_with_policy(
             start_idx = mapped_agent_num * expected_action_dim
             end_idx = start_idx + expected_action_dim
             action_np = action_np[start_idx:end_idx]
-            if step_count == 0:
+            if verbose_logging and step_count == 0:
                 if agent_num != mapped_agent_num:
                     logger.info(f"  Extracted action slice for {agent_id}: mapped agent_{agent_num} -> agent_{mapped_agent_num}, indices [{start_idx}:{end_idx}] from policy output")
                 else:
@@ -435,7 +504,7 @@ def run_rollout_with_policy(
             start_idx = agent_num * expected_action_dim
             end_idx = start_idx + expected_action_dim
             action_np = action_np[start_idx:end_idx]
-            if step_count == 0:
+            if verbose_logging and step_count == 0:
                 logger.info(f"  Extracted action slice for {agent_id}: indices [{start_idx}:{end_idx}] from policy output")
         elif action_np.shape[0] != expected_action_dim:
             # Unexpected action dimension
@@ -452,9 +521,10 @@ def run_rollout_with_policy(
         
         # Debug: Log action for first step (TODO: Remove this)
         if step_count == 0:
-            logger.info(f"  Action before step: shape={action_np.shape}, sample values: {action_np[:5]}")
-            logger.info(f"    Action lower_deltas (first {env.n_features}): mean={action_np[:env.n_features].mean():.4f}, std={action_np[:env.n_features].std():.4f}")
-            logger.info(f"    Action upper_deltas (last {env.n_features}): mean={action_np[env.n_features:].mean():.4f}, std={action_np[env.n_features:].std():.4f}")
+            if verbose_logging:
+                logger.info(f"  Action before step: shape={action_np.shape}, sample values: {action_np[:5]}")
+                logger.info(f"    Action lower_deltas (first {env.n_features}): mean={action_np[:env.n_features].mean():.4f}, std={action_np[:env.n_features].std():.4f}")
+                logger.info(f"    Action upper_deltas (last {env.n_features}): mean={action_np[env.n_features:].mean():.4f}, std={action_np[env.n_features:].std():.4f}")
         
         # Step environment directly
         action_dict = {agent_id: action_np}
@@ -474,7 +544,8 @@ def run_rollout_with_policy(
                 upper_after = env.upper[agent_id].copy()
                 lower_diff = np.abs(lower_after - lower_before).max()
                 upper_diff = np.abs(upper_after - upper_before).max()
-                logger.info(f"  Box change after step 0: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}")
+                if verbose_logging:
+                    logger.info(f"  Box change after step 0: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}")
                 if lower_diff < 1e-6 and upper_diff < 1e-6:
                     logger.warning(f"  Box did not change after action! Actions may not be applied correctly.")
         
@@ -501,9 +572,10 @@ def run_rollout_with_policy(
                 class_coverage = float(class_union_metrics[target_class].get("union_coverage", 0.0))
             else:
                 # Debug: log why class-level metrics might be missing
-                logger.debug(f"  Class {target_class} not found in class_union_metrics. Available classes: {list(class_union_metrics.keys())}")
-                logger.debug(f"  Agents with boxes: {list(env.lower.keys())}")
-                logger.debug(f"  Active agents: {list(env.agents) if hasattr(env, 'agents') else 'N/A'}")
+                if verbose_logging:
+                    logger.debug(f"  Class {target_class} not found in class_union_metrics. Available classes: {list(class_union_metrics.keys())}")
+                    logger.debug(f"  Agents with boxes: {list(env.lower.keys())}")
+                    logger.debug(f"  Active agents: {list(env.agents) if hasattr(env, 'agents') else 'N/A'}")
         
         # Get final box bounds
         lower = env.lower[agent_id]
@@ -526,17 +598,19 @@ def run_rollout_with_policy(
             "final_observation": final_obs.tolist(),
         }
         
-        # Debug: Log metrics (TODO: Remove this)
-        logger.debug(
-            f"  Extracted metrics from environment: "
-            f"instance_precision={instance_precision:.4f}, instance_coverage={instance_coverage:.4f}, "
-            f"class_precision={class_precision:.4f}, class_coverage={class_coverage:.4f}"
-        )
+        # Debug: Log metrics
+        if verbose_logging:
+            logger.debug(
+                f"  Extracted metrics from environment: "
+                f"instance_precision={instance_precision:.4f}, instance_coverage={instance_coverage:.4f}, "
+                f"class_precision={class_precision:.4f}, class_coverage={class_coverage:.4f}"
+            )
         
     except Exception as e:
         logger.warning(f"  Error getting metrics from environment for {agent_id}: {e}")
-        import traceback
-        logger.debug(f"  Traceback: {traceback.format_exc()}")
+        if verbose_logging:
+            import traceback
+            logger.debug(f"  Traceback: {traceback.format_exc()}")
         # Return empty episode data
         episode_data = {
             "instance_precision": 0.0,
@@ -693,6 +767,21 @@ def extract_rules_from_policies(
     feature_names = env_data["feature_names"]
     n_features = len(feature_names)
     
+    # Create trainer early to get env_config and check verbosity
+    from anchor_trainer import AnchorTrainer
+    trainer = AnchorTrainer(
+        dataset_loader=dataset_loader,
+        algorithm="maddpg",
+        output_dir=output_dir or os.path.join(experiment_dir, "inference"),
+        seed=seed
+    )
+    env_config = trainer._get_default_env_config()
+    
+    # Check logging verbosity from config
+    verbose_logging = _should_log_verbose(env_config)
+    if verbose_logging:
+        logger.info("Verbose logging enabled - showing detailed debug information")
+    
     # Load all policy models and extract individual agent policies
     logger.info(f"\nLoading policy models...")
     policies = {}
@@ -718,9 +807,11 @@ def extract_rules_from_policies(
         state_dict_path = policy_files[group]
         raw_state_dict = torch.load(state_dict_path, map_location=device)
         
-        # Debug: Print some keys to understand structure (TODO: Remove this)
-        logger.info(f"  Debug: Total keys in state_dict: {len(raw_state_dict.keys())}")
-        logger.info(f"  Debug: Sample state_dict keys (first 20): {list(raw_state_dict.keys())[:20]}")
+        # Debug: Print some keys to understand structure
+        # Only log if verbose logging is enabled
+        if verbose_logging:
+            logger.info(f"  Debug: Total keys in state_dict: {len(raw_state_dict.keys())}")
+            logger.info(f"  Debug: Sample state_dict keys (first 20): {list(raw_state_dict.keys())[:20]}")
         
         # Check for agent-specific keys in the raw state_dict
         # In MADDPG, the actor module might have separate networks for each agent
@@ -785,12 +876,13 @@ def extract_rules_from_policies(
                             pass
         
         # If no agent indices found in raw state_dict, the policy might be shared
-        # In that case, we'll use the same policy for all agents (TODO: Remove this)
-        if not agent_indices:
-            logger.info(f"  Debug: No agent-specific indices found in raw state_dict")
-            logger.info(f"  Debug: This might be a shared policy for all agents")
-        else:
-            logger.info(f"  Debug: Found agent indices: {sorted(agent_indices)}")
+        # In that case, we'll use the same policy for all agents
+        if verbose_logging:
+            if not agent_indices:
+                logger.info(f"  Debug: No agent-specific indices found in raw state_dict")
+                logger.info(f"  Debug: This might be a shared policy for all agents")
+            else:
+                logger.info(f"  Debug: Found agent indices: {sorted(agent_indices)}")
         
         # Use raw_state_dict for agent extraction
         state_dict = raw_state_dict
@@ -858,9 +950,10 @@ def extract_rules_from_policies(
                                 if new_key and not new_key.startswith('__'):
                                     agent_state_dict[new_key] = value
                 
-                logger.info(f"  Debug: Found {len(agent_keys_found)} keys for {agent_name}")
-                if agent_keys_found:
-                    logger.info(f"  Debug: Sample keys for {agent_name}: {agent_keys_found[:5]}")
+                if verbose_logging:
+                    logger.info(f"  Debug: Found {len(agent_keys_found)} keys for {agent_name}")
+                    if agent_keys_found:
+                        logger.info(f"  Debug: Sample keys for {agent_name}: {agent_keys_found[:5]}")
                 
                 if agent_state_dict:
                     # Infer dimensions from agent state_dict
@@ -911,43 +1004,47 @@ def extract_rules_from_policies(
     expected_agent_names = [f"agent_{i}" for i in range(len(target_classes))]
     missing_agents = [name for name in expected_agent_names if name not in agent_policies]
     
+    # Check if we have a combined policy available (for shared policy scenarios)
+    combined_policy = None
+    for g in policies.keys():
+        if policies[g] is not None:
+            combined_policy = policies[g]
+            break
+    
     if missing_agents:
-        logger.warning(f"\n  Warning: Missing policies for agents: {missing_agents}")
-        logger.info(f"  Found policies for: {list(agent_policies.keys())}")
-        logger.info(f"  Expected policies for: {expected_agent_names}")
-        
-        # If we have a combined policy but missing some agents, try to use the combined policy
-        # for the missing agents (assuming shared policy)
-        # Use the first available combined policy from any group
-        combined_policy = None
-        for g in policies.keys():
-            if policies[g] is not None:
-                combined_policy = policies[g]
-                break
-        
+        # If we have a combined policy available, this is likely a shared policy scenario
+        # (not an error, just informational)
         if combined_policy is not None:
-            logger.info(f"  Using combined policy for missing agents (assuming shared policy)")
+            logger.info(f"\n  Info: Using shared policy for agents: {missing_agents}")
+            logger.info(f"  Found individual policies for: {list(agent_policies.keys())}")
+            logger.info(f"  Expected policies for: {expected_agent_names}")
+            logger.info(f"  Using combined/shared policy for missing agents (this is normal for shared policies)")
+            
+            # Use the combined policy for the missing agents (assuming shared policy)
             for missing_agent in missing_agents:
                 agent_policies[missing_agent] = combined_policy
-                logger.info(f"  Assigned combined policy to {missing_agent}")
+                logger.info(f"  Assigned shared policy to {missing_agent}")
         else:
+            # This is a real problem - no policy available
+            logger.warning(f"\n  Warning: Missing policies for agents: {missing_agents}")
+            logger.warning(f"  Found policies for: {list(agent_policies.keys())}")
+            logger.warning(f"  Expected policies for: {expected_agent_names}")
             logger.warning(f"  Error: No combined policy available to assign to missing agents")
     
-    # Create environment config (needed before we can determine if policy is shared)
-    from anchor_trainer import AnchorTrainer
-    trainer = AnchorTrainer(
-        dataset_loader=dataset_loader,
-        algorithm="maddpg",
-        output_dir=output_dir or os.path.join(experiment_dir, "inference"),
-        seed=seed
-    )
-    env_config = trainer._get_default_env_config()
     # Disable coverage floor check during inference to allow exploration even with low coverage
     env_config["min_coverage_floor"] = 0.0
     env_config.update({
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
     })
+    
+    # Apply logging verbosity early (before any logging happens)
+    verbose_logging = _should_log_verbose(env_config)
+    _apply_logging_verbosity(env_config)
+    if verbose_logging:
+        logger.info("Verbose logging enabled - showing detailed debug information")
+    elif env_config.get("logging_verbosity") == "quiet":
+        logger.warning("Quiet logging mode enabled - only warnings and errors will be shown")
     
     # For class-level inference, compute cluster centroids per class
     logger.info("\nComputing cluster centroids per class for class-level inference...")
@@ -986,6 +1083,11 @@ def extract_rules_from_policies(
         logger.warning(f"  Error computing cluster centroids: {e}")
         logger.warning(f"  Falling back to mean centroid per class")
         env_config["cluster_centroids_per_class"] = None
+    
+    # Check logging verbosity from config
+    verbose_logging = _should_log_verbose(env_config)
+    if verbose_logging:
+        logger.info("Verbose logging enabled - showing detailed debug information")
     
     # Always use test data for inference (unless explicitly overridden)
     if eval_on_test_data:
@@ -1208,10 +1310,11 @@ def extract_rules_from_policies(
                 seed=rollout_seed,  # Pass seed for reproducible rollouts
                 exploration_mode=exploration_mode,  # Pass exploration mode for diversity
                 action_noise_scale=action_noise_scale,  # Pass action noise scale
+                verbose_logging=verbose_logging,  # Pass verbosity setting
             )
             
             # Debug logging for first episode of each class
-            if instance_idx == 0:
+            if verbose_logging and instance_idx == 0:
                 logger.info(f"  Debug class {target_class} episode 0:")
                 logger.info(f"    actual_agent_name: {actual_agent_name}")
                 logger.info(f"    episode_data keys: {list(episode_data.keys()) if episode_data else 'empty'}")
@@ -1437,6 +1540,39 @@ def extract_rules_from_policies(
         logger.info(f"  Unique rules: {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
+    
+    # Save results if output_dir is provided
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert to serializable format
+        def _convert_to_serializable(obj: Any) -> Any:
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int_)):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, (float, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, dict):
+                return {k: _convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [_convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        
+        rules_filepath = os.path.join(output_dir, "extracted_rules.json")
+        serializable_results = _convert_to_serializable(results)
+        
+        with open(rules_filepath, 'w') as f:
+            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Results saved to: {rules_filepath}")
     
     return results
 

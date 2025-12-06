@@ -133,19 +133,17 @@ def analyze_baseline(json_path):
                 print(f"  Instance-level (avg across {n_instances} instances):")
                 print(f"    Avg Precision: {instance_prec:.4f}")
                 print(f"    Avg Coverage:  {instance_cov:.4f}")
-                if class_prec > 0 or class_cov > 0:
-                    print(f"  Class-level (union of all anchors):")
-                    print(f"    Union Precision: {class_prec:.4f}")
-                    print(f"    Union Coverage:  {class_cov:.4f}")
+                # Note: Class-level union metrics are computed and stored but not printed,
+                # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
+                # They are available in the JSON output for reference if needed
             
             print(f"\nOverall Statistics:")
             print(f"  Instance-level (avg across instances):")
             print(f"    Mean Precision: {np.mean(instance_precisions):.4f} (+/- {np.std(instance_precisions):.4f})")
             print(f"    Mean Coverage:  {np.mean(instance_coverages):.4f} (+/- {np.std(instance_coverages):.4f})")
-            if class_precisions:
-                print(f"  Class-level (union of all anchors):")
-                print(f"    Mean Union Precision: {np.mean(class_precisions):.4f} (+/- {np.std(class_precisions):.4f})")
-                print(f"    Mean Union Coverage:  {np.mean(class_coverages):.4f} (+/- {np.std(class_coverages):.4f})")
+            # Note: Class-level union metrics are computed and stored but not printed,
+            # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
+            # They are available in the JSON output for reference if needed
         else:
             print("No Static Anchors results available")
     

@@ -20,6 +20,7 @@ import logging
 import json
 from datetime import datetime
 import shutil
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -265,10 +266,28 @@ class AnchorTrainerSB3:
             target_classes = sorted(np.unique(self.dataset_loader.y_train).tolist())
         
         self.target_classes = target_classes
-        
+
         # Get default environment configuration
         if env_config is None:
             env_config = self._get_default_env_config()
+        
+        # Apply logging verbosity early based on config
+        verbosity = env_config.get("logging_verbosity", "normal")
+        level = logging.WARNING if verbosity == "quiet" else (logging.DEBUG if verbosity == "verbose" else logging.INFO)
+        
+        # Set root logger level
+        root_logger = logging.getLogger()
+        root_logger.setLevel(level)
+        for handler in root_logger.handlers:
+            handler.setLevel(level)
+        
+        # Set for all existing loggers
+        for name in logging.Logger.manager.loggerDict:
+            if isinstance(logging.Logger.manager.loggerDict[name], logging.Logger):
+                log = logging.getLogger(name)
+                log.setLevel(level)
+                for handler in log.handlers:
+                    handler.setLevel(level)
         
         # Create environment configuration with data
         env_config_with_data = {
@@ -321,10 +340,29 @@ class AnchorTrainerSB3:
         logger.info("="*80)
     
     def _get_default_env_config(self) -> Dict[str, Any]:
-        """Get default environment configuration."""
-        return {
-            "precision_target": 0.8,
-            "coverage_target": 0.05,
+        """Get default environment configuration from YAML file if available, otherwise use defaults."""
+        # Try to load from config file
+        config_path = os.path.join(os.path.dirname(__file__), "conf", "anchor_single.yaml")
+        env_config = {}
+        
+        if os.path.exists(config_path):
+            try:
+                import yaml
+                with open(config_path, 'r') as f:
+                    config_data = yaml.safe_load(f)
+                    if config_data and "env_config" in config_data:
+                        env_config = config_data["env_config"]
+                        # Also load logging_verbosity from top-level YAML if present
+                        if "logging_verbosity" in config_data:
+                            env_config["logging_verbosity"] = config_data["logging_verbosity"]
+                        logger.info(f"Loaded environment config from: {config_path}")
+            except Exception as e:
+                logger.warning(f"Could not load config from {config_path}: {e}. Using defaults.")
+        
+        # Set defaults (will be overridden by config file values if present)
+        defaults = {
+            "precision_target": 0.95,
+            "coverage_target": 0.5,
             "use_perturbation": True,
             "perturbation_mode": "adaptive",
             "n_perturb": 4096,
@@ -341,13 +379,30 @@ class AnchorTrainerSB3:
             "max_action_scale": 0.1,
             "min_absolute_step": 0.001,
             "use_class_centroids": True,
+            # Coverage bonus weights (defaults match reduced values)
+            "coverage_bonus_weight_met": 0.01,
+            "coverage_bonus_weight_high_prec": 0.03,
+            "coverage_bonus_weight_high_prec_progress": 0.07,
+            "coverage_bonus_weight_high_prec_distance": 0.02,
+            "coverage_bonus_weight_reasonable_prec": 0.01,
+            "coverage_bonus_weight_reasonable_prec_progress": 0.02,
+            # Target class bonus weight
+            "target_class_bonus_weight": 0.02,
             # Termination reason counters: disable overused reasons
             # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
             "max_termination_count_both_targets": -1,
             "max_termination_count_high_precision": 200,
             "max_termination_count_both_close": 50,
             "max_termination_count_excellent_precision": 30,
+            "logging_verbosity": "normal",  # Default logging verbosity
         }
+        
+        # Merge: defaults first, then config file values override
+        final_config = {**defaults, **env_config}
+        # Ensure logging_verbosity is set (default to "normal" if not in config)
+        if "logging_verbosity" not in final_config:
+            final_config["logging_verbosity"] = "normal"
+        return final_config
     
     def _setup_environments(
         self,
@@ -484,8 +539,11 @@ class AnchorTrainerSB3:
 
         # Fix wandb warning: patch tensorboard before init when using multiple event log directories
         # Get the root tensorboard log directory (parent of all class-specific logs)
-        if not WANDB_AVAILABLE:
-            logger.warning("wandb not available, skipping tensorboard patch")
+        if not WANDB_AVAILABLE or os.environ.get("DISABLE_WANDB", "0") == "1":
+            if os.environ.get("DISABLE_WANDB", "0") == "1":
+                logger.debug("wandb disabled via DISABLE_WANDB environment variable, skipping tensorboard patch")
+            else:
+                logger.warning("wandb not available, skipping tensorboard patch")
         elif self.experiment_config.get("tensorboard_log", True):
             root_tensorboard_log = os.path.join(self.experiment_folder, "tensorboard")
             try:
@@ -503,7 +561,7 @@ class AnchorTrainerSB3:
             except Exception as e:
                 logger.warning(f"Could not patch wandb tensorboard: {e}")
 
-        if WANDB_AVAILABLE:
+        if WANDB_AVAILABLE and os.environ.get("DISABLE_WANDB", "0") != "1":
             wandb.init(project="single-agent-anchor-rl", name=f"single-agent-anchor-rl_{self.dataset_loader.dataset_name}", 
             config=self.algorithm_config, sync_tensorboard=True)
             wandb.config.update({
@@ -572,7 +630,7 @@ class AnchorTrainerSB3:
 
             # Train this model
             train_callbacks = callbacks.copy() if callbacks else []
-            if WANDB_AVAILABLE:
+            if WANDB_AVAILABLE and os.environ.get("DISABLE_WANDB", "0") != "1":
                 train_callbacks = [WandbCallback(gradient_save_freq=100)] + train_callbacks
             model.learn(
                 total_timesteps=timesteps_per_class,
@@ -593,7 +651,7 @@ class AnchorTrainerSB3:
         logger.info(f"Results saved to: {self.experiment_folder}")
         
         # Save wandb run URL for later reference
-        if WANDB_AVAILABLE:
+        if WANDB_AVAILABLE and os.environ.get("DISABLE_WANDB", "0") != "1":
             try:
                 if wandb.run is not None:
                     wandb_run_url = wandb.run.url if hasattr(wandb.run, 'url') else None

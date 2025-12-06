@@ -305,6 +305,33 @@ def extract_rules_single_agent(
         "X_range": env_data["X_range"],
     })
     
+    # Check logging verbosity from config and apply to loggers
+    verbosity = env_config.get("logging_verbosity", "normal")
+    verbose_logging = (verbosity == "verbose")
+    
+    # Apply logging verbosity to all loggers
+    import logging
+    level = logging.WARNING if verbosity == "quiet" else (logging.DEBUG if verbosity == "verbose" else logging.INFO)
+    
+    # Set root logger level
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+    
+    # Set for all existing loggers
+    for name in logging.Logger.manager.loggerDict:
+        if isinstance(logging.Logger.manager.loggerDict[name], logging.Logger):
+            log = logging.getLogger(name)
+            log.setLevel(level)
+            for handler in log.handlers:
+                handler.setLevel(level)
+    
+    if verbose_logging:
+        logger.info("Verbose logging enabled - showing detailed debug information")
+    elif verbosity == "quiet":
+        logger.warning("Quiet logging mode enabled - only warnings and errors will be shown")
+    
     # Always use test data for inference
     if eval_on_test_data:
         if env_data.get("X_test_unit") is None:
@@ -361,13 +388,18 @@ def extract_rules_single_agent(
     
     for target_class in target_classes:
         # Try best model first (prefer best model over final model)
-        model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
+        # Best model is saved as best_model.zip in best_model/class_X/ directory
+        model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", "best_model.zip")
+        if not os.path.exists(model_path):
+            # Also try the old naming convention for backward compatibility
+            model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
         if not os.path.exists(model_path):
             # Fallback to final model if best model doesn't exist
             model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip")
         
         if not os.path.exists(model_path):
             logger.warning(f"Model for class {target_class} not found")
+            logger.warning(f"  Tried: best_model/class_{target_class}/best_model.zip")
             logger.warning(f"  Tried: best_model/class_{target_class}/class_{target_class}.zip")
             logger.warning(f"  Tried: final_model/class_{target_class}.zip")
             continue
@@ -698,6 +730,37 @@ def extract_rules_single_agent(
         logger.info(f"  Unique rules (after deduplication): {len(unique_rules)}")
     
     logger.info("\n" + "="*80)
+    
+    # Save results if output_dir is provided
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Convert to serializable format
+        def _convert_to_serializable(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.integer, np.int_)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, dict):
+                return {k: _convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [_convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+        
+        rules_filepath = os.path.join(output_dir, "extracted_rules_single_agent.json")
+        serializable_results = _convert_to_serializable(results)
+        
+        with open(rules_filepath, 'w') as f:
+            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Results saved to: {rules_filepath}")
     
     return results
 

@@ -51,9 +51,9 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-# CPU-optimized: Reduced for faster iteration, adjusted to be divisible by off_policy_collected_frames_per_batch (32000)
-# 20 * 8000 = 160,000 frames
-max_n_frames: 160_000
+# Increased for better convergence with max_cycles=500: 600 * 500 = 300,000 frames
+# This maintains similar episode count while allowing longer episodes for better anchor refinement
+max_n_frames: 300_000
 
 # Number of frames collected and each experiment iteration
 # CPU-optimized: Reduced batch size to prevent CPU overload and hangs

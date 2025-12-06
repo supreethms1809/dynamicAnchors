@@ -567,6 +567,46 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     # Format title with dataset name
     title_prefix = f"Single-Agent - {dataset_name.upper()}" if dataset_name else "Single-Agent"
     
+    # Helper function to sort rules for consistent ordering in plots
+    def sort_rules_for_plotting(class_data: Dict, rules: List[str]) -> List[str]:
+        """
+        Sort rules for consistent plotting order.
+        Priority: 1) Use ranked_unique_rules if available (already sorted)
+                  2) Sort by metrics from ranked_rules if available
+                  3) Sort by rule length (simpler first), then alphabetically
+        """
+        # If rules are already ranked, use them as-is
+        ranked_unique = class_data.get("ranked_unique_rules", [])
+        if ranked_unique and set(rules) == set(ranked_unique):
+            return ranked_unique
+        
+        # Try to get metrics from ranked_rules
+        ranked_rules_with_metrics = class_data.get("ranked_rules", [])
+        if ranked_rules_with_metrics:
+            # Create a mapping from rule string to metrics
+            rule_to_metrics = {r["rule"]: r for r in ranked_rules_with_metrics if isinstance(r, dict) and "rule" in r}
+            
+            # Sort by combined_score (descending), then precision, then coverage
+            def sort_key(rule_str: str) -> tuple:
+                if rule_str in rule_to_metrics:
+                    metrics = rule_to_metrics[rule_str]
+                    return (
+                        -metrics.get("combined_score", 0.0),  # Negative for descending
+                        -metrics.get("rule_precision", 0.0),
+                        -metrics.get("rule_coverage", 0.0)
+                    )
+                # Fallback: sort by rule length (shorter/simpler first), then alphabetically
+                return (len(extract_feature_intervals_from_rule(rule_str)), rule_str)
+            
+            return sorted(rules, key=sort_key)
+        
+        # Fallback: sort by rule length (simpler rules first), then alphabetically
+        def sort_key(rule_str: str) -> tuple:
+            intervals = extract_feature_intervals_from_rule(rule_str)
+            return (len(intervals), rule_str)  # Shorter rules first, then alphabetical
+        
+        return sorted(rules, key=sort_key)
+    
     # Get classes with multiple rules for overlap visualization
     # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
     classes_with_rules = []
@@ -577,6 +617,9 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
         if not ranked_rules:
             # Fallback to unique_rules if ranked rules not available
             ranked_rules = class_data.get("unique_rules", [])
+        
+        # Sort rules for consistent plotting
+        ranked_rules = sort_rules_for_plotting(class_data, ranked_rules)
         
         if len(ranked_rules) > 1:
             classes_with_rules.append((target_class, ranked_rules))
@@ -685,7 +728,12 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     # Calculate rule overlap helper function
     def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
                                rule2_intervals: List[Tuple[str, float, float]]) -> float:
-        """Calculate overlap score between two rules based on their intervals."""
+        """
+        Calculate overlap score between two rules based on their intervals.
+        
+        Since rules are AND conditions, we use the minimum overlap across all common features.
+        This correctly reflects that ALL features must overlap for rules to overlap.
+        """
         if not rule1_intervals or not rule2_intervals:
             return 0.0
         
@@ -699,7 +747,7 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
             return 0.0
         
         # Calculate overlap for each common feature
-        total_overlap = 0.0
+        feature_overlaps = []
         for feat in common_features:
             lower1, upper1 = rule1_dict[feat]
             lower2, upper2 = rule2_dict[feat]
@@ -716,10 +764,21 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
                 union = union_upper - union_lower
                 
                 if union > 0:
-                    total_overlap += intersection / union
+                    feature_overlaps.append(intersection / union)
+                else:
+                    # Zero-width intervals: if they're the same point, perfect overlap (1.0)
+                    # Otherwise, different points, no overlap (0.0)
+                    if lower1 == upper1 == lower2 == upper2:
+                        feature_overlaps.append(1.0)
+                    else:
+                        feature_overlaps.append(0.0)
+            else:
+                # No intersection for this feature
+                feature_overlaps.append(0.0)
         
-        # Normalize by number of common features
-        return total_overlap / len(common_features) if common_features else 0.0
+        # For AND conditions, use minimum (all features must overlap)
+        # This is more accurate than averaging, which can overestimate overlap
+        return min(feature_overlaps) if feature_overlaps else 0.0
     
     # Plot rule overlap for each class
     if n_overlap_classes == 0:

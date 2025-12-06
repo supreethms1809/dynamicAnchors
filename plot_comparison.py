@@ -676,7 +676,12 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
     # Calculate rule overlap for each class
     def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
                                rule2_intervals: List[Tuple[str, float, float]]) -> float:
-        """Calculate overlap score between two rules based on their intervals."""
+        """
+        Calculate overlap score between two rules based on their intervals.
+        
+        Since rules are AND conditions, we use the minimum overlap across all common features.
+        This correctly reflects that ALL features must overlap for rules to overlap.
+        """
         if not rule1_intervals or not rule2_intervals:
             return 0.0
         
@@ -690,7 +695,7 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
             return 0.0
         
         # Calculate overlap for each common feature
-        total_overlap = 0.0
+        feature_overlaps = []
         for feat in common_features:
             lower1, upper1 = rule1_dict[feat]
             lower2, upper2 = rule2_dict[feat]
@@ -707,10 +712,61 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
                 union = union_upper - union_lower
                 
                 if union > 0:
-                    total_overlap += intersection / union
+                    feature_overlaps.append(intersection / union)
+                else:
+                    # Zero-width intervals: if they're the same point, perfect overlap (1.0)
+                    # Otherwise, different points, no overlap (0.0)
+                    if lower1 == upper1 == lower2 == upper2:
+                        feature_overlaps.append(1.0)
+                    else:
+                        feature_overlaps.append(0.0)
+            else:
+                # No intersection for this feature
+                feature_overlaps.append(0.0)
         
-        # Normalize by number of common features
-        return total_overlap / len(common_features) if common_features else 0.0
+        # For AND conditions, use minimum (all features must overlap)
+        # This is more accurate than averaging, which can overestimate overlap
+        return min(feature_overlaps) if feature_overlaps else 0.0
+    
+    # Helper function to sort rules for consistent ordering in plots
+    def sort_rules_for_plotting(class_data: Dict, rules: List[str]) -> List[str]:
+        """
+        Sort rules for consistent plotting order.
+        Priority: 1) Use ranked_unique_rules if available (already sorted)
+                  2) Sort by metrics from ranked_rules if available
+                  3) Sort by rule length (simpler first), then alphabetically
+        """
+        # If rules are already ranked, use them as-is
+        ranked_unique = class_data.get("ranked_unique_rules", [])
+        if ranked_unique and set(rules) == set(ranked_unique):
+            return ranked_unique
+        
+        # Try to get metrics from ranked_rules
+        ranked_rules_with_metrics = class_data.get("ranked_rules", [])
+        if ranked_rules_with_metrics:
+            # Create a mapping from rule string to metrics
+            rule_to_metrics = {r["rule"]: r for r in ranked_rules_with_metrics if isinstance(r, dict) and "rule" in r}
+            
+            # Sort by combined_score (descending), then precision, then coverage
+            def sort_key(rule_str: str) -> tuple:
+                if rule_str in rule_to_metrics:
+                    metrics = rule_to_metrics[rule_str]
+                    return (
+                        -metrics.get("combined_score", 0.0),  # Negative for descending
+                        -metrics.get("rule_precision", 0.0),
+                        -metrics.get("rule_coverage", 0.0)
+                    )
+                # Fallback: sort by rule length (shorter/simpler first), then alphabetically
+                return (len(extract_feature_intervals_from_rule(rule_str)), rule_str)
+            
+            return sorted(rules, key=sort_key)
+        
+        # Fallback: sort by rule length (simpler rules first), then alphabetically
+        def sort_key(rule_str: str) -> tuple:
+            intervals = extract_feature_intervals_from_rule(rule_str)
+            return (len(intervals), rule_str)  # Shorter rules first, then alphabetical
+        
+        return sorted(rules, key=sort_key)
     
     # Find class with most rules
     # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
@@ -724,6 +780,9 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
         if not ranked_rules:
             # Fallback to unique_rules if ranked rules not available
             ranked_rules = class_data.get("unique_rules", [])
+        
+        # Sort rules for consistent plotting
+        ranked_rules = sort_rules_for_plotting(class_data, ranked_rules)
         
         if len(ranked_rules) > max_rules_count:
             max_rules_count = len(ranked_rules)
@@ -753,14 +812,16 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
     if not class_rules:
         class_rules = class_data.get("unique_rules", [])
     
+    # Sort rules for consistent plotting
+    class_rules = sort_rules_for_plotting(class_data, class_rules)
+    
     if len(class_rules) <= 1:
         ax.text(0.5, 0.5, f'Class {class_with_most_rules} has only 1 rule\n(no overlap to show)', 
                 ha='center', va='center', transform=ax.transAxes, fontsize=9)
         ax.set_title(title, fontsize=10, fontweight='bold')
         return
     
-    # Always show top 5 rules for overlap analysis
-    # Always show top 5 rules for overlap analysis (already ranked if available)
+    # Always show top 5 rules for overlap analysis (already sorted)
     n_rules_to_show = min(5, len(class_rules))
     class_rules_subset = class_rules[:n_rules_to_show]
     
@@ -824,7 +885,12 @@ def plot_rule_overlap_comparison_per_class(
     # Calculate rule overlap helper function
     def calculate_rule_overlap(rule1_intervals: List[Tuple[str, float, float]], 
                                rule2_intervals: List[Tuple[str, float, float]]) -> float:
-        """Calculate overlap score between two rules based on their intervals."""
+        """
+        Calculate overlap score between two rules based on their intervals.
+        
+        Since rules are AND conditions, we use the minimum overlap across all common features.
+        This correctly reflects that ALL features must overlap for rules to overlap.
+        """
         if not rule1_intervals or not rule2_intervals:
             return 0.0
         
@@ -835,7 +901,8 @@ def plot_rule_overlap_comparison_per_class(
         if not common_features:
             return 0.0
         
-        total_overlap = 0.0
+        # Calculate overlap for each common feature
+        feature_overlaps = []
         for feat in common_features:
             lower1, upper1 = rule1_dict[feat]
             lower2, upper2 = rule2_dict[feat]
@@ -850,9 +917,16 @@ def plot_rule_overlap_comparison_per_class(
                 union = union_upper - union_lower
                 
                 if union > 0:
-                    total_overlap += intersection / union
+                    feature_overlaps.append(intersection / union)
+                else:
+                    feature_overlaps.append(0.0)
+            else:
+                # No intersection for this feature
+                feature_overlaps.append(0.0)
         
-        return total_overlap / len(common_features) if common_features else 0.0
+        # For AND conditions, use minimum (all features must overlap)
+        # This is more accurate than averaging, which can overestimate overlap
+        return min(feature_overlaps) if feature_overlaps else 0.0
     
     def plot_overlap_for_class(ax, class_rules: List[str], class_num: int, title: str, per_class_data: Optional[Dict] = None):
         """Plot overlap heatmap for a class on given axis."""
@@ -862,7 +936,11 @@ def plot_rule_overlap_comparison_per_class(
             ax.set_title(title, fontsize=10, fontweight='bold')
             return
         
-        # Always show top 5 rules for overlap analysis (already ranked if per_class_data has ranked_rules)
+        # Sort rules for consistent plotting if per_class_data is available
+        if per_class_data:
+            class_rules = sort_rules_for_plotting(per_class_data, class_rules)
+        
+        # Always show top 5 rules for overlap analysis (already sorted)
         n_rules_to_show = min(5, len(class_rules))
         class_rules_subset = class_rules[:n_rules_to_show]
         
@@ -954,6 +1032,8 @@ def plot_rule_overlap_comparison_per_class(
                 sa_class_rules = class_data.get("ranked_unique_rules", [])
                 if not sa_class_rules:
                     sa_class_rules = class_data.get("unique_rules", [])
+                # Sort rules for consistent plotting
+                sa_class_rules = sort_rules_for_plotting(class_data, sa_class_rules)
                 break
         
         for class_data in ma_per_class.values():
@@ -963,6 +1043,8 @@ def plot_rule_overlap_comparison_per_class(
                 ma_class_rules = class_data.get("ranked_unique_rules", [])
                 if not ma_class_rules:
                     ma_class_rules = class_data.get("unique_rules", [])
+                # Sort rules for consistent plotting
+                ma_class_rules = sort_rules_for_plotting(class_data, ma_class_rules)
                 break
         
         # Plot single-agent overlap

@@ -1669,6 +1669,29 @@ def main(
     unique_classes_train = np.unique(y_train)
     n_classes = len(unique_classes_train)
     
+    # Determine training parameters based on dataset size and type
+    # Large datasets (folktables, uci, housing, covtype) need longer training
+    n_train_samples = len(X_train)
+    is_large_dataset = (
+        dataset_name.startswith("folktables_") or 
+        dataset_name.startswith("uci_") or 
+        dataset_name in ["housing", "covtype"] or
+        n_train_samples > 10000
+    )
+    
+    if is_large_dataset:
+        # Use longer training for large datasets
+        classifier_epochs = 500
+        classifier_patience = 100
+        print(f"\nLarge dataset detected ({n_train_samples} samples), using extended training:")
+        print(f"  Epochs: {classifier_epochs}, Patience: {classifier_patience}")
+    else:
+        # Standard training for smaller datasets
+        classifier_epochs = 100
+        classifier_patience = 10
+        print(f"\nStandard dataset ({n_train_samples} samples), using standard training:")
+        print(f"  Epochs: {classifier_epochs}, Patience: {classifier_patience}")
+    
     # Train classifier
     print("\n" + "="*80)
     print("STEP 2: Training Classifier")
@@ -1679,10 +1702,10 @@ def main(
         n_features=n_features,
         n_classes=n_classes,
         device=device,
-        epochs=100,
+        epochs=classifier_epochs,
         batch_size=256,
         lr=1e-3,
-        patience=10
+        patience=classifier_patience
     )
     
     print(f"\nClassifier test accuracy: {test_acc:.3f}")
