@@ -219,6 +219,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
+    total_timesteps: int = 12_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -231,6 +232,7 @@ def run_single_agent_training(
         device: Device to use
         output_dir: Output directory (optional)
         force_retrain: If True, retrain even if experiment exists
+        total_timesteps: Total timesteps for training
         **kwargs: Additional arguments to pass to driver
     
     Returns:
@@ -270,6 +272,7 @@ def run_single_agent_training(
         "--algorithm", algorithm,
         "--seed", str(seed),
         "--device", device,
+        "--total_timesteps", str(total_timesteps),
         "--output_dir", output_dir,
     ]
     
@@ -548,8 +551,35 @@ def run_multi_agent_training(
             logger.info(f"✓ Using experiment directory from training output: {experiment_dir_from_output}")
             return str(experiment_dir_from_output)
         
-        # Fallback: Find the experiment directory (checkpoint path)
-        # BenchMARL creates experiment directories directly in the BenchMARL directory
+        # Fallback: Find the experiment directory by searching BenchMARL/ root
+        # BenchMARL/Hydra creates experiment directories directly in the BenchMARL directory
+        # with names like: maddpg_anchor_mlp__{hash}_{date}-{time}
+        benchmarl_dir = PROJECT_ROOT / "BenchMARL"
+        if benchmarl_dir.exists():
+            # Find most recent experiment directory that matches algorithm and has checkpoints/individual_models
+            experiment_dirs = []
+            excluded_dirs = {'output', 'conf', 'data', 'docs', '__pycache__', 'old_results', '.git'}
+            
+            for item in benchmarl_dir.iterdir():
+                if item.is_dir() and not item.name.startswith('.') and item.name not in excluded_dirs:
+                    # Check if this looks like an experiment directory
+                    if (item / "checkpoints").exists() or (item / "individual_models").exists() or (item / "config.pkl").exists():
+                        # Check if it matches the algorithm pattern (e.g., "maddpg" in name)
+                        if algorithm.lower() in item.name.lower():
+                            # Check if it was created recently (within last hour for newly trained models)
+                            import time
+                            mtime = item.stat().st_mtime
+                            if time.time() - mtime < 3600:  # Within last hour
+                                experiment_dirs.append(item)
+            
+            if experiment_dirs:
+                # Get most recent
+                experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
+                logger.info(f"✓ Found experiment directory (fallback search, recent): {experiment_dir}")
+                return str(experiment_dir)
+        
+        logger.warning("⚠ Training completed but could not find experiment directory")
+        return None
         # with names like: maddpg_anchor_mlp__e30d851d_25_11_29-19_41_35
         benchmarl_dir = PROJECT_ROOT / "BenchMARL"
         
@@ -1501,7 +1531,8 @@ Examples:
     baseline_results_file = None
     
     # Run baseline pipeline first (it's independent and typically faster)
-    if not args.skip_baseline:
+    # Skip if either --skip_baseline or --skip_training is set (baseline includes training)
+    if not args.skip_baseline and not args.skip_training:
         logger.info(f"\n{'='*80}")
         logger.info("BASELINE PIPELINE")
         logger.info(f"{'='*80}\n")
@@ -1523,6 +1554,10 @@ Examples:
             )
     else:
         # Try to find existing baseline results
+        if args.skip_training:
+            logger.info(f"\n{'='*80}")
+            logger.info("BASELINE PIPELINE (SKIPPED - --skip_training enabled)")
+            logger.info(f"{'='*80}\n")
         baseline_dir = output_path / "baseline"
         if baseline_dir.exists():
             baseline_files = list(baseline_dir.glob("baseline_results_*.json"))
@@ -1625,27 +1660,42 @@ Examples:
                 force_retrain=args.force_retrain
             )
         else:
+            logger.info("Training skipped (--skip_training). Looking for existing experiment directory...")
             # Try to find existing experiment directory
             if args.multi_agent_output_dir:
                 multi_agent_experiment_dir = args.multi_agent_output_dir
+                logger.info(f"Using specified multi-agent output directory: {multi_agent_experiment_dir}")
             else:
-                # Check BenchMARL output directory
-                default_dir = PROJECT_ROOT / "BenchMARL" / "output" / f"{args.dataset}_{multi_agent_algorithm}" / "training"
-                if default_dir.exists():
-                    experiment_dirs = [d for d in default_dir.iterdir() if d.is_dir()]
+                # BenchMARL/Hydra stores experiments directly in the BenchMARL root directory
+                # with names like: maddpg_anchor_mlp__{hash}_{date}-{time}
+                # The experiment directory name is printed in training output: "BenchMARL checkpoint location: {path}"
+                benchmarl_dir = PROJECT_ROOT / "BenchMARL"
+                
+                if benchmarl_dir.exists():
+                    experiment_dirs = []
+                    for item in benchmarl_dir.iterdir():
+                        if item.is_dir() and not item.name.startswith('.') and item.name not in ['output', 'conf', 'data', 'docs', '__pycache__', 'old_results']:
+                            # Check if this looks like an experiment directory
+                            if (item / "checkpoints").exists() or (item / "individual_models").exists() or (item / "config.pkl").exists():
+                                # Check if it matches the algorithm pattern (e.g., "maddpg" in name)
+                                if multi_agent_algorithm.lower() in item.name.lower():
+                                    experiment_dirs.append(item)
+                    
                     if experiment_dirs:
+                        # Sort by modification time (most recent first)
                         multi_agent_experiment_dir = str(max(experiment_dirs, key=lambda p: p.stat().st_mtime))
-                        logger.info(f"Found existing experiment directory: {multi_agent_experiment_dir}")
+                        logger.info(f"✓ Found existing experiment directory in BenchMARL/: {multi_agent_experiment_dir}")
+                    else:
+                        logger.warning(f"⚠ No experiment directories found in {benchmarl_dir} matching algorithm '{multi_agent_algorithm}'")
                 else:
-                    # Also check if experiment directory is directly in output (BenchMARL structure)
-                    output_dir = PROJECT_ROOT / "BenchMARL" / "output" / f"{args.dataset}_{multi_agent_algorithm}"
-                    if output_dir.exists():
-                        experiment_dirs = [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
-                        for exp_dir in experiment_dirs:
-                            if (exp_dir / "checkpoints").exists() or (exp_dir / "individual_models").exists():
-                                multi_agent_experiment_dir = str(exp_dir)
-                                logger.info(f"Found existing experiment directory: {multi_agent_experiment_dir}")
-                                break
+                    logger.warning(f"⚠ BenchMARL directory not found at {benchmarl_dir}")
+                
+                if not multi_agent_experiment_dir:
+                    logger.warning("⚠ No existing multi-agent experiment directory found.")
+                    logger.warning("  Multi-agent inference, testing, and summarization will be skipped.")
+                    logger.warning("  To run multi-agent pipeline, either:")
+                    logger.warning("    1. Run without --skip_training to train a new model")
+                    logger.warning("    2. Specify --multi_agent_output_dir to point to an existing experiment")
         
         # Inference
         if not args.skip_inference and multi_agent_experiment_dir:
@@ -1657,13 +1707,20 @@ Examples:
                 n_instances_per_class=args.n_instances_per_class,
                 device=args.device
             )
-        else:
+        elif args.skip_inference:
+            logger.info("Inference skipped (--skip_inference). Looking for existing rules file...")
             # Try to find existing rules file
             if multi_agent_experiment_dir:
                 rules_file = Path(multi_agent_experiment_dir) / "inference" / "extracted_rules.json"
                 if rules_file.exists():
                     multi_agent_rules_file = str(rules_file)
-                    logger.info(f"Found existing rules file: {multi_agent_rules_file}")
+                    logger.info(f"✓ Found existing rules file: {multi_agent_rules_file}")
+                else:
+                    logger.warning(f"⚠ Rules file not found at {rules_file}")
+            else:
+                logger.warning("⚠ Cannot search for rules file: no experiment directory found")
+        elif not multi_agent_experiment_dir:
+            logger.warning("⚠ Inference skipped: no experiment directory found")
         
         # Testing
         if not args.skip_testing and multi_agent_rules_file:
@@ -1672,6 +1729,10 @@ Examples:
                 dataset=args.dataset,
                 seed=args.seed
             )
+        elif args.skip_testing:
+            logger.info("Testing skipped (--skip_testing)")
+        elif not multi_agent_rules_file:
+            logger.warning("⚠ Testing skipped: no rules file found")
         
         # Summarize and plot
         if multi_agent_rules_file:
@@ -1687,6 +1748,11 @@ Examples:
             summary_file = ma_output_dir / "summary.json"
             if summary_file.exists():
                 multi_agent_summary_file = str(summary_file)
+                logger.info(f"✓ Multi-agent summary saved to: {multi_agent_summary_file}")
+            else:
+                logger.warning(f"⚠ Multi-agent summary file not found at {summary_file}")
+        else:
+            logger.warning("⚠ Summarization skipped: no rules file available")
     
     # Create comparison summary
     if single_agent_summary_file or multi_agent_summary_file:

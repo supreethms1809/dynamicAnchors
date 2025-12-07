@@ -35,7 +35,9 @@ env_config:
   max_action_scale: 0.1
   min_absolute_step: 0.001
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
-  shared_reward_weight: 0.02  # Weight for shared cooperative reward (reduced from 0.2 to prevent high cumulative rewards)
+  shared_reward_weight: 0.5  # Weight for shared cooperative reward - MUST be significant to encourage cooperation
+  # If shared_reward_weight is too low, multi-agent training becomes equivalent to independent single-agent training
+  # The shared reward incentivizes agents to work together and achieve collective goals
   # Class union metrics weights: reward agents based on union of all agents' anchors for their class
   class_union_cov_weight: 0.01   # Weight for class-union coverage bonus (reduced from 0.1 to prevent high cumulative rewards)
   class_union_prec_weight: 0.01  # Weight for class-union precision bonus (reduced from 0.1 to prevent high cumulative rewards)
@@ -44,8 +46,8 @@ env_config:
   global_coverage_threshold: 0.1 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
   # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
   # These bonuses reward good coverage behavior (same as single-agent for fair comparison)
-  coverage_bonus_weight_met: 0.01          # When targets are met: weight * (coverage / target)
-  coverage_bonus_weight_high_prec: 0.03    # When precision >= threshold and making progress: base weight
+  coverage_bonus_weight_met: 0.1          # When targets are met: weight * (coverage / target)
+  coverage_bonus_weight_high_prec: 0.1    # When precision >= threshold and making progress: base weight
   coverage_bonus_weight_high_prec_progress: 0.07  # Progress multiplier when precision >= threshold
   coverage_bonus_weight_high_prec_distance: 0.02  # Distance to target multiplier when precision >= threshold
   coverage_bonus_weight_reasonable_prec: 0.01     # When precision >= 0.8 * threshold and making progress: base weight

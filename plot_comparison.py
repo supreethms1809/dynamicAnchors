@@ -66,15 +66,75 @@ def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float,
     return intervals
 
 
-def load_summary_file(summary_file: str) -> Dict:
+def sort_rules_for_plotting(class_data: Dict, rules: List[str]) -> List[str]:
+    """
+    Sort rules for consistent plotting order.
+    Priority: 1) Use ranked_unique_rules if available (already sorted)
+              2) Sort by metrics from ranked_rules if available
+              3) Sort by rule length (simpler first), then alphabetically
+    """
+    # If rules are already ranked, use them as-is
+    ranked_unique = class_data.get("ranked_unique_rules", [])
+    if ranked_unique and set(rules) == set(ranked_unique):
+        return ranked_unique
+    
+    # Try to get metrics from ranked_rules
+    ranked_rules_with_metrics = class_data.get("ranked_rules", [])
+    if ranked_rules_with_metrics:
+        # Create a mapping from rule string to metrics
+        rule_to_metrics = {r["rule"]: r for r in ranked_rules_with_metrics if isinstance(r, dict) and "rule" in r}
+        
+        # Sort by combined_score (descending), then precision, then coverage
+        def sort_key(rule_str: str) -> tuple:
+            if rule_str in rule_to_metrics:
+                metrics = rule_to_metrics[rule_str]
+                return (
+                    -metrics.get("combined_score", 0.0),  # Negative for descending
+                    -metrics.get("rule_precision", 0.0),
+                    -metrics.get("rule_coverage", 0.0)
+                )
+            # Fallback: sort by rule length (shorter/simpler first), then alphabetically
+            return (len(extract_feature_intervals_from_rule(rule_str)), rule_str)
+        
+        return sorted(rules, key=sort_key)
+    
+    # Fallback: sort by rule length (simpler rules first), then alphabetically
+    def sort_key(rule_str: str) -> tuple:
+        intervals = extract_feature_intervals_from_rule(rule_str)
+        return (len(intervals), rule_str)  # Shorter rules first, then alphabetical
+    
+    return sorted(rules, key=sort_key)
+
+
+def load_summary_file(summary_file: str) -> Optional[Dict]:
     """Load summary JSON file."""
-    with open(summary_file, 'r') as f:
-        data = json.load(f)
+    if not os.path.exists(summary_file):
+        logger.warning(f"Summary file does not exist: {summary_file}")
+        return None
+    
+    try:
+        with open(summary_file, 'r') as f:
+            data = json.load(f)
+        
         # Handle nested structure: {"summary": {...}, "test_results": {...}}
         if "summary" in data:
-            return data["summary"]
+            summary = data["summary"]
+            # Check if summary is actually empty or None
+            if not summary:
+                logger.warning(f"Summary file {summary_file} contains empty 'summary' field")
+                return None
+            return summary
         # If already flat structure, return as-is
+        if not data:
+            logger.warning(f"Summary file {summary_file} is empty")
+            return None
         return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from {summary_file}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to load summary file {summary_file}: {e}")
+        return None
 
 
 def extract_baseline_metrics(baseline_results_file: str) -> Optional[Dict]:
@@ -453,7 +513,7 @@ def plot_precision_coverage_comparison(
     logger.info(f"Saved precision-coverage comparison plot to {output_dir}/precision_coverage_comparison.png")
 
 
-def plot_feature_importance_subplot(ax, summary: Dict, title: str, top_n: int = 10):
+def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top_n: int = 10):
     """
     Plot feature importance on a given axis with class-wise breakdown.
     
@@ -461,6 +521,11 @@ def plot_feature_importance_subplot(ax, summary: Dict, title: str, top_n: int = 
     Normalized to percentages (sum to 100%) for easy interpretation.
     Shows overall importance with stacked bars indicating per-class contributions.
     """
+    if summary is None:
+        ax.text(0.5, 0.5, 'No summary data available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        return
+    
     per_class = summary.get("per_class_summary", {})
     
     # Collect feature intervals per class and globally
@@ -605,8 +670,13 @@ def plot_feature_importance_subplot(ax, summary: Dict, title: str, top_n: int = 
         cbar.set_label('Importance (%)', fontsize=7, fontweight='bold')
 
 
-def plot_global_metrics_subplot(ax, summary: Dict, title: str):
+def plot_global_metrics_subplot(ax, summary: Optional[Dict], title: str):
     """Plot global metrics on a given axis."""
+    if summary is None:
+        ax.text(0.5, 0.5, 'No summary data available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        return
+    
     per_class = summary.get("per_class_summary", {})
     overall_stats = summary.get("overall_stats", {})
     
@@ -728,46 +798,6 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
         # This is more accurate than averaging, which can overestimate overlap
         return min(feature_overlaps) if feature_overlaps else 0.0
     
-    # Helper function to sort rules for consistent ordering in plots
-    def sort_rules_for_plotting(class_data: Dict, rules: List[str]) -> List[str]:
-        """
-        Sort rules for consistent plotting order.
-        Priority: 1) Use ranked_unique_rules if available (already sorted)
-                  2) Sort by metrics from ranked_rules if available
-                  3) Sort by rule length (simpler first), then alphabetically
-        """
-        # If rules are already ranked, use them as-is
-        ranked_unique = class_data.get("ranked_unique_rules", [])
-        if ranked_unique and set(rules) == set(ranked_unique):
-            return ranked_unique
-        
-        # Try to get metrics from ranked_rules
-        ranked_rules_with_metrics = class_data.get("ranked_rules", [])
-        if ranked_rules_with_metrics:
-            # Create a mapping from rule string to metrics
-            rule_to_metrics = {r["rule"]: r for r in ranked_rules_with_metrics if isinstance(r, dict) and "rule" in r}
-            
-            # Sort by combined_score (descending), then precision, then coverage
-            def sort_key(rule_str: str) -> tuple:
-                if rule_str in rule_to_metrics:
-                    metrics = rule_to_metrics[rule_str]
-                    return (
-                        -metrics.get("combined_score", 0.0),  # Negative for descending
-                        -metrics.get("rule_precision", 0.0),
-                        -metrics.get("rule_coverage", 0.0)
-                    )
-                # Fallback: sort by rule length (shorter/simpler first), then alphabetically
-                return (len(extract_feature_intervals_from_rule(rule_str)), rule_str)
-            
-            return sorted(rules, key=sort_key)
-        
-        # Fallback: sort by rule length (simpler rules first), then alphabetically
-        def sort_key(rule_str: str) -> tuple:
-            intervals = extract_feature_intervals_from_rule(rule_str)
-            return (len(intervals), rule_str)  # Shorter rules first, then alphabetical
-        
-        return sorted(rules, key=sort_key)
-    
     # Find class with most rules
     # Prefer ranked rules if available (from test_extracted_rules), otherwise use unique_rules
     class_with_most_rules = None
@@ -872,14 +902,19 @@ def plot_rule_overlap_subplot(ax, summary: Dict, title: str, max_rules: int = 5)
 
 
 def plot_rule_overlap_comparison_per_class(
-    single_agent_summary: Dict,
-    multi_agent_summary: Dict,
+    single_agent_summary: Optional[Dict],
+    multi_agent_summary: Optional[Dict],
     output_dir: str,
     dataset_name: str = "",
     max_rules: int = 5
 ):
     """Plot rule overlap comparison class-by-class (single vs multi)."""
     if not HAS_PLOTTING:
+        return
+    
+    # Check for None summaries
+    if single_agent_summary is None and multi_agent_summary is None:
+        logger.warning("Both summaries are None, skipping rule overlap comparison.")
         return
     
     # Calculate rule overlap helper function
@@ -989,8 +1024,8 @@ def plot_rule_overlap_comparison_per_class(
         cbar.set_label('Overlap', fontsize=7, fontweight='bold')
     
     # Get classes with multiple rules from both summaries
-    sa_per_class = single_agent_summary.get("per_class_summary", {})
-    ma_per_class = multi_agent_summary.get("per_class_summary", {})
+    sa_per_class = single_agent_summary.get("per_class_summary", {}) if single_agent_summary else {}
+    ma_per_class = multi_agent_summary.get("per_class_summary", {}) if multi_agent_summary else {}
     
     # Find all classes that have multiple rules in either summary
     all_classes = set()
@@ -1159,14 +1194,39 @@ Examples:
     if args.single_agent_summary:
         logger.info(f"Loading single-agent summary from {args.single_agent_summary}")
         single_agent_summary = load_summary_file(args.single_agent_summary)
-        logger.info(f"Single-agent summary keys: {list(single_agent_summary.keys())}")
-        logger.info(f"Single-agent per_class_summary entries: {len(single_agent_summary.get('per_class_summary', {}))}")
+        if single_agent_summary:
+            logger.info(f"✓ Single-agent summary loaded successfully")
+            logger.info(f"  Summary keys: {list(single_agent_summary.keys())}")
+            per_class_count = len(single_agent_summary.get('per_class_summary', {}))
+            logger.info(f"  Per-class summary entries: {per_class_count}")
+            if per_class_count == 0:
+                logger.warning("  ⚠ WARNING: Single-agent summary has no per_class_summary data!")
+        else:
+            logger.warning("⚠ Failed to load single-agent summary (returned None/empty)")
+            single_agent_summary = None
     
     if args.multi_agent_summary:
         logger.info(f"Loading multi-agent summary from {args.multi_agent_summary}")
         multi_agent_summary = load_summary_file(args.multi_agent_summary)
-        logger.info(f"Multi-agent summary keys: {list(multi_agent_summary.keys())}")
-        logger.info(f"Multi-agent per_class_summary entries: {len(multi_agent_summary.get('per_class_summary', {}))}")
+        if multi_agent_summary:
+            logger.info(f"✓ Multi-agent summary loaded successfully")
+            logger.info(f"  Summary keys: {list(multi_agent_summary.keys())}")
+            per_class_count = len(multi_agent_summary.get('per_class_summary', {}))
+            logger.info(f"  Per-class summary entries: {per_class_count}")
+            if per_class_count == 0:
+                logger.warning("  ⚠ WARNING: Multi-agent summary has no per_class_summary data!")
+                logger.warning("  This could mean:")
+                logger.warning("    1. The summary.json file was not generated correctly")
+                logger.warning("    2. The inference/test step did not produce any rules")
+                logger.warning("    3. The file structure is different than expected")
+        else:
+            logger.warning("⚠ Failed to load multi-agent summary (returned None/empty)")
+            logger.warning(f"  File path was: {args.multi_agent_summary}")
+            logger.warning("  This could mean:")
+            logger.warning("    1. The file does not exist")
+            logger.warning("    2. The file is empty or invalid JSON")
+            logger.warning("    3. The file structure is different than expected")
+            multi_agent_summary = None
     
     if args.baseline_results:
         logger.info(f"Loading baseline results from {args.baseline_results}")

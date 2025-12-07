@@ -128,29 +128,42 @@ def load_policy_model(
     input_dim = state_dict[first_layer_key].shape[1]
     output_dim = None
     
-    # Find output dimension from last layer
-    last_layer_key = None
-    for key in sorted(state_dict.keys(), reverse=True):
-        if 'weight' in key:
-            last_layer_key = key
-            output_dim = state_dict[last_layer_key].shape[0]
-            break
+    # Infer hidden layer sizes from the state_dict weights
+    # Sort all weight keys to get layers in order
+    weight_keys = sorted([k for k in state_dict.keys() if 'weight' in k])
+    
+    # Extract hidden layer sizes from weight matrices
+    # For MLP: layer i weight shape is [out_dim, in_dim]
+    # Hidden layers are all layers except first (input->hidden) and last (hidden->output)
+    hidden_sizes = []
+    for i, key in enumerate(weight_keys):
+        weight_shape = state_dict[key].shape
+        if i == 0:
+            # First layer: [hidden1, input_dim]
+            hidden_sizes.append(weight_shape[0])
+        elif i < len(weight_keys) - 1:
+            # Hidden layers: [hidden_i+1, hidden_i]
+            hidden_sizes.append(weight_shape[0])
+        else:
+            # Last layer: [output_dim, hidden_last]
+            output_dim = weight_shape[0]
     
     if output_dim is None:
         raise ValueError(f"Could not infer output dimension from {policy_path}")
     
     logger.info(f"  Inferred model dimensions: input={input_dim}, output={output_dim}")
+    logger.info(f"  Inferred hidden layer sizes from checkpoint: {hidden_sizes}")
     
-    # Create MLP model using BenchMARL's MLP config
-    # We need to create a simple MLP that matches the saved architecture
+    # Create MLP model using the inferred architecture from the checkpoint
+    # This ensures we match the actual trained model, not the config file
     from benchmarl.models.common import ModelConfig
     from torchrl.modules import MLP
     
-    # Build MLP with the inferred dimensions
+    # Build MLP with the inferred dimensions from the checkpoint
     mlp = MLP(
         in_features=input_dim,
         out_features=output_dim,
-        num_cells=mlp_config.num_cells,
+        num_cells=hidden_sizes,  # Use inferred hidden sizes, not config file
         activation_class=mlp_config.activation_class,
         activation_kwargs=mlp_config.activation_kwargs or {},
         norm_class=mlp_config.norm_class,
@@ -966,17 +979,28 @@ def extract_rules_from_policies(
                     if first_layer_key:
                         input_dim = agent_state_dict[first_layer_key].shape[1]
                         output_dim = None
-                        for key in sorted(agent_state_dict.keys(), reverse=True):
-                            if 'weight' in key:
-                                output_dim = agent_state_dict[key].shape[0]
-                                break
+                        
+                        # Infer hidden layer sizes from the state_dict weights
+                        weight_keys = sorted([k for k in agent_state_dict.keys() if 'weight' in k])
+                        hidden_sizes = []
+                        for i, key in enumerate(weight_keys):
+                            weight_shape = agent_state_dict[key].shape
+                            if i == 0:
+                                # First layer: [hidden1, input_dim]
+                                hidden_sizes.append(weight_shape[0])
+                            elif i < len(weight_keys) - 1:
+                                # Hidden layers: [hidden_i+1, hidden_i]
+                                hidden_sizes.append(weight_shape[0])
+                            else:
+                                # Last layer: [output_dim, hidden_last]
+                                output_dim = weight_shape[0]
                         
                         if output_dim:
-                            # Create MLP for this agent
+                            # Create MLP for this agent using inferred architecture
                             agent_mlp = MLP(
                                 in_features=input_dim,
                                 out_features=output_dim,
-                                num_cells=mlp_config.num_cells,
+                                num_cells=hidden_sizes,  # Use inferred hidden sizes, not config file
                                 activation_class=mlp_config.activation_class,
                                 activation_kwargs=mlp_config.activation_kwargs or {},
                                 norm_class=mlp_config.norm_class,
@@ -987,7 +1011,7 @@ def extract_rules_from_policies(
                             agent_mlp.load_state_dict(agent_state_dict)
                             agent_mlp.eval()
                             agent_policies[agent_name] = agent_mlp
-                            logger.info(f"  Extracted policy for {agent_name}")
+                            logger.info(f"  Extracted policy for {agent_name} (hidden sizes: {hidden_sizes})")
                         else:
                             logger.warning(f"  Could not infer output dimension for {agent_name}")
                     else:
