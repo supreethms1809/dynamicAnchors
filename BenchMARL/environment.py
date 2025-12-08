@@ -855,7 +855,7 @@ class AnchorEnv(ParallelEnv):
                 - progress_factor * js_penalty
                 - progress_factor * inter_class_overlap_penalty
                 - progress_factor * same_class_overlap_penalty
-                + coverage_floor_penalty
+                + coverage_floor_penalty )
             
             reward_without_shared[agent] = float(reward_local)
             
