@@ -112,10 +112,6 @@ class AnchorEnv(ParallelEnv):
         self.min_width = env_config.get("min_width", 0.05)
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
-        self.gamma = env_config.get("gamma", 0.1)
-
-        self.directions = ("shrink_lower", "expand_lower", "shrink_upper", "expand_upper")
-        self.precision_target = env_config.get("precision_target", 0.8)
         self.coverage_target = env_config.get("coverage_target", 0.02)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
@@ -844,6 +840,10 @@ class AnchorEnv(ParallelEnv):
             # SS: R_local: Local reward component
             # Note: survival_bonus removed - it was causing positive rewards for long episodes
             # without progress. Episodes should terminate early when targets are met.
+            
+            # SS: R_local: Local reward component
+            # Note: survival_bonus removed - it was causing positive rewards for long episodes
+            # without progress. Episodes should terminate early when targets are met.
             reward_local = (
                 self.alpha * precision_weight * precision_gain_for_reward
                 + coverage_weight * coverage_gain_for_reward
@@ -856,10 +856,6 @@ class AnchorEnv(ParallelEnv):
                 - progress_factor * inter_class_overlap_penalty
                 - progress_factor * same_class_overlap_penalty
                 + coverage_floor_penalty
-            )
-            
-            if not np.isfinite(reward_local):
-                reward_local = 0.0
             
             reward_without_shared[agent] = float(reward_local)
             

@@ -66,6 +66,71 @@ def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float,
     return intervals
 
 
+def calculate_equilibrium_metrics(per_class_summary: Dict, precision_target: float = 0.95, coverage_target: float = 0.5) -> Dict:
+    """
+    Calculate equilibrium metrics from per_class_summary.
+    
+    Equilibrium means all classes meet both precision and coverage targets.
+    This is a fair comparison metric between single-agent and multi-agent:
+    - Single-agent: one agent per class, equilibrium = all classes meet targets
+    - Multi-agent: multiple agents per class, equilibrium = all classes meet targets (union metrics)
+    
+    Returns:
+        Dict with equilibrium metrics:
+        - equilibrium_reached: bool
+        - equilibrium_fraction: float (0.0 to 1.0)
+        - classes_meeting_targets: int
+        - total_classes: int
+        - per_class_status: Dict[class_id, {"meets_targets": bool, "precision_gap": float, "coverage_gap": float}]
+    """
+    if not per_class_summary:
+        return {
+            "equilibrium_reached": False,
+            "equilibrium_fraction": 0.0,
+            "classes_meeting_targets": 0,
+            "total_classes": 0,
+            "per_class_status": {}
+        }
+    
+    classes_meeting_targets = 0
+    per_class_status = {}
+    
+    for class_key, class_data in per_class_summary.items():
+        # Use class-level metrics (union) if available, otherwise instance-level
+        precision = class_data.get("class_precision", class_data.get("instance_precision", 0.0))
+        coverage = class_data.get("class_coverage", class_data.get("instance_coverage", 0.0))
+        
+        meets_precision = precision >= precision_target
+        meets_coverage = coverage >= coverage_target
+        meets_both = meets_precision and meets_coverage
+        
+        if meets_both:
+            classes_meeting_targets += 1
+        
+        class_id = class_data.get("class", -1)
+        per_class_status[class_id] = {
+            "meets_targets": meets_both,
+            "precision": precision,
+            "coverage": coverage,
+            "precision_gap": max(0.0, precision_target - precision),
+            "coverage_gap": max(0.0, coverage_target - coverage)
+        }
+    
+    total_classes = len(per_class_summary)
+    equilibrium_fraction = classes_meeting_targets / total_classes if total_classes > 0 else 0.0
+    equilibrium_reached = (classes_meeting_targets == total_classes) and (total_classes > 0)
+    
+    return {
+        "equilibrium_reached": equilibrium_reached,
+        "equilibrium_fraction": equilibrium_fraction,
+        "classes_meeting_targets": classes_meeting_targets,
+        "total_classes": total_classes,
+        "per_class_status": per_class_status,
+        "precision_target": precision_target,
+        "coverage_target": coverage_target
+    }
+
+
 def sort_rules_for_plotting(class_data: Dict, rules: List[str]) -> List[str]:
     """
     Sort rules for consistent plotting order.
@@ -670,6 +735,86 @@ def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top
         cbar.set_label('Importance (%)', fontsize=7, fontweight='bold')
 
 
+def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_agent_summary: Optional[Dict], 
+                                precision_target: float = 0.95, coverage_target: float = 0.5):
+    """Plot equilibrium comparison between single-agent and multi-agent."""
+    if not HAS_PLOTTING:
+        return
+    
+    single_eq = None
+    multi_eq = None
+    
+    if single_agent_summary:
+        single_per_class = single_agent_summary.get("per_class_summary", {})
+        if single_per_class:
+            single_eq = calculate_equilibrium_metrics(single_per_class, precision_target, coverage_target)
+    
+    if multi_agent_summary:
+        multi_per_class = multi_agent_summary.get("per_class_summary", {})
+        if multi_per_class:
+            multi_eq = calculate_equilibrium_metrics(multi_per_class, precision_target, coverage_target)
+    
+    if not single_eq and not multi_eq:
+        ax.text(0.5, 0.5, 'No equilibrium data available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Equilibrium Comparison', fontsize=11, fontweight='bold')
+        return
+    
+    # Prepare data for plotting
+    methods = []
+    equilibrium_fractions = []
+    equilibrium_reached = []
+    colors = []
+    
+    if single_eq:
+        methods.append('Single-Agent')
+        equilibrium_fractions.append(single_eq["equilibrium_fraction"])
+        equilibrium_reached.append(single_eq["equilibrium_reached"])
+        colors.append('steelblue' if single_eq["equilibrium_reached"] else 'lightblue')
+    
+    if multi_eq:
+        methods.append('Multi-Agent')
+        equilibrium_fractions.append(multi_eq["equilibrium_fraction"])
+        equilibrium_reached.append(multi_eq["equilibrium_reached"])
+        colors.append('darkgreen' if multi_eq["equilibrium_reached"] else 'lightgreen')
+    
+    if not methods:
+        return
+    
+    x = np.arange(len(methods))
+    bars = ax.bar(x, equilibrium_fractions, alpha=0.8, color=colors, edgecolor='black', linewidth=2)
+    
+    # Add equilibrium threshold line
+    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='Equilibrium (100%)', alpha=0.7)
+    
+    # Add value labels and status
+    for i, (frac, reached) in enumerate(zip(equilibrium_fractions, equilibrium_reached)):
+        label = f'{frac:.1%}'
+        if reached:
+            label += '\n✓ EQUILIBRIUM'
+        ax.text(i, frac + 0.05, label, ha='center', va='bottom', fontsize=10, fontweight='bold',
+                color='darkgreen' if reached else 'black')
+    
+    # Add class counts
+    if single_eq:
+        ax.text(0, -0.15, f'{single_eq["classes_meeting_targets"]}/{single_eq["total_classes"]} classes',
+                ha='center', va='top', fontsize=8, transform=ax.get_xaxis_transform())
+    if multi_eq:
+        idx = 1 if single_eq else 0
+        ax.text(idx, -0.15, f'{multi_eq["classes_meeting_targets"]}/{multi_eq["total_classes"]} classes',
+                ha='center', va='top', fontsize=8, transform=ax.get_xaxis_transform())
+    
+    ax.set_ylabel('Equilibrium Fraction', fontsize=10, fontweight='bold')
+    ax.set_title('Equilibrium Comparison\n(All classes meet targets: P≥0.95, C≥0.50)', 
+                 fontsize=11, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods, fontsize=10, fontweight='bold')
+    ax.set_ylim([0, 1.2])
+    ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.set_yticklabels(['0%', '25%', '50%', '75%', '100%'])
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax.legend(loc='upper right', fontsize=8)
+
+
 def plot_global_metrics_subplot(ax, summary: Optional[Dict], title: str):
     """Plot global metrics on a given axis."""
     if summary is None:
@@ -1107,24 +1252,35 @@ def plot_comprehensive_comparison(
     dataset_name: str = "",
     baseline_summary: Optional[Dict] = None
 ):
-    """Plot comprehensive comparison with 4 subplots (2x2 grid)."""
+    """Plot comprehensive comparison with 5 subplots (2x3 grid: 2 rows, 3 columns)."""
     if not HAS_PLOTTING:
         return
     
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
-    ax1, ax2 = axes[0, 0], axes[0, 1]  # Row 1: Feature importance
-    ax3, ax4 = axes[1, 0], axes[1, 1]  # Row 2: Global metrics
+    # Create 2x3 grid: add equilibrium comparison as 5th subplot
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
-    # Row 1: Feature importance
+    # Create axes
+    axes = [
+        [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])],
+        [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1]), fig.add_subplot(gs[1, 2])]
+    ]
+    ax1, ax2, ax_eq = axes[0, 0], axes[0, 1], axes[0, 2]  # Row 1: Feature importance + Equilibrium
+    ax3, ax4, ax5 = axes[1, 0], axes[1, 1], axes[1, 2]  # Row 2: Global metrics + empty
+    
+    # Row 1: Feature importance + Equilibrium comparison
     plot_feature_importance_subplot(ax1, single_agent_summary, f'{title_prefix}: Single-Agent Feature Importance', top_n=10)
     plot_feature_importance_subplot(ax2, multi_agent_summary, f'{title_prefix}: Multi-Agent Feature Importance', top_n=10)
+    plot_equilibrium_comparison(ax_eq, single_agent_summary, multi_agent_summary)
     
     # Row 2: Global metrics
     plot_global_metrics_subplot(ax3, single_agent_summary, f'{title_prefix}: Single-Agent Global Metrics')
     plot_global_metrics_subplot(ax4, multi_agent_summary, f'{title_prefix}: Multi-Agent Global Metrics')
+    # Hide 6th subplot (bottom right)
+    ax5.axis('off')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'comprehensive_comparison.png'), dpi=300, bbox_inches='tight')

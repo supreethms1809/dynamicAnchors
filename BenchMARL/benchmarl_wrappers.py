@@ -153,6 +153,33 @@ class AnchorMetricsCallback(Callback):
         # Track best model
         self.best_eval_score = -float('inf')  # Track best evaluation score (precision + coverage)
         self.best_model_path = None  # Path to best model checkpoint
+        
+        # Track best models per class (for multi-agent equilibrium evaluation)
+        self.best_eval_score_per_class = {}  # class -> best score
+        self.best_model_path_per_class = {}  # class -> best model path
+        
+        # Equilibrium evaluation: track if all classes meet targets
+        self.equilibrium_eval_mode = True  # If True, save best model when all classes meet targets
+        self.best_equilibrium_score = -float('inf')  # Track best equilibrium score (min class score when all meet targets)
+    
+    def _extract_class_from_group_name(self, group_name: str) -> Optional[int]:
+        """
+        Extract class ID from agent/group name.
+        Handles both formats:
+        - agent_0, agent_1 (agents_per_class == 1)
+        - agent_0_0, agent_0_1, agent_1_0 (agents_per_class > 1)
+        Returns None if format is unrecognized.
+        """
+        try:
+            # Remove 'agent_' prefix
+            if group_name.startswith("agent_"):
+                parts = group_name.replace("agent_", "").split("_")
+                # First part is always the class ID
+                if parts:
+                    return int(parts[0])
+        except (ValueError, AttributeError):
+            pass
+        return None
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -162,6 +189,7 @@ class AnchorMetricsCallback(Callback):
         
         metric_keys = [
             "anchor_precision", "anchor_coverage",
+            "class_union_precision", "class_union_coverage",  # Union metrics for multi-agent per class
             "drift", "anchor_drift", "js_penalty",
             "precision_gain", "coverage_gain", "coverage_bonus", "target_class_bonus",
             "overlap_penalty", "drift_penalty", "anchor_drift_penalty", 
@@ -598,12 +626,207 @@ class AnchorMetricsCallback(Callback):
                     f"(n={n_episodes})"
                 )
                 
-                # Save best model based on combined score (precision + coverage)
-                # This encourages both high precision and good coverage
+                # Multi-agent best model selection: track per-class metrics and evaluate equilibrium
                 if self.save_best_model and self.experiment is not None:
+                    # Extract per-class metrics for equilibrium evaluation
+                    class_metrics = {}  # class -> list of (precision, coverage, score) from agents
+                    class_union_metrics = {}  # class -> (union_precision, union_coverage, score)
+                    groups_to_check = list(self.experiment.group_map.keys()) if hasattr(self.experiment, 'group_map') else []
+                    
+                    # Determine if we have multiple agents per class by checking group names
+                    # If we see agent_0_0, agent_0_1, etc., we have multiple agents per class
+                    agents_per_class = 1
+                    for group in groups_to_check:
+                        if group.startswith("agent_"):
+                            parts = group.replace("agent_", "").split("_")
+                            if len(parts) >= 2:  # Has format agent_class_idx (e.g., agent_0_0, agent_0_1)
+                                class_prefix = parts[0]
+                                # Count how many groups start with agent_{class_prefix}_
+                                count = len([g for g in groups_to_check if g.startswith(f"agent_{class_prefix}_")])
+                                agents_per_class = max(agents_per_class, count)
+                    
+                    for group in groups_to_check:
+                        class_id = self._extract_class_from_group_name(group)
+                        if class_id is not None:
+                            # When agents_per_class > 1: use union metrics (what class achieves when all agents work together)
+                            # When agents_per_class == 1: use individual agent metrics
+                            if agents_per_class > 1:
+                                # Try to get union metrics (represent class performance when all agents work together)
+                                # Union metrics are the same for all agents in a class, so we only need to store once
+                                union_precision_key = f"evaluation/{group}/class_union_precision_mean"
+                                union_coverage_key = f"evaluation/{group}/class_union_coverage_mean"
+                                
+                                union_precision = aggregated.get(union_precision_key, 0.0)
+                                union_coverage = aggregated.get(union_coverage_key, 0.0)
+                                
+                                # Store union metrics once per class (they're the same for all agents in the class)
+                                if class_id not in class_union_metrics:
+                                    if union_precision > 0 or union_coverage > 0:
+                                        # Union metrics available - use them
+                                        class_union_metrics[class_id] = (union_precision, union_coverage, 
+                                                                         union_precision + union_coverage)
+                                    else:
+                                        # Union metrics not available - fallback to individual agent metrics
+                                        # This shouldn't happen if environment is configured correctly, but handle gracefully
+                                        group_precision_key = f"evaluation/{group}/anchor_precision_mean"
+                                        group_coverage_key = f"evaluation/{group}/anchor_coverage_mean"
+                                        group_precision = aggregated.get(group_precision_key, 0.0)
+                                        group_coverage = aggregated.get(group_coverage_key, 0.0)
+                                        if group_precision > 0 or group_coverage > 0:
+                                            class_union_metrics[class_id] = (group_precision, group_coverage,
+                                                                             group_precision + group_coverage)
+                            else:
+                                # Single agent per class: use individual agent metrics
+                                group_precision_key = f"evaluation/{group}/anchor_precision_mean"
+                                group_coverage_key = f"evaluation/{group}/anchor_coverage_mean"
+                                
+                                group_precision = aggregated.get(group_precision_key, 0.0)
+                                group_coverage = aggregated.get(group_coverage_key, 0.0)
+                                group_score = group_precision + group_coverage
+                                
+                                if class_id not in class_metrics:
+                                    class_metrics[class_id] = []
+                                class_metrics[class_id].append((group_precision, group_coverage, group_score))
+                    
+                    # Build class_scores: use union metrics if available (multi-agent per class), otherwise individual metrics
+                    class_scores = {}
+                    
+                    # First, use union metrics for classes with multiple agents (agents_per_class > 1)
+                    for class_id, (p, c, s) in class_union_metrics.items():
+                        class_scores[class_id] = (p, c, s)
+                    
+                    # Then, add individual metrics for classes with single agent (agents_per_class == 1)
+                    for class_id, metrics_list in class_metrics.items():
+                        if class_id not in class_scores and metrics_list:
+                            # For single agent per class, there should be only one metric
+                            if len(metrics_list) == 1:
+                                p, c, s = metrics_list[0]
+                                class_scores[class_id] = (p, c, s)
+                            else:
+                                # Fallback: use mean if somehow multiple metrics exist (shouldn't happen)
+                                avg_precision = sum(m[0] for m in metrics_list) / len(metrics_list)
+                                avg_coverage = sum(m[1] for m in metrics_list) / len(metrics_list)
+                                avg_score = sum(m[2] for m in metrics_list) / len(metrics_list)
+                                class_scores[class_id] = (avg_precision, avg_coverage, avg_score)
+                    
+                    # Evaluate equilibrium: check if all classes meet targets
+                    # Get targets from environment if available (may be wrapped)
+                    precision_target = 0.95  # Default
+                    coverage_target = 0.5    # Default
+                    env = None
+                    if hasattr(self.experiment, 'env'):
+                        env = self.experiment.env
+                        # Try to unwrap if it's a wrapped environment
+                        while hasattr(env, 'env') or hasattr(env, '_env'):
+                            env = getattr(env, 'env', None) or getattr(env, '_env', None)
+                            if env is None:
+                                break
+                    if env is not None:
+                        if hasattr(env, 'precision_target'):
+                            precision_target = env.precision_target
+                        if hasattr(env, 'coverage_target'):
+                            coverage_target = env.coverage_target
+                    
+                    # Evaluate equilibrium: check if all classes meet targets
+                    all_classes_meet_targets = True
+                    classes_meeting_targets = []
+                    classes_not_meeting_targets = []
+                    equilibrium_details = {}
+                    n_classes_total = 0
+                    n_classes_meeting = 0
+                    equilibrium_fraction = 0.0
+                    
+                    if class_scores:
+                        n_classes_total = len(class_scores)
+                        for class_id, (p, c, s) in class_scores.items():
+                            meets_precision = p >= precision_target
+                            meets_coverage = c >= coverage_target
+                            meets_both = meets_precision and meets_coverage
+                            
+                            equilibrium_details[class_id] = {
+                                "precision": p,
+                                "coverage": c,
+                                "score": s,
+                                "meets_precision": meets_precision,
+                                "meets_coverage": meets_coverage,
+                                "meets_both": meets_both,
+                                "precision_gap": max(0, precision_target - p),
+                                "coverage_gap": max(0, coverage_target - c)
+                            }
+                            
+                            if meets_both:
+                                classes_meeting_targets.append(class_id)
+                                n_classes_meeting += 1
+                            else:
+                                all_classes_meet_targets = False
+                                classes_not_meeting_targets.append(class_id)
+                        
+                        equilibrium_fraction = n_classes_meeting / n_classes_total if n_classes_total > 0 else 0.0
+                    
+                    # Log equilibrium status (always, not just when reached)
+                    if class_scores:
+                        if all_classes_meet_targets:
+                            logger.info(f"  ✓ EQUILIBRIUM: All {n_classes_total} classes meet targets!")
+                        else:
+                            logger.info(
+                                f"  Equilibrium status: {n_classes_meeting}/{n_classes_total} classes meet targets "
+                                f"({equilibrium_fraction:.1%})"
+                            )
+                            if classes_not_meeting_targets:
+                                for class_id in classes_not_meeting_targets:
+                                    details = equilibrium_details[class_id]
+                                    gaps = []
+                                    if not details["meets_precision"]:
+                                        gaps.append(f"P gap: {details['precision_gap']:.4f}")
+                                    if not details["meets_coverage"]:
+                                        gaps.append(f"C gap: {details['coverage_gap']:.4f}")
+                                    logger.info(
+                                        f"    Class {class_id}: P={details['precision']:.4f} (target: {precision_target:.2f}), "
+                                        f"C={details['coverage']:.4f} (target: {coverage_target:.4f}) - {', '.join(gaps)}"
+                                    )
+                    
+                    # Add equilibrium metrics to aggregated for wandb/file logging
+                    if class_scores:
+                        aggregated["evaluation/equilibrium_fraction"] = equilibrium_fraction
+                        aggregated["evaluation/equilibrium_reached"] = 1.0 if all_classes_meet_targets else 0.0
+                        aggregated["evaluation/classes_meeting_targets"] = float(n_classes_meeting)
+                        aggregated["evaluation/total_classes"] = float(n_classes_total)
+                        
+                        # Add per-class equilibrium status
+                        for class_id, details in equilibrium_details.items():
+                            aggregated[f"evaluation/class_{class_id}/meets_targets"] = 1.0 if details["meets_both"] else 0.0
+                            aggregated[f"evaluation/class_{class_id}/precision_gap"] = details["precision_gap"]
+                            aggregated[f"evaluation/class_{class_id}/coverage_gap"] = details["coverage_gap"]
+                    
+                    # Save best model based on strategy
+                    save_model = False
+                    save_reason = ""
+                    
+                    # Strategy 1: Equilibrium-based (all classes meet targets)
+                    if self.equilibrium_eval_mode and all_classes_meet_targets:
+                        # Check if this is better than previous equilibrium
+                        if class_scores:
+                            min_class_score = min(s for _, _, s in class_scores.values())
+                            if not hasattr(self, 'best_equilibrium_score') or min_class_score > self.best_equilibrium_score:
+                                save_model = True
+                                save_reason = "equilibrium"
+                                self.best_equilibrium_score = min_class_score
+                                logger.info(f"  ✓ New equilibrium checkpoint! Min class score: {min_class_score:.4f}")
+                    
+                    # Strategy 2: Global aggregate (fallback or if equilibrium not reached)
                     eval_score = precision + coverage  # Combined score
-                    if eval_score > self.best_eval_score:
+                    if not save_model and eval_score > self.best_eval_score:
+                        save_model = True
+                        save_reason = "aggregate"
                         self.best_eval_score = eval_score
+                    
+                    # Strategy 3: Per-class best (optional - save if any class improves)
+                    if class_scores:
+                        for class_id, (p, c, s) in class_scores.items():
+                            if class_id not in self.best_eval_score_per_class or s > self.best_eval_score_per_class[class_id]:
+                                self.best_eval_score_per_class[class_id] = s
+                    
+                    if save_model:
                         try:
                             # Save best model checkpoint
                             best_model_dir = os.path.join(str(self.experiment.folder_name), "best_model")
@@ -614,10 +837,20 @@ class AnchorMetricsCallback(Callback):
                             self.experiment.save(best_model_path)
                             self.best_model_path = best_model_path
                             
-                            logger.info(
-                                f"  ✓ New best model saved! (Score: {eval_score:.4f}, "
-                                f"Precision: {precision:.4f}, Coverage: {coverage:.4f})"
-                            )
+                            if save_reason == "equilibrium":
+                                logger.info(
+                                    f"  ✓ New best model saved (EQUILIBRIUM)! "
+                                    f"All classes meet targets. "
+                                    f"Global: P={precision:.4f}, C={coverage:.4f}"
+                                )
+                                if class_scores:
+                                    for class_id, (p, c, s) in sorted(class_scores.items()):
+                                        logger.info(f"    Class {class_id}: P={p:.4f}, C={c:.4f}, Score={s:.4f}")
+                            else:
+                                logger.info(
+                                    f"  ✓ New best model saved! (Score: {eval_score:.4f}, "
+                                    f"Precision: {precision:.4f}, Coverage: {coverage:.4f})"
+                                )
                             logger.info(f"    Best model path: {best_model_path}")
                         except Exception as e:
                             logger.warning(f"  ⚠ Could not save best model: {e}")
