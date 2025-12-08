@@ -112,7 +112,9 @@ class AnchorEnv(ParallelEnv):
         self.min_width = env_config.get("min_width", 0.05)
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
+        self.gamma = env_config.get("gamma", 0.1)
         self.coverage_target = env_config.get("coverage_target", 0.02)
+        self.precision_target = env_config.get("precision_target", 0.95)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
         
