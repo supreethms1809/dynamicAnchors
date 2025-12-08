@@ -455,11 +455,17 @@ class AnchorTrainer:
                 
                 # Run evaluation episodes
                 manual_rollouts = []
+                import time
+                eval_start_time = time.perf_counter()
+                
                 for episode in range(n_eval_episodes):
                     # Reset environment
                     td = env.reset()
                     done = False
                     episode_data = {}
+                    
+                    # Start timing this episode
+                    episode_start_time = time.perf_counter()
                     
                     # Run episode
                     step_count = 0
@@ -549,6 +555,10 @@ class AnchorTrainer:
                         td = env.step(td)
                         done = td.get("done", torch.zeros(1, dtype=torch.bool)).any().item()
                         step_count += 1
+                    
+                    # End timing this episode
+                    episode_end_time = time.perf_counter()
+                    episode_duration = episode_end_time - episode_start_time
                     
                     # Collect final metrics from info - SS: REMOVE THIS DEBUG LATER
                     unwrapped_env = None
@@ -927,12 +937,23 @@ class AnchorTrainer:
                                     elif isinstance(group_data, dict):
                                         logger.info(f"  Debug: td['{group}'] dict keys: {list(group_data.keys())}")
                     
+                    # Add timing to episode_data
                     if episode_data:
+                        # Add timing to each agent's episode data
+                        for agent_name in episode_data.keys():
+                            if isinstance(episode_data[agent_name], dict):
+                                episode_data[agent_name]["rollout_time_seconds"] = float(episode_duration)
+                        
                         manual_rollouts.append(episode_data)
                         if hasattr(self.callback, 'evaluation_anchor_data'):
                             self.callback.evaluation_anchor_data.append(episode_data)
                 
+                eval_end_time = time.perf_counter()
+                eval_total_time = eval_end_time - eval_start_time
+                avg_episode_time = eval_total_time / n_eval_episodes if n_eval_episodes > 0 else 0.0
+                
                 logger.info(f"   Collected {len(manual_rollouts)} episodes from manual rollouts")
+                logger.info(f"   Evaluation time: {eval_total_time:.4f}s total, {avg_episode_time:.4f}s per episode")
                 evaluation_anchor_data.extend(manual_rollouts)
                 
             except Exception as e:

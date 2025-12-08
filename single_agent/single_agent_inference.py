@@ -25,6 +25,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import argparse
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -66,6 +67,9 @@ def run_single_agent_rollout(
     # Reset environment
     obs, info = env.reset(seed=seed)
     
+    # Start timing the rollout
+    rollout_start_time = time.perf_counter()
+    
     done = False
     step_count = 0
     total_reward = 0.0
@@ -86,6 +90,10 @@ def run_single_agent_rollout(
         done = terminated or truncated
         step_count += 1
     
+    # End timing the rollout
+    rollout_end_time = time.perf_counter()
+    rollout_duration = rollout_end_time - rollout_start_time
+    
     # Get final metrics
     precision, coverage, details = env._current_metrics()
     
@@ -99,6 +107,7 @@ def run_single_agent_rollout(
         "coverage": float(coverage),
         "total_reward": float(total_reward),
         "n_steps": step_count,
+        "rollout_time_seconds": float(rollout_duration),
         "final_observation": obs.tolist(),
         "initial_lower": initial_lower.tolist(),
         "initial_upper": initial_upper.tolist(),
@@ -431,6 +440,9 @@ def extract_rules_single_agent(
     logger.info(f"  Steps per episode: {steps_per_episode}")
     logger.info(f"  Max features in rule: {max_features_in_rule}")
     
+    # Start overall timing
+    overall_start_time = time.perf_counter()
+    
     results = {
         "per_class_results": {},
         "metadata": {
@@ -464,6 +476,10 @@ def extract_rules_single_agent(
         rules_list = []
         precisions = []
         coverages = []
+        rollout_times = []
+        
+        # Track time for this class
+        class_start_time = time.perf_counter()
         
         for instance_idx in range(n_instances_per_class):
             # Create environment for this class
@@ -503,9 +519,11 @@ def extract_rules_single_agent(
             
             precision = episode_data.get("precision", 0.0)
             coverage = episode_data.get("coverage", 0.0)
+            rollout_time = episode_data.get("rollout_time_seconds", 0.0)
             
             precisions.append(float(precision))
             coverages.append(float(coverage))
+            rollout_times.append(float(rollout_time))
             
             # Extract rule from final bounds
             rule = "any values (no tightened features)"
@@ -572,9 +590,15 @@ def extract_rules_single_agent(
         
         unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
         
+        # End timing for this class
+        class_end_time = time.perf_counter()
+        class_total_time = class_end_time - class_start_time
+        
         # Compute instance-level metrics (average across all instances)
         instance_precision = float(np.mean(precisions)) if precisions else 0.0
         instance_coverage = float(np.mean(coverages)) if coverages else 0.0
+        avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
+        total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
         # Compute class-level metrics (union of all anchors for this class)
         class_precision = 0.0
@@ -719,6 +743,10 @@ def extract_rules_single_agent(
             "unique_rules": unique_rules,
             "unique_rules_count": len(unique_rules),
             "anchors": anchors_list,
+            # Timing metrics
+            "avg_rollout_time_seconds": avg_rollout_time,
+            "total_rollout_time_seconds": total_rollout_time,
+            "class_total_time_seconds": float(class_total_time),
         }
         
         logger.info(f"  Processed {len(anchors_list)} episodes")
@@ -728,8 +756,27 @@ def extract_rules_single_agent(
         logger.info(f"  Class-level metrics (class-union: union of all {n_anchors_for_union} anchors):")
         logger.info(f"    Union precision: {class_precision:.4f}, Union coverage: {class_coverage:.4f}")
         logger.info(f"  Unique rules (after deduplication): {len(unique_rules)}")
+        logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
+        logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
+        logger.info(f"  Total class processing time: {class_total_time:.4f}s")
+    
+    # End overall timing
+    overall_end_time = time.perf_counter()
+    overall_total_time = overall_end_time - overall_start_time
     
     logger.info("\n" + "="*80)
+    logger.info(f"Overall inference time: {overall_total_time:.4f}s")
+    logger.info("="*80)
+    
+    # Calculate total rollout time across all classes
+    total_rollout_time_all_classes = sum(
+        result.get("total_rollout_time_seconds", 0.0)
+        for result in results["per_class_results"].values()
+    )
+    
+    # Add timing summary to metadata
+    results["metadata"]["total_inference_time_seconds"] = float(overall_total_time)
+    results["metadata"]["total_rollout_time_seconds"] = float(total_rollout_time_all_classes)
     
     # Save results if output_dir is provided
     if output_dir is not None:
