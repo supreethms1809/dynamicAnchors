@@ -25,6 +25,7 @@ import sys
 import os
 import json
 import re
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Any, Optional
 from sklearn.model_selection import train_test_split
@@ -1151,6 +1152,9 @@ def run_static_anchors(
     results = {}
     unique_classes = np.unique(y_test)
     
+    # Start overall timing
+    overall_start_time = time.perf_counter()
+    
     for cls in unique_classes:
         idx_cls = np.where(y_test == cls)[0]
         if idx_cls.size == 0:
@@ -1161,13 +1165,25 @@ def run_static_anchors(
         sel = np.random.choice(idx_cls, size=min(n_instances_per_class, idx_cls.size), replace=False)
         
         class_results = []
+        rollout_times = []
+        
+        # Track time for this class
+        class_start_time = time.perf_counter()
         
         for i in sel:
+            # Start timing this instance explanation
+            instance_start_time = time.perf_counter()
+            
             exp = explainer.explain_instance(
                 X_test[i], 
                 predict_labels, 
                 threshold=anchor_threshold,
             )
+            
+            # End timing this instance
+            instance_end_time = time.perf_counter()
+            instance_duration = instance_end_time - instance_start_time
+            rollout_times.append(instance_duration)
             
             def _metric(val):
                 try:
@@ -1198,12 +1214,19 @@ def run_static_anchors(
                 "precision": prec_val,
                 "coverage": cov_val,
                 "anchor": anchor_names,
+                "rollout_time_seconds": float(instance_duration),
             })
+        
+        # End timing for this class
+        class_end_time = time.perf_counter()
+        class_total_time = class_end_time - class_start_time
         
         if len(class_results) > 0:
             # Instance-level metrics (average across all instances)
             avg_prec = float(np.mean([r["precision"] for r in class_results]))
             avg_cov = float(np.mean([r["coverage"] for r in class_results]))
+            avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
+            total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
             
             # Class-level metrics (union of all anchors for this class)
             # Filter out None, empty strings, and invalid anchor rules
@@ -1261,19 +1284,45 @@ def run_static_anchors(
                 "avg_coverage": avg_cov,
                 "n_instances": len(class_results),
                 "individual_results": class_results,
+                # Timing metrics
+                "avg_rollout_time_seconds": avg_rollout_time,
+                "total_rollout_time_seconds": total_rollout_time,
+                "class_total_time_seconds": float(class_total_time),
             }
             
             print(f"\nClass {cls} ({class_names[cls] if cls < len(class_names) else cls}):")
             print(f"  Instance-level (avg across {len(class_results)} instances):")
             print(f"    Avg Precision: {avg_prec:.3f}")
             print(f"    Avg Coverage:  {avg_cov:.3f}")
+            print(f"    Average rollout time per instance: {avg_rollout_time:.4f}s")
+            print(f"    Total rollout time for class: {total_rollout_time:.4f}s")
+            print(f"    Total class processing time: {class_total_time:.4f}s")
             # Note: Class-level union metrics are computed and stored in results but not printed,
             # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
             # They are available in the JSON output for reference if needed
     
+    # End overall timing
+    overall_end_time = time.perf_counter()
+    overall_total_time = overall_end_time - overall_start_time
+    
+    # Calculate total rollout time across all classes
+    total_rollout_time_all_classes = sum(
+        result.get("total_rollout_time_seconds", 0.0)
+        for result in results.values()
+    )
+    
+    print("\n" + "="*80)
+    print(f"Overall baseline time: {overall_total_time:.4f}s")
+    print(f"Total rollout time across all classes: {total_rollout_time_all_classes:.4f}s")
+    print("="*80)
+    
     return {
         "method": "Static Anchors",
         "per_class_results": results,
+        "metadata": {
+            "total_inference_time_seconds": float(overall_total_time),
+            "total_rollout_time_seconds": float(total_rollout_time_all_classes),
+        }
     }
 
 
@@ -1893,6 +1942,16 @@ def main(
                 print(f"  Instance-level (avg across instances):")
                 print(f"    Overall Avg Precision: {np.mean(instance_precisions):.3f}")
                 print(f"    Overall Avg Coverage:  {np.mean(instance_coverages):.3f}")
+                
+                # Print timing summary
+                metadata = method_results.get("metadata", {})
+                if metadata:
+                    total_time = metadata.get("total_inference_time_seconds", 0.0)
+                    total_rollout_time = metadata.get("total_rollout_time_seconds", 0.0)
+                    print(f"  Timing:")
+                    print(f"    Total inference time: {total_time:.4f}s")
+                    print(f"    Total rollout time: {total_rollout_time:.4f}s")
+                
                 # Note: Class-level union metrics are computed and stored but not printed,
                 # as they are not a fair comparison (union of 20 instance-level anchors vs single optimized anchor)
                 # They are available in the JSON output for reference if needed

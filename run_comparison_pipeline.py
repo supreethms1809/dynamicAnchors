@@ -976,10 +976,11 @@ def create_consolidated_metrics_json(
                 baseline_data = json.load(f)
             
             # Extract static_anchors metrics (baseline doesn't use wandb, so no URL)
-            static_anchors = baseline_data.get("static_anchors", {})
+            static_anchors = baseline_data.get("methods", {}).get("static_anchors", {}) or baseline_data.get("static_anchors", {})
             if static_anchors:
                 baseline_stats = static_anchors.get("overall_stats", {})
                 baseline_per_class = static_anchors.get("per_class_results", {})
+                baseline_metadata = static_anchors.get("metadata", {})
                 
                 consolidated["baseline"] = {
                     "wandb_run_url": None,  # Baseline doesn't use wandb
@@ -991,16 +992,26 @@ def create_consolidated_metrics_json(
                             "std_coverage": baseline_stats.get("std_coverage", 0.0),
                         }
                     },
+                    "timing": {
+                        "total_inference_time_seconds": baseline_metadata.get("total_inference_time_seconds", 0.0),
+                        "total_rollout_time_seconds": baseline_metadata.get("total_rollout_time_seconds", 0.0),
+                    },
                     "per_class": {}
                 }
                 
                 # Add per-class baseline metrics (instance-level only)
                 for class_key, class_data in baseline_per_class.items():
-                    cls = class_data.get("class", -1)
-                    consolidated["baseline"]["per_class"][f"class_{cls}"] = {
-                        "instance_precision": class_data.get("mean_precision", 0.0),
-                        "instance_coverage": class_data.get("mean_coverage", 0.0),
-                    }
+                    cls = class_data.get("class", -1) if isinstance(class_data, dict) else int(class_key.split("_")[-1]) if "_" in class_key else int(class_key)
+                    if isinstance(class_data, dict):
+                        consolidated["baseline"]["per_class"][f"class_{cls}"] = {
+                            "instance_precision": class_data.get("instance_precision", class_data.get("mean_precision", 0.0)),
+                            "instance_coverage": class_data.get("instance_coverage", class_data.get("mean_coverage", 0.0)),
+                            "timing": {
+                                "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
+                                "total_rollout_time_seconds": class_data.get("total_rollout_time_seconds", 0.0),
+                                "class_total_time_seconds": class_data.get("class_total_time_seconds", 0.0),
+                            }
+                        }
                 
                 logger.info("✓ Loaded baseline metrics")
         except Exception as e:
@@ -1018,8 +1029,24 @@ def create_consolidated_metrics_json(
                 consolidated["single_agent"] = {
                     "wandb_run_url": sa_consolidated.get("wandb_run_url"),
                     "metrics": sa_consolidated.get("metrics", {}),
-                    "per_class": sa_consolidated.get("per_class", {})
+                    "per_class": sa_consolidated.get("per_class", {}),
+                    "timing": sa_consolidated.get("timing", {})
                 }
+                # If timing not in consolidated, try to extract from inference file
+                if not consolidated["single_agent"]["timing"]:
+                    sa_inference_file = sa_summary_path.parent / "extracted_rules_single_agent.json"
+                    if sa_inference_file.exists():
+                        try:
+                            with open(sa_inference_file, 'r') as f:
+                                sa_inference_data = json.load(f)
+                            sa_metadata = sa_inference_data.get("metadata", {})
+                            if sa_metadata:
+                                consolidated["single_agent"]["timing"] = {
+                                    "total_inference_time_seconds": sa_metadata.get("total_inference_time_seconds", 0.0),
+                                    "total_rollout_time_seconds": sa_metadata.get("total_rollout_time_seconds", 0.0),
+                                }
+                        except Exception:
+                            pass
                 logger.info("✓ Loaded single-agent consolidated metrics")
             except Exception as e:
                 logger.warning(f"⚠ Could not load single-agent consolidated metrics: {e}")
@@ -1051,7 +1078,8 @@ def create_consolidated_metrics_json(
                             "mean_unique_rules_per_class": sa_stats.get("mean_unique_rules_per_class", 0.0),
                         }
                     },
-                    "per_class": {}
+                    "per_class": {},
+                    "timing": {}
                 }
                 
                 # Add per-class metrics
@@ -1064,7 +1092,27 @@ def create_consolidated_metrics_json(
                         "class_precision": class_data.get("class_precision", 0.0),
                         "class_coverage": class_data.get("class_coverage", 0.0),
                         "n_unique_rules": class_data.get("n_unique_rules", 0),
+                        "timing": {
+                            "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
+                            "total_rollout_time_seconds": class_data.get("total_rollout_time_seconds", 0.0),
+                            "class_total_time_seconds": class_data.get("class_total_time_seconds", 0.0),
+                        }
                     }
+                
+                # Try to extract timing from inference results file
+                sa_inference_file = sa_summary_path.parent / "extracted_rules_single_agent.json"
+                if sa_inference_file.exists():
+                    try:
+                        with open(sa_inference_file, 'r') as f:
+                            sa_inference_data = json.load(f)
+                        sa_metadata = sa_inference_data.get("metadata", {})
+                        if sa_metadata:
+                            consolidated["single_agent"]["timing"] = {
+                                "total_inference_time_seconds": sa_metadata.get("total_inference_time_seconds", 0.0),
+                                "total_rollout_time_seconds": sa_metadata.get("total_rollout_time_seconds", 0.0),
+                            }
+                    except Exception as e:
+                        logger.debug(f"Could not extract timing from single-agent inference file: {e}")
                 
                 # Try to get wandb URL from file
                 wandb_url_file = sa_summary_path.parent.parent / "wandb_run_url.txt"
@@ -1094,8 +1142,24 @@ def create_consolidated_metrics_json(
                 consolidated["multi_agent"] = {
                     "wandb_run_url": ma_consolidated.get("wandb_run_url"),
                     "metrics": ma_consolidated.get("metrics", {}),
-                    "per_class": ma_consolidated.get("per_class", {})
+                    "per_class": ma_consolidated.get("per_class", {}),
+                    "timing": ma_consolidated.get("timing", {})
                 }
+                # If timing not in consolidated, try to extract from inference file
+                if not consolidated["multi_agent"]["timing"]:
+                    ma_inference_file = ma_summary_path.parent / "extracted_rules.json"
+                    if ma_inference_file.exists():
+                        try:
+                            with open(ma_inference_file, 'r') as f:
+                                ma_inference_data = json.load(f)
+                            ma_metadata = ma_inference_data.get("metadata", {})
+                            if ma_metadata:
+                                consolidated["multi_agent"]["timing"] = {
+                                    "total_inference_time_seconds": ma_metadata.get("total_inference_time_seconds", 0.0),
+                                    "total_rollout_time_seconds": ma_metadata.get("total_rollout_time_seconds", 0.0),
+                                }
+                        except Exception:
+                            pass
                 logger.info("✓ Loaded multi-agent consolidated metrics")
             except Exception as e:
                 logger.warning(f"⚠ Could not load multi-agent consolidated metrics: {e}")
@@ -1127,7 +1191,8 @@ def create_consolidated_metrics_json(
                             "mean_unique_rules_per_class": ma_stats.get("mean_unique_rules_per_class", 0.0),
                         }
                     },
-                    "per_class": {}
+                    "per_class": {},
+                    "timing": {}
                 }
                 
                 # Add per-class metrics
@@ -1140,7 +1205,27 @@ def create_consolidated_metrics_json(
                         "class_precision": class_data.get("class_precision", 0.0),
                         "class_coverage": class_data.get("class_coverage", 0.0),
                         "n_unique_rules": class_data.get("n_unique_rules", 0),
+                        "timing": {
+                            "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
+                            "total_rollout_time_seconds": class_data.get("total_rollout_time_seconds", 0.0),
+                            "class_total_time_seconds": class_data.get("class_total_time_seconds", 0.0),
+                        }
                     }
+                
+                # Try to extract timing from inference results file
+                ma_inference_file = ma_summary_path.parent / "extracted_rules.json"
+                if ma_inference_file.exists():
+                    try:
+                        with open(ma_inference_file, 'r') as f:
+                            ma_inference_data = json.load(f)
+                        ma_metadata = ma_inference_data.get("metadata", {})
+                        if ma_metadata:
+                            consolidated["multi_agent"]["timing"] = {
+                                "total_inference_time_seconds": ma_metadata.get("total_inference_time_seconds", 0.0),
+                                "total_rollout_time_seconds": ma_metadata.get("total_rollout_time_seconds", 0.0),
+                            }
+                    except Exception as e:
+                        logger.debug(f"Could not extract timing from multi-agent inference file: {e}")
                 
                 # Try to get wandb URL from file
                 wandb_url_file = ma_summary_path.parent / "wandb_run_url.txt"
@@ -1168,7 +1253,7 @@ def create_consolidated_metrics_json(
         json.dump(consolidated, f, indent=2)
     
     logger.info(f"✓ Consolidated metrics JSON saved to: {consolidated_file}")
-    logger.info(f"  This file contains all metrics and wandb URLs for easy copying and comparison")
+    logger.info(f"  This file contains all metrics, timing information, and wandb URLs for easy copying and comparison")
 
 
 def create_comparison_summary(
@@ -1232,9 +1317,38 @@ def create_comparison_summary(
             logger.warning(f"⚠ Could not load multi-agent summary: {e}")
     
     # Create comparison metrics
-    baseline_stats = comparison["baseline"].get("static_anchors", {}).get("overall_stats", {}) if comparison.get("baseline") else {}
+    baseline_data_full = comparison.get("baseline", {})
+    baseline_static_anchors = baseline_data_full.get("methods", {}).get("static_anchors", {}) or baseline_data_full.get("static_anchors", {})
+    baseline_stats = baseline_static_anchors.get("overall_stats", {}) if baseline_static_anchors else {}
+    baseline_metadata = baseline_static_anchors.get("metadata", {}) if baseline_static_anchors else {}
+    
     sa_stats = comparison["single_agent"].get("overall_stats", {})
     ma_stats = comparison["multi_agent"].get("overall_stats", {})
+    
+    # Extract timing from inference files if not in summary
+    sa_timing = {}
+    ma_timing = {}
+    baseline_timing = baseline_metadata or {}
+    
+    if single_agent_summary_file:
+        sa_inference_file = Path(single_agent_summary_file).parent / "extracted_rules_single_agent.json"
+        if sa_inference_file.exists():
+            try:
+                with open(sa_inference_file, 'r') as f:
+                    sa_inference_data = json.load(f)
+                sa_timing = sa_inference_data.get("metadata", {}).get("timing", {}) or sa_inference_data.get("metadata", {})
+            except Exception:
+                pass
+    
+    if multi_agent_summary_file:
+        ma_inference_file = Path(multi_agent_summary_file).parent / "extracted_rules.json"
+        if ma_inference_file.exists():
+            try:
+                with open(ma_inference_file, 'r') as f:
+                    ma_inference_data = json.load(f)
+                ma_timing = ma_inference_data.get("metadata", {}).get("timing", {}) or ma_inference_data.get("metadata", {})
+            except Exception:
+                pass
     
     # Handle both formats: single-agent uses "mean_precision", multi-agent uses "mean_instance_precision"
     if sa_stats and ma_stats:
@@ -1258,6 +1372,27 @@ def create_comparison_summary(
             "class_precision_diff": sa_class_precision - ma_class_precision,
             "class_coverage_diff": sa_class_coverage - ma_class_coverage,
             "rules_diff": sa_stats.get("total_unique_rules", 0) - ma_stats.get("total_unique_rules", 0),
+            # Timing comparison
+            "timing": {
+                "baseline": {
+                    "total_inference_time_seconds": baseline_timing.get("total_inference_time_seconds", 0.0),
+                    "total_rollout_time_seconds": baseline_timing.get("total_rollout_time_seconds", 0.0),
+                },
+                "single_agent": {
+                    "total_inference_time_seconds": sa_timing.get("total_inference_time_seconds", 0.0),
+                    "total_rollout_time_seconds": sa_timing.get("total_rollout_time_seconds", 0.0),
+                },
+                "multi_agent": {
+                    "total_inference_time_seconds": ma_timing.get("total_inference_time_seconds", 0.0),
+                    "total_rollout_time_seconds": ma_timing.get("total_rollout_time_seconds", 0.0),
+                },
+                "single_vs_multi_time_diff_seconds": (sa_timing.get("total_rollout_time_seconds", 0.0) - 
+                                                      ma_timing.get("total_rollout_time_seconds", 0.0)),
+                "baseline_vs_single_time_diff_seconds": (baseline_timing.get("total_rollout_time_seconds", 0.0) - 
+                                                         sa_timing.get("total_rollout_time_seconds", 0.0)),
+                "baseline_vs_multi_time_diff_seconds": (baseline_timing.get("total_rollout_time_seconds", 0.0) - 
+                                                        ma_timing.get("total_rollout_time_seconds", 0.0)),
+            },
             # Legacy fields for backward compatibility
             "precision_diff": sa_instance_precision - ma_instance_precision,
             "coverage_diff": sa_instance_coverage - ma_instance_coverage,
@@ -1289,31 +1424,49 @@ def create_comparison_summary(
     if baseline_stats:
         baseline_instance_precision = baseline_stats.get("mean_precision", 0.0)
         baseline_instance_coverage = baseline_stats.get("mean_coverage", 0.0)
+        baseline_total_time = baseline_timing.get("total_rollout_time_seconds", 0.0)
         logger.info(f"Baseline (Static Anchors):")
         logger.info(f"  Instance-Level - Precision: {baseline_instance_precision:.4f}, Coverage: {baseline_instance_coverage:.4f}")
+        if baseline_total_time > 0:
+            logger.info(f"  Timing - Total Rollout Time: {baseline_total_time:.4f}s")
     if sa_stats:
         sa_instance_precision = sa_stats.get("mean_instance_precision") or sa_stats.get("mean_precision", 0.0)
         sa_instance_coverage = sa_stats.get("mean_instance_coverage") or sa_stats.get("mean_coverage", 0.0)
         sa_class_precision = sa_stats.get("mean_class_precision", 0.0)
         sa_class_coverage = sa_stats.get("mean_class_coverage", 0.0)
+        sa_total_time = sa_timing.get("total_rollout_time_seconds", 0.0)
         logger.info(f"Single-Agent:")
         logger.info(f"  Instance-Level - Precision: {sa_instance_precision:.4f}, Coverage: {sa_instance_coverage:.4f}")
         logger.info(f"  Class-Level - Precision: {sa_class_precision:.4f}, Coverage: {sa_class_coverage:.4f}")
         logger.info(f"  Total Unique Rules: {sa_stats.get('total_unique_rules', 0)}")
+        if sa_total_time > 0:
+            logger.info(f"  Timing - Total Rollout Time: {sa_total_time:.4f}s")
     if ma_stats:
         ma_instance_precision = ma_stats.get("mean_instance_precision", 0.0)
         ma_instance_coverage = ma_stats.get("mean_instance_coverage", 0.0)
         ma_class_precision = ma_stats.get("mean_class_precision", 0.0)
         ma_class_coverage = ma_stats.get("mean_class_coverage", 0.0)
+        ma_total_time = ma_timing.get("total_rollout_time_seconds", 0.0)
         logger.info(f"Multi-Agent:")
         logger.info(f"  Instance-Level - Precision: {ma_instance_precision:.4f}, Coverage: {ma_instance_coverage:.4f}")
         logger.info(f"  Class-Level - Precision: {ma_class_precision:.4f}, Coverage: {ma_class_coverage:.4f}")
         logger.info(f"  Total Unique Rules: {ma_stats.get('total_unique_rules', 0)}")
+        if ma_total_time > 0:
+            logger.info(f"  Timing - Total Rollout Time: {ma_total_time:.4f}s")
     if comparison["comparison"]:
         logger.info(f"Differences (Single - Multi):")
         logger.info(f"  Instance-Level - Precision: {comparison['comparison']['instance_precision_diff']:.4f}, Coverage: {comparison['comparison']['instance_coverage_diff']:.4f}")
         logger.info(f"  Class-Level - Precision: {comparison['comparison']['class_precision_diff']:.4f}, Coverage: {comparison['comparison']['class_coverage_diff']:.4f}")
         logger.info(f"  Rules: {comparison['comparison']['rules_diff']}")
+        if "timing" in comparison["comparison"]:
+            timing = comparison["comparison"]["timing"]
+            logger.info(f"Timing Comparison:")
+            if timing.get("single_vs_multi_time_diff_seconds", 0) != 0:
+                logger.info(f"  Single vs Multi Time Difference: {timing['single_vs_multi_time_diff_seconds']:.4f}s")
+            if timing.get("baseline_vs_single_time_diff_seconds", 0) != 0:
+                logger.info(f"  Baseline vs Single Time Difference: {timing['baseline_vs_single_time_diff_seconds']:.4f}s")
+            if timing.get("baseline_vs_multi_time_diff_seconds", 0) != 0:
+                logger.info(f"  Baseline vs Multi Time Difference: {timing['baseline_vs_multi_time_diff_seconds']:.4f}s")
     logger.info(f"{'='*80}")
 
 
