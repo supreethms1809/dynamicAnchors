@@ -18,7 +18,7 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 # Environment configuration dictionary
 env_config:
   precision_target: 0.95
-  coverage_target: 0.5
+  coverage_target: 0.1
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
@@ -46,8 +46,8 @@ env_config:
   global_coverage_threshold: 0.1 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
   # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
   # These bonuses reward good coverage behavior (same as single-agent for fair comparison)
-  coverage_bonus_weight_met: 0.1          # When targets are met: weight * (coverage / target)
-  coverage_bonus_weight_high_prec: 0.1    # When precision >= threshold and making progress: base weight
+  coverage_bonus_weight_met: 0.01          # When targets are met: weight * (coverage / target) - Fixed: match single-agent for fair comparison
+  coverage_bonus_weight_high_prec: 0.03    # When precision >= threshold and making progress: base weight - Fixed: match single-agent for fair comparison
   coverage_bonus_weight_high_prec_progress: 0.07  # Progress multiplier when precision >= threshold
   coverage_bonus_weight_high_prec_distance: 0.02  # Distance to target multiplier when precision >= threshold
   coverage_bonus_weight_reasonable_prec: 0.01     # When precision >= 0.8 * threshold and making progress: base weight

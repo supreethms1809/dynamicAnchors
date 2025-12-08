@@ -219,7 +219,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 12_000,
+    total_timesteps: int = 18_000,
     **kwargs
 ) -> Optional[str]:
     """

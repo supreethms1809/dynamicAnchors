@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.5
+  coverage_target: 0.1
   
   # Data perturbation settings
   use_perturbation: True

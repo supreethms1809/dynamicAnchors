@@ -2339,7 +2339,7 @@ class AnchorTrainer:
         
         return {
             "precision_target": 0.8,
-            "coverage_target": 0.02,
+            "coverage_target": 0.1,
             "use_perturbation": False,
             "perturbation_mode": "bootstrap",
             "n_perturb": 1024,

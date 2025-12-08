@@ -362,7 +362,7 @@ class AnchorTrainerSB3:
         # Set defaults (will be overridden by config file values if present)
         defaults = {
             "precision_target": 0.95,
-            "coverage_target": 0.5,
+            "coverage_target": 0.1,
             "use_perturbation": True,
             "perturbation_mode": "adaptive",
             "n_perturb": 4096,

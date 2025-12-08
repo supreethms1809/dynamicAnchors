@@ -712,7 +712,7 @@ class AnchorMetricsCallback(Callback):
                     # Evaluate equilibrium: check if all classes meet targets
                     # Get targets from environment if available (may be wrapped)
                     precision_target = 0.95  # Default
-                    coverage_target = 0.5    # Default
+                    coverage_target = 0.1    # Default (updated to match config files)
                     env = None
                     if hasattr(self.experiment, 'env'):
                         env = self.experiment.env

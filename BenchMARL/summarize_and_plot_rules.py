@@ -73,10 +73,12 @@ def extract_features_from_rule(rule_str: str) -> List[str]:
 
 def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float, float]]:
     """Extract feature names and intervals (lower, upper) from a rule string."""
-    if rule_str == "any values (no tightened features)":
+    if rule_str == "any values (no tightened features)" or not rule_str:
         return []
     
     intervals = []
+    seen_features = set()  # Track duplicate features
+    
     # Pattern to match: "feature_name ∈ [lower, upper]"
     pattern = r'(.+?)\s*∈\s*\[([-\d.]+),\s*([-\d.]+)\]'
     
@@ -85,12 +87,38 @@ def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float,
     
     for condition in conditions:
         condition = condition.strip()
+        if not condition:
+            continue
         match = re.search(pattern, condition)
         if match:
             feature_name = match.group(1).strip()
-            lower = float(match.group(2))
-            upper = float(match.group(3))
-            intervals.append((feature_name, lower, upper))
+            try:
+                lower = float(match.group(2))
+                upper = float(match.group(3))
+                
+                # Validate interval: ensure lower <= upper
+                if lower > upper:
+                    logger.warning(
+                        f"Invalid interval in rule '{rule_str[:100]}...': "
+                        f"feature '{feature_name}' has lower={lower} > upper={upper}. Swapping."
+                    )
+                    lower, upper = upper, lower
+                
+                # Check for duplicate features (keep first occurrence)
+                if feature_name in seen_features:
+                    logger.debug(
+                        f"Duplicate feature '{feature_name}' in rule '{rule_str[:100]}...'. "
+                        f"Keeping first occurrence."
+                    )
+                    continue
+                
+                seen_features.add(feature_name)
+                intervals.append((feature_name, lower, upper))
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Failed to parse interval from condition '{condition}' in rule '{rule_str[:100]}...': {e}"
+                )
+                continue
     
     return intervals
 
@@ -471,11 +499,46 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     # Calculate global importance scores
     feature_importance_global = {}
     for feature_name, intervals_list in feature_intervals_global.items():
-        interval_widths = [upper - lower for lower, upper in intervals_list]
-        avg_width = np.mean(interval_widths) if interval_widths else 1.0
+        # Calculate interval widths, filtering out invalid (negative or zero) widths
+        interval_widths = []
+        for lower, upper in intervals_list:
+            width = float(upper - lower)
+            # Validate width: should be non-negative, and finite
+            if width >= 0 and np.isfinite(width):
+                interval_widths.append(width)
+            else:
+                logger.warning(
+                    f"Invalid interval width for feature '{feature_name}': "
+                    f"lower={lower}, upper={upper}, width={width}. Skipping."
+                )
+        
+        # Calculate average width, handling edge cases
+        if not interval_widths:
+            # No valid intervals: use default width
+            avg_width = 1.0
+            logger.debug(f"Feature '{feature_name}' has no valid intervals, using default avg_width=1.0")
+        else:
+            avg_width = float(np.mean(interval_widths))
+            # Ensure avg_width is finite and positive
+            if not np.isfinite(avg_width) or avg_width <= 0:
+                logger.warning(
+                    f"Invalid avg_width for feature '{feature_name}': {avg_width}. Using default 1.0."
+                )
+                avg_width = 1.0
+        
         frequency = feature_frequency_global[feature_name]
         # Importance = frequency / avg_width (higher frequency and narrower intervals = more important)
-        importance_score = frequency / (avg_width + 1e-6)
+        # Use small epsilon to avoid division by zero
+        importance_score = float(frequency) / (avg_width + 1e-6)
+        
+        # Validate importance score
+        if not np.isfinite(importance_score) or importance_score < 0:
+            logger.warning(
+                f"Invalid importance score for feature '{feature_name}': {importance_score}. "
+                f"Setting to 0.0."
+            )
+            importance_score = 0.0
+        
         feature_importance_global[feature_name] = {
             "importance": importance_score,
             "frequency": frequency,
@@ -487,10 +550,35 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     for target_class, class_intervals in feature_intervals_per_class.items():
         class_importance = {}
         for feature_name, intervals_list in class_intervals.items():
-            interval_widths = [upper - lower for lower, upper in intervals_list]
-            avg_width = np.mean(interval_widths) if interval_widths else 1.0
+            # Calculate interval widths, filtering out invalid widths
+            interval_widths = []
+            for lower, upper in intervals_list:
+                width = float(upper - lower)
+                # Validate width: should be non-negative, and finite
+                if width >= 0 and np.isfinite(width):
+                    interval_widths.append(width)
+                else:
+                    logger.debug(
+                        f"Invalid interval width for feature '{feature_name}' in class {target_class}: "
+                        f"lower={lower}, upper={upper}, width={width}. Skipping."
+                    )
+            
+            # Calculate average width, handling edge cases
+            if not interval_widths:
+                avg_width = 1.0
+            else:
+                avg_width = float(np.mean(interval_widths))
+                # Ensure avg_width is finite and positive
+                if not np.isfinite(avg_width) or avg_width <= 0:
+                    avg_width = 1.0
+            
             frequency = feature_frequency_per_class[target_class][feature_name]
-            importance_score = frequency / (avg_width + 1e-6)
+            importance_score = float(frequency) / (avg_width + 1e-6)
+            
+            # Validate importance score
+            if not np.isfinite(importance_score) or importance_score < 0:
+                importance_score = 0.0
+            
             class_importance[feature_name] = {
                 "importance": importance_score,
                 "frequency": frequency,
@@ -517,10 +605,29 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     # Calculate sum of all importance scores (not just top N, for proper normalization)
     total_importance = sum(f["importance"] for f in feature_importance_global.values())
     
+    # Validate total_importance
+    if not np.isfinite(total_importance) or total_importance <= 0:
+        logger.warning(
+            f"Invalid total_importance: {total_importance}. "
+            f"All feature importance percentages will be set to 0."
+        )
+        total_importance = 1.0  # Use 1.0 to avoid division by zero, but all percentages will be 0
+    
     # Normalize top features to percentages
     features = [f[0] for f in top_features]
     importances_raw = [f[1]["importance"] for f in top_features]
-    importances_pct = [(imp / total_importance * 100) if total_importance > 0 else 0.0 for imp in importances_raw]
+    importances_pct = []
+    for imp in importances_raw:
+        if total_importance > 0 and np.isfinite(imp):
+            pct = (imp / total_importance * 100)
+            # Validate percentage
+            if np.isfinite(pct) and pct >= 0:
+                importances_pct.append(pct)
+            else:
+                logger.debug(f"Invalid percentage calculated: {pct} from imp={imp}, total={total_importance}")
+                importances_pct.append(0.0)
+        else:
+            importances_pct.append(0.0)
     frequencies = [f[1]["frequency"] for f in top_features]
     avg_widths = [f[1]["avg_interval_width"] for f in top_features]
     
@@ -528,11 +635,27 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     feature_importance_per_class_pct: Dict[int, Dict[str, float]] = {}
     for target_class, class_importance in feature_importance_per_class.items():
         class_total = sum(imp["importance"] for imp in class_importance.values())
+        
+        # Validate class_total
+        if not np.isfinite(class_total) or class_total <= 0:
+            logger.debug(
+                f"Invalid class_total for class {target_class}: {class_total}. "
+                f"All percentages for this class will be set to 0."
+            )
+            class_total = 1.0  # Avoid division by zero
+        
         class_pct = {}
         for feat_name, feat_data in class_importance.items():
             raw_imp = feat_data["importance"]
-            pct_imp = (raw_imp / class_total * 100) if class_total > 0 else 0.0
-            class_pct[feat_name] = pct_imp
+            if class_total > 0 and np.isfinite(raw_imp):
+                pct_imp = (raw_imp / class_total * 100)
+                # Validate percentage
+                if np.isfinite(pct_imp) and pct_imp >= 0:
+                    class_pct[feat_name] = pct_imp
+                else:
+                    class_pct[feat_name] = 0.0
+            else:
+                class_pct[feat_name] = 0.0
         feature_importance_per_class_pct[target_class] = class_pct
     
     # Format title with dataset name
@@ -659,9 +782,26 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
         if not rule1_intervals or not rule2_intervals:
             return 0.0
         
-        # Create feature to interval mapping
-        rule1_dict = {feat: (lower, upper) for feat, lower, upper in rule1_intervals}
-        rule2_dict = {feat: (lower, upper) for feat, lower, upper in rule2_intervals}
+        # Create feature to interval mapping (handle duplicate features by keeping first occurrence)
+        rule1_dict = {}
+        for feat, lower, upper in rule1_intervals:
+            # Validate interval: lower <= upper
+            if lower > upper:
+                logger.warning(f"Invalid interval in rule1: {feat} has lower={lower} > upper={upper}. Swapping.")
+                lower, upper = upper, lower
+            # Only keep first occurrence if duplicate features exist
+            if feat not in rule1_dict:
+                rule1_dict[feat] = (lower, upper)
+        
+        rule2_dict = {}
+        for feat, lower, upper in rule2_intervals:
+            # Validate interval: lower <= upper
+            if lower > upper:
+                logger.warning(f"Invalid interval in rule2: {feat} has lower={lower} > upper={upper}. Swapping.")
+                lower, upper = upper, lower
+            # Only keep first occurrence if duplicate features exist
+            if feat not in rule2_dict:
+                rule2_dict[feat] = (lower, upper)
         
         # Find common features
         common_features = set(rule1_dict.keys()) & set(rule2_dict.keys())
@@ -673,6 +813,11 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
         for feat in common_features:
             lower1, upper1 = rule1_dict[feat]
             lower2, upper2 = rule2_dict[feat]
+            
+            # Ensure valid intervals (should be guaranteed by validation above, but double-check)
+            if lower1 > upper1 or lower2 > upper2:
+                feature_overlaps.append(0.0)
+                continue
             
             # Calculate intersection
             intersect_lower = max(lower1, lower2)
@@ -690,8 +835,12 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
                 else:
                     # Zero-width intervals: if they're the same point, perfect overlap (1.0)
                     # Otherwise, different points, no overlap (0.0)
-                    if lower1 == upper1 == lower2 == upper2:
-                        feature_overlaps.append(1.0)
+                    if abs(lower1 - upper1) < 1e-10 and abs(lower2 - upper2) < 1e-10:
+                        # Both are zero-width intervals
+                        if abs(lower1 - lower2) < 1e-10:
+                            feature_overlaps.append(1.0)  # Same point
+                        else:
+                            feature_overlaps.append(0.0)  # Different points
                     else:
                         feature_overlaps.append(0.0)
             else:

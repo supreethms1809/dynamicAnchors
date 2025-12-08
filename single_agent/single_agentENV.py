@@ -117,8 +117,8 @@ class SingleAgentAnchorEnv(Env):
         self.gamma = env_config.get("gamma", 0.1)
 
         self.directions = ("shrink_lower", "expand_lower", "shrink_upper", "expand_upper")
-        self.precision_target = env_config.get("precision_target", 0.8)
-        self.coverage_target = env_config.get("coverage_target", 0.02)
+        self.precision_target = env_config.get("precision_target", 0.95)  # Fixed: match multi-agent default (0.95) and config file
+        self.coverage_target = env_config.get("coverage_target", 0.1)  # Updated to match config file default
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
 
@@ -339,18 +339,8 @@ class SingleAgentAnchorEnv(Env):
     def _current_metrics(self) -> tuple:
         mask = self._mask_in_box()
         covered = np.where(mask)[0]
-        coverage = float(mask.mean())
         
-        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
-            data_source = "test" if self.eval_on_test_data else "training"
-            return 0.0, coverage, {
-                "hard_precision": 0.0, 
-                "avg_prob": 0.0, 
-                "n_points": 0, 
-                "sampler": "none",
-                "data_source": data_source
-            }
-
+        # Determine which dataset to use (test or training)
         if self.eval_on_test_data:
             X_data_std = self.X_test_std
             y_data = self.y_test
@@ -359,6 +349,70 @@ class SingleAgentAnchorEnv(Env):
             X_data_std = self.X_std
             y_data = self.y
             data_source = "training"
+        
+        # Ensure mask and y_data have the same length (safety check)
+        if len(mask) != len(y_data):
+            logger.error(
+                f"SingleAgent: Mask length ({len(mask)}) != y_data length ({len(y_data)}). "
+                f"This indicates a data mismatch. eval_on_test_data={self.eval_on_test_data}"
+            )
+            # Try to fix: use the data source that matches the mask
+            if len(mask) == len(self.y_test) if self.eval_on_test_data else len(self.y):
+                y_data = self.y_test if self.eval_on_test_data else self.y
+                logger.warning(f"  Corrected y_data to match mask length")
+        
+        # Determine coverage calculation based on mode:
+        # - Instance-based (x_star_unit set): Overall coverage P(x in box) - like original Anchor
+        # - Class-based (x_star_unit not set): Class-conditional coverage P(x in box | y = target_class)
+        is_instance_based = self.x_star_unit is not None
+        
+        if is_instance_based:
+            # Instance-based mode: Overall coverage P(x in box)
+            # This matches the original Anchor paper definition
+            coverage = float(mask.mean())
+        else:
+            # Class-based mode: Class-conditional coverage P(x in box | y = target_class)
+            # This is the fraction of target class samples that fall within the box
+            class_mask = (y_data == self.target_class)
+            n_class_samples = class_mask.sum()
+            
+            if n_class_samples == 0:
+                coverage = 0.0
+                logger.warning(
+                    f"SingleAgent: No samples found for target class {self.target_class} in {data_source} data. "
+                    f"Total samples: {len(y_data)}, Classes present: {sorted(np.unique(y_data).tolist())}"
+                )
+            else:
+                # Coverage = number of target class samples in box / total target class samples
+                # This is class-conditional coverage: P(x in box | y = target_class)
+                # Ensure mask and class_mask are aligned
+                if len(mask) != len(class_mask):
+                    logger.error(
+                        f"SingleAgent: Mask length ({len(mask)}) != class_mask length ({len(class_mask)})"
+                    )
+                    coverage = 0.0
+                else:
+                    n_class_in_box = (mask & class_mask).sum()
+                    coverage = float(n_class_in_box / n_class_samples)
+                    
+                    # Debug: Log if coverage is unexpectedly zero but box covers samples
+                    if coverage == 0.0 and covered.size > 0:
+                        # Box covers some samples but none from target class - log this for debugging
+                        n_covered_total = mask.sum()
+                        logger.debug(
+                            f"SingleAgent: Box covers {n_covered_total} total samples but 0 target class samples. "
+                            f"Target class: {self.target_class}, Class samples in dataset: {n_class_samples}, "
+                            f"Box bounds: lower={self.lower[:3]}, upper={self.upper[:3]} (first 3 dims)"
+                        )
+        
+        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
+            return 0.0, coverage, {
+                "hard_precision": 0.0, 
+                "avg_prob": 0.0, 
+                "n_points": 0, 
+                "sampler": "none",
+                "data_source": data_source
+            }
 
         if not self.use_perturbation:
             X_eval = X_data_std[covered]
@@ -435,25 +489,23 @@ class SingleAgentAnchorEnv(Env):
 
         preds = probs.argmax(axis=1)
         positive_idx = (preds == self.target_class)
+        
+        # Precision: P(y = target_class | x in box)
+        # When ground truth labels are available, use them directly
+        # When labels are not available (uniform sampling), use model predictions as proxy
         if y_eval is None:
+            # Uniform sampling: no ground truth labels, use model predictions as proxy
             hard_precision = float(positive_idx.mean())
         else:
-            if positive_idx.sum() == 0:
-                target_in_box = (y_eval == self.target_class)
-                if target_in_box.sum() == 0:
-                    hard_precision = 0.0
-                else:
-                    hard_precision = 0.01
-            else:
-                hard_precision = float((y_eval[positive_idx] == self.target_class).mean())
+            # Bootstrap/empirical sampling: ground truth labels available
+            # Precision = fraction of samples in box that are actually target class
+            hard_precision = float((y_eval == self.target_class).mean())
 
         avg_prob = float(probs[:, self.target_class].mean())
         precision_proxy = (
             self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
         )
-        target_class_fraction = 0.0
-        if y_eval is not None:
-            target_class_fraction = float((y_eval == self.target_class).mean())
+        target_class_fraction = hard_precision  # Same as hard_precision when y_eval is available
         
         return precision_proxy, coverage, {
             "hard_precision": hard_precision,
@@ -1205,7 +1257,7 @@ def main():
     
     env_config = {
         "precision_target": 0.8,
-        "coverage_target": 0.02,
+        "coverage_target": 0.1,
         "use_perturbation": False,
         "X_min": X_min,
         "X_range": X_range,
