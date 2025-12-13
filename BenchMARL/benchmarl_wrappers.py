@@ -133,7 +133,7 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -161,6 +161,25 @@ class AnchorMetricsCallback(Callback):
         # Equilibrium evaluation: track if all classes meet targets
         self.equilibrium_eval_mode = True  # If True, save best model when all classes meet targets
         self.best_equilibrium_score = -float('inf')  # Track best equilibrium score (min class score when all meet targets)
+        
+        # NashConv/exploitability computation settings
+        self.compute_nashconv = compute_nashconv  # Whether to compute NashConv during evaluation
+        self.nashconv_batch_size = nashconv_batch_size  # Batch size for best response computation
+        self.nashconv_lr = nashconv_lr  # Learning rate for gradient ascent
+        self.nashconv_steps = nashconv_steps  # Number of gradient ascent steps
+        
+        # Experiment reference (will be set by BenchMARL)
+        self.experiment = None
+    
+    def on_experiment_start(self, experiment):
+        """Called when experiment starts. Sets the experiment reference."""
+        self.experiment = experiment
+        print(f"\n{'='*80}")
+        print(f"CALLBACK: on_experiment_start called!")
+        print(f"  Experiment: {experiment}")
+        print(f"  Experiment folder: {getattr(experiment, 'folder_name', 'N/A')}")
+        print(f"{'='*80}\n")
+        logger.info("Callback: Experiment started, experiment reference set")
     
     def _extract_class_from_group_name(self, group_name: str) -> Optional[int]:
         """
@@ -210,6 +229,494 @@ class AnchorMetricsCallback(Callback):
                     metrics[f"{prefix}{key}"] = float(value)
         
         return metrics
+    
+    def _compute_nashconv_metrics(self, rollouts: List[TensorDictBase]) -> Dict[str, float]:
+        """
+        Compute NashConv and exploitability metrics using centralized critic.
+        
+        NashConv(π) = Σ_i (BR_i(π_{-i}) - V_i^π)
+        where BR_i(π_{-i}) is the best response value for agent i against frozen opponents.
+        
+        Uses critic-based one-step best response approximation:
+        1. For each state s in evaluation batch
+        2. Compute current joint action a = π(o)
+        3. For each agent i:
+           - Optimize a_i (holding a_{-i} fixed) by gradient ascent on Q_i(s, a_i, a_{-i})
+           - Compute exploitability: Δ_i = E_s[Q_i(s, a_i^BR, a_{-i}) - Q_i(s, a)]
+        4. NashConv = Σ_i Δ_i, exploitability_max = max_i Δ_i
+        
+        Returns:
+            Dict with keys:
+            - evaluation/nashconv_sum: sum of exploitabilities
+            - evaluation/exploitability_max: maximum exploitability
+            - evaluation/exploitability_{group}: per-agent exploitability
+        """
+        if not self.compute_nashconv or not hasattr(self, 'experiment') or self.experiment is None:
+            print(f"    NashConv: Skipping - compute_nashconv={self.compute_nashconv}, has_experiment={hasattr(self, 'experiment')}")
+            return {}
+        
+        try:
+            algorithm = self.experiment.algorithm
+            if algorithm is None:
+                print(f"    NashConv: Algorithm is None")
+                return {}
+            
+            # Get groups (agents)
+            groups = list(self.experiment.group_map.keys()) if hasattr(self.experiment, 'group_map') else []
+            if not groups:
+                print(f"    NashConv: No groups found")
+                return {}
+            
+            print(f"    NashConv: Found {len(groups)} groups: {groups}")
+            
+            # Collect states and actions from rollouts
+            states = []
+            actions = {}
+            observations = {}
+            
+            # Debug: Check rollout structure
+            if rollouts:
+                print(f"    NashConv: Checking rollout structure...")
+                first_rollout = rollouts[0]
+                if hasattr(first_rollout, 'keys'):
+                    rollout_keys = list(first_rollout.keys())
+                    print(f"    NashConv: First rollout keys: {rollout_keys[:10]}...")  # Show first 10 keys
+                    # Check for nested structure
+                    if "next" in rollout_keys:
+                        next_keys = list(first_rollout["next"].keys()) if hasattr(first_rollout["next"], 'keys') else []
+                        print(f"    NashConv: 'next' keys: {next_keys}")
+                        # Check what's inside agent_0 in next
+                        if groups and groups[0] in first_rollout["next"]:
+                            agent_data = first_rollout["next"][groups[0]]
+                            if hasattr(agent_data, 'keys'):
+                                agent_keys = list(agent_data.keys())
+                                print(f"    NashConv: '{groups[0]}' in 'next' has keys: {agent_keys[:10]}")
+                        # Check what's in current state (rollout[group])
+                        if groups and groups[0] in first_rollout:
+                            agent_data_curr = first_rollout[groups[0]]
+                            if hasattr(agent_data_curr, 'keys'):
+                                agent_keys_curr = list(agent_data_curr.keys())
+                                print(f"    NashConv: '{groups[0]}' in current state has keys: {agent_keys_curr[:10]}")
+            
+            for rollout in rollouts:
+                # Extract observations (states) and actions for each group
+                # BenchMARL structure: rollout is a TensorDict with nested structure
+                # - Observations: rollout["next"][group]["observation"] (next state observations)
+                # - Actions: rollout[group]["action"] (actions taken to reach next state)
+                
+                # Check if rollout has the expected structure
+                rollout_keys = list(rollout.keys()) if hasattr(rollout, 'keys') else []
+                if "next" not in rollout_keys:
+                    continue
+                
+                next_data = rollout["next"]
+                if not hasattr(next_data, 'keys'):
+                    continue
+                
+                for group in groups:
+                    obs = None
+                    action = None
+                    
+                    try:
+                        # Get observation from next state
+                        if group in next_data:
+                            group_data_next = next_data[group]
+                            # TensorDict supports direct indexing - try multiple methods
+                            try:
+                                obs = group_data_next["observation"]
+                            except (KeyError, TypeError):
+                                if hasattr(group_data_next, 'get'):
+                                    obs = group_data_next.get("observation", None)
+                                else:
+                                    obs = None
+                        
+                        # Get action from current state (the action that led to the next state)
+                        if group in rollout:
+                            group_data_curr = rollout[group]
+                            try:
+                                action = group_data_curr["action"]
+                            except (KeyError, TypeError):
+                                if hasattr(group_data_curr, 'get'):
+                                    action = group_data_curr.get("action", None)
+                                else:
+                                    action = None
+                                
+                    except (KeyError, AttributeError, TypeError, IndexError) as e:
+                        # Only log first error to avoid spam
+                        if group == groups[0] and len(observations) == 0:
+                            print(f"    NashConv: Exception accessing {group}: {type(e).__name__}: {e}")
+                            import traceback
+                            print(f"    Traceback: {traceback.format_exc()}")
+                        continue
+                    
+                    # Debug: Log what we extracted (only for first group, first rollout)
+                    if group == groups[0] and len(observations) == 0:
+                        print(f"    NashConv: Extracted data for {group}")
+                        print(f"      obs type: {type(obs)}, shape: {obs.shape if hasattr(obs, 'shape') else 'N/A'}")
+                        print(f"      action type: {type(action)}, shape: {action.shape if hasattr(action, 'shape') else 'N/A'}")
+                    
+                    if obs is not None and action is not None:
+                        # Convert to tensors if needed
+                        if isinstance(obs, np.ndarray):
+                            obs = torch.from_numpy(obs).float()
+                        elif isinstance(obs, torch.Tensor):
+                            obs = obs.float()
+                        else:
+                            continue  # Skip if we can't convert
+                            
+                        if isinstance(action, np.ndarray):
+                            action = torch.from_numpy(action).float()
+                        elif isinstance(action, torch.Tensor):
+                            action = action.float()
+                        else:
+                            continue  # Skip if we can't convert
+                        
+                        # Handle batched data - rollouts are sequences of steps
+                        # Shape analysis:
+                        # - obs.shape: [time_steps, num_agents, obs_dim] or [time_steps, obs_dim]
+                        # - action.shape: [time_steps, num_agents, action_dim] or [time_steps, action_dim]
+                        # We need to extract data for the specific group (agent)
+                        
+                        # If data has 3 dimensions [time_steps, num_agents, dim], we need to select the agent
+                        # The group index in groups list corresponds to the agent index
+                        agent_idx = groups.index(group) if group in groups else 0
+                        
+                        if obs.dim() == 3:
+                            # Shape: [time_steps, num_agents, obs_dim] - select agent
+                            if agent_idx < obs.shape[1]:
+                                obs = obs[:, agent_idx, :]  # [time_steps, obs_dim]
+                            else:
+                                continue  # Agent index out of bounds
+                        elif obs.dim() == 2:
+                            # Shape: [time_steps, obs_dim] - already per-agent
+                            pass
+                        elif obs.dim() == 1:
+                            # Single step - add batch dimension
+                            obs = obs.unsqueeze(0)
+                        elif obs.dim() == 0:
+                            obs = obs.unsqueeze(0)
+                        else:
+                            continue  # Unexpected shape
+                        
+                        if action.dim() == 3:
+                            # Shape: [time_steps, num_agents, action_dim] - select agent
+                            if agent_idx < action.shape[1]:
+                                action = action[:, agent_idx, :]  # [time_steps, action_dim]
+                            else:
+                                continue  # Agent index out of bounds
+                        elif action.dim() == 2:
+                            # Shape: [time_steps, action_dim] - already per-agent
+                            pass
+                        elif action.dim() == 1:
+                            action = action.unsqueeze(0)
+                        elif action.dim() == 0:
+                            action = action.unsqueeze(0)
+                        else:
+                            continue  # Unexpected shape
+                        
+                        # Now obs and action should be [time_steps, dim]
+                        # Get number of time steps
+                        time_steps = obs.shape[0]
+                        action_time_steps = action.shape[0]
+                        min_steps = min(time_steps, action_time_steps)
+                        
+                        # Debug: Log final shapes (only for first group, first rollout)
+                        if group == groups[0] and len(observations) == 0:
+                            print(f"    NashConv: After processing - obs shape: {obs.shape}, action shape: {action.shape}")
+                            print(f"    NashConv: Time steps: {time_steps}, action time steps: {action_time_steps}")
+                        
+                        if min_steps > 0:
+                            if group not in observations:
+                                observations[group] = []
+                                actions[group] = []
+                            
+                            # Add all time steps from this rollout
+                            for step_idx in range(min_steps):
+                                observations[group].append(obs[step_idx])
+                                actions[group].append(action[step_idx])
+            
+            # Check if we have enough data
+            if not observations or not all(len(obs_list) > 0 for obs_list in observations.values()):
+                print(f"    NashConv: Not enough observations - observations keys: {list(observations.keys()) if observations else 'empty'}")
+                if observations:
+                    for group, obs_list in observations.items():
+                        print(f"      {group}: {len(obs_list)} observations")
+                else:
+                    print(f"    NashConv: observations dict is empty")
+                logger.debug("Not enough data for NashConv computation")
+                return {}
+            
+            # Debug: Log what we collected
+            print(f"    NashConv: Collected data - {len(observations)} groups")
+            for group, obs_list in observations.items():
+                print(f"      {group}: {len(obs_list)} observations, {len(actions.get(group, []))} actions")
+            
+            # Stack observations and actions into batches
+            min_length = min(len(obs_list) for obs_list in observations.values())
+            if min_length == 0:
+                print(f"    NashConv: Min length is 0, skipping.")
+                return {}
+            
+            # Use a subset for efficiency
+            batch_size = min(self.nashconv_batch_size, min_length)
+            indices = np.random.choice(min_length, size=batch_size, replace=False)
+            print(f"    NashConv: Using batch_size={batch_size} from {min_length} samples")
+            
+            # Stack into tensors
+            obs_batch = {}
+            action_batch = {}
+            for group in groups:
+                if group in observations and len(observations[group]) > 0:
+                    obs_list = [observations[group][i] for i in indices if i < len(observations[group])]
+                    action_list = [actions[group][i] for i in indices if i < len(actions[group])]
+                    
+                    if obs_list and action_list:
+                        # Ensure all have same shape
+                        obs_tensor = torch.stack(obs_list)
+                        action_tensor = torch.stack(action_list)
+                        
+                        # Move to device
+                        device = next(algorithm.parameters()).device if hasattr(algorithm, 'parameters') else torch.device("cpu")
+                        obs_batch[group] = obs_tensor.to(device)
+                        action_batch[group] = action_tensor.to(device)
+            
+            if not obs_batch or not action_batch:
+                print(f"    NashConv: Empty batches - obs_batch keys: {list(obs_batch.keys())}, action_batch keys: {list(action_batch.keys())}")
+                return {}
+            
+            print(f"    NashConv: Batches created - obs_batch: {list(obs_batch.keys())}, action_batch: {list(action_batch.keys())}")
+            
+            # Compute exploitability for each agent
+            exploitabilities = {}
+            
+            for agent_group in groups:
+                if agent_group not in obs_batch or agent_group not in action_batch:
+                    print(f"    NashConv: Skipping {agent_group} - not in batches")
+                    continue
+                
+                try:
+                    # Get critic for this agent
+                    if not hasattr(algorithm, 'get_value_module'):
+                        print(f"    NashConv: Algorithm {type(algorithm).__name__} has no get_value_module")
+                        continue
+                    
+                    critic_module = algorithm.get_value_module(agent_group)
+                    if critic_module is None:
+                        print(f"    NashConv: Critic module for {agent_group} is None")
+                        continue
+                    
+                    print(f"    NashConv: Computing exploitability for {agent_group}...")
+                    
+                    # Get current observations and actions
+                    agent_obs = obs_batch[agent_group]
+                    agent_action = action_batch[agent_group]
+                    
+                    # Build joint observation and action for centralized critic
+                    # BenchMARL's MADDPG critic expects TensorDict with nested structure
+                    # Try TensorDict format first, fallback to concatenated format
+                    from tensordict import TensorDict
+                    
+                    # Construct joint observation and action
+                    joint_obs_list = []
+                    joint_action_list = []
+                    for group in sorted(groups):
+                        if group in obs_batch:
+                            joint_obs_list.append(obs_batch[group])
+                            joint_action_list.append(action_batch[group])
+                    
+                    if not joint_obs_list or not joint_action_list:
+                        continue
+                    
+                    # Try TensorDict format (BenchMARL standard)
+                    # Note: BenchMARL's critic may expect a specific structure - if this fails, use concatenated format
+                    use_tensordict = False
+                    try:
+                        # Create TensorDict with nested structure for critic
+                        # BenchMARL critics typically expect: {group: {"observation": obs, "action": act}}
+                        critic_input_td = TensorDict({}, batch_size=[batch_size])
+                        for group in sorted(groups):
+                            if group in obs_batch and group in action_batch:
+                                critic_input_td[group] = TensorDict({
+                                    "observation": obs_batch[group],
+                                    "action": action_batch[group]
+                                }, batch_size=[batch_size])
+                        
+                        # Try to call critic with TensorDict
+                        critic_module.eval()
+                        with torch.no_grad():
+                            current_q = critic_module(critic_input_td)
+                            # Handle different output formats
+                            if isinstance(current_q, TensorDict):
+                                current_q = current_q.get("state_value", current_q.get("action_value", None))
+                            if current_q is None or not isinstance(current_q, torch.Tensor):
+                                raise ValueError("Critic output format not recognized")
+                            if current_q.dim() > 1:
+                                current_q = current_q.squeeze(-1) if current_q.shape[-1] == 1 else current_q.mean(dim=-1)
+                            current_q_mean = current_q.mean().item()
+                        
+                        use_tensordict = True
+                        print(f"    NashConv: Using TensorDict format for {agent_group}")
+                    except Exception as e:
+                        # Fallback to concatenated format
+                        print(f"    NashConv: TensorDict format failed for {agent_group}, trying concatenated format: {type(e).__name__}")
+                        logger.debug(f"TensorDict format failed, using concatenated format: {e}")
+                        use_tensordict = False
+                        
+                        # Concatenate along feature dimension
+                        if not joint_obs_list or not joint_action_list:
+                            raise ValueError(f"Empty joint_obs_list or joint_action_list for {agent_group}")
+                        
+                        try:
+                            joint_obs = torch.cat(joint_obs_list, dim=-1)  # [batch, n_features_total]
+                            joint_action = torch.cat(joint_action_list, dim=-1)  # [batch, n_actions_total]
+                            
+                            # Construct input to critic: [joint_obs, joint_action]
+                            critic_input = torch.cat([joint_obs, joint_action], dim=-1)
+                            
+                            # Compute current Q-value: Q_i(s, a)
+                            critic_module.eval()
+                            with torch.no_grad():
+                                current_q = critic_module(critic_input)
+                                if current_q.dim() > 1:
+                                    current_q = current_q.squeeze(-1) if current_q.shape[-1] == 1 else current_q.mean(dim=-1)
+                                current_q_mean = current_q.mean().item()
+                            print(f"    NashConv: Concatenated format worked for {agent_group}, current_q_mean={current_q_mean:.6f}")
+                        except Exception as e2:
+                            print(f"    NashConv: Concatenated format also failed for {agent_group}: {type(e2).__name__}: {e2}")
+                            raise  # Re-raise to be caught by outer exception handler
+                    
+                    # Compute best response for agent i by optimizing a_i while holding a_{-i} fixed
+                    # Initialize best response action as current action
+                    agent_action_br = agent_action.clone().detach().requires_grad_(True)
+                    
+                    # Optimize a_i using gradient ascent on Q_i
+                    optimizer = torch.optim.Adam([agent_action_br], lr=self.nashconv_lr)
+                    
+                    for step in range(self.nashconv_steps):
+                        optimizer.zero_grad()
+                        
+                        if use_tensordict:
+                            # Reconstruct TensorDict with optimized action
+                            critic_input_br_td = TensorDict({}, batch_size=[batch_size])
+                            for group in sorted(groups):
+                                if group in obs_batch:
+                                    if group == agent_group:
+                                        action_br = agent_action_br
+                                    else:
+                                        action_br = action_batch[group]
+                                    critic_input_br_td[group] = TensorDict({
+                                        "observation": obs_batch[group],
+                                        "action": action_br
+                                    }, batch_size=[batch_size])
+                            
+                            # Compute Q-value with best response action
+                            q_br = critic_module(critic_input_br_td)
+                            if isinstance(q_br, TensorDict):
+                                q_br = q_br.get("state_value", q_br.get("action_value", None))
+                            if q_br is None or not isinstance(q_br, torch.Tensor):
+                                raise ValueError("Critic output format not recognized")
+                            if q_br.dim() > 1:
+                                q_br = q_br.squeeze(-1) if q_br.shape[-1] == 1 else q_br.mean(dim=-1)
+                        else:
+                            # Reconstruct joint action with optimized a_i
+                            joint_action_br_list = []
+                            for group in sorted(groups):
+                                if group == agent_group:
+                                    joint_action_br_list.append(agent_action_br)
+                                else:
+                                    joint_action_br_list.append(action_batch[group])
+                            
+                            joint_action_br = torch.cat(joint_action_br_list, dim=-1)
+                            critic_input_br = torch.cat([joint_obs, joint_action_br], dim=-1)
+                            
+                            # Compute Q-value with best response action
+                            q_br = critic_module(critic_input_br)
+                            if q_br.dim() > 1:
+                                q_br = q_br.squeeze(-1) if q_br.shape[-1] == 1 else q_br.mean(dim=-1)
+                        
+                        # Maximize Q-value (minimize negative)
+                        loss = -q_br.mean()
+                        loss.backward()
+                        
+                        # Clip gradients for stability
+                        torch.nn.utils.clip_grad_norm_([agent_action_br], max_norm=1.0)
+                        
+                        optimizer.step()
+                        
+                        # Clip actions to valid range (assuming actions are in [-1, 1] or [0, 1])
+                        with torch.no_grad():
+                            agent_action_br.clamp_(-1.0, 1.0)
+                    
+                    # Compute best response Q-value
+                    critic_module.eval()
+                    with torch.no_grad():
+                        if use_tensordict:
+                            critic_input_br_final_td = TensorDict({}, batch_size=[batch_size])
+                            for group in sorted(groups):
+                                if group in obs_batch:
+                                    if group == agent_group:
+                                        action_br = agent_action_br
+                                    else:
+                                        action_br = action_batch[group]
+                                    critic_input_br_final_td[group] = TensorDict({
+                                        "observation": obs_batch[group],
+                                        "action": action_br
+                                    }, batch_size=[batch_size])
+                            
+                            q_br_final = critic_module(critic_input_br_final_td)
+                            if isinstance(q_br_final, TensorDict):
+                                q_br_final = q_br_final.get("state_value", q_br_final.get("action_value", None))
+                            if q_br_final is None or not isinstance(q_br_final, torch.Tensor):
+                                raise ValueError("Critic output format not recognized")
+                            if q_br_final.dim() > 1:
+                                q_br_final = q_br_final.squeeze(-1) if q_br_final.shape[-1] == 1 else q_br_final.mean(dim=-1)
+                        else:
+                            joint_action_br_final = torch.cat([
+                                agent_action_br if group == agent_group else action_batch[group]
+                                for group in sorted(groups)
+                            ], dim=-1)
+                            critic_input_br_final = torch.cat([joint_obs, joint_action_br_final], dim=-1)
+                            q_br_final = critic_module(critic_input_br_final)
+                            if q_br_final.dim() > 1:
+                                q_br_final = q_br_final.squeeze(-1) if q_br_final.shape[-1] == 1 else q_br_final.mean(dim=-1)
+                        q_br_mean = q_br_final.mean().item()
+                    
+                    # Exploitability = E[Q_i(s, a_i^BR, a_{-i}) - Q_i(s, a)]
+                    exploitability = q_br_mean - current_q_mean
+                    exploitabilities[agent_group] = max(0.0, exploitability)  # Exploitability is non-negative
+                    print(f"    NashConv: Exploitability for {agent_group}: {exploitability:.6f}")
+                    
+                except Exception as e:
+                    print(f"    NashConv: Error computing exploitability for {agent_group}: {type(e).__name__}: {e}")
+                    import traceback
+                    print(f"    NashConv: Traceback: {traceback.format_exc()}")
+                    logger.debug(f"Error computing exploitability for {agent_group}: {e}")
+                    continue
+            
+            if not exploitabilities:
+                return {}
+            
+            # Compute NashConv and exploitability_max
+            nashconv_sum = sum(exploitabilities.values())
+            exploitability_max = max(exploitabilities.values()) if exploitabilities else 0.0
+            
+            # Build result dictionary
+            metrics = {
+                "evaluation/nashconv_sum": nashconv_sum,
+                "evaluation/exploitability_max": exploitability_max,
+            }
+            
+            # Add per-agent exploitability
+            for group, exploit in exploitabilities.items():
+                metrics[f"evaluation/exploitability_{group}"] = exploit
+            
+            return metrics
+            
+        except Exception as e:
+            logger.warning(f"Error computing NashConv metrics: {e}")
+            import traceback
+            logger.debug(f"NashConv computation error traceback: {traceback.format_exc()}")
+            return {}
     
     def on_batch_collected(self, batch: TensorDictBase):
         if not self.log_training_metrics:
@@ -376,7 +883,21 @@ class AnchorMetricsCallback(Callback):
     # SS: This function is way too messy. We need to fix this. Its not working right now.
     def on_evaluation_end(self, rollouts: List[TensorDictBase]):
         if not self.log_evaluation_metrics:
+            logger.debug("Evaluation metrics logging disabled, skipping on_evaluation_end")
             return
+        
+        # Check if experiment is available
+        if not hasattr(self, 'experiment') or self.experiment is None:
+            logger.warning("on_evaluation_end called but experiment is not set. Callback may not be properly initialized.")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"CALLBACK: on_evaluation_end called!")
+        print(f"  Number of rollouts: {len(rollouts) if rollouts else 0}")
+        print(f"  Experiment: {self.experiment}")
+        print(f"  Compute NashConv: {self.compute_nashconv}")
+        print(f"{'='*80}\n")
+        logger.info(f"on_evaluation_end called with {len(rollouts) if rollouts else 0} rollouts")
         
         all_metrics = {}
         n_episodes = 0
@@ -584,16 +1105,41 @@ class AnchorMetricsCallback(Callback):
                 self.evaluation_anchor_data.append(episode_data)
                 logger.info(f"  Collected anchor data for episode {n_episodes}: {list(episode_data.keys())}")
         
+        # Always create aggregated dict, even if all_metrics is empty (for NashConv)
+        aggregated = {}
         if all_metrics:
-            aggregated = {}
             for key, values in all_metrics.items():
                 if values:
                     aggregated[f"{key}_mean"] = sum(values) / len(values)
                     aggregated[f"{key}_std"] = np.std(values) if len(values) > 1 else 0.0
                     aggregated[f"{key}_min"] = min(values)
                     aggregated[f"{key}_max"] = max(values)
-            
-            aggregated["evaluation/n_episodes"] = n_episodes
+        
+        aggregated["evaluation/n_episodes"] = n_episodes
+        
+        # Compute NashConv/exploitability metrics (always compute, even if other metrics are empty)
+        if self.compute_nashconv:
+            try:
+                print(f"  Computing NashConv metrics from {len(rollouts)} rollouts...")
+                nashconv_metrics = self._compute_nashconv_metrics(rollouts)
+                if nashconv_metrics:
+                    aggregated.update(nashconv_metrics)
+                    nashconv_sum = nashconv_metrics.get('evaluation/nashconv_sum', 0.0)
+                    exploitability_max = nashconv_metrics.get('evaluation/exploitability_max', 0.0)
+                    print(f"  ✓ NashConv computed successfully!")
+                    print(f"    NashConv sum: {nashconv_sum:.6f}")
+                    print(f"    Exploitability max: {exploitability_max:.6f}")
+                    logger.info(f"NashConv metrics: sum={nashconv_sum:.6f}, max={exploitability_max:.6f}")
+                else:
+                    print(f"  ⚠ NashConv computation returned empty metrics (insufficient data or computation failed)")
+                    logger.debug("NashConv computation returned empty metrics (this is normal if computation fails or data is insufficient)")
+            except Exception as e:
+                print(f"  ✗ Error during NashConv computation: {e}")
+                logger.warning(f"Error during NashConv computation (non-fatal): {e}")
+                import traceback
+                logger.debug(f"NashConv error traceback: {traceback.format_exc()}")
+        
+        if aggregated:
             
             # Try to log to wandb, but handle case where run is finished
             try:
