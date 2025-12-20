@@ -147,8 +147,8 @@ def main():
     parser.add_argument(
         "--max_cycles",
         type=int,
-        default=500,
-        help="Maximum cycles per episode (default: 500 for better convergence)"
+        default=100,
+        help="Maximum cycles per episode (default: 100)"
     )
     
     parser.add_argument(
@@ -171,7 +171,7 @@ def main():
         "--total_timesteps",
         type=int,
         default=60_000,
-        help="Total training timesteps (increased from 24k to 60k for better convergence with max_cycles=500)"
+        help="Total training timesteps (increased from 24k to 60k for better convergence with max_cycles=100)"
     )
     
     parser.add_argument(

@@ -17,44 +17,60 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 
 # Environment configuration dictionary
 env_config:
-  precision_target: 0.95
-  coverage_target: 0.1
+  precision_target: 0.99
+  coverage_target: 0.8
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
   step_fracs: [0.005, 0.01, 0.02]
   min_width: 0.05
   alpha: 0.7
-  beta: 0.6
+  beta: 1.0  # Increased from 0.6 to 1.0 to give coverage equal or higher weight than precision
   gamma: 0.1
   precision_blend_lambda: 0.5
   drift_penalty_weight: 0.05
-  min_coverage_floor: 0.005
+  min_coverage_floor: 0.1  # Increased from 0.005 to 0.01 to prevent boxes from becoming too small
   js_penalty_weight: 0.05
+  # Episode length (kept here so it is passed directly into AnchorEnv.__init__)
+  max_cycles: 100
+
+  # Stabilization-based early termination (per-agent)
+  enable_stability_termination: true
+  stability_window: 10
+  stability_min_steps: 20
+  stability_precision_tol: 1e-3
+  stability_coverage_tol: 1e-3
+  stability_drift_tol: 1e-3
+
   initial_window: 0.1
-  max_action_scale: 0.1
-  min_absolute_step: 0.001
+  max_action_scale: 0.15  # Increased from 0.1 to 0.15 to allow faster box expansion for better coverage
+  min_absolute_step: 0.01
   inter_class_overlap_weight: 0.1  # Penalty weight for overlap between different agents' rules
   shared_reward_weight: 0.5  # Weight for shared cooperative reward - MUST be significant to encourage cooperation
   # If shared_reward_weight is too low, multi-agent training becomes equivalent to independent single-agent training
   # The shared reward incentivizes agents to work together and achieve collective goals
   # Class union metrics weights: reward agents based on union of all agents' anchors for their class
-  class_union_cov_weight: 0.01   # Weight for class-union coverage bonus (reduced from 0.1 to prevent high cumulative rewards)
-  class_union_prec_weight: 0.01  # Weight for class-union precision bonus (reduced from 0.1 to prevent high cumulative rewards)
+  # Significantly increased to encourage better coverage through coordination.
+  class_union_cov_weight: 0.3   # Weight for class-union coverage bonus (increased from 0.05 to strongly incentivize coverage)
+  class_union_prec_weight: 0.3  # Weight for class-union precision bonus (increased from 0.02)
   # Global coverage reward: reward when all agents together cover the dataset well
-  global_coverage_weight: 0.01    # Weight for global coverage bonus (reduced from 0.1 to prevent high cumulative rewards)
-  global_coverage_threshold: 0.1 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
-  # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
-  # These bonuses reward good coverage behavior (same as single-agent for fair comparison)
-  coverage_bonus_weight_met: 0.01          # When targets are met: weight * (coverage / target) - Fixed: match single-agent for fair comparison
-  coverage_bonus_weight_high_prec: 0.03    # When precision >= threshold and making progress: base weight - Fixed: match single-agent for fair comparison
-  coverage_bonus_weight_high_prec_progress: 0.07  # Progress multiplier when precision >= threshold
-  coverage_bonus_weight_high_prec_distance: 0.02  # Distance to target multiplier when precision >= threshold
-  coverage_bonus_weight_reasonable_prec: 0.01     # When precision >= 0.8 * threshold and making progress: base weight
-  coverage_bonus_weight_reasonable_prec_progress: 0.02  # Progress multiplier when precision >= 0.8 * threshold
+  # Significantly increased to encourage overall coverage improvement.
+  global_coverage_weight: 0.10    # Weight for global coverage bonus (increased from 0.03)
+  global_coverage_threshold: 0.8 # Minimum global coverage required to receive bonus (0.0 = reward any positive coverage)
+  # Coverage bonus weights - SIGNIFICANTLY INCREASED to incentivize coverage expansion
+  # These bonuses reward good coverage behavior and encourage agents to expand boxes
+  coverage_bonus_weight_met: 0.05          # When targets are met: weight * (coverage / target) - Increased from 0.01
+  coverage_bonus_weight_high_prec: 0.10    # When precision >= threshold and making progress: base weight - Increased from 0.03
+  coverage_bonus_weight_high_prec_progress: 0.20  # Progress multiplier when precision >= threshold - Increased from 0.07
+  coverage_bonus_weight_high_prec_distance: 0.10  # Distance to target multiplier when precision >= threshold - Increased from 0.02
+  coverage_bonus_weight_reasonable_prec: 0.05     # When precision >= 0.8 * threshold and making progress: base weight - Increased from 0.01
+  coverage_bonus_weight_reasonable_prec_progress: 0.30  # Progress multiplier when precision >= 0.8 * threshold - Increased from 0.02
   # Target class bonus weight (reduced from 0.2 to prevent high cumulative rewards, same as single-agent)
   target_class_bonus_weight: 0.02  # Weight for target class fraction bonus
-  agents_per_class: 3        # Number of agents per class (set >1 to learn multiple anchors per class)
+  agents_per_class: 4        # Number of agents per class (set >1 to learn multiple anchors per class)
+  # IMPORTANT: This should match the training configuration. If you trained with agents_per_class: 3,
+  # use 3 here to use all individual policies. If you trained with agents_per_class: 1, use 1 here.
+  # The inference code now properly uses individual policies for each agent when agents_per_class > 1.
   # Use class centroids to initialize the initial window (default: true)
   # If true: initial window is set around class centroid (mean of class instances)
   # If false: initial window is full space (0 to 1 for all features)
@@ -74,9 +90,9 @@ env_config:
 # Controls logging in training, inference, and environment during rollouts
 logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
 
-# Maximum number of steps per episode
-# Increased to 500 for better convergence (allows agents more time to refine anchors)
-max_cycles: 500
+# Maximum number of steps per episode (source of truth is env_config.max_cycles; kept here for backward compatibility)
+# If your task wrapper reads only the top-level max_cycles, keep both in sync.
+max_cycles: 100
 
 # Termination reason counters: disable overused reasons
 # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
@@ -84,4 +100,3 @@ max_termination_count_both_targets: -1
 max_termination_count_high_precision: 200
 max_termination_count_both_close: 50
 max_termination_count_excellent_precision: 30
-

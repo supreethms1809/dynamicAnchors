@@ -81,7 +81,7 @@ class AnchorTrainer:
         self,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 500,
+        max_cycles: Optional[int] = None,
         device: str = "cpu",
         eval_on_test_data: bool = True
     ) -> Experiment:
@@ -132,6 +132,13 @@ class AnchorTrainer:
         # Get the environment configuration from YAML file or use defaults.
         if env_config is None:
             env_config = self._load_env_config_from_yaml()
+
+        # Support YAML layouts that include a nested `env_config:` section.
+        # If present, merge nested keys first, then let any top-level keys override.
+        if isinstance(env_config, dict) and isinstance(env_config.get("env_config", None), dict):
+            nested = env_config.get("env_config", {})
+            top = {k: v for k, v in env_config.items() if k != "env_config"}
+            env_config = {**nested, **top}
         
         # Apply logging verbosity early based on config
         verbosity = env_config.get("logging_verbosity", "normal")
@@ -155,6 +162,12 @@ class AnchorTrainer:
         if target_classes is None:
             target_classes = list(np.unique(self.dataset_loader.y_train))
         
+        # Resolve episode length: if not explicitly provided, use env_config (or default).
+        if max_cycles is None:
+            max_cycles = int(env_config.get("max_cycles", 100))
+        else:
+            max_cycles = int(max_cycles)
+
         # Create the environment configuration with the data.
         env_config_with_data = {
             **env_config,
@@ -1253,6 +1266,7 @@ class AnchorTrainer:
             import json
             index_data = {
                 "agents_per_class": agents_per_class,
+                "seed": self.seed,  # Save seed to match training seed during inference
                 "policies_by_class": {}
             }
             for class_id, policies in sorted(policies_by_class.items()):
@@ -1668,16 +1682,46 @@ class AnchorTrainer:
                 n_samples = X_data.shape[0]
                 union_mask = np.zeros(n_samples, dtype=bool)
                 
+                # IMPORTANT:
+                # - X_data here is always in unit space [0, 1] (X_unit / X_test_unit)
+                # - During extraction we store BOTH:
+                #     * lower_bounds / upper_bounds           -> in standardized feature space
+                #     * lower_bounds_normalized / upper_bounds_normalized -> in unit space [0, 1]
+                # - If we compare X_unit against standardized bounds, almost no samples will match,
+                #   which collapses the union to all-False and yields class_precision = class_coverage = 0.
+                #
+                # To compute a correct union in the same space as the environment, we MUST use the
+                # normalized bounds when they are available, and only fall back to raw bounds if
+                # normalized ones are missing (for older runs).
+                
                 # Build union mask from all anchors
                 for anchor_data in anchors_list:
-                    if "lower_bounds" in anchor_data and "upper_bounds" in anchor_data:
-                        # Bounds from observation are in normalized space (unit space [0, 1])
+                    # Prefer normalized bounds if available (they live in the same space as X_data)
+                    if (
+                        "lower_bounds_normalized" in anchor_data
+                        and "upper_bounds_normalized" in anchor_data
+                    ):
+                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    elif "lower_bounds" in anchor_data and "upper_bounds" in anchor_data:
+                        # Backward compatibility: assume these bounds are already in the same space as X_data
                         lower = np.array(anchor_data["lower_bounds"], dtype=np.float32)
                         upper = np.array(anchor_data["upper_bounds"], dtype=np.float32)
-                        
-                        # Check which points fall in this anchor box
-                        in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
-                        union_mask |= in_box
+                    else:
+                        # No usable bounds for this anchor
+                        continue
+                    
+                    # Check which points fall in this anchor box (inclusive bounds)
+                    if lower.shape[0] != X_data.shape[1] or upper.shape[0] != X_data.shape[1]:
+                        # Dimension mismatch – skip this anchor but log once at debug level
+                        logger.debug(
+                            f"Skipping anchor for class {target_class} due to dimension mismatch: "
+                            f"bounds_dim={lower.shape[0]}, X_dim={X_data.shape[1]}"
+                        )
+                        continue
+                    
+                    in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+                    union_mask |= in_box
                 
                 # Class-level coverage: fraction of class samples that are in the union
                 mask_cls = (y_data == target_class)

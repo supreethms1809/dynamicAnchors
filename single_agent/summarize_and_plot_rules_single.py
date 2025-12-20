@@ -1373,15 +1373,55 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
     
     # Add per-class metrics
     per_class_summary = summary.get("per_class_summary", {})
+    total_rollout_time = 0.0
     for class_key, class_data in per_class_summary.items():
         cls = class_data.get("class", -1)
+        class_timing = {
+            "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
+            "total_rollout_time_seconds": class_data.get("total_rollout_time_seconds", 0.0),
+            "class_total_time_seconds": class_data.get("class_total_time_seconds", 0.0),
+        }
+        total_rollout_time += class_timing.get("total_rollout_time_seconds", 0.0)
+        
         consolidated["per_class"][f"class_{cls}"] = {
             "instance_precision": class_data.get("instance_precision", 0.0),
             "instance_coverage": class_data.get("instance_coverage", 0.0),
             "class_precision": class_data.get("class_precision", 0.0),
             "class_coverage": class_data.get("class_coverage", 0.0),
             "n_unique_rules": class_data.get("n_unique_rules", 0),
+            "timing": class_timing
         }
+    
+    # Try to load timing from inference results file if available
+    timing = {}
+    if experiment_dir:
+        # Try to find inference results file
+        inference_file = os.path.join(experiment_dir, "extracted_rules_single_agent.json")
+        if not os.path.exists(inference_file):
+            # Also check in inference subdirectory
+            inference_file = os.path.join(experiment_dir, "inference", "extracted_rules_single_agent.json")
+        
+        if os.path.exists(inference_file):
+            try:
+                with open(inference_file, 'r') as f:
+                    inference_data = json.load(f)
+                metadata = inference_data.get("metadata", {})
+                if metadata:
+                    timing = {
+                        "total_inference_time_seconds": metadata.get("total_inference_time_seconds", 0.0),
+                        "total_rollout_time_seconds": metadata.get("total_rollout_time_seconds", total_rollout_time),
+                    }
+            except Exception as e:
+                logger.debug(f"Could not load timing from inference file: {e}")
+    
+    # If no timing from inference file, aggregate from per-class data
+    if not timing and total_rollout_time > 0:
+        timing = {
+            "total_rollout_time_seconds": total_rollout_time,
+            "total_inference_time_seconds": 0.0,  # Not available without inference file
+        }
+    
+    consolidated["timing"] = timing
     
     # Save to file
     with open(output_file, 'w') as f:

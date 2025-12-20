@@ -25,6 +25,80 @@ from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime
 import json
 
+
+def load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load NashConv metrics from training_history.json and evaluation_history.json.
+    
+    Args:
+        experiment_dir: Path to experiment directory
+        
+    Returns:
+        Dictionary with training and evaluation NashConv metrics
+    """
+    nashconv_data = {
+        "training": None,
+        "evaluation": None,
+        "available": False
+    }
+    
+    if not experiment_dir:
+        return nashconv_data
+    
+    experiment_path = Path(experiment_dir)
+    
+    # Load training history
+    training_history_path = experiment_path / "training_history.json"
+    if training_history_path.exists():
+        try:
+            with open(training_history_path, 'r') as f:
+                training_history = json.load(f)
+            
+            # Extract NashConv metrics from training history
+            training_nashconv = []
+            for entry in training_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("training/nashconv") or key.startswith("training/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    training_nashconv.append(nashconv_entry)
+            
+            if training_nashconv:
+                nashconv_data["training"] = training_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load training NashConv metrics: {e}")
+    
+    # Load evaluation history
+    evaluation_history_path = experiment_path / "evaluation_history.json"
+    if evaluation_history_path.exists():
+        try:
+            with open(evaluation_history_path, 'r') as f:
+                evaluation_history = json.load(f)
+            
+            # Extract NashConv metrics from evaluation history
+            evaluation_nashconv = []
+            for entry in evaluation_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("evaluation/nashconv") or key.startswith("evaluation/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    evaluation_nashconv.append(nashconv_entry)
+            
+            if evaluation_nashconv:
+                nashconv_data["evaluation"] = evaluation_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load evaluation NashConv metrics: {e}")
+    
+    return nashconv_data
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -219,7 +293,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 18_000,
+    total_timesteps: int = 24_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -345,7 +419,7 @@ def run_single_agent_inference(
     experiment_dir: str,
     dataset: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 500,
+    steps_per_episode: int = 100,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -635,7 +709,7 @@ def run_multi_agent_inference(
     experiment_dir: str,
     dataset: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 500,
+    steps_per_episode: int = 100,
     n_instances_per_class: int = 20,
     device: str = "cpu",
     **kwargs
@@ -1030,10 +1104,14 @@ def create_consolidated_metrics_json(
                     "wandb_run_url": sa_consolidated.get("wandb_run_url"),
                     "metrics": sa_consolidated.get("metrics", {}),
                     "per_class": sa_consolidated.get("per_class", {}),
-                    "timing": sa_consolidated.get("timing", {})
+                    "timing": sa_consolidated.get("timing", {}),
+                    "algorithm": sa_consolidated.get("algorithm"),
+                    "model_type": sa_consolidated.get("model_type")
                 }
-                # If timing not in consolidated, try to extract from inference file
-                if not consolidated["single_agent"]["timing"]:
+                # If timing not in consolidated or empty, try to extract from inference file or aggregate from per_class
+                timing_dict = consolidated["single_agent"]["timing"]
+                if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                    # First try inference file
                     sa_inference_file = sa_summary_path.parent / "extracted_rules_single_agent.json"
                     if sa_inference_file.exists():
                         try:
@@ -1047,6 +1125,19 @@ def create_consolidated_metrics_json(
                                 }
                         except Exception:
                             pass
+                    
+                    # If still no timing, aggregate from per_class
+                    timing_dict = consolidated["single_agent"]["timing"]
+                    if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                        total_rollout = sum(
+                            pc.get("timing", {}).get("total_rollout_time_seconds", 0.0)
+                            for pc in consolidated["single_agent"]["per_class"].values()
+                        )
+                        if total_rollout > 0:
+                            consolidated["single_agent"]["timing"] = {
+                                "total_rollout_time_seconds": total_rollout,
+                                "total_inference_time_seconds": 0.0,  # Not available without inference file
+                            }
                 logger.info("✓ Loaded single-agent consolidated metrics")
             except Exception as e:
                 logger.warning(f"⚠ Could not load single-agent consolidated metrics: {e}")
@@ -1060,6 +1151,8 @@ def create_consolidated_metrics_json(
                 
                 consolidated["single_agent"] = {
                     "wandb_run_url": None,  # Try to get from wandb_run_url.txt if available
+                    "algorithm": sa_summary.get("algorithm"),
+                    "model_type": sa_summary.get("model_type"),
                     "metrics": {
                         "instance_level": {
                             "mean_precision": sa_stats.get("mean_precision", sa_stats.get("mean_instance_precision", 0.0)),
@@ -1114,6 +1207,19 @@ def create_consolidated_metrics_json(
                     except Exception as e:
                         logger.debug(f"Could not extract timing from single-agent inference file: {e}")
                 
+                # If still no timing, aggregate from per_class timing data
+                timing_dict = consolidated["single_agent"]["timing"]
+                if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                    total_rollout = sum(
+                        pc.get("timing", {}).get("total_rollout_time_seconds", 0.0)
+                        for pc in consolidated["single_agent"]["per_class"].values()
+                    )
+                    if total_rollout > 0:
+                        consolidated["single_agent"]["timing"] = {
+                            "total_rollout_time_seconds": total_rollout,
+                            "total_inference_time_seconds": 0.0,  # Not available without inference file
+                        }
+                
                 # Try to get wandb URL from file
                 wandb_url_file = sa_summary_path.parent.parent / "wandb_run_url.txt"
                 if not wandb_url_file.exists():
@@ -1143,10 +1249,14 @@ def create_consolidated_metrics_json(
                     "wandb_run_url": ma_consolidated.get("wandb_run_url"),
                     "metrics": ma_consolidated.get("metrics", {}),
                     "per_class": ma_consolidated.get("per_class", {}),
-                    "timing": ma_consolidated.get("timing", {})
+                    "timing": ma_consolidated.get("timing", {}),
+                    "algorithm": ma_consolidated.get("algorithm"),
+                    "model_type": ma_consolidated.get("model_type")
                 }
-                # If timing not in consolidated, try to extract from inference file
-                if not consolidated["multi_agent"]["timing"]:
+                # If timing not in consolidated or empty, try to extract from inference file or aggregate from per_class
+                timing_dict = consolidated["multi_agent"]["timing"]
+                if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                    # First try inference file
                     ma_inference_file = ma_summary_path.parent / "extracted_rules.json"
                     if ma_inference_file.exists():
                         try:
@@ -1160,6 +1270,19 @@ def create_consolidated_metrics_json(
                                 }
                         except Exception:
                             pass
+                    
+                    # If still no timing, aggregate from per_class
+                    timing_dict = consolidated["multi_agent"]["timing"]
+                    if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                        total_rollout = sum(
+                            pc.get("timing", {}).get("total_rollout_time_seconds", 0.0)
+                            for pc in consolidated["multi_agent"]["per_class"].values()
+                        )
+                        if total_rollout > 0:
+                            consolidated["multi_agent"]["timing"] = {
+                                "total_rollout_time_seconds": total_rollout,
+                                "total_inference_time_seconds": 0.0,  # Not available without inference file
+                            }
                 logger.info("✓ Loaded multi-agent consolidated metrics")
             except Exception as e:
                 logger.warning(f"⚠ Could not load multi-agent consolidated metrics: {e}")
@@ -1173,6 +1296,8 @@ def create_consolidated_metrics_json(
                 
                 consolidated["multi_agent"] = {
                     "wandb_run_url": None,  # Try to get from wandb_run_url.txt if available
+                    "algorithm": ma_summary.get("algorithm"),
+                    "model_type": ma_summary.get("model_type"),
                     "metrics": {
                         "instance_level": {
                             "mean_precision": ma_stats.get("mean_instance_precision", 0.0),
@@ -1227,6 +1352,19 @@ def create_consolidated_metrics_json(
                     except Exception as e:
                         logger.debug(f"Could not extract timing from multi-agent inference file: {e}")
                 
+                # If still no timing, aggregate from per_class timing data
+                timing_dict = consolidated["multi_agent"]["timing"]
+                if not timing_dict or (isinstance(timing_dict, dict) and not any(v for v in timing_dict.values() if v)):
+                    total_rollout = sum(
+                        pc.get("timing", {}).get("total_rollout_time_seconds", 0.0)
+                        for pc in consolidated["multi_agent"]["per_class"].values()
+                    )
+                    if total_rollout > 0:
+                        consolidated["multi_agent"]["timing"] = {
+                            "total_rollout_time_seconds": total_rollout,
+                            "total_inference_time_seconds": 0.0,  # Not available without inference file
+                        }
+                
                 # Try to get wandb URL from file
                 wandb_url_file = ma_summary_path.parent / "wandb_run_url.txt"
                 if not wandb_url_file.exists():
@@ -1246,6 +1384,22 @@ def create_consolidated_metrics_json(
                 logger.info("✓ Loaded multi-agent metrics from summary")
             except Exception as e:
                 logger.warning(f"⚠ Could not load multi-agent summary: {e}")
+        
+        # Load NashConv metrics for multi-agent (only multi-agent has NashConv)
+        if multi_agent_summary_file:
+            ma_summary_path = Path(multi_agent_summary_file)
+            # Try to infer experiment directory from summary path
+            # Summary is typically at: experiment_dir/inference/summary.json or experiment_dir/summary.json
+            ma_experiment_dir = None
+            if "inference" in str(ma_summary_path):
+                ma_experiment_dir = str(ma_summary_path.parent.parent)  # Go up from inference/
+            else:
+                ma_experiment_dir = str(ma_summary_path.parent)  # Same directory
+            
+            ma_nashconv = load_nashconv_metrics(ma_experiment_dir)
+            if ma_nashconv.get("available", False):
+                consolidated["multi_agent"]["nashconv"] = ma_nashconv
+                logger.info("✓ Loaded multi-agent NashConv metrics")
     
     # Save consolidated metrics JSON
     consolidated_file = output_path / "consolidated_metrics_all_methods.json"
@@ -1325,6 +1479,19 @@ def create_comparison_summary(
     sa_stats = comparison["single_agent"].get("overall_stats", {})
     ma_stats = comparison["multi_agent"].get("overall_stats", {})
     
+    # Load NashConv metrics for multi-agent
+    ma_nashconv = None
+    if multi_agent_summary_file:
+        ma_summary_path = Path(multi_agent_summary_file)
+        # Try to infer experiment directory
+        if "inference" in str(ma_summary_path):
+            ma_experiment_dir = str(ma_summary_path.parent.parent)
+        else:
+            ma_experiment_dir = str(ma_summary_path.parent)
+        ma_nashconv = load_nashconv_metrics(ma_experiment_dir)
+        if ma_nashconv.get("available", False):
+            comparison["multi_agent"]["nashconv_metrics"] = ma_nashconv
+    
     # Extract timing from inference files if not in summary
     sa_timing = {}
     ma_timing = {}
@@ -1372,6 +1539,8 @@ def create_comparison_summary(
             "class_precision_diff": sa_class_precision - ma_class_precision,
             "class_coverage_diff": sa_class_coverage - ma_class_coverage,
             "rules_diff": sa_stats.get("total_unique_rules", 0) - ma_stats.get("total_unique_rules", 0),
+            # NashConv metrics (multi-agent only)
+            "nashconv": {},
             # Timing comparison
             "timing": {
                 "baseline": {
@@ -1397,6 +1566,61 @@ def create_comparison_summary(
             "precision_diff": sa_instance_precision - ma_instance_precision,
             "coverage_diff": sa_instance_coverage - ma_instance_coverage,
         }
+        
+        # Add NashConv metrics to comparison if available
+        if ma_nashconv and ma_nashconv.get("available", False):
+            nashconv_comparison = {}
+            
+            # Training metrics
+            if ma_nashconv.get("training"):
+                training_data = ma_nashconv["training"]
+                if training_data:
+                    final_training = training_data[-1]
+                    nashconv_comparison["training"] = {
+                        "final_nashconv_sum": final_training.get("training/nashconv_sum", 0.0),
+                        "final_exploitability_max": final_training.get("training/exploitability_max", 0.0),
+                        "final_class_nashconv_sum": final_training.get("training/class_nashconv_sum", None),
+                        "final_step": final_training.get("step"),
+                        "total_data_points": len(training_data)
+                    }
+                    
+                    # Calculate convergence trend (first vs last)
+                    if len(training_data) > 1:
+                        first_training = training_data[0]
+                        nashconv_comparison["training"]["convergence"] = {
+                            "initial_nashconv_sum": first_training.get("training/nashconv_sum", 0.0),
+                            "final_nashconv_sum": final_training.get("training/nashconv_sum", 0.0),
+                            "improvement": first_training.get("training/nashconv_sum", 0.0) - final_training.get("training/nashconv_sum", 0.0),
+                            "improvement_pct": ((first_training.get("training/nashconv_sum", 0.0) - final_training.get("training/nashconv_sum", 0.0)) / 
+                                              max(first_training.get("training/nashconv_sum", 1e-6), 1e-6) * 100) if first_training.get("training/nashconv_sum", 0.0) > 0 else 0.0
+                        }
+            
+            # Evaluation metrics
+            if ma_nashconv.get("evaluation"):
+                eval_data = ma_nashconv["evaluation"]
+                if eval_data:
+                    final_eval = eval_data[-1]
+                    nashconv_comparison["evaluation"] = {
+                        "final_nashconv_sum": final_eval.get("evaluation/nashconv_sum", 0.0),
+                        "final_exploitability_max": final_eval.get("evaluation/exploitability_max", 0.0),
+                        "final_class_nashconv_sum": final_eval.get("evaluation/class_nashconv_sum", None),
+                        "final_step": final_eval.get("step"),
+                        "total_data_points": len(eval_data)
+                    }
+                    
+                    # Calculate convergence trend (first vs last)
+                    if len(eval_data) > 1:
+                        first_eval = eval_data[0]
+                        nashconv_comparison["evaluation"]["convergence"] = {
+                            "initial_nashconv_sum": first_eval.get("evaluation/nashconv_sum", 0.0),
+                            "final_nashconv_sum": final_eval.get("evaluation/nashconv_sum", 0.0),
+                            "improvement": first_eval.get("evaluation/nashconv_sum", 0.0) - final_eval.get("evaluation/nashconv_sum", 0.0),
+                            "improvement_pct": ((first_eval.get("evaluation/nashconv_sum", 0.0) - final_eval.get("evaluation/nashconv_sum", 0.0)) / 
+                                              max(first_eval.get("evaluation/nashconv_sum", 1e-6), 1e-6) * 100) if first_eval.get("evaluation/nashconv_sum", 0.0) > 0 else 0.0
+                        }
+            
+            if nashconv_comparison:
+                comparison["comparison"]["nashconv"] = nashconv_comparison
     
     # Save comparison
     output_path = Path(output_dir)
@@ -1453,6 +1677,25 @@ def create_comparison_summary(
         logger.info(f"  Total Unique Rules: {ma_stats.get('total_unique_rules', 0)}")
         if ma_total_time > 0:
             logger.info(f"  Timing - Total Rollout Time: {ma_total_time:.4f}s")
+        
+        # Log NashConv metrics if available
+        if ma_nashconv and ma_nashconv.get("available", False):
+            logger.info(f"\nMulti-Agent Nash Equilibrium Convergence:")
+            if ma_nashconv.get("training"):
+                training_data = ma_nashconv["training"]
+                if training_data:
+                    final_training = training_data[-1]
+                    logger.info(f"  Training NashConv (final):")
+                    logger.info(f"    NashConv sum: {final_training.get('training/nashconv_sum', 'N/A'):.6f}")
+                    logger.info(f"    Max exploitability: {final_training.get('training/exploitability_max', 'N/A'):.6f}")
+            if ma_nashconv.get("evaluation"):
+                eval_data = ma_nashconv["evaluation"]
+                if eval_data:
+                    final_eval = eval_data[-1]
+                    logger.info(f"  Evaluation NashConv (final):")
+                    logger.info(f"    NashConv sum: {final_eval.get('evaluation/nashconv_sum', 'N/A'):.6f}")
+                    logger.info(f"    Max exploitability: {final_eval.get('evaluation/exploitability_max', 'N/A'):.6f}")
+    
     if comparison["comparison"]:
         logger.info(f"Differences (Single - Multi):")
         logger.info(f"  Instance-Level - Precision: {comparison['comparison']['instance_precision_diff']:.4f}, Coverage: {comparison['comparison']['instance_coverage_diff']:.4f}")
@@ -1467,6 +1710,30 @@ def create_comparison_summary(
                 logger.info(f"  Baseline vs Single Time Difference: {timing['baseline_vs_single_time_diff_seconds']:.4f}s")
             if timing.get("baseline_vs_multi_time_diff_seconds", 0) != 0:
                 logger.info(f"  Baseline vs Multi Time Difference: {timing['baseline_vs_multi_time_diff_seconds']:.4f}s")
+    
+    # Log NashConv comparison if available
+    if comparison.get("comparison", {}).get("nashconv"):
+        nashconv_comp = comparison["comparison"]["nashconv"]
+        logger.info(f"\nNash Equilibrium Convergence (Multi-Agent):")
+        if nashconv_comp.get("training"):
+            train_nc = nashconv_comp["training"]
+            logger.info(f"  Training (final):")
+            logger.info(f"    NashConv sum: {train_nc.get('final_nashconv_sum', 'N/A'):.6f}")
+            logger.info(f"    Max exploitability: {train_nc.get('final_exploitability_max', 'N/A'):.6f}")
+            if train_nc.get("convergence"):
+                conv = train_nc["convergence"]
+                logger.info(f"    Convergence: {conv.get('initial_nashconv_sum', 0.0):.6f} → {conv.get('final_nashconv_sum', 0.0):.6f} "
+                          f"(improvement: {conv.get('improvement', 0.0):.6f}, {conv.get('improvement_pct', 0.0):.1f}%)")
+        if nashconv_comp.get("evaluation"):
+            eval_nc = nashconv_comp["evaluation"]
+            logger.info(f"  Evaluation (final):")
+            logger.info(f"    NashConv sum: {eval_nc.get('final_nashconv_sum', 'N/A'):.6f}")
+            logger.info(f"    Max exploitability: {eval_nc.get('final_exploitability_max', 'N/A'):.6f}")
+            if eval_nc.get("convergence"):
+                conv = eval_nc["convergence"]
+                logger.info(f"    Convergence: {conv.get('initial_nashconv_sum', 0.0):.6f} → {conv.get('final_nashconv_sum', 0.0):.6f} "
+                          f"(improvement: {conv.get('improvement', 0.0):.6f}, {conv.get('improvement_pct', 0.0):.1f}%)")
+    
     logger.info(f"{'='*80}")
 
 
@@ -1590,8 +1857,8 @@ Examples:
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=500,
-        help="Steps per episode"
+        default=100,
+        help="Steps per episode (default: 100)"
     )
     
     parser.add_argument(

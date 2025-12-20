@@ -113,7 +113,16 @@ class AnchorEnv(ParallelEnv):
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
         self.gamma = env_config.get("gamma", 0.1)
-        self.coverage_target = env_config.get("coverage_target", 0.1)  # Updated to match config file default
+        # IMPORTANT: Default should match config file (0.3), but kept at 0.1 for backward compatibility
+        # Config file sets coverage_target: 0.3, so this default should rarely be used
+        self.coverage_target = env_config.get("coverage_target", 0.1)  # Config default is 0.3
+        if self.coverage_target == 0.1 and "coverage_target" not in env_config:
+            logger.warning(
+                f"coverage_target not found in env_config, using default 0.1. "
+                f"Expected value from config: 0.3. Check if config is being passed correctly."
+            )
+        else:
+            logger.info(f"coverage_target set to: {self.coverage_target} (from config: {env_config.get('coverage_target', 'NOT SET')})")
         self.precision_target = env_config.get("precision_target", 0.95)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
@@ -130,6 +139,15 @@ class AnchorEnv(ParallelEnv):
         self.use_perturbation = env_config.get("use_perturbation", False)
         self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
         self.n_perturb = env_config.get("n_perturb", 1024)
+        
+        # Log perturbation settings during initialization
+        logger.info(f"AnchorEnv initialized with perturbation settings: "
+                   f"use_perturbation={self.use_perturbation}, "
+                   f"perturbation_mode={self.perturbation_mode}, "
+                   f"n_perturb={self.n_perturb}")
+        if self.use_perturbation and self.perturbation_mode == "adaptive":
+            min_points_threshold = max(1, int(0.1 * self.n_perturb))
+            # logger.info(f"  Adaptive mode threshold: will use uniform sampling if covered points < {min_points_threshold}")
         self.X_min = env_config.get("X_min", None)
         self.X_range = env_config.get("X_range", None)
         self.rng = env_config.get("rng", None)
@@ -144,6 +162,12 @@ class AnchorEnv(ParallelEnv):
         self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
         
         self.eval_on_test_data = env_config.get("eval_on_test_data", False)
+        
+        # Track warnings per agent per episode to reduce log spam
+        # Only warn once per episode about adaptive mode switching and precision-coverage mismatch
+        self._adaptive_uniform_warned_this_episode = defaultdict(bool)  # agent -> bool
+        self._precision_coverage_mismatch_warned_this_episode = defaultdict(bool)  # agent -> bool
+        
         if self.eval_on_test_data:
             X_test_unit = env_config.get("X_test_unit", None)
             X_test_std = env_config.get("X_test_std", None)
@@ -203,7 +227,21 @@ class AnchorEnv(ParallelEnv):
         self.box_history = {}
         self.coverage_floor_hits = {}
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 500)
+        self.max_cycles = env_config.get("max_cycles", 100)
+
+        # -----------------------------
+        # Stabilization-based early termination (per-agent)
+        # -----------------------------
+        # If an agent's box and metrics stop changing for a window of steps, terminate early.
+        self.enable_stability_termination = env_config.get("enable_stability_termination", True)
+        self.stability_window = int(env_config.get("stability_window", 10))
+        self.stability_min_steps = int(env_config.get("stability_min_steps", 20))
+        self.stability_precision_tol = float(env_config.get("stability_precision_tol", 1e-3))
+        self.stability_coverage_tol = float(env_config.get("stability_coverage_tol", 1e-3))
+        self.stability_drift_tol = float(env_config.get("stability_drift_tol", 1e-3))
+
+        # Counter of consecutive "stable" steps per agent
+        self._stable_counts: Dict[str, int] = {}
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
@@ -228,9 +266,32 @@ class AnchorEnv(ParallelEnv):
         else:
             X_eval_unit = self.X_unit
         
+        # FIX: Ensure we have valid data and box bounds
+        if X_eval_unit is None or X_eval_unit.shape[0] == 0:
+            logger.warning(f"Agent {agent}: X_eval_unit is None or empty in _mask_in_box")
+            return np.zeros(0, dtype=bool)
+        
+        if agent not in self.lower or agent not in self.upper:
+            logger.warning(f"Agent {agent}: Box bounds not found in _mask_in_box")
+            return np.zeros(X_eval_unit.shape[0], dtype=bool)
+        
+        # FIX: Verify that box bounds are in normalized space [0, 1]
+        # This ensures the mask computation uses the same normalized space as the data
+        lower = self.lower[agent]
+        upper = self.upper[agent]
+        
+        # Debug: Log if box bounds are outside [0, 1] range (indicates normalization issue)
+        if np.any(lower < 0) or np.any(lower > 1) or np.any(upper < 0) or np.any(upper > 1):
+            logger.warning(
+                f"Agent {agent}: Box bounds outside [0, 1] range in _mask_in_box. "
+                f"lower range: [{lower.min():.3f}, {lower.max():.3f}], "
+                f"upper range: [{upper.min():.3f}, {upper.max():.3f}]. "
+                f"This may indicate a normalization mismatch."
+            )
+        
         conds = []
         for j in range(self.n_features):
-            conds.append((X_eval_unit[:, j] >= self.lower[agent][j]) & (X_eval_unit[:, j] <= self.upper[agent][j]))
+            conds.append((X_eval_unit[:, j] >= lower[j]) & (X_eval_unit[:, j] <= upper[j]))
         mask = np.logical_and.reduce(conds) if conds else np.ones(X_eval_unit.shape[0], dtype=bool)
         return mask
 
@@ -379,6 +440,7 @@ class AnchorEnv(ParallelEnv):
             # Instance-based mode: Overall coverage P(x in box)
             # This matches the original Anchor paper definition
             coverage = float(mask.mean())
+            logger.debug(f"Agent {agent}: Instance-based coverage calculation - coverage={coverage:.4f}, covered points={covered.size}/{len(mask)}")
         else:
             # Class-based mode: Class-conditional coverage P(x in box | y = target_class)
             # This is the fraction of target class samples that fall within the box
@@ -415,6 +477,7 @@ class AnchorEnv(ParallelEnv):
                         )
         
         if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
+            logger.debug(f"Agent {agent}: No covered points (coverage={coverage:.4f}) and perturbation not enabled for uniform/adaptive modes - returning precision=0")
             return 0.0, coverage, {
                 "hard_precision": 0.0, 
                 "avg_prob": 0.0, 
@@ -428,10 +491,12 @@ class AnchorEnv(ParallelEnv):
             y_eval = y_data[covered]
             n_points = int(X_eval.shape[0])
             sampler_note = f"empirical_{data_source}"
+            logger.debug(f"Agent {agent}: Perturbation disabled - using {n_points} empirical points from {data_source} data")
         else:
             if self.perturbation_mode == "bootstrap":
                 if covered.size == 0:
                     data_source = "test" if self.eval_on_test_data else "training"
+                    logger.debug(f"Agent {agent}: Bootstrap mode - no covered points, returning precision=0, coverage={coverage:.4f}")
                     return 0.0, coverage, {
                         "hard_precision": 0.0, 
                         "avg_prob": 0.0, 
@@ -445,6 +510,7 @@ class AnchorEnv(ParallelEnv):
                 y_eval = y_data[idx]
                 n_points = int(n_samp)
                 sampler_note = f"bootstrap_{data_source}"
+                logger.debug(f"Agent {agent}: Bootstrap mode - sampled {n_points} points from {covered.size} covered points (n_perturb={self.n_perturb})")
             elif self.perturbation_mode == "uniform":
                 n_samp = self.n_perturb
                 U = np.zeros((n_samp, self.n_features), dtype=np.float32)
@@ -459,17 +525,23 @@ class AnchorEnv(ParallelEnv):
                 y_eval = None
                 n_points = int(n_samp)
                 sampler_note = f"uniform_{data_source}"
+                logger.debug(f"Agent {agent}: Uniform mode - generating {n_points} synthetic samples (coverage={coverage:.4f} from {covered.size} real points)")
             elif self.perturbation_mode == "adaptive":
+                # Adaptive mode: use bootstrap when enough covered points, otherwise use uniform
                 min_points_for_bootstrap = max(1, int(0.1 * self.n_perturb))
                 
                 if covered.size >= min_points_for_bootstrap:
+                    # Use bootstrap sampling from real data points
                     n_samp = min(self.n_perturb, covered.size)
                     idx = self.rng.choice(covered, size=n_samp, replace=True)
                     X_eval = X_data_std[idx]
                     y_eval = y_data[idx]
                     n_points = int(n_samp)
                     sampler_note = f"adaptive_bootstrap_{data_source}"
+                    logger.debug(f"Agent {agent}: Adaptive mode - using bootstrap sampling: {n_points} points from {covered.size} covered points "
+                               f"(threshold={min_points_for_bootstrap}, coverage={coverage:.4f})")
                 else:
+                    # Fall back to uniform sampling when not enough covered points
                     n_samp = self.n_perturb
                     U = np.zeros((n_samp, self.n_features), dtype=np.float32)
                     for j in range(self.n_features):
@@ -483,6 +555,16 @@ class AnchorEnv(ParallelEnv):
                     y_eval = None
                     n_points = int(n_samp)
                     sampler_note = f"adaptive_uniform_{data_source}"
+                    # Only warn once per episode to reduce log spam
+                    # if not self._adaptive_uniform_warned_this_episode[agent]:
+                    #     logger.warning(f"Agent {agent}: Adaptive mode - switching to uniform sampling! "
+                    #                  f"covered.size={covered.size} < threshold={min_points_for_bootstrap}, "
+                    #                  f"coverage={coverage:.4f}. Precision will be calculated from synthetic samples, "
+                    #                  f"but coverage is from real data points. This may cause precision-coverage mismatch. "
+                    #                  f"(This warning will appear once per episode)")
+                    #     self._adaptive_uniform_warned_this_episode[agent] = True
+                    # else:
+                    #     logger.debug(f"Agent {agent}: Adaptive mode using uniform sampling (covered.size={covered.size} < threshold={min_points_for_bootstrap}, coverage={coverage:.4f})")
             else:
                 raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap', 'uniform', or 'adaptive'.")
 
@@ -505,16 +587,35 @@ class AnchorEnv(ParallelEnv):
         if y_eval is None:
             # Uniform sampling: no ground truth labels, use model predictions as proxy
             hard_precision = float(positive_idx.mean())
+            using_synthetic_samples = True
         else:
             # Bootstrap/empirical sampling: ground truth labels available
             # Precision = fraction of samples in box that are actually target class
             hard_precision = float((y_eval == target_class).mean())
+            using_synthetic_samples = False
 
         avg_prob = float(probs[:, target_class].mean())
         precision_proxy = (
             self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
         )
         target_class_fraction = hard_precision  # Same as hard_precision when y_eval is available
+        
+        # # Warn if there's a precision-coverage mismatch (synthetic precision vs real coverage)
+        # # Only warn once per episode to reduce log spam
+        # if using_synthetic_samples and coverage == 0.0:
+        #     if not self._precision_coverage_mismatch_warned_this_episode[agent]:
+        #         logger.warning(f"Agent {agent}: PRECISION-COVERAGE MISMATCH! "
+        #                      f"Precision={precision_proxy:.4f} (from {n_points} synthetic samples) but "
+        #                      f"coverage={coverage:.4f} (from real data points). "
+        #                      f"Box may have shrunk away from real data. sampler={sampler_note} "
+        #                      f"(This warning will appear once per episode)")
+        #         self._precision_coverage_mismatch_warned_this_episode[agent] = True
+        #     else:
+        #         logger.debug(f"Agent {agent}: Precision-coverage mismatch (precision={precision_proxy:.4f} from synthetic, coverage={coverage:.4f} from real data)")
+        # elif using_synthetic_samples and coverage > 0.0:
+        #     logger.debug(f"Agent {agent}: Using synthetic samples for precision (sampler={sampler_note}), "
+        #                 f"but coverage={coverage:.4f} from real data. precision_proxy={precision_proxy:.4f}, "
+        #                 f"hard_precision={hard_precision:.4f}")
         
         return precision_proxy, coverage, {
             "hard_precision": hard_precision,
@@ -592,6 +693,11 @@ class AnchorEnv(ParallelEnv):
             self.prev_upper[agent] = self.upper[agent].copy()
             self.box_history[agent] = [(self.lower[agent].copy(), self.upper[agent].copy())]
             self.coverage_floor_hits[agent] = 0
+            # Reset stabilization counter
+            self._stable_counts[agent] = 0
+            # Reset warning flags for this episode
+            self._adaptive_uniform_warned_this_episode[agent] = False
+            self._precision_coverage_mismatch_warned_this_episode[agent] = False
             
             precision, coverage, _ = self._current_metrics(agent)
             state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
@@ -736,6 +842,7 @@ class AnchorEnv(ParallelEnv):
                     "global_coverage": 0.0,
                     "total_reward": 0.0,
                 }
+                self._stable_counts[agent] = 0
                 continue
             
             action = actions[agent]
@@ -788,6 +895,37 @@ class AnchorEnv(ParallelEnv):
                 logger.debug(
                     f"  Box reverted for {agent}: coverage after revert={coverage_after_revert:.6f}"
                 )
+                # Box revert indicates instability - reset stability counter
+                if self.enable_stability_termination:
+                    self._stable_counts[agent] = 0
+
+            # -----------------------------
+            # Stabilization tracking (for early termination)
+            # -----------------------------
+            # Only track stability if box was not reverted (coverage_clipped == False)
+            if not coverage_clipped:
+                try:
+                    anchor_drift = float(
+                        max(
+                            np.abs(self.lower[agent] - prev_lower).max(),
+                            np.abs(self.upper[agent] - prev_upper).max(),
+                        )
+                    )
+                except Exception:
+                    anchor_drift = 0.0
+
+                dp = float(abs(precision - prev_precision))
+                dc = float(abs(coverage - prev_coverage))
+
+                if self.enable_stability_termination:
+                    if (
+                        dp <= self.stability_precision_tol
+                        and dc <= self.stability_coverage_tol
+                        and anchor_drift <= self.stability_drift_tol
+                    ):
+                        self._stable_counts[agent] = int(self._stable_counts.get(agent, 0)) + 1
+                    else:
+                        self._stable_counts[agent] = 0
             
             # Cache post-action metrics (after possible revert)
             metrics_cache[agent] = (precision, coverage, details)
@@ -810,8 +948,10 @@ class AnchorEnv(ParallelEnv):
             
             min_denominator = max(prev_coverage, 1e-6)
             coverage_gain_normalized = coverage_gain / min_denominator
-            coverage_gain_scaled = coverage_gain_normalized * 0.5
-            coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.5, 0.5)
+            # INCREASED coverage gain scaling from 0.5 to 1.0 to give stronger signal for coverage expansion
+            # This helps agents learn to expand boxes to achieve higher coverage
+            coverage_gain_scaled = coverage_gain_normalized * 1.0  # Increased from 0.5 to 1.0
+            coverage_gain_scaled = np.clip(coverage_gain_scaled, -1.0, 1.0)  # Increased clip range from ±0.5 to ±1.0
             coverage_gain_for_reward = coverage_gain_scaled
             
             if not np.isfinite(coverage_gain_for_reward):
@@ -1014,13 +1154,13 @@ class AnchorEnv(ParallelEnv):
                             f"after {count} uses (max: {max_count}). Agent must now meet other conditions."
                         )
                     
-                    # Log which termination condition was met (SS: Debugging (disable later))
-                    logger.info(
-                        f"Agent {agent} episode terminated (step {self.timestep}): "
-                        f"{termination_reason} (count: {count}/{max_count if max_count > 0 else 'unlimited'}). "
-                        f"Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
-                        f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
-                    )
+                    # # Log which termination condition was met (SS: Debugging (disable later))
+                    # logger.info(
+                    #     f"Agent {agent} episode terminated (step {self.timestep}): "
+                    #     f"{termination_reason} (count: {count}/{max_count if max_count > 0 else 'unlimited'}). "
+                    #     f"Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
+                    #     f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
+                    # )
             
             precision_gain_component = self.alpha * precision_weight * precision_gain
             coverage_gain_component = coverage_weight * coverage_gain_for_reward
@@ -1168,6 +1308,19 @@ class AnchorEnv(ParallelEnv):
         self.timestep += 1
         
         max_steps_reached = self.timestep >= self.max_cycles
+
+        # -----------------------------
+        # Post-process: stabilization-based early termination
+        # -----------------------------
+        if self.enable_stability_termination:
+            if int(self.timestep) >= int(self.stability_min_steps):
+                for agent in list(self.agents):
+                    if not terminations.get(agent, False) and not truncations.get(agent, False):
+                        if int(self._stable_counts.get(agent, 0)) >= int(self.stability_window):
+                            terminations[agent] = True
+                            if agent in infos and isinstance(infos[agent], dict):
+                                infos[agent]["stabilized"] = 1.0
+                                infos[agent]["termination_reason_str"] = "stabilized"
         
         # If we hit the maximum number of steps, truncate any agents that are not yet terminated
         if max_steps_reached:
@@ -1318,7 +1471,24 @@ class AnchorEnv(ParallelEnv):
                 continue
             
             union_mask = np.zeros(n_samples, dtype=bool)
+            # FIX: Only include agents that have valid boxes (both lower and upper bounds exist)
+            # and have been updated (not just initialized). During inference with single-agent rollouts,
+            # other agents' boxes might be initialized but never updated, causing incorrect union metrics.
+            valid_agents = []
             for agent in agents_c:
+                if agent in self.lower and agent in self.upper:
+                    # Check if box is valid (not all zeros or all ones, which might indicate uninitialized state)
+                    lower = self.lower[agent]
+                    upper = self.upper[agent]
+                    # Valid box should have upper > lower for at least some features
+                    if np.any(upper > lower):
+                        valid_agents.append(agent)
+            
+            # If no valid agents, skip this class
+            if not valid_agents:
+                continue
+            
+            for agent in valid_agents:
                 mask_agent = self._mask_in_box(agent)
                 if mask_agent.shape[0] == union_mask.shape[0]:
                     union_mask |= mask_agent
@@ -1393,7 +1563,10 @@ class AnchorEnv(ParallelEnv):
     ) -> tuple:
         if precision >= precision_threshold:
             precision_weight = max(2.0, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
-            coverage_weight = self.beta * min(1.0, precision / (precision_threshold + eps))
+            # INCREASED coverage_weight to give coverage equal or higher emphasis than precision
+            # When precision is high, we want to strongly encourage coverage expansion
+            # Use beta (now 1.0) with a multiplier to match precision_weight scale
+            coverage_weight = self.beta * max(1.5, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
             
             if precision >= self.precision_target * 0.95 and coverage_gain > 0:
                 js_penalty = self.js_penalty_weight * js_proxy * 0.3
@@ -1401,7 +1574,9 @@ class AnchorEnv(ParallelEnv):
                 js_penalty = self.js_penalty_weight * js_proxy
         else:
             precision_weight = 2.0
-            coverage_weight = self.beta * (0.5 + 0.5 * (precision / (precision_threshold + eps)))
+            # INCREASED coverage_weight when precision is low to encourage both precision and coverage
+            # Give coverage higher weight when precision is low to encourage exploration
+            coverage_weight = self.beta * max(1.0, 0.5 + 0.5 * (precision / (precision_threshold + eps)) + 0.5)
             if coverage_gain > 0:
                 js_penalty = self.js_penalty_weight * js_proxy * 0.5
             else:
@@ -1535,10 +1710,15 @@ class AnchorEnv(ParallelEnv):
         coverage_progress = min(1.0, avg_coverage / (self.coverage_target + eps))
         
         # Reward when average performance is good
+        # INCREASED coverage reward to strongly incentivize coverage expansion
         if avg_precision >= self.precision_target * 0.8:
             shared_reward += shared_reward_weight * 0.2 * precision_progress
         if avg_coverage >= self.coverage_target * 0.5:
-            shared_reward += shared_reward_weight * 0.2 * coverage_progress
+            # Increased from 0.2 to 0.5 to give stronger signal for coverage
+            shared_reward += shared_reward_weight * 0.5 * coverage_progress
+        # Also reward coverage even when below 0.5 * target to encourage early expansion
+        if avg_coverage > 0:
+            shared_reward += shared_reward_weight * 0.1 * coverage_progress
         
         # Global coverage bonus: reward when union of all agents covers the dataset well
         if self.global_coverage_weight > 0:

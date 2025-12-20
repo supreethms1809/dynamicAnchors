@@ -18,16 +18,91 @@ import numpy as np
 import re
 import os
 import sys
-from typing import Dict, List, Tuple, Set, Any
+from typing import Dict, List, Tuple, Set, Any, Optional
 from collections import defaultdict
 import logging
 from datetime import datetime
 
 from tabular_datasets import TabularDatasetLoader
+from pathlib import Path
 
 # Set up basic logging (will be reconfigured in main)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load NashConv metrics from training_history.json and evaluation_history.json.
+    
+    Args:
+        experiment_dir: Path to experiment directory
+        
+    Returns:
+        Dictionary with training and evaluation NashConv metrics
+    """
+    nashconv_data = {
+        "training": None,
+        "evaluation": None,
+        "available": False
+    }
+    
+    if not experiment_dir:
+        return nashconv_data
+    
+    experiment_path = Path(experiment_dir)
+    
+    # Load training history
+    training_history_path = experiment_path / "training_history.json"
+    if training_history_path.exists():
+        try:
+            with open(training_history_path, 'r') as f:
+                training_history = json.load(f)
+            
+            # Extract NashConv metrics from training history
+            training_nashconv = []
+            for entry in training_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("training/nashconv") or key.startswith("training/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    training_nashconv.append(nashconv_entry)
+            
+            if training_nashconv:
+                nashconv_data["training"] = training_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load training NashConv metrics: {e}")
+    
+    # Load evaluation history
+    evaluation_history_path = experiment_path / "evaluation_history.json"
+    if evaluation_history_path.exists():
+        try:
+            with open(evaluation_history_path, 'r') as f:
+                evaluation_history = json.load(f)
+            
+            # Extract NashConv metrics from evaluation history
+            evaluation_nashconv = []
+            for entry in evaluation_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("evaluation/nashconv") or key.startswith("evaluation/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    evaluation_nashconv.append(nashconv_entry)
+            
+            if evaluation_nashconv:
+                nashconv_data["evaluation"] = evaluation_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load evaluation NashConv metrics: {e}")
+    
+    return nashconv_data
 
 
 def setup_file_logging(log_file_path: str):
@@ -972,6 +1047,40 @@ def test_rules_from_json(
     logger.info(f"{'='*80}")
     logger.info(f"Total unique rules tested: {len(all_unique_rules)}")
     logger.info(f"Rules satisfying multiple classes: {len(rules_satisfying_both_classes)}")
+    
+    # Load and log NashConv metrics if available
+    experiment_dir = get_experiment_dir_from_rules_file(rules_file)
+    nashconv_data = _load_nashconv_metrics(experiment_dir)
+    if nashconv_data.get("available", False):
+        logger.info(f"\n{'='*80}")
+        logger.info("NASH EQUILIBRIUM CONVERGENCE METRICS")
+        logger.info(f"{'='*80}")
+        
+        # Training metrics
+        if nashconv_data.get("training"):
+            training_data = nashconv_data["training"]
+            if training_data:
+                final_training = training_data[-1]
+                logger.info("Training NashConv (final):")
+                logger.info(f"  NashConv sum: {final_training.get('training/nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Max exploitability: {final_training.get('training/exploitability_max', 'N/A'):.6f}")
+                if 'training/class_nashconv_sum' in final_training:
+                    logger.info(f"  Class NashConv sum: {final_training.get('training/class_nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Training step: {final_training.get('step', 'N/A')}")
+        
+        # Evaluation metrics
+        if nashconv_data.get("evaluation"):
+            eval_data = nashconv_data["evaluation"]
+            if eval_data:
+                final_eval = eval_data[-1]
+                logger.info("\nEvaluation NashConv (final):")
+                logger.info(f"  NashConv sum: {final_eval.get('evaluation/nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Max exploitability: {final_eval.get('evaluation/exploitability_max', 'N/A'):.6f}")
+                if 'evaluation/class_nashconv_sum' in final_eval:
+                    logger.info(f"  Class NashConv sum: {final_eval.get('evaluation/class_nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Evaluation step: {final_eval.get('step', 'N/A')}")
+        
+        logger.info(f"{'='*80}\n")
     
     if rules_satisfying_both_classes:
         logger.info(f"Rules that satisfy multiple classes:")

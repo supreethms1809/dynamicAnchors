@@ -129,6 +129,80 @@ def load_rules_file(rules_file: str) -> Dict:
         return json.load(f)
 
 
+def load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load NashConv metrics from training_history.json and evaluation_history.json.
+    
+    Args:
+        experiment_dir: Path to experiment directory
+        
+    Returns:
+        Dictionary with training and evaluation NashConv metrics
+    """
+    nashconv_data = {
+        "training": None,
+        "evaluation": None,
+        "available": False
+    }
+    
+    if not experiment_dir:
+        return nashconv_data
+    
+    experiment_path = Path(experiment_dir)
+    
+    # Load training history
+    training_history_path = experiment_path / "training_history.json"
+    if training_history_path.exists():
+        try:
+            with open(training_history_path, 'r') as f:
+                training_history = json.load(f)
+            
+            # Extract NashConv metrics from training history
+            training_nashconv = []
+            for entry in training_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("training/nashconv") or key.startswith("training/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    training_nashconv.append(nashconv_entry)
+            
+            if training_nashconv:
+                nashconv_data["training"] = training_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.warning(f"Could not load training NashConv metrics: {e}")
+    
+    # Load evaluation history
+    evaluation_history_path = experiment_path / "evaluation_history.json"
+    if evaluation_history_path.exists():
+        try:
+            with open(evaluation_history_path, 'r') as f:
+                evaluation_history = json.load(f)
+            
+            # Extract NashConv metrics from evaluation history
+            evaluation_nashconv = []
+            for entry in evaluation_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("evaluation/nashconv") or key.startswith("evaluation/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    evaluation_nashconv.append(nashconv_entry)
+            
+            if evaluation_nashconv:
+                nashconv_data["evaluation"] = evaluation_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.warning(f"Could not load evaluation NashConv metrics: {e}")
+    
+    return nashconv_data
+
+
 def summarize_rules_from_json(rules_data: Dict) -> Dict:
     """Extract summary statistics from rules JSON."""
     per_class_results = rules_data.get("per_class_results", {})
@@ -225,6 +299,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         "mean_instance_coverage": float(np.mean([s["instance_coverage"] for s in summary["per_class_summary"].values()])),
         "mean_class_precision": float(np.mean([s["class_precision"] for s in summary["per_class_summary"].values()])),
         "mean_class_coverage": float(np.mean([s["class_coverage"] for s in summary["per_class_summary"].values()])),
+        # NashConv metrics will be added later if available
         "total_unique_rules": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
         "mean_unique_rules_per_class": float(np.mean(all_unique_rule_counts)),
         "feature_frequency": dict(feature_frequency.most_common())
@@ -444,6 +519,92 @@ def plot_global_metrics(summary: Dict, output_dir: str, dataset_name: str = ""):
     plt.savefig(os.path.join(output_dir, 'global_metrics.png'), dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved global metrics plot to {output_dir}/global_metrics.png")
+
+
+def plot_nashconv_convergence(nashconv_data: Dict[str, Any], output_dir: str, dataset_name: str = ""):
+    """
+    Plot NashConv convergence over training iterations.
+    
+    Args:
+        nashconv_data: Dictionary with 'training' and 'evaluation' NashConv metrics
+        output_dir: Output directory for the plot
+        dataset_name: Dataset name for title
+    """
+    if not HAS_PLOTTING:
+        return
+    
+    if not nashconv_data.get("available", False):
+        logger.debug("NashConv data not available, skipping convergence plot")
+        return
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Nash Equilibrium Convergence Metrics{' - ' + dataset_name if dataset_name else ''}", fontsize=14, fontweight='bold')
+    
+    # Plot 1: Training NashConv Sum
+    ax1 = axes[0, 0]
+    training_data = nashconv_data.get("training", [])
+    if training_data:
+        steps = [e.get("step", i) for i, e in enumerate(training_data)]
+        nashconv_sums = [e.get("training/nashconv_sum", 0.0) for e in training_data]
+        ax1.plot(steps, nashconv_sums, 'b-', marker='o', linewidth=2, markersize=4, label='Training NashConv')
+        ax1.set_xlabel('Training Step')
+        ax1.set_ylabel('NashConv Sum')
+        ax1.set_title('Training NashConv Convergence')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        if nashconv_sums:
+            ax1.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    
+    # Plot 2: Training Exploitability Max
+    ax2 = axes[0, 1]
+    if training_data:
+        exploitability_max = [e.get("training/exploitability_max", 0.0) for e in training_data]
+        ax2.plot(steps, exploitability_max, 'g-', marker='s', linewidth=2, markersize=4, label='Max Exploitability')
+        ax2.set_xlabel('Training Step')
+        ax2.set_ylabel('Max Exploitability')
+        ax2.set_title('Training Max Exploitability')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+    
+    # Plot 3: Evaluation NashConv Sum
+    ax3 = axes[1, 0]
+    eval_data = nashconv_data.get("evaluation", [])
+    if eval_data:
+        eval_steps = [e.get("step", i) for i, e in enumerate(eval_data)]
+        eval_nashconv_sums = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
+        ax3.plot(eval_steps, eval_nashconv_sums, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
+        ax3.set_xlabel('Evaluation Step')
+        ax3.set_ylabel('NashConv Sum')
+        ax3.set_title('Evaluation NashConv Convergence')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        if eval_nashconv_sums:
+            ax3.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    
+    # Plot 4: Evaluation Exploitability Max
+    ax4 = axes[1, 1]
+    if eval_data:
+        eval_exploitability_max = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
+        ax4.plot(eval_steps, eval_exploitability_max, 'm-', marker='d', linewidth=2, markersize=4, label='Max Exploitability')
+        ax4.set_xlabel('Evaluation Step')
+        ax4.set_ylabel('Max Exploitability')
+        ax4.set_title('Evaluation Max Exploitability')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+    
+    # Hide empty subplots
+    if not training_data:
+        ax1.axis('off')
+        ax2.axis('off')
+    if not eval_data:
+        ax3.axis('off')
+        ax4.axis('off')
+    
+    plt.tight_layout()
+    output_path = Path(output_dir) / "nashconv_convergence.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved NashConv convergence plot to {output_path}")
 
 
 def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = "", top_n: int = 15):
@@ -1186,6 +1347,40 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
         f.write(f"Mean class-level precision: {summary['overall_stats']['mean_class_precision']:.4f}\n")
         f.write(f"Mean class-level coverage: {summary['overall_stats']['mean_class_coverage']:.4f}\n\n")
         
+        # NashConv metrics if available
+        if 'nashconv_metrics' in summary and summary['nashconv_metrics'].get('available', False):
+            f.write("NASH EQUILIBRIUM CONVERGENCE METRICS\n")
+            f.write("-"*80 + "\n")
+            nashconv = summary['nashconv_metrics']
+            
+            # Training metrics
+            if nashconv.get('training'):
+                training_data = nashconv['training']
+                if training_data:
+                    final_training = training_data[-1]
+                    f.write("Training NashConv (final):\n")
+                    f.write(f"  NashConv sum: {final_training.get('training/nashconv_sum', 'N/A'):.6f}\n")
+                    f.write(f"  Max exploitability: {final_training.get('training/exploitability_max', 'N/A'):.6f}\n")
+                    if 'training/class_nashconv_sum' in final_training:
+                        f.write(f"  Class NashConv sum: {final_training.get('training/class_nashconv_sum', 'N/A'):.6f}\n")
+                    f.write(f"  Training step: {final_training.get('step', 'N/A')}\n")
+                    f.write(f"  Total data points: {len(training_data)}\n")
+            
+            # Evaluation metrics
+            if nashconv.get('evaluation'):
+                eval_data = nashconv['evaluation']
+                if eval_data:
+                    final_eval = eval_data[-1]
+                    f.write("\nEvaluation NashConv (final):\n")
+                    f.write(f"  NashConv sum: {final_eval.get('evaluation/nashconv_sum', 'N/A'):.6f}\n")
+                    f.write(f"  Max exploitability: {final_eval.get('evaluation/exploitability_max', 'N/A'):.6f}\n")
+                    if 'evaluation/class_nashconv_sum' in final_eval:
+                        f.write(f"  Class NashConv sum: {final_eval.get('evaluation/class_nashconv_sum', 'N/A'):.6f}\n")
+                    f.write(f"  Evaluation step: {final_eval.get('step', 'N/A')}\n")
+                    f.write(f"  Total data points: {len(eval_data)}\n")
+            
+            f.write("\n")
+        
         # Per-class details
         f.write("PER-CLASS DETAILS\n")
         f.write("-"*80 + "\n")
@@ -1325,15 +1520,55 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
     
     # Add per-class metrics
     per_class_summary = summary.get("per_class_summary", {})
+    total_rollout_time = 0.0
     for class_key, class_data in per_class_summary.items():
         cls = class_data.get("class", -1)
+        class_timing = {
+            "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
+            "total_rollout_time_seconds": class_data.get("total_rollout_time_seconds", 0.0),
+            "class_total_time_seconds": class_data.get("class_total_time_seconds", 0.0),
+        }
+        total_rollout_time += class_timing.get("total_rollout_time_seconds", 0.0)
+        
         consolidated["per_class"][f"class_{cls}"] = {
             "instance_precision": class_data.get("instance_precision", 0.0),
             "instance_coverage": class_data.get("instance_coverage", 0.0),
             "class_precision": class_data.get("class_precision", 0.0),
             "class_coverage": class_data.get("class_coverage", 0.0),
             "n_unique_rules": class_data.get("n_unique_rules", 0),
+            "timing": class_timing
         }
+    
+    # Try to load timing from inference results file if available
+    timing = {}
+    if experiment_dir:
+        # Try to find inference results file
+        inference_file = os.path.join(experiment_dir, "extracted_rules.json")
+        if not os.path.exists(inference_file):
+            # Also check in inference subdirectory
+            inference_file = os.path.join(experiment_dir, "inference", "extracted_rules.json")
+        
+        if os.path.exists(inference_file):
+            try:
+                with open(inference_file, 'r') as f:
+                    inference_data = json.load(f)
+                metadata = inference_data.get("metadata", {})
+                if metadata:
+                    timing = {
+                        "total_inference_time_seconds": metadata.get("total_inference_time_seconds", 0.0),
+                        "total_rollout_time_seconds": metadata.get("total_rollout_time_seconds", total_rollout_time),
+                    }
+            except Exception as e:
+                logger.debug(f"Could not load timing from inference file: {e}")
+    
+    # If no timing from inference file, aggregate from per-class data
+    if not timing and total_rollout_time > 0:
+        timing = {
+            "total_rollout_time_seconds": total_rollout_time,
+            "total_inference_time_seconds": 0.0,  # Not available without inference file
+        }
+    
+    consolidated["timing"] = timing
     
     # Save to file
     with open(output_file, 'w') as f:
@@ -1465,6 +1700,16 @@ Examples:
     # Add dataset name to summary
     summary["dataset"] = args.dataset
     
+    # Load NashConv metrics if available
+    logger.info("Loading NashConv metrics...")
+    nashconv_data = load_nashconv_metrics(experiment_dir_str)
+    if nashconv_data.get("available", False):
+        summary["nashconv_metrics"] = nashconv_data
+        logger.info("✓ NashConv metrics loaded successfully")
+    else:
+        logger.info("  NashConv metrics not available (training/evaluation history files not found)")
+        summary["nashconv_metrics"] = {"available": False}
+    
     # Optionally run tests
     test_results = None
     if args.run_tests:
@@ -1492,6 +1737,10 @@ Examples:
         plot_precision_coverage_tradeoff(summary, str(output_dir), args.dataset)
         plot_global_metrics(summary, str(output_dir), args.dataset)
         plot_feature_importance(summary, str(output_dir), args.dataset)
+        
+        # Plot NashConv convergence if available
+        if summary.get("nashconv_metrics", {}).get("available", False):
+            plot_nashconv_convergence(summary["nashconv_metrics"], str(output_dir), args.dataset)
         
         if test_results:
             plot_test_results_overlap(test_results, str(output_dir), args.dataset)

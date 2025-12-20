@@ -9,7 +9,7 @@ import torch
 from torchrl.data import Composite
 from torchrl.envs import EnvBase, PettingZooEnv
 from torchrl.envs.libs.pettingzoo import PettingZooWrapper
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
 
 from benchmarl.environments.common import Task, TaskClass
 from benchmarl.experiment.callback import Callback
@@ -37,7 +37,7 @@ class AnchorTaskClass(TaskClass):
         
         # SS: Track where this max_cycles is set. The reading from yaml is not getting passed to the environment.
         # Below code needs fixing.
-        max_cycles = config.get("max_cycles", 500)
+        max_cycles = config.get("max_cycles", 100)
 
         env_config = {k: v for k, v in config.items() if k != "max_cycles"}
         
@@ -82,7 +82,7 @@ class AnchorTaskClass(TaskClass):
         return False
     
     def max_steps(self, env: EnvBase) -> int:
-        return self.config.get("max_cycles", 500)
+        return self.config.get("max_cycles", 100)
     
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
         return env.group_map
@@ -133,7 +133,7 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -150,6 +150,15 @@ class AnchorMetricsCallback(Callback):
         # Store training episode details (bounds, precision, coverage per episode)
         self.training_episode_details = []  # List of episode details from training batches
         self.experiment_folder = None  # Will be set when experiment starts
+        # Track training batches for NashConv computation (compute periodically, not every batch)
+        self.training_batches_for_nashconv = []  # Store recent batches for NashConv computation
+        # NashConv computation frequency recommendations:
+        # - Short training (< 20 iterations): 2-3 batches (more frequent for visibility)
+        # - Medium training (20-100 iterations): 5-10 batches (balanced)
+        # - Long training (> 100 iterations): 10-20 batches (less frequent, still sufficient data points)
+        # Note: NashConv computation is expensive, so higher frequency = more compute time
+        self.nashconv_compute_frequency = nashconv_compute_frequency  # Compute NashConv every N batches (configurable via __init__)
+        self.training_batch_count = 0  # Counter for tracking batches
         # Track best model
         self.best_eval_score = -float('inf')  # Track best evaluation score (precision + coverage)
         self.best_model_path = None  # Path to best model checkpoint
@@ -182,23 +191,32 @@ class AnchorMetricsCallback(Callback):
         logger.info("Callback: Experiment started, experiment reference set")
     
     def _extract_class_from_group_name(self, group_name: str) -> Optional[int]:
-        """
-        Extract class ID from agent/group name.
-        Handles both formats:
-        - agent_0, agent_1 (agents_per_class == 1)
-        - agent_0_0, agent_0_1, agent_1_0 (agents_per_class > 1)
+        """Extract class id from a GROUP name.
+
+        Supported group naming conventions:
+          - class_0, class_1, ...           (recommended: GROUP == class/player)
+          - agent_0, agent_1, ...           (legacy: GROUP == class/player)
+          - agent_0_0, agent_0_1, ...       (legacy: per-agent groups; first index is class)
+
         Returns None if format is unrecognized.
         """
         try:
-            # Remove 'agent_' prefix
+            if not isinstance(group_name, str):
+                return None
+
+            # Preferred: group == class/player
+            if group_name.startswith("class_"):
+                parts = group_name.replace("class_", "").split("_")
+                return int(parts[0]) if parts and parts[0] != "" else None
+
+            # Backward compatible: group starts with agent_
             if group_name.startswith("agent_"):
                 parts = group_name.replace("agent_", "").split("_")
-                # First part is always the class ID
-                if parts:
-                    return int(parts[0])
-        except (ValueError, AttributeError):
-            pass
-        return None
+                return int(parts[0]) if parts and parts[0] != "" else None
+
+            return None
+        except (ValueError, TypeError):
+            return None
     
     def _extract_metrics_from_info(self, info: TensorDictBase, prefix: str = "") -> Dict[str, float]:
         metrics = {}
@@ -231,496 +249,696 @@ class AnchorMetricsCallback(Callback):
         return metrics
     
     def _compute_nashconv_metrics(self, rollouts: List[TensorDictBase]) -> Dict[str, float]:
-        """
-        Compute NashConv and exploitability metrics using centralized critic.
-        
-        NashConv(π) = Σ_i (BR_i(π_{-i}) - V_i^π)
-        where BR_i(π_{-i}) is the best response value for agent i against frozen opponents.
-        
-        Uses critic-based one-step best response approximation:
-        1. For each state s in evaluation batch
-        2. Compute current joint action a = π(o)
-        3. For each agent i:
-           - Optimize a_i (holding a_{-i} fixed) by gradient ascent on Q_i(s, a_i, a_{-i})
-           - Compute exploitability: Δ_i = E_s[Q_i(s, a_i^BR, a_{-i}) - Q_i(s, a)]
-        4. NashConv = Σ_i Δ_i, exploitability_max = max_i Δ_i
-        
+        """Compute a critic-based *one-step deviation* exploitability proxy at the CLASS level.
+
+        IMPORTANT:
+        - This treats each CLASS as a player, not individual agents.
+        - For classes with multiple agents, we compute joint best response for all agents in that class.
+        - This is commonly called "NashConv" in codebases, but it is *not* a full best-response-over-policies
+          computation. It measures whether a CLASS can improve its Q-value at sampled states by deviating
+          the joint action of all agents in that class while holding other classes fixed.
+
+        Proxy definition (per-class):
+          Δ_c(s) = max_{a_c} Q_c(s, a_c, a_{-c}) - Q_c(s, a^π)
+          where a_c is the joint action of all agents in class c, and a_{-c} are actions of all other classes.
+
         Returns:
-            Dict with keys:
-            - evaluation/nashconv_sum: sum of exploitabilities
-            - evaluation/exploitability_max: maximum exploitability
-            - evaluation/exploitability_{group}: per-agent exploitability
+          - evaluation/nashconv_sum: sum_c E[Δ_c] (sum over classes)
+          - evaluation/exploitability_max: max_c E[Δ_c]
+          - evaluation/exploitability_class_{c}: per-class E[Δ_c]
+          - evaluation/class_nashconv_sum: same as nashconv_sum (for backward compatibility)
+          - evaluation/class_exploitability_max: same as exploitability_max (for backward compatibility)
         """
-        if not self.compute_nashconv or not hasattr(self, 'experiment') or self.experiment is None:
-            print(f"    NashConv: Skipping - compute_nashconv={self.compute_nashconv}, has_experiment={hasattr(self, 'experiment')}")
+        if not self.compute_nashconv or self.experiment is None:
+            return {}
+
+        algorithm = getattr(self.experiment, "algorithm", None)
+        if algorithm is None:
+            return {}
+
+        group_map = getattr(self.experiment, "group_map", None)
+        groups = list(group_map.keys()) if isinstance(group_map, dict) else []
+        if not groups:
+            return {}
+        group_order = list(groups)  # consistent ordering everywhere
+
+        from tensordict import TensorDict
+
+        def _to_tensor(x: Any) -> Optional[torch.Tensor]:
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x.float()
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float()
+            try:
+                return torch.as_tensor(x).float()
+            except Exception:
+                return None
+
+        # Collect per-group (obs, action) pairs from rollouts
+        obs_buf: Dict[str, List[torch.Tensor]] = {g: [] for g in group_order}
+        act_buf: Dict[str, List[torch.Tensor]] = {g: [] for g in group_order}
+
+        for rollout in rollouts or []:
+            if rollout is None:
+                continue
+
+            # next TD
+            try:
+                next_td = rollout.get("next", None) if hasattr(rollout, "get") else (rollout["next"] if "next" in rollout.keys() else None)
+            except Exception:
+                next_td = None
+
+            for g in group_order:
+                try:
+                    # observation from next state
+                    gd_next = None
+                    if next_td is not None:
+                        gd_next = next_td.get(g, None) if hasattr(next_td, "get") else (next_td[g] if hasattr(next_td, "keys") and g in next_td.keys() else None)
+                    obs = None
+                    if gd_next is not None:
+                        obs = gd_next.get("observation", None) if hasattr(gd_next, "get") else (gd_next["observation"] if hasattr(gd_next, "keys") and "observation" in gd_next.keys() else None)
+
+                    # action from current state
+                    gd_cur = rollout.get(g, None) if hasattr(rollout, "get") else (rollout[g] if hasattr(rollout, "keys") and g in rollout.keys() else None)
+                    act = None
+                    if gd_cur is not None:
+                        act = gd_cur.get("action", None) if hasattr(gd_cur, "get") else (gd_cur["action"] if hasattr(gd_cur, "keys") and "action" in gd_cur.keys() else None)
+
+                    # Fallback: some rollouts store all agents under a shared key (often "agent")
+                    # In that case, we read from that container and slice by the agent index.
+                    if (obs is None or act is None) and next_td is not None:
+                        try:
+                            shared_key = None
+                            if hasattr(next_td, "keys") and "agent" in next_td.keys():
+                                shared_key = "agent"
+                            elif hasattr(next_td, "keys") and "agents" in next_td.keys():
+                                shared_key = "agents"
+
+                            if shared_key is not None:
+                                shared_next = next_td.get(shared_key, None) if hasattr(next_td, "get") else next_td[shared_key]
+                                if obs is None and shared_next is not None:
+                                    obs = shared_next.get("observation", None) if hasattr(shared_next, "get") else (shared_next["observation"] if hasattr(shared_next, "keys") and "observation" in shared_next.keys() else None)
+
+                                shared_cur = None
+                                if hasattr(rollout, "keys") and shared_key in rollout.keys():
+                                    shared_cur = rollout.get(shared_key, None) if hasattr(rollout, "get") else rollout[shared_key]
+                                if act is None and shared_cur is not None:
+                                    act = shared_cur.get("action", None) if hasattr(shared_cur, "get") else (shared_cur["action"] if hasattr(shared_cur, "keys") and "action" in shared_cur.keys() else None)
+                        except Exception:
+                            pass
+
+                    obs_t = _to_tensor(obs)
+                    act_t = _to_tensor(act)
+                    if obs_t is None or act_t is None:
+                        continue
+
+                    # NOTE: Do NOT slice away the agent dimension here.
+                    # For grouped policies (e.g., `agent_0`, `agent_1`), observations/actions are often
+                    # shaped as [T, agents_per_class, dim]. The critic expects the per-group agent dimension
+                    # to be preserved (e.g., shape[-2] == agents_per_class).
+
+                    if obs_t.dim() == 1:
+                        obs_t = obs_t.unsqueeze(0)
+                    if act_t.dim() == 1:
+                        act_t = act_t.unsqueeze(0)
+
+                    T = min(obs_t.shape[0], act_t.shape[0])
+                    if T <= 0:
+                        continue
+
+                    for t in range(T):
+                        obs_buf[g].append(obs_t[t])
+                        act_buf[g].append(act_t[t])
+
+                except Exception:
+                    continue
+
+        min_len = min((len(obs_buf[g]) for g in group_order), default=0)
+        if min_len <= 0:
+            logger.warning(
+                f"NashConv: no (obs, action) pairs collected. groups={group_order}. "
+                f"counts={{g: (len(obs_buf[g]), len(act_buf[g])) for g in group_order}}"
+            )
+            return {}
+
+        batch_size = min(self.nashconv_batch_size, min_len)
+        indices = np.random.choice(min_len, size=batch_size, replace=False)
+
+        # Choose device (prefer algorithm params; fall back to cpu)
+        try:
+            device = next(algorithm.parameters()).device  # type: ignore[attr-defined]
+        except Exception:
+            device = torch.device("cpu")
+
+        # Infer agents_per_class for reshaping flattened tensors (when each group == class/player)
+        def _infer_agents_per_class() -> int:
+            try:
+                cfg = getattr(getattr(self.experiment, "task", None), "config", None)
+                if isinstance(cfg, dict):
+                    env_cfg = cfg.get("env_config", None)
+                    if isinstance(env_cfg, dict) and env_cfg.get("agents_per_class", None) is not None:
+                        return int(env_cfg["agents_per_class"])
+            except Exception:
+                pass
+            try:
+                env = getattr(self.experiment, "env", None)
+                while env is not None and (hasattr(env, "env") or hasattr(env, "_env")):
+                    env = getattr(env, "env", None) or getattr(env, "_env", None)
+                apc = getattr(env, "agents_per_class", None)
+                if apc is not None:
+                    return int(apc)
+            except Exception:
+                pass
+            return 1
+
+        agents_per_class = _infer_agents_per_class()
+
+        obs_batch: Dict[str, torch.Tensor] = {}
+        act_batch: Dict[str, torch.Tensor] = {}
+        for g in group_order:
+            obs_batch[g] = torch.stack([obs_buf[g][i] for i in indices]).to(device)
+            act_batch[g] = torch.stack([act_buf[g][i] for i in indices]).to(device)
+
+        # If wrappers flattened internal agent dimension, reshape back to [B, A, D]
+        if agents_per_class and agents_per_class > 1:
+            for g in group_order:
+                ob = obs_batch[g]
+                ac = act_batch[g]
+                if ob.dim() == 2 and ob.shape[1] % agents_per_class == 0:
+                    obs_batch[g] = ob.view(batch_size, agents_per_class, ob.shape[1] // agents_per_class)
+                if ac.dim() == 2 and ac.shape[1] % agents_per_class == 0:
+                    act_batch[g] = ac.view(batch_size, agents_per_class, ac.shape[1] // agents_per_class)
+
+        def _list_value_module_keys() -> List[str]:
+            """Best-effort introspection of available value/critic module keys on the algorithm."""
+            candidates = []
+            for attr in ("value_modules", "value_module", "critics", "critic_modules", "_value_modules", "_critics"):
+                if hasattr(algorithm, attr):
+                    obj = getattr(algorithm, attr)
+                    if isinstance(obj, dict):
+                        candidates.extend([str(k) for k in obj.keys()])
+            # Deduplicate while preserving order
+            seen = set()
+            out = []
+            for k in candidates:
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+            return out
+
+        def _get_value_module_for(group_name: str):
+            """Try multiple naming conventions to find the critic/value module."""
+            tried = []
+
+            def _try(name: str):
+                if not name:
+                    return None
+                tried.append(name)
+                if hasattr(algorithm, "get_value_module"):
+                    try:
+                        return algorithm.get_value_module(name)
+                    except Exception:
+                        return None
+                return None
+
+            # 1) direct
+            mod = _try(group_name)
+            if mod is not None:
+                return mod, tried
+
+            # 2) common shared group keys
+            for alt in ("agent", "agents", "group", "default"):
+                mod = _try(alt)
+                if mod is not None:
+                    return mod, tried
+
+            # 3) normalize group names like agent_0 -> agent
+            if group_name.startswith("agent_"):
+                mod = _try("agent")
+                if mod is not None:
+                    return mod, tried
+
+            # 4) try class-only prefix (agent_0_1 -> agent_0)
+            if group_name.startswith("agent_") and "_" in group_name.replace("agent_", ""):
+                parts = group_name.split("_")
+                if len(parts) >= 2:
+                    base = "_".join(parts[:2])  # agent_0
+                    mod = _try(base)
+                    if mod is not None:
+                        return mod, tried
+
+            # 5) dict-based fallbacks if present
+            for attr in ("value_modules", "critics", "critic_modules", "_value_modules", "_critics"):
+                if hasattr(algorithm, attr):
+                    obj = getattr(algorithm, attr)
+                    if isinstance(obj, dict):
+                        # direct lookup
+                        if group_name in obj:
+                            return obj[group_name], tried
+                        # shared key lookups
+                        for alt in ("agent", "agents", "default"):
+                            if alt in obj:
+                                return obj[alt], tried
+
+            return None, tried
+
+        def _critic_q(critic_module, agent_group: str, act_by_group: Dict[str, torch.Tensor]) -> torch.Tensor:
+            """Return Q-values for a given *target group* while providing the critic the full joint (s, a).
+
+            Why: Most BenchMARL critics are centralized (CTDE) and expect observations/actions for *all* groups
+            to be present in the input TensorDict. Passing only the current group's (obs, action) often yields
+            missing outputs (None), which then caused the old flatten(None) crash.
+            """
+            # Ensure the input TensorDict is built on the SAME device as the critic.
+            # This avoids cpu<->mps (or cpu<->cuda) mismatches during evaluation.
+            try:
+                td_device = next(critic_module.parameters()).device
+            except Exception:
+                td_device = obs_batch[agent_group].device
+            td = TensorDict({}, batch_size=[batch_size], device=td_device)
+
+            # Always provide the full joint observation/action keyed by group.
+            for g in group_order:
+                if g not in obs_batch:
+                    raise KeyError(f"NashConv: obs_batch missing group '{g}'. Available={list(obs_batch.keys())}")
+                if g not in act_by_group:
+                    raise KeyError(f"NashConv: act_by_group missing group '{g}'. Available={list(act_by_group.keys())}")
+
+                obs_g = obs_batch[g].to(td_device)
+                act_g = act_by_group[g].to(td_device)
+
+                # TorchRL-style tuple keys
+                td[(g, "observation")] = obs_g
+                td[(g, "action")] = act_g
+
+                # Nested group TensorDict
+                td[g] = TensorDict({"observation": obs_g, "action": act_g}, batch_size=[batch_size], device=td_device)
+
+            # Also provide flat keys for compatibility (set to the *target* group)
+            td["observation"] = obs_batch[agent_group].to(td_device)
+            td["action"] = act_by_group[agent_group].to(td_device)
+
+            out = critic_module(td)
+
+            # -----------------------------
+            # Robust Q extraction
+            # -----------------------------
+            q = None
+
+            # Candidates we will try in priority order
+            candidate_keys = [
+                (agent_group, "state_action_value"),
+                (agent_group, "chosen_action_value"),
+                (agent_group, "action_value"),
+                (agent_group, "q"),
+                (agent_group, "Q"),
+                "state_action_value",
+                "chosen_action_value",
+                "action_value",
+                "q",
+                "Q",
+            ]
+
+            # Try direct extraction from dict or TensorDict
+            try:
+                if isinstance(out, TensorDictBase):
+                    out_keys = list(out.keys(True))
+                    for k in candidate_keys:
+                        if k in out.keys(True):
+                            q = out.get(k)
+                            if q is not None:
+                                break
+
+                    # Fallback: if critic returns per-group nested TDs
+                    if q is None and agent_group in out.keys(True):
+                        out_g = out.get(agent_group)
+                        if isinstance(out_g, TensorDictBase):
+                            for k2 in ("state_action_value", "chosen_action_value", "action_value", "q", "Q"):
+                                if k2 in out_g.keys(True):
+                                    q = out_g.get(k2)
+                                    if q is not None:
+                                        break
+                elif isinstance(out, dict):
+                    out_keys = list(out.keys())
+                    for k in candidate_keys:
+                        if k in out:
+                            q = out[k]
+                            if q is not None:
+                                break
+                else:
+                    out_keys = [type(out).__name__]
+                    q = out
+            except Exception:
+                out_keys = ["<unavailable>"]
+                q = None
+
+            if q is None:
+                raise TypeError(
+                    f"NashConv: critic output did not contain an action-dependent Q tensor for group='{agent_group}'. "
+                    f"Tried keys={candidate_keys}. Available out_keys={out_keys}"
+                )
+
+            if not torch.is_tensor(q):
+                raise TypeError(f"NashConv: extracted Q is not a Tensor for group='{agent_group}'. type={type(q)}")
+
+            # Normalize Q to shape [B] by averaging over any remaining dims.
+            # Common outputs: [B], [B,1], [B,agents_per_class], [B,agents_per_class,1], etc.
+            if q.dim() == 2 and q.shape[-1] == 1:
+                q = q.squeeze(-1)
+            if q.dim() >= 2:
+                q = q.reshape(q.shape[0], -1).mean(dim=1)
+
+            return q
+
+        # -----------------------------
+        # CLASS-AS-PLAYER MODEL
+        # -----------------------------
+        # We want each PLAYER to be one CLASS. In BenchMARL terms, this means:
+        #   - `group_map` should expose ONE group per class/player (recommended name: "class_{c}")
+        #   - each group tensor can still carry an *internal* agent dimension, e.g. [B, agents_per_class, dim]
+        #
+        # For backward compatibility, if the user still exposes multiple groups per class (e.g. agent_0_0, agent_0_1),
+        # we will aggregate them under the same class id.
+
+        class_to_groups: Dict[int, List[str]] = {}
+        for g in group_order:
+            cls = self._extract_class_from_group_name(g)
+            if cls is None:
+                continue
+            class_to_groups.setdefault(cls, []).append(g)
+
+        if not class_to_groups:
+            logger.warning(
+                f"NashConv: Could not extract class ids from group names. groups={group_order}"
+            )
+            return {}
+
+        classes = sorted(class_to_groups.keys())
+        logger.debug(f"NashConv: Computing CLASS-level exploitability for classes: {classes}")
+        logger.debug(f"NashConv: Class-to-groups mapping: {class_to_groups}")
+
+        def _class_q_value(class_id: int, act_by_group: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+            groups_in_class = class_to_groups.get(class_id, [])
+            if not groups_in_class:
+                logger.debug(f"NashConv: Class {class_id} has no groups")
+                return None
+
+            q_values = []
+            failed = []
+
+            for group_name in groups_in_class:
+                critic_module, tried_names = _get_value_module_for(group_name)
+                if critic_module is None:
+                    failed.append((group_name, "no_critic"))
+                    continue
+
+                try:
+                    q = _critic_q(critic_module, group_name, act_by_group)
+                    if q is not None:
+                        q_values.append(q)
+                    else:
+                        failed.append((group_name, "q_none"))
+                except Exception as e:
+                    failed.append((group_name, f"{type(e).__name__}: {e}"))
+
+            if not q_values:
+                logger.warning(
+                    f"NashConv: Class {class_id} Q-value computation failed for all groups. "
+                    f"Groups: {groups_in_class}, Failed: {failed}"
+                )
+                return None
+
+            # If there is exactly one group per class (recommended), this is just that group's Q.
+            # If there are multiple groups (legacy), we average them.
+            q_stack = torch.stack(q_values, dim=0)  # [n_groups, B]
+            return q_stack.mean(dim=0)
+
+        def _approx_class_br_random_search(class_id: int, act_by_group: Dict[str, torch.Tensor]) -> float:
+            """Approximate class-level best-response via black-box random search over *joint actions* of the class.
+
+            Here a "class" corresponds to the group(s) in `class_to_groups[class_id]`. In the recommended setup,
+            there is exactly one group per class (e.g., 'class_0' or 'agent_0'), and its action tensor can still
+            contain an internal agent dimension: [B, agents_per_class, act_dim].
+            """
+            groups_in_class = class_to_groups.get(class_id, [])
+            if not groups_in_class:
+                return 0.0
+
+            # Hyperparams
+            num_samples = int(getattr(self, "nashconv_num_samples", 256))
+            noise_std = float(getattr(self, "nashconv_noise_std", 0.25))
+            eval_chunk = int(getattr(self, "nashconv_eval_chunk", 64))
+
+            # Base actions for this class (by group)
+            base_acts = {g: act_by_group[g] for g in groups_in_class if g in act_by_group}
+            if not base_acts:
+                return 0.0
+
+            B = next(iter(base_acts.values())).shape[0]
+            best_q = None
+            candidates_total = num_samples + 1  # include the original action as candidate 0
+
+            for start in range(0, candidates_total, eval_chunk):
+                end = min(candidates_total, start + eval_chunk)
+                k = end - start
+
+                # Sample candidates for each group in the class
+                cand_by_group = {}
+                for g, base_act in base_acts.items():
+                    if base_act.dim() == 3:
+                        # [B, A, act_dim]
+                        n_agents = base_act.shape[1]
+                        act_dim = base_act.shape[2]
+                        noise = torch.randn((k, B, n_agents, act_dim), device=base_act.device, dtype=base_act.dtype) * noise_std
+                        cand = base_act.unsqueeze(0) + noise  # [k, B, A, act_dim]
+                        if start == 0:
+                            cand[0] = base_act
+                        cand_by_group[g] = cand.clamp(-1.0, 1.0)
+                    elif base_act.dim() == 2:
+                        # [B, act_dim]
+                        act_dim = base_act.shape[1]
+                        noise = torch.randn((k, B, act_dim), device=base_act.device, dtype=base_act.dtype) * noise_std
+                        cand = base_act.unsqueeze(0) + noise  # [k, B, act_dim]
+                        if start == 0:
+                            cand[0] = base_act
+                        cand_by_group[g] = cand.clamp(-1.0, 1.0)
+                    else:
+                        # Unexpected shape
+                        continue
+
+                if not cand_by_group:
+                    continue
+
+                # Evaluate candidates
+                q_vals = []
+                for j in range(k):
+                    act_tmp = dict(act_by_group)
+                    for g in groups_in_class:
+                        if g in cand_by_group:
+                            act_tmp[g] = cand_by_group[g][j]
+                    q_class = _class_q_value(class_id, act_tmp)
+                    if q_class is not None:
+                        q_vals.append(q_class)
+
+                if q_vals:
+                    q_stack = torch.stack(q_vals, dim=0)  # [k, B]
+                    q_chunk_best = q_stack.max(dim=0).values  # [B]
+                    best_q = q_chunk_best if best_q is None else torch.maximum(best_q, q_chunk_best)
+
+            return best_q.mean().item() if best_q is not None else 0.0
+
+        # -----------------------------
+        # Compute class-level exploitabilities
+        # -----------------------------
+        class_exploitabilities: Dict[int, float] = {}
+        available_value_keys = _list_value_module_keys()
+        
+        # Get critic modules for all groups (need at least one per class)
+        critic_modules_by_group: Dict[str, Any] = {}
+        for g in group_order:
+            critic_module, tried_names = _get_value_module_for(g)
+            if critic_module is not None:
+                critic_modules_by_group[g] = critic_module
+
+        if not critic_modules_by_group:
+            logger.warning(
+                f"NashConv: No critic modules found. Available_keys={available_value_keys}"
+            )
+            return {}
+
+        # Freeze all critic parameters
+        saved_rg_dicts: Dict[str, List[bool]] = {}
+        for g, critic_module in critic_modules_by_group.items():
+            saved_rg = []
+            try:
+                for p in critic_module.parameters():
+                    saved_rg.append(p.requires_grad)
+                    p.requires_grad_(False)
+            except Exception:
+                saved_rg = []
+            saved_rg_dicts[g] = saved_rg
+
+        try:
+            for critic_module in critic_modules_by_group.values():
+                critic_module.eval()
+
+            for class_id in classes:
+                groups_in_class = class_to_groups[class_id]
+
+                # Check if we have at least one critic for this class
+                has_critic = any(g in critic_modules_by_group for g in groups_in_class)
+                if not has_critic:
+                    logger.warning(
+                        f"NashConv: No critic module found for class {class_id} (groups: {groups_in_class}). "
+                        f"Available critics: {list(critic_modules_by_group.keys())}"
+                    )
+                    continue
+
+                # Check if we have actions for all groups in this class
+                missing_actions = [g for g in groups_in_class if g not in act_batch]
+                if missing_actions:
+                    logger.warning(
+                        f"NashConv: Class {class_id} missing actions for groups: {missing_actions}. "
+                        f"Available actions: {list(act_batch.keys())}"
+                    )
+                    continue
+
+                logger.debug(f"NashConv: Computing exploitability for class {class_id} with groups: {groups_in_class}")
+
+                try:
+                    # Current class Q-value (aggregate over all groups in class)
+                    with torch.no_grad():
+                        q_cur = _class_q_value(class_id, act_batch)
+                        if q_cur is None:
+                            logger.warning(
+                                f"NashConv: Class {class_id} current Q-value is None, skipping exploitability computation. "
+                                f"Groups in class: {groups_in_class}, Actions available: {list(act_batch.keys())}"
+                            )
+                            continue
+                        q_cur_mean = q_cur.mean().item()
+                        logger.debug(f"NashConv: Class {class_id} current Q-value mean: {q_cur_mean:.6f}")
+
+                    # Probe if Q is differentiable w.r.t. actions of groups in this class
+                    q_has_action_grad = False
+                    with torch.inference_mode(False):
+                        act_probe = dict(act_batch)
+                        probes = {}
+                        for g in groups_in_class:
+                            if g in act_batch:
+                                a_probe = act_batch[g].clone().detach().requires_grad_(True)
+                                act_probe[g] = a_probe
+                                probes[g] = a_probe
+
+                        if probes:
+                            with torch.enable_grad():
+                                q_probe = _class_q_value(class_id, act_probe)
+                                if q_probe is not None:
+                                    q_has_action_grad = bool(getattr(q_probe, "requires_grad", False))
+
+                    # Optimize joint actions of all groups in class
+                    if q_has_action_grad and probes:
+                        with torch.inference_mode(False):
+                            # Create optimizable actions for all groups in class
+                            optimizable_acts = {}
+                            opt_params = []
+                            for g in groups_in_class:
+                                if g in act_batch:
+                                    a_br = act_batch[g].clone().detach().requires_grad_(True)
+                                    optimizable_acts[g] = a_br
+                                    opt_params.append(a_br)
+
+                            if not opt_params:
+                                continue
+
+                            opt = torch.optim.Adam(opt_params, lr=self.nashconv_lr)
+                            act_tmp = dict(act_batch)
+
+                            for _ in range(self.nashconv_steps):
+                                opt.zero_grad()
+                                for g, a_br in optimizable_acts.items():
+                                    act_tmp[g] = a_br
+
+                                with torch.enable_grad():
+                                    q_br = _class_q_value(class_id, act_tmp)
+                                    if q_br is None:
+                                        break
+                                    loss = -q_br.mean()
+                                    loss.backward()
+
+                                torch.nn.utils.clip_grad_norm_(opt_params, max_norm=1.0)
+                                opt.step()
+                                with torch.no_grad():
+                                    for a_br in optimizable_acts.values():
+                                        a_br.clamp_(-1.0, 1.0)
+
+                            with torch.no_grad():
+                                for g, a_br in optimizable_acts.items():
+                                    act_tmp[g] = a_br
+                                q_br_final = _class_q_value(class_id, act_tmp)
+                                q_br_mean = q_br_final.mean().item() if q_br_final is not None else q_cur_mean
+                    else:
+                        # Fall back to random search for class-level best response
+                        logger.debug(
+                            f"NashConv: Class {class_id} Q not differentiable w.r.t. actions. "
+                            f"Using random-search BR (num_samples={int(getattr(self, 'nashconv_num_samples', 256))})."
+                        )
+                        q_br_mean = _approx_class_br_random_search(class_id, act_batch)
+
+                    delta = max(0.0, q_br_mean - q_cur_mean)
+                    class_exploitabilities[class_id] = float(delta)
+
+                except Exception as e:
+                    logger.warning(
+                        f"NashConv: Class {class_id} exploitability computation failed. "
+                        f"Error={type(e).__name__}: {e}"
+                    )
+                    continue
+
+        finally:
+            # Restore critic requires_grad flags
+            for g, saved_rg in saved_rg_dicts.items():
+                if g in critic_modules_by_group:
+                    try:
+                        critic_module = critic_modules_by_group[g]
+                        for p, rg in zip(critic_module.parameters(), saved_rg):
+                            p.requires_grad_(rg)
+                    except Exception:
+                        pass
+        
+        if not class_exploitabilities:
+            logger.warning(
+                f"NashConv: No class exploitabilities computed. Classes tried: {classes}"
+            )
             return {}
         
-        try:
-            algorithm = self.experiment.algorithm
-            if algorithm is None:
-                print(f"    NashConv: Algorithm is None")
-                return {}
-            
-            # Get groups (agents)
-            groups = list(self.experiment.group_map.keys()) if hasattr(self.experiment, 'group_map') else []
-            if not groups:
-                print(f"    NashConv: No groups found")
-                return {}
-            
-            print(f"    NashConv: Found {len(groups)} groups: {groups}")
-            
-            # Collect states and actions from rollouts
-            states = []
-            actions = {}
-            observations = {}
-            
-            # Debug: Check rollout structure
-            if rollouts:
-                print(f"    NashConv: Checking rollout structure...")
-                first_rollout = rollouts[0]
-                if hasattr(first_rollout, 'keys'):
-                    rollout_keys = list(first_rollout.keys())
-                    print(f"    NashConv: First rollout keys: {rollout_keys[:10]}...")  # Show first 10 keys
-                    # Check for nested structure
-                    if "next" in rollout_keys:
-                        next_keys = list(first_rollout["next"].keys()) if hasattr(first_rollout["next"], 'keys') else []
-                        print(f"    NashConv: 'next' keys: {next_keys}")
-                        # Check what's inside agent_0 in next
-                        if groups and groups[0] in first_rollout["next"]:
-                            agent_data = first_rollout["next"][groups[0]]
-                            if hasattr(agent_data, 'keys'):
-                                agent_keys = list(agent_data.keys())
-                                print(f"    NashConv: '{groups[0]}' in 'next' has keys: {agent_keys[:10]}")
-                        # Check what's in current state (rollout[group])
-                        if groups and groups[0] in first_rollout:
-                            agent_data_curr = first_rollout[groups[0]]
-                            if hasattr(agent_data_curr, 'keys'):
-                                agent_keys_curr = list(agent_data_curr.keys())
-                                print(f"    NashConv: '{groups[0]}' in current state has keys: {agent_keys_curr[:10]}")
-            
-            for rollout in rollouts:
-                # Extract observations (states) and actions for each group
-                # BenchMARL structure: rollout is a TensorDict with nested structure
-                # - Observations: rollout["next"][group]["observation"] (next state observations)
-                # - Actions: rollout[group]["action"] (actions taken to reach next state)
-                
-                # Check if rollout has the expected structure
-                rollout_keys = list(rollout.keys()) if hasattr(rollout, 'keys') else []
-                if "next" not in rollout_keys:
-                    continue
-                
-                next_data = rollout["next"]
-                if not hasattr(next_data, 'keys'):
-                    continue
-                
-                for group in groups:
-                    obs = None
-                    action = None
-                    
-                    try:
-                        # Get observation from next state
-                        if group in next_data:
-                            group_data_next = next_data[group]
-                            # TensorDict supports direct indexing - try multiple methods
-                            try:
-                                obs = group_data_next["observation"]
-                            except (KeyError, TypeError):
-                                if hasattr(group_data_next, 'get'):
-                                    obs = group_data_next.get("observation", None)
-                                else:
-                                    obs = None
-                        
-                        # Get action from current state (the action that led to the next state)
-                        if group in rollout:
-                            group_data_curr = rollout[group]
-                            try:
-                                action = group_data_curr["action"]
-                            except (KeyError, TypeError):
-                                if hasattr(group_data_curr, 'get'):
-                                    action = group_data_curr.get("action", None)
-                                else:
-                                    action = None
-                                
-                    except (KeyError, AttributeError, TypeError, IndexError) as e:
-                        # Only log first error to avoid spam
-                        if group == groups[0] and len(observations) == 0:
-                            print(f"    NashConv: Exception accessing {group}: {type(e).__name__}: {e}")
-                            import traceback
-                            print(f"    Traceback: {traceback.format_exc()}")
-                        continue
-                    
-                    # Debug: Log what we extracted (only for first group, first rollout)
-                    if group == groups[0] and len(observations) == 0:
-                        print(f"    NashConv: Extracted data for {group}")
-                        print(f"      obs type: {type(obs)}, shape: {obs.shape if hasattr(obs, 'shape') else 'N/A'}")
-                        print(f"      action type: {type(action)}, shape: {action.shape if hasattr(action, 'shape') else 'N/A'}")
-                    
-                    if obs is not None and action is not None:
-                        # Convert to tensors if needed
-                        if isinstance(obs, np.ndarray):
-                            obs = torch.from_numpy(obs).float()
-                        elif isinstance(obs, torch.Tensor):
-                            obs = obs.float()
-                        else:
-                            continue  # Skip if we can't convert
-                            
-                        if isinstance(action, np.ndarray):
-                            action = torch.from_numpy(action).float()
-                        elif isinstance(action, torch.Tensor):
-                            action = action.float()
-                        else:
-                            continue  # Skip if we can't convert
-                        
-                        # Handle batched data - rollouts are sequences of steps
-                        # Shape analysis:
-                        # - obs.shape: [time_steps, num_agents, obs_dim] or [time_steps, obs_dim]
-                        # - action.shape: [time_steps, num_agents, action_dim] or [time_steps, action_dim]
-                        # We need to extract data for the specific group (agent)
-                        
-                        # If data has 3 dimensions [time_steps, num_agents, dim], we need to select the agent
-                        # The group index in groups list corresponds to the agent index
-                        agent_idx = groups.index(group) if group in groups else 0
-                        
-                        if obs.dim() == 3:
-                            # Shape: [time_steps, num_agents, obs_dim] - select agent
-                            if agent_idx < obs.shape[1]:
-                                obs = obs[:, agent_idx, :]  # [time_steps, obs_dim]
-                            else:
-                                continue  # Agent index out of bounds
-                        elif obs.dim() == 2:
-                            # Shape: [time_steps, obs_dim] - already per-agent
-                            pass
-                        elif obs.dim() == 1:
-                            # Single step - add batch dimension
-                            obs = obs.unsqueeze(0)
-                        elif obs.dim() == 0:
-                            obs = obs.unsqueeze(0)
-                        else:
-                            continue  # Unexpected shape
-                        
-                        if action.dim() == 3:
-                            # Shape: [time_steps, num_agents, action_dim] - select agent
-                            if agent_idx < action.shape[1]:
-                                action = action[:, agent_idx, :]  # [time_steps, action_dim]
-                            else:
-                                continue  # Agent index out of bounds
-                        elif action.dim() == 2:
-                            # Shape: [time_steps, action_dim] - already per-agent
-                            pass
-                        elif action.dim() == 1:
-                            action = action.unsqueeze(0)
-                        elif action.dim() == 0:
-                            action = action.unsqueeze(0)
-                        else:
-                            continue  # Unexpected shape
-                        
-                        # Now obs and action should be [time_steps, dim]
-                        # Get number of time steps
-                        time_steps = obs.shape[0]
-                        action_time_steps = action.shape[0]
-                        min_steps = min(time_steps, action_time_steps)
-                        
-                        # Debug: Log final shapes (only for first group, first rollout)
-                        if group == groups[0] and len(observations) == 0:
-                            print(f"    NashConv: After processing - obs shape: {obs.shape}, action shape: {action.shape}")
-                            print(f"    NashConv: Time steps: {time_steps}, action time steps: {action_time_steps}")
-                        
-                        if min_steps > 0:
-                            if group not in observations:
-                                observations[group] = []
-                                actions[group] = []
-                            
-                            # Add all time steps from this rollout
-                            for step_idx in range(min_steps):
-                                observations[group].append(obs[step_idx])
-                                actions[group].append(action[step_idx])
-            
-            # Check if we have enough data
-            if not observations or not all(len(obs_list) > 0 for obs_list in observations.values()):
-                print(f"    NashConv: Not enough observations - observations keys: {list(observations.keys()) if observations else 'empty'}")
-                if observations:
-                    for group, obs_list in observations.items():
-                        print(f"      {group}: {len(obs_list)} observations")
-                else:
-                    print(f"    NashConv: observations dict is empty")
-                logger.debug("Not enough data for NashConv computation")
-                return {}
-            
-            # Debug: Log what we collected
-            print(f"    NashConv: Collected data - {len(observations)} groups")
-            for group, obs_list in observations.items():
-                print(f"      {group}: {len(obs_list)} observations, {len(actions.get(group, []))} actions")
-            
-            # Stack observations and actions into batches
-            min_length = min(len(obs_list) for obs_list in observations.values())
-            if min_length == 0:
-                print(f"    NashConv: Min length is 0, skipping.")
-                return {}
-            
-            # Use a subset for efficiency
-            batch_size = min(self.nashconv_batch_size, min_length)
-            indices = np.random.choice(min_length, size=batch_size, replace=False)
-            print(f"    NashConv: Using batch_size={batch_size} from {min_length} samples")
-            
-            # Stack into tensors
-            obs_batch = {}
-            action_batch = {}
-            for group in groups:
-                if group in observations and len(observations[group]) > 0:
-                    obs_list = [observations[group][i] for i in indices if i < len(observations[group])]
-                    action_list = [actions[group][i] for i in indices if i < len(actions[group])]
-                    
-                    if obs_list and action_list:
-                        # Ensure all have same shape
-                        obs_tensor = torch.stack(obs_list)
-                        action_tensor = torch.stack(action_list)
-                        
-                        # Move to device
-                        device = next(algorithm.parameters()).device if hasattr(algorithm, 'parameters') else torch.device("cpu")
-                        obs_batch[group] = obs_tensor.to(device)
-                        action_batch[group] = action_tensor.to(device)
-            
-            if not obs_batch or not action_batch:
-                print(f"    NashConv: Empty batches - obs_batch keys: {list(obs_batch.keys())}, action_batch keys: {list(action_batch.keys())}")
-                return {}
-            
-            print(f"    NashConv: Batches created - obs_batch: {list(obs_batch.keys())}, action_batch: {list(action_batch.keys())}")
-            
-            # Compute exploitability for each agent
-            exploitabilities = {}
-            
-            for agent_group in groups:
-                if agent_group not in obs_batch or agent_group not in action_batch:
-                    print(f"    NashConv: Skipping {agent_group} - not in batches")
-                    continue
-                
-                try:
-                    # Get critic for this agent
-                    if not hasattr(algorithm, 'get_value_module'):
-                        print(f"    NashConv: Algorithm {type(algorithm).__name__} has no get_value_module")
-                        continue
-                    
-                    critic_module = algorithm.get_value_module(agent_group)
-                    if critic_module is None:
-                        print(f"    NashConv: Critic module for {agent_group} is None")
-                        continue
-                    
-                    print(f"    NashConv: Computing exploitability for {agent_group}...")
-                    
-                    # Get current observations and actions
-                    agent_obs = obs_batch[agent_group]
-                    agent_action = action_batch[agent_group]
-                    
-                    # Build joint observation and action for centralized critic
-                    # BenchMARL's MADDPG critic expects TensorDict with nested structure
-                    # Try TensorDict format first, fallback to concatenated format
-                    from tensordict import TensorDict
-                    
-                    # Construct joint observation and action
-                    joint_obs_list = []
-                    joint_action_list = []
-                    for group in sorted(groups):
-                        if group in obs_batch:
-                            joint_obs_list.append(obs_batch[group])
-                            joint_action_list.append(action_batch[group])
-                    
-                    if not joint_obs_list or not joint_action_list:
-                        continue
-                    
-                    # Try TensorDict format (BenchMARL standard)
-                    # Note: BenchMARL's critic may expect a specific structure - if this fails, use concatenated format
-                    use_tensordict = False
-                    try:
-                        # Create TensorDict with nested structure for critic
-                        # BenchMARL critics typically expect: {group: {"observation": obs, "action": act}}
-                        critic_input_td = TensorDict({}, batch_size=[batch_size])
-                        for group in sorted(groups):
-                            if group in obs_batch and group in action_batch:
-                                critic_input_td[group] = TensorDict({
-                                    "observation": obs_batch[group],
-                                    "action": action_batch[group]
-                                }, batch_size=[batch_size])
-                        
-                        # Try to call critic with TensorDict
-                        critic_module.eval()
-                        with torch.no_grad():
-                            current_q = critic_module(critic_input_td)
-                            # Handle different output formats
-                            if isinstance(current_q, TensorDict):
-                                current_q = current_q.get("state_value", current_q.get("action_value", None))
-                            if current_q is None or not isinstance(current_q, torch.Tensor):
-                                raise ValueError("Critic output format not recognized")
-                            if current_q.dim() > 1:
-                                current_q = current_q.squeeze(-1) if current_q.shape[-1] == 1 else current_q.mean(dim=-1)
-                            current_q_mean = current_q.mean().item()
-                        
-                        use_tensordict = True
-                        print(f"    NashConv: Using TensorDict format for {agent_group}")
-                    except Exception as e:
-                        # Fallback to concatenated format
-                        print(f"    NashConv: TensorDict format failed for {agent_group}, trying concatenated format: {type(e).__name__}")
-                        logger.debug(f"TensorDict format failed, using concatenated format: {e}")
-                        use_tensordict = False
-                        
-                        # Concatenate along feature dimension
-                        if not joint_obs_list or not joint_action_list:
-                            raise ValueError(f"Empty joint_obs_list or joint_action_list for {agent_group}")
-                        
-                        try:
-                            joint_obs = torch.cat(joint_obs_list, dim=-1)  # [batch, n_features_total]
-                            joint_action = torch.cat(joint_action_list, dim=-1)  # [batch, n_actions_total]
-                            
-                            # Construct input to critic: [joint_obs, joint_action]
-                            critic_input = torch.cat([joint_obs, joint_action], dim=-1)
-                            
-                            # Compute current Q-value: Q_i(s, a)
-                            critic_module.eval()
-                            with torch.no_grad():
-                                current_q = critic_module(critic_input)
-                                if current_q.dim() > 1:
-                                    current_q = current_q.squeeze(-1) if current_q.shape[-1] == 1 else current_q.mean(dim=-1)
-                                current_q_mean = current_q.mean().item()
-                            print(f"    NashConv: Concatenated format worked for {agent_group}, current_q_mean={current_q_mean:.6f}")
-                        except Exception as e2:
-                            print(f"    NashConv: Concatenated format also failed for {agent_group}: {type(e2).__name__}: {e2}")
-                            raise  # Re-raise to be caught by outer exception handler
-                    
-                    # Compute best response for agent i by optimizing a_i while holding a_{-i} fixed
-                    # Initialize best response action as current action
-                    agent_action_br = agent_action.clone().detach().requires_grad_(True)
-                    
-                    # Optimize a_i using gradient ascent on Q_i
-                    optimizer = torch.optim.Adam([agent_action_br], lr=self.nashconv_lr)
-                    
-                    for step in range(self.nashconv_steps):
-                        optimizer.zero_grad()
-                        
-                        if use_tensordict:
-                            # Reconstruct TensorDict with optimized action
-                            critic_input_br_td = TensorDict({}, batch_size=[batch_size])
-                            for group in sorted(groups):
-                                if group in obs_batch:
-                                    if group == agent_group:
-                                        action_br = agent_action_br
-                                    else:
-                                        action_br = action_batch[group]
-                                    critic_input_br_td[group] = TensorDict({
-                                        "observation": obs_batch[group],
-                                        "action": action_br
-                                    }, batch_size=[batch_size])
-                            
-                            # Compute Q-value with best response action
-                            q_br = critic_module(critic_input_br_td)
-                            if isinstance(q_br, TensorDict):
-                                q_br = q_br.get("state_value", q_br.get("action_value", None))
-                            if q_br is None or not isinstance(q_br, torch.Tensor):
-                                raise ValueError("Critic output format not recognized")
-                            if q_br.dim() > 1:
-                                q_br = q_br.squeeze(-1) if q_br.shape[-1] == 1 else q_br.mean(dim=-1)
-                        else:
-                            # Reconstruct joint action with optimized a_i
-                            joint_action_br_list = []
-                            for group in sorted(groups):
-                                if group == agent_group:
-                                    joint_action_br_list.append(agent_action_br)
-                                else:
-                                    joint_action_br_list.append(action_batch[group])
-                            
-                            joint_action_br = torch.cat(joint_action_br_list, dim=-1)
-                            critic_input_br = torch.cat([joint_obs, joint_action_br], dim=-1)
-                            
-                            # Compute Q-value with best response action
-                            q_br = critic_module(critic_input_br)
-                            if q_br.dim() > 1:
-                                q_br = q_br.squeeze(-1) if q_br.shape[-1] == 1 else q_br.mean(dim=-1)
-                        
-                        # Maximize Q-value (minimize negative)
-                        loss = -q_br.mean()
-                        loss.backward()
-                        
-                        # Clip gradients for stability
-                        torch.nn.utils.clip_grad_norm_([agent_action_br], max_norm=1.0)
-                        
-                        optimizer.step()
-                        
-                        # Clip actions to valid range (assuming actions are in [-1, 1] or [0, 1])
-                        with torch.no_grad():
-                            agent_action_br.clamp_(-1.0, 1.0)
-                    
-                    # Compute best response Q-value
-                    critic_module.eval()
-                    with torch.no_grad():
-                        if use_tensordict:
-                            critic_input_br_final_td = TensorDict({}, batch_size=[batch_size])
-                            for group in sorted(groups):
-                                if group in obs_batch:
-                                    if group == agent_group:
-                                        action_br = agent_action_br
-                                    else:
-                                        action_br = action_batch[group]
-                                    critic_input_br_final_td[group] = TensorDict({
-                                        "observation": obs_batch[group],
-                                        "action": action_br
-                                    }, batch_size=[batch_size])
-                            
-                            q_br_final = critic_module(critic_input_br_final_td)
-                            if isinstance(q_br_final, TensorDict):
-                                q_br_final = q_br_final.get("state_value", q_br_final.get("action_value", None))
-                            if q_br_final is None or not isinstance(q_br_final, torch.Tensor):
-                                raise ValueError("Critic output format not recognized")
-                            if q_br_final.dim() > 1:
-                                q_br_final = q_br_final.squeeze(-1) if q_br_final.shape[-1] == 1 else q_br_final.mean(dim=-1)
-                        else:
-                            joint_action_br_final = torch.cat([
-                                agent_action_br if group == agent_group else action_batch[group]
-                                for group in sorted(groups)
-                            ], dim=-1)
-                            critic_input_br_final = torch.cat([joint_obs, joint_action_br_final], dim=-1)
-                            q_br_final = critic_module(critic_input_br_final)
-                            if q_br_final.dim() > 1:
-                                q_br_final = q_br_final.squeeze(-1) if q_br_final.shape[-1] == 1 else q_br_final.mean(dim=-1)
-                        q_br_mean = q_br_final.mean().item()
-                    
-                    # Exploitability = E[Q_i(s, a_i^BR, a_{-i}) - Q_i(s, a)]
-                    exploitability = q_br_mean - current_q_mean
-                    exploitabilities[agent_group] = max(0.0, exploitability)  # Exploitability is non-negative
-                    print(f"    NashConv: Exploitability for {agent_group}: {exploitability:.6f}")
-                    
-                except Exception as e:
-                    print(f"    NashConv: Error computing exploitability for {agent_group}: {type(e).__name__}: {e}")
-                    import traceback
-                    print(f"    NashConv: Traceback: {traceback.format_exc()}")
-                    logger.debug(f"Error computing exploitability for {agent_group}: {e}")
-                    continue
-            
-            if not exploitabilities:
-                return {}
-            
-            # Compute NashConv and exploitability_max
-            nashconv_sum = sum(exploitabilities.values())
-            exploitability_max = max(exploitabilities.values()) if exploitabilities else 0.0
-            
-            # Build result dictionary
-            metrics = {
-                "evaluation/nashconv_sum": nashconv_sum,
-                "evaluation/exploitability_max": exploitability_max,
-            }
-            
-            # Add per-agent exploitability
-            for group, exploit in exploitabilities.items():
-                metrics[f"evaluation/exploitability_{group}"] = exploit
-            
-            return metrics
-            
-        except Exception as e:
-            logger.warning(f"Error computing NashConv metrics: {e}")
-            import traceback
-            logger.debug(f"NashConv computation error traceback: {traceback.format_exc()}")
-            return {}
+        # Compute metrics
+        nashconv_sum = float(sum(class_exploitabilities.values()))
+        exploitability_max = float(max(class_exploitabilities.values()))
+        
+        metrics: Dict[str, float] = {
+            "evaluation/nashconv_sum": nashconv_sum,
+            "evaluation/exploitability_max": exploitability_max,
+            "evaluation/class_nashconv_sum": nashconv_sum,  # Alias for clarity
+            "evaluation/class_exploitability_max": exploitability_max,  # Alias for clarity
+        }
+        
+        # Per-class exploitability
+        for class_id, v in class_exploitabilities.items():
+            metrics[f"evaluation/exploitability_class_{class_id}"] = float(v)
+            metrics[f"evaluation/class_exploitability_class_{class_id}"] = float(v)  # Alias for backward compatibility
+        
+        return metrics
     
     def on_batch_collected(self, batch: TensorDictBase):
         if not self.log_training_metrics:
             return
+        
+        # Debug: Log that on_batch_collected is being called (use print for visibility)
+        self.training_batch_count = getattr(self, 'training_batch_count', 0) + 1
+        # Log every batch for debugging (can be reduced later)
+        print(f"[TRAINING] on_batch_collected: batch_count={self.training_batch_count}, compute_nashconv={self.compute_nashconv}, frequency={self.nashconv_compute_frequency}")
         
         all_metrics = {}
         episode_details = {}
@@ -834,6 +1052,80 @@ class AnchorMetricsCallback(Callback):
                     episode_detail["total_frames"] = self.experiment.total_frames if hasattr(self.experiment, 'total_frames') else None
                     
                     episode_details[group] = episode_detail
+        
+        # Compute NashConv periodically during training (epsilon-Nash equilibrium convergence)
+        # Do this BEFORE checking all_metrics so we can compute even if other metrics are empty
+        # Note: training_batch_count was already incremented above
+        training_nashconv_metrics = {}
+        
+        if self.compute_nashconv and self.training_batch_count % self.nashconv_compute_frequency == 0:
+            print(f"[TRAINING NASHCONV] ⚡ Computing at batch {self.training_batch_count} (iter {self.experiment.n_iters_performed if hasattr(self, 'experiment') and hasattr(self.experiment, 'n_iters_performed') else 'N/A'})")
+            try:
+                # Store batch for NashConv computation
+                # Training batches have structure: {group: {...}, "next": {group: {...}}}
+                # This is compatible with _compute_nashconv_metrics which expects rollouts
+                from tensordict import TensorDict
+                
+                # Clone batch to avoid modifying the original
+                rollout_like = batch.clone()
+                self.training_batches_for_nashconv.append(rollout_like)
+                
+                # Keep only recent batches (last 2-3) to avoid memory issues
+                if len(self.training_batches_for_nashconv) > 3:
+                    self.training_batches_for_nashconv.pop(0)
+                
+                # Compute NashConv from recent training batches
+                if len(self.training_batches_for_nashconv) >= 1:
+                    logger.debug(f"Computing NashConv from {len(self.training_batches_for_nashconv)} training batch(es)")
+                    nashconv_metrics = self._compute_nashconv_metrics(self.training_batches_for_nashconv)
+                    if nashconv_metrics:
+                        logger.debug(f"NashConv computation succeeded, got {len(nashconv_metrics)} metrics")
+                        # Convert evaluation/ prefix to training/ prefix for training metrics
+                        for key, value in nashconv_metrics.items():
+                            if key.startswith("evaluation/"):
+                                training_key = key.replace("evaluation/", "training/")
+                                training_nashconv_metrics[training_key] = value
+                            else:
+                                training_nashconv_metrics[f"training/{key}"] = value
+                        
+                        # Log NashConv metrics for monitoring epsilon-Nash equilibrium convergence
+                        nashconv_sum = training_nashconv_metrics.get('training/nashconv_sum', 0.0)
+                        exploitability_max = training_nashconv_metrics.get('training/exploitability_max', 0.0)
+                        class_nashconv_sum = training_nashconv_metrics.get('training/class_nashconv_sum', None)
+                        
+                        # Print to console for visibility
+                        print(f"[TRAINING NASHCONV] ✓ Success! batch={self.training_batch_count}, iter={self.experiment.n_iters_performed if hasattr(self, 'experiment') and hasattr(self.experiment, 'n_iters_performed') else 'N/A'}")
+                        print(f"  NashConv sum: {nashconv_sum:.6f}, max exploitability: {exploitability_max:.6f}" + (f", class_sum: {class_nashconv_sum:.6f}" if class_nashconv_sum is not None else ""))
+                        
+                        logger.info(
+                            f"Training NashConv (iter {self.experiment.n_iters_performed}, batch {self.training_batch_count}): "
+                            f"sum={nashconv_sum:.6f}, max={exploitability_max:.6f}"
+                            + (f", class_sum={class_nashconv_sum:.6f}" if class_nashconv_sum is not None else "")
+                        )
+                        
+                        # Also log per-agent exploitability if available
+                        for key, value in training_nashconv_metrics.items():
+                            if key.startswith("training/exploitability_") and not key.endswith("_max") and not key.startswith("training/class_"):
+                                logger.debug(f"  {key}: {value:.6f}")
+                        
+                        # Log class-level exploitability if available
+                        for key, value in training_nashconv_metrics.items():
+                            if key.startswith("training/class_exploitability_class_"):
+                                class_id = key.replace("training/class_exploitability_class_", "")
+                                logger.debug(f"  Class {class_id} exploitability: {value:.6f}")
+                    else:
+                        print(f"[TRAINING NASHCONV] ⚠ No metrics returned (insufficient data or computation failed)")
+                        logger.warning(f"NashConv computation returned empty metrics (this may indicate insufficient data or computation failure)")
+            except Exception as e:
+                # NashConv computation failure during training is non-fatal
+                print(f"[TRAINING NASHCONV] ✗ Error: {type(e).__name__}: {e}")
+                logger.warning(f"Could not compute NashConv during training (non-fatal): {type(e).__name__}: {e}")
+                import traceback
+                logger.debug(f"NashConv training computation traceback: {traceback.format_exc()}")
+        
+        # Add NashConv metrics to all_metrics if computed
+        if training_nashconv_metrics:
+            all_metrics.update(training_nashconv_metrics)
         
         if all_metrics:
             self.training_metrics.append(all_metrics)

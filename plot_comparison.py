@@ -42,6 +42,80 @@ if HAS_PLOTTING:
     plt.rcParams['font.size'] = 10
 
 
+def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load NashConv metrics from training_history.json and evaluation_history.json.
+    
+    Args:
+        experiment_dir: Path to experiment directory
+        
+    Returns:
+        Dictionary with training and evaluation NashConv metrics
+    """
+    nashconv_data = {
+        "training": None,
+        "evaluation": None,
+        "available": False
+    }
+    
+    if not experiment_dir:
+        return nashconv_data
+    
+    experiment_path = Path(experiment_dir)
+    
+    # Load training history
+    training_history_path = experiment_path / "training_history.json"
+    if training_history_path.exists():
+        try:
+            with open(training_history_path, 'r') as f:
+                training_history = json.load(f)
+            
+            # Extract NashConv metrics from training history
+            training_nashconv = []
+            for entry in training_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("training/nashconv") or key.startswith("training/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    training_nashconv.append(nashconv_entry)
+            
+            if training_nashconv:
+                nashconv_data["training"] = training_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load training NashConv metrics: {e}")
+    
+    # Load evaluation history
+    evaluation_history_path = experiment_path / "evaluation_history.json"
+    if evaluation_history_path.exists():
+        try:
+            with open(evaluation_history_path, 'r') as f:
+                evaluation_history = json.load(f)
+            
+            # Extract NashConv metrics from evaluation history
+            evaluation_nashconv = []
+            for entry in evaluation_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("evaluation/nashconv") or key.startswith("evaluation/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    evaluation_nashconv.append(nashconv_entry)
+            
+            if evaluation_nashconv:
+                nashconv_data["evaluation"] = evaluation_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load evaluation NashConv metrics: {e}")
+    
+    return nashconv_data
+
+
 def extract_feature_intervals_from_rule(rule_str: str) -> List[Tuple[str, float, float]]:
     """Extract feature names and intervals (lower, upper) from a rule string."""
     if rule_str == "any values (no tightened features)" or not rule_str:
@@ -894,7 +968,7 @@ def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top
 
 def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_agent_summary: Optional[Dict], 
                                 precision_target: float = 0.95, coverage_target: float = 0.1):
-    """Plot equilibrium comparison between single-agent and multi-agent."""
+    """Plot target achievement comparison between single-agent and multi-agent."""
     if not HAS_PLOTTING:
         return
     
@@ -912,8 +986,8 @@ def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_
             multi_eq = calculate_equilibrium_metrics(multi_per_class, precision_target, coverage_target)
     
     if not single_eq and not multi_eq:
-        ax.text(0.5, 0.5, 'No equilibrium data available', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('Equilibrium Comparison', fontsize=11, fontweight='bold')
+        ax.text(0.5, 0.5, 'No target achievement data available', ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Target Achievement Comparison', fontsize=11, fontweight='bold')
         return
     
     # Prepare data for plotting
@@ -940,14 +1014,14 @@ def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_
     x = np.arange(len(methods))
     bars = ax.bar(x, equilibrium_fractions, alpha=0.8, color=colors, edgecolor='black', linewidth=2)
     
-    # Add equilibrium threshold line
-    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='Equilibrium (100%)', alpha=0.7)
+    # Add target achievement threshold line
+    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='Target Achievement (100%)', alpha=0.7)
     
     # Add value labels and status
     for i, (frac, reached) in enumerate(zip(equilibrium_fractions, equilibrium_reached)):
         label = f'{frac:.1%}'
         if reached:
-            label += '\n✓ EQUILIBRIUM'
+            label += '\n✓ TARGETS MET'
         ax.text(i, frac + 0.05, label, ha='center', va='bottom', fontsize=10, fontweight='bold',
                 color='darkgreen' if reached else 'black')
     
@@ -960,8 +1034,8 @@ def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_
         ax.text(idx, -0.15, f'{multi_eq["classes_meeting_targets"]}/{multi_eq["total_classes"]} classes',
                 ha='center', va='top', fontsize=8, transform=ax.get_xaxis_transform())
     
-    ax.set_ylabel('Equilibrium Fraction', fontsize=10, fontweight='bold')
-    ax.set_title('Equilibrium Comparison\n(All classes meet targets: P≥0.95, C≥0.50)', 
+    ax.set_ylabel('Target Achievement Fraction', fontsize=10, fontweight='bold')
+    ax.set_title('Target Achievement Comparison\n(All classes meet targets: P≥0.95, C≥0.50)', 
                  fontsize=11, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(methods, fontsize=10, fontweight='bold')
@@ -1466,6 +1540,138 @@ def plot_rule_overlap_comparison_per_class(
     logger.info(f"Saved rule overlap comparison plot to {output_dir}/rule_overlap_comparison.png")
 
 
+def plot_nashconv_comparison(
+    multi_agent_summary: Optional[Dict],
+    output_dir: str,
+    dataset_name: str = ""
+):
+    """
+    Plot NashConv convergence comparison (only for multi-agent, as single-agent doesn't have NashConv).
+    
+    Args:
+        multi_agent_summary: Multi-agent summary dictionary (may contain nashconv_metrics)
+        output_dir: Output directory for the plot
+        dataset_name: Dataset name for title
+    """
+    if not HAS_PLOTTING:
+        return
+    
+    if not multi_agent_summary:
+        logger.debug("No multi-agent summary, skipping NashConv plot")
+        return
+    
+    nashconv_data = multi_agent_summary.get("nashconv_metrics", {})
+    if not nashconv_data.get("available", False):
+        logger.debug("NashConv data not available in multi-agent summary, skipping plot")
+        return
+    
+    title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"{title_prefix}: Nash Equilibrium Convergence Metrics", fontsize=14, fontweight='bold')
+    
+    # Plot 1: Training NashConv Sum
+    ax1 = axes[0, 0]
+    training_data = nashconv_data.get("training", [])
+    if training_data:
+        # Use total_frames if available (more accurate), otherwise use step, otherwise use index
+        x_values = []
+        for i, e in enumerate(training_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                x_values.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                x_values.append(e["step"])
+            else:
+                x_values.append(i)
+        
+        nashconv_sums = [e.get("training/nashconv_sum", 0.0) for e in training_data]
+        
+        # If only one data point, use scatter plot instead of line plot
+        if len(training_data) == 1:
+            ax1.scatter(x_values, nashconv_sums, s=100, color='b', marker='o', label='Training NashConv', zorder=3)
+            ax1.text(x_values[0], nashconv_sums[0] + 0.01, f'{nashconv_sums[0]:.6f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        else:
+            ax1.plot(x_values, nashconv_sums, 'b-', marker='o', linewidth=2, markersize=4, label='Training NashConv')
+        
+        ax1.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
+        ax1.set_ylabel('NashConv Sum')
+        ax1.set_title(f'Training NashConv Convergence ({len(training_data)} data point{"s" if len(training_data) > 1 else ""})')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        if nashconv_sums:
+            ax1.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    
+    # Plot 2: Training Exploitability Max
+    ax2 = axes[0, 1]
+    if training_data:
+        # Use same x_values as Plot 1 for consistency
+        x_values = []
+        for i, e in enumerate(training_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                x_values.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                x_values.append(e["step"])
+            else:
+                x_values.append(i)
+        
+        exploitability_max = [e.get("training/exploitability_max", 0.0) for e in training_data]
+        
+        # If only one data point, use scatter plot instead of line plot
+        if len(training_data) == 1:
+            ax2.scatter(x_values, exploitability_max, s=100, color='g', marker='s', label='Max Exploitability', zorder=3)
+            ax2.text(x_values[0], exploitability_max[0] + 0.01, f'{exploitability_max[0]:.6f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        else:
+            ax2.plot(x_values, exploitability_max, 'g-', marker='s', linewidth=2, markersize=4, label='Max Exploitability')
+        
+        ax2.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
+        ax2.set_ylabel('Max Exploitability')
+        ax2.set_title(f'Training Max Exploitability ({len(training_data)} data point{"s" if len(training_data) > 1 else ""})')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+    
+    # Plot 3: Evaluation NashConv Sum
+    ax3 = axes[1, 0]
+    eval_data = nashconv_data.get("evaluation", [])
+    if eval_data:
+        eval_steps = [e.get("step", i) for i, e in enumerate(eval_data)]
+        eval_nashconv_sums = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
+        ax3.plot(eval_steps, eval_nashconv_sums, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
+        ax3.set_xlabel('Evaluation Step')
+        ax3.set_ylabel('NashConv Sum')
+        ax3.set_title('Evaluation NashConv Convergence')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        if eval_nashconv_sums:
+            ax3.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    
+    # Plot 4: Evaluation Exploitability Max
+    ax4 = axes[1, 1]
+    if eval_data:
+        eval_exploitability_max = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
+        ax4.plot(eval_steps, eval_exploitability_max, 'm-', marker='d', linewidth=2, markersize=4, label='Max Exploitability')
+        ax4.set_xlabel('Evaluation Step')
+        ax4.set_ylabel('Max Exploitability')
+        ax4.set_title('Evaluation Max Exploitability')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+    
+    # Hide empty subplots
+    if not training_data:
+        ax1.axis('off')
+        ax2.axis('off')
+    if not eval_data:
+        ax3.axis('off')
+        ax4.axis('off')
+    
+    plt.tight_layout()
+    output_path = Path(output_dir) / "nashconv_convergence_comparison.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved NashConv convergence comparison plot to {output_path}")
+
+
 def plot_comprehensive_comparison(
     single_agent_summary: Optional[Dict],
     multi_agent_summary: Optional[Dict],
@@ -1480,7 +1686,7 @@ def plot_comprehensive_comparison(
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    # Create 2x3 grid: add equilibrium comparison as 5th subplot
+    # Create 2x3 grid: add target achievement comparison as 5th subplot
     fig = plt.figure(figsize=(20, 14))
     gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
@@ -1489,10 +1695,10 @@ def plot_comprehensive_comparison(
         [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])],
         [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1]), fig.add_subplot(gs[1, 2])]
     ]
-    ax1, ax2, ax_eq = axes[0][0], axes[0][1], axes[0][2]  # Row 1: Feature importance + Equilibrium
+    ax1, ax2, ax_eq = axes[0][0], axes[0][1], axes[0][2]  # Row 1: Feature importance + Target achievement
     ax3, ax4, ax5 = axes[1][0], axes[1][1], axes[1][2]  # Row 2: Global metrics + empty
     
-    # Row 1: Feature importance + Equilibrium comparison
+    # Row 1: Feature importance + Target achievement comparison
     plot_feature_importance_subplot(ax1, single_agent_summary, f'{title_prefix}: Single-Agent Feature Importance', top_n=10)
     plot_feature_importance_subplot(ax2, multi_agent_summary, f'{title_prefix}: Multi-Agent Feature Importance', top_n=10)
     plot_equilibrium_comparison(ax_eq, single_agent_summary, multi_agent_summary)
@@ -1510,6 +1716,9 @@ def plot_comprehensive_comparison(
     
     # Also create separate rule overlap comparison plot
     plot_rule_overlap_comparison_per_class(single_agent_summary, multi_agent_summary, output_dir, dataset_name)
+    
+    # Create NashConv convergence plot (multi-agent only)
+    plot_nashconv_comparison(multi_agent_summary, output_dir, dataset_name)
 
 
 def main():
@@ -1596,6 +1805,20 @@ Examples:
                 logger.warning("    1. The summary.json file was not generated correctly")
                 logger.warning("    2. The inference/test step did not produce any rules")
                 logger.warning("    3. The file structure is different than expected")
+            
+            # Load NashConv metrics if available
+            if 'nashconv_metrics' not in multi_agent_summary:
+                # Try to load from experiment directory
+                ma_summary_path = Path(args.multi_agent_summary)
+                if "inference" in str(ma_summary_path):
+                    ma_experiment_dir = str(ma_summary_path.parent.parent)
+                else:
+                    ma_experiment_dir = str(ma_summary_path.parent)
+                
+                nashconv_data = _load_nashconv_metrics(ma_experiment_dir)
+                if nashconv_data.get("available", False):
+                    multi_agent_summary["nashconv_metrics"] = nashconv_data
+                    logger.info("✓ Loaded NashConv metrics for multi-agent")
         else:
             logger.warning("⚠ Failed to load multi-agent summary (returned None/empty)")
             logger.warning(f"  File path was: {args.multi_agent_summary}")

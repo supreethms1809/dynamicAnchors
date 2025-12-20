@@ -207,7 +207,7 @@ class SingleAgentAnchorEnv(Env):
         self.box_history = []
         self.coverage_floor_hits = 0
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 500)
+        self.max_cycles = env_config.get("max_cycles", 100)
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
@@ -451,9 +451,11 @@ class SingleAgentAnchorEnv(Env):
                 n_points = int(n_samp)
                 sampler_note = f"uniform_{data_source}"
             elif self.perturbation_mode == "adaptive":
+                # Adaptive mode: use bootstrap when enough covered points, otherwise use uniform
                 min_points_for_bootstrap = max(1, int(0.1 * self.n_perturb))
                 
                 if covered.size >= min_points_for_bootstrap:
+                    # Use bootstrap sampling from real data points
                     n_samp = min(self.n_perturb, covered.size)
                     idx = self.rng.choice(covered, size=n_samp, replace=True)
                     X_eval = X_data_std[idx]
@@ -461,6 +463,7 @@ class SingleAgentAnchorEnv(Env):
                     n_points = int(n_samp)
                     sampler_note = f"adaptive_bootstrap_{data_source}"
                 else:
+                    # Fall back to uniform sampling when not enough covered points
                     n_samp = self.n_perturb
                     U = np.zeros((n_samp, self.n_features), dtype=np.float32)
                     for j in range(self.n_features):
@@ -469,7 +472,7 @@ class SingleAgentAnchorEnv(Env):
                         mid = 0.5 * (low + up)
                         low = max(0.0, mid - width / 2.0)
                         up = min(1.0, mid + width / 2.0)
-                        U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                    U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
                     X_eval = self._unit_to_std(U)
                     y_eval = None
                     n_points = int(n_samp)

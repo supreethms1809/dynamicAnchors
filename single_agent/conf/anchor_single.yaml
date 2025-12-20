@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.1
+  coverage_target: 0.3
   
   # Data perturbation settings
   use_perturbation: True
@@ -62,7 +62,7 @@ env_config:
 logging_verbosity: "quiet"  # Options: "quiet", "normal", "verbose"
 
 # Maximum number of steps per episode
-max_cycles: 500
+max_cycles: 100
 
 # Termination reason counters: disable overused reasons
 # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes

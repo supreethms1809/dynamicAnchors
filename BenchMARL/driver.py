@@ -170,8 +170,8 @@ def main():
     parser.add_argument(
         "--max_cycles",
         type=int,
-        default=500,
-        help="Maximum cycles per episode (default: 500 for better convergence)"
+        default=None,
+        help="Maximum cycles per episode. If omitted, uses env_config.max_cycles from conf/anchor.yaml"
     )
     
     parser.add_argument(
@@ -205,6 +205,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Algorithm: {args.algorithm}")
     print(f"Output directory: {args.output_dir}")
+    print(f"Max cycles override: {args.max_cycles if args.max_cycles is not None else 'None (use conf/anchor.yaml)'}")
     if args.load_checkpoint:
         print(f"Checkpoint: {args.load_checkpoint}")
     print("="*80)

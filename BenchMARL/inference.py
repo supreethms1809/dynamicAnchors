@@ -25,6 +25,7 @@ import logging
 import sys
 from datetime import datetime
 from logging import INFO, WARNING, ERROR, CRITICAL
+from pathlib import Path
 
 # Configure logging to write to both console and file
 def setup_logging(log_file=None):
@@ -60,6 +61,80 @@ def setup_logging(log_file=None):
 # Initialize with default
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load NashConv metrics from training_history.json and evaluation_history.json.
+    
+    Args:
+        experiment_dir: Path to experiment directory
+        
+    Returns:
+        Dictionary with training and evaluation NashConv metrics
+    """
+    nashconv_data = {
+        "training": None,
+        "evaluation": None,
+        "available": False
+    }
+    
+    if not experiment_dir:
+        return nashconv_data
+    
+    experiment_path = Path(experiment_dir)
+    
+    # Load training history
+    training_history_path = experiment_path / "training_history.json"
+    if training_history_path.exists():
+        try:
+            with open(training_history_path, 'r') as f:
+                training_history = json.load(f)
+            
+            # Extract NashConv metrics from training history
+            training_nashconv = []
+            for entry in training_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("training/nashconv") or key.startswith("training/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    training_nashconv.append(nashconv_entry)
+            
+            if training_nashconv:
+                nashconv_data["training"] = training_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load training NashConv metrics: {e}")
+    
+    # Load evaluation history
+    evaluation_history_path = experiment_path / "evaluation_history.json"
+    if evaluation_history_path.exists():
+        try:
+            with open(evaluation_history_path, 'r') as f:
+                evaluation_history = json.load(f)
+            
+            # Extract NashConv metrics from evaluation history
+            evaluation_nashconv = []
+            for entry in evaluation_history:
+                nashconv_entry = {}
+                for key, value in entry.items():
+                    if key.startswith("evaluation/nashconv") or key.startswith("evaluation/exploitability"):
+                        nashconv_entry[key] = value
+                if nashconv_entry:
+                    nashconv_entry["step"] = entry.get("step")
+                    nashconv_entry["total_frames"] = entry.get("total_frames")
+                    evaluation_nashconv.append(nashconv_entry)
+            
+            if evaluation_nashconv:
+                nashconv_data["evaluation"] = evaluation_nashconv
+                nashconv_data["available"] = True
+        except Exception as e:
+            logger.debug(f"Could not load evaluation NashConv metrics: {e}")
+    
+    return nashconv_data
 
 
 def load_policy_model(
@@ -265,6 +340,14 @@ def run_rollout_with_policy(
     if hasattr(env, 'mode'):
         env.mode = "inference"
     
+    # Verify x_star_unit is set before reset
+    if agent_id in env.x_star_unit:
+        x_star = env.x_star_unit[agent_id]
+        if verbose_logging:
+            logger.debug(f"  x_star_unit set for {agent_id}: shape={x_star.shape}, mean={x_star.mean():.4f}, range=[{x_star.min():.4f}, {x_star.max():.4f}]")
+    else:
+        logger.warning(f"  x_star_unit NOT set for {agent_id} before reset! This will cause class-based mode instead of instance-based.")
+    
     # Reset environment (returns dict, not TensorDict)
     obs_dict, infos_dict = env.reset(seed=seed)
     
@@ -279,21 +362,41 @@ def run_rollout_with_policy(
         else:
             raise ValueError(f"Agent '{agent_id}' not found in environment. Available agents: {list(obs_dict.keys())}")
     
-    # Debug: Check initial box state
-    if verbose_logging and hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
+    # Debug: Check initial box state and verify x_star_unit is still set after reset
+    if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
         lower_init = env.lower[agent_id]
         upper_init = env.upper[agent_id]
         widths_init = upper_init - lower_init
+        
+        # Check if x_star_unit is still set (reset should preserve it)
+        has_x_star = agent_id in env.x_star_unit and env.x_star_unit[agent_id] is not None
+        if not has_x_star:
+            logger.warning(f"  x_star_unit was lost after reset for {agent_id}! Coverage calculation will be wrong.")
+        
         precision_init, coverage_init, details_init = env._current_metrics(agent_id)
-        logger.info(f"  Initial box state for {agent_id}:")
-        logger.info(f"    Box center: {((lower_init + upper_init) / 2).mean():.4f} (mean across features)")
-        logger.info(f"    Box widths: min={widths_init.min():.4f}, max={widths_init.max():.4f}, mean={widths_init.mean():.4f}")
-        logger.info(f"    Initial precision: {precision_init:.4f}, coverage: {coverage_init:.4f}")
-        logger.info(f"    Initial n_points: {details_init.get('n_points', 'N/A')}")
+        
+        if verbose_logging:
+            logger.info(f"  Initial box state for {agent_id}:")
+            logger.info(f"    x_star_unit set: {has_x_star}")
+            logger.info(f"    Box center: {((lower_init + upper_init) / 2).mean():.4f} (mean across features)")
+            logger.info(f"    Box widths: min={widths_init.min():.4f}, max={widths_init.max():.4f}, mean={widths_init.mean():.4f}")
+            logger.info(f"    Initial precision: {precision_init:.4f}, coverage: {coverage_init:.4f}")
+            logger.info(f"    Initial n_points: {details_init.get('n_points', 'N/A')}")
+        
+        # CRITICAL: Log warning if coverage is 0 but box seems reasonable
+        if coverage_init == 0.0 and widths_init.mean() > 0.01:
+            logger.warning(
+                f"  ⚠ Initial coverage is 0 but box width is reasonable (mean={widths_init.mean():.4f}). "
+                f"This suggests the box might not contain any data points, or x_star_unit is not set correctly. "
+                f"x_star_unit set: {has_x_star}"
+            )
     
     done = False
     step_count = 0
     total_reward = 0.0
+    last_info_for_agent: Dict[str, Any] = {}
+    last_termination = False
+    last_truncation = False
     
     # Store box state before first action for debugging
     lower_before = None
@@ -546,6 +649,11 @@ def run_rollout_with_policy(
         # Step environment directly
         action_dict = {agent_id: action_np}
         obs_dict, rewards_dict, terminations_dict, truncations_dict, infos_dict = env.step(action_dict)
+        # Track last infos / done reasons for this agent
+        if isinstance(infos_dict, dict) and agent_id in infos_dict and isinstance(infos_dict[agent_id], dict):
+            last_info_for_agent = infos_dict[agent_id]
+        last_termination = bool(terminations_dict.get(agent_id, False))
+        last_truncation = bool(truncations_dict.get(agent_id, False))
         
         # Accumulate reward
         if agent_id in rewards_dict:
@@ -587,6 +695,8 @@ def run_rollout_with_policy(
         
         if target_class is not None:
             # Compute class-level union metrics
+            # FIX: When only one agent acts during inference, class-level metrics should only consider that agent's box
+            # This avoids issues where other agents' boxes (initialized but never updated) affect the union
             class_union_metrics = env._compute_class_union_metrics()
             if target_class in class_union_metrics:
                 class_precision = float(class_union_metrics[target_class].get("union_precision", 0.0))
@@ -597,6 +707,18 @@ def run_rollout_with_policy(
                     logger.debug(f"  Class {target_class} not found in class_union_metrics. Available classes: {list(class_union_metrics.keys())}")
                     logger.debug(f"  Agents with boxes: {list(env.lower.keys())}")
                     logger.debug(f"  Active agents: {list(env.agents) if hasattr(env, 'agents') else 'N/A'}")
+            
+            # FIX: If class-level metrics are 0 but instance-level are > 0, it might be because
+            # other agents' boxes (that were never updated) are included in the union.
+            # For single-agent rollouts, class-level metrics should match instance-level.
+            if class_precision == 0.0 and class_coverage == 0.0 and instance_precision > 0.0:
+                # During single-agent inference, class-level should equal instance-level
+                # This happens when only one agent exists or only one agent's box is valid
+                if verbose_logging:
+                    logger.debug(f"  Class-level metrics are 0 but instance-level are > 0. Using instance-level as fallback for single-agent rollout.")
+                # For single-agent rollouts, class-level = instance-level
+                class_precision = instance_precision
+                class_coverage = instance_coverage
         
         # Get final box bounds
         lower = env.lower[agent_id]
@@ -619,6 +741,11 @@ def run_rollout_with_policy(
             "n_steps": step_count,
             "rollout_time_seconds": float(rollout_duration),
             "final_observation": final_obs.tolist(),
+            # Termination diagnostics
+            "terminated": float(1.0 if last_termination else 0.0),
+            "truncated": float(1.0 if last_truncation else 0.0),
+            "termination_reason_str": str(last_info_for_agent.get("termination_reason_str", "")),
+            "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
         
         # Debug: Log metrics
@@ -645,6 +772,10 @@ def run_rollout_with_policy(
             "total_reward": total_reward,
             "n_steps": step_count,
             "rollout_time_seconds": float(rollout_duration),
+            "terminated": float(1.0 if last_termination else 0.0),
+            "truncated": float(1.0 if last_truncation else 0.0),
+            "termination_reason_str": str(last_info_for_agent.get("termination_reason_str", "")),
+            "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
     
     return episode_data
@@ -655,7 +786,7 @@ def extract_rules_from_policies(
     dataset_name: str,
     mlp_config_path: str = "conf/mlp.yaml",
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 500,
+    steps_per_episode: Optional[int] = None,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
     output_dir: Optional[str] = None,
@@ -690,31 +821,56 @@ def extract_rules_from_policies(
         with open(index_path, 'r') as f:
             index_data = json.load(f)
         
+        # Try to load seed from policies_index.json (to match training seed)
+        training_seed = index_data.get("seed")
+        if training_seed is not None:
+            logger.info(f"Found training seed in policies_index.json: {training_seed}")
+            # Use training seed instead of provided seed to ensure reproducibility
+            if seed != training_seed:
+                logger.info(f"Using training seed ({training_seed}) instead of provided seed ({seed}) to ensure reproducibility")
+            seed = training_seed
+        else:
+            logger.info(f"Using provided seed: {seed} (training seed not found in policies_index.json)")
+        
         agents_per_class = index_data.get("agents_per_class", 1)
         policies_by_class = index_data.get("policies_by_class", {})
+        
+        # IMPORTANT:
+        # - anchor_trainer.extract_and_save_individual_models() saves one file per *agent*
+        #   (e.g., policy_agent_0_0.pth, policy_agent_0_1.pth, ...), along with metadata that
+        #   includes both the group (agent_0) and the specific agent name (agent_0_0, etc.).
+        # - The original loader keyed policy_files by "group", which caused later entries for
+        #   the same group to overwrite earlier ones (only the last agent per class survived).
+        # - Here we key by the *agent* name so that all per-agent policies are visible, while
+        #   still retaining backward compatibility if "agent" is missing.
         
         for class_key, class_info in policies_by_class.items():
             class_policies = class_info.get("policies", [])
             for policy_info in class_policies:
-                group = policy_info.get("group") or policy_info.get("agent")
+                agent_name = policy_info.get("agent")
+                group = policy_info.get("group") or agent_name
                 policy_file = policy_info.get("policy_file")
                 metadata_file = policy_info.get("metadata_file")
                 
-                if group and policy_file:
+                # Use agent_name as the primary key when available, otherwise fall back to group.
+                key = agent_name or group
+                
+                if key and policy_file:
                     # Resolve relative paths
                     policy_path = os.path.join(individual_models_dir, policy_file)
                     if os.path.exists(policy_path):
-                        policy_files[group] = policy_path
+                        policy_files[key] = policy_path
                         
                         if metadata_file:
                             metadata_path = os.path.join(individual_models_dir, metadata_file)
                             if os.path.exists(metadata_path):
-                                metadata_files[group] = metadata_path
+                                metadata_files[key] = metadata_path
         
         logger.info(f"  Loaded {len(policy_files)} policies from index (agents_per_class={agents_per_class})")
     else:
         # Fallback: Search for policies in flat structure - older version
         logger.info("No policies_index.json found, searching for policies in flat structure...")
+        logger.info(f"Using provided seed: {seed} (training seed not available - policies_index.json not found)")
         
         # Search in root directory
         for filename in os.listdir(individual_models_dir):
@@ -800,7 +956,21 @@ def extract_rules_from_policies(
         output_dir=output_dir or os.path.join(experiment_dir, "inference"),
         seed=seed
     )
-    env_config = trainer._get_default_env_config()
+    # Prefer YAML-based env config so inference matches training settings.
+    try:
+        env_config = trainer._load_env_config_from_yaml()
+    except Exception:
+        env_config = trainer._get_default_env_config()
+
+    # Support YAML layouts that include a nested `env_config:` section.
+    if isinstance(env_config, dict) and isinstance(env_config.get("env_config", None), dict):
+        nested = env_config.get("env_config", {})
+        top = {k: v for k, v in env_config.items() if k != "env_config"}
+        env_config = {**nested, **top}
+
+    # Resolve rollout length: if not explicitly provided, use env_config.max_cycles.
+    if steps_per_episode is None:
+        steps_per_episode = int(env_config.get("max_cycles", 100))
     
     # Check logging verbosity from config
     verbose_logging = _should_log_verbose(env_config)
@@ -1036,39 +1206,72 @@ def extract_rules_from_policies(
             logger.info(f"  Debug: No agent-specific indices found, will use shared policy")
     
     # Check if we have policies for all expected agents
-    # Expected agents are agent_0, agent_1, ..., agent_{n_classes-1}
-    expected_agent_names = [f"agent_{i}" for i in range(len(target_classes))]
-    missing_agents = [name for name in expected_agent_names if name not in agent_policies]
+    # Expected agent names depend on agents_per_class:
+    # - If agents_per_class == 1: agent_0, agent_1, ..., agent_{n_classes-1}
+    # - If agents_per_class > 1: agent_0_0, agent_0_1, ..., agent_{class}_{agent_idx}
+    # NOTE: This check is done BEFORE the mapping section below, so we skip it if agents_per_class > 1
+    # because the mapping section (lines 1300+) will handle individual agent policies correctly
+    if agents_per_class == 1:
+        expected_agent_names = [f"agent_{cls}" for cls in target_classes]
+        missing_agents = [name for name in expected_agent_names if name not in agent_policies]
+        
+        # Check if we have a combined policy available (for shared policy scenarios)
+        combined_policy = None
+        for g in policies.keys():
+            if policies[g] is not None:
+                combined_policy = policies[g]
+                break
+        
+        if missing_agents:
+            # If we have a combined policy available, this is likely a shared policy scenario
+            # (not an error, just informational)
+            if combined_policy is not None:
+                logger.info(f"\n  Info: Using shared policy for agents: {missing_agents}")
+                logger.info(f"  Found individual policies for: {list(agent_policies.keys())}")
+                logger.info(f"  Expected policies for: {expected_agent_names}")
+                logger.info(f"  Using combined/shared policy for missing agents (this is normal for shared policies)")
+                
+                # Use the combined policy for the missing agents (assuming shared policy)
+                for missing_agent in missing_agents:
+                    agent_policies[missing_agent] = combined_policy
+                    logger.info(f"  Assigned shared policy to {missing_agent}")
+            else:
+                # This is a real problem - no policy available
+                logger.warning(f"\n  Warning: Missing policies for agents: {missing_agents}")
+                logger.warning(f"  Found policies for: {list(agent_policies.keys())}")
+    else:
+        # When agents_per_class > 1, skip the old naming convention check
+        # The mapping section below will handle individual agent policies correctly
+        logger.debug(f"  Skipping old naming convention check (agents_per_class={agents_per_class} > 1)")
     
-    # Check if we have a combined policy available (for shared policy scenarios)
-    combined_policy = None
-    for g in policies.keys():
-        if policies[g] is not None:
-            combined_policy = policies[g]
-            break
+    # Set min_coverage_floor to ensure box always covers at least the anchor instance
+    # Use 1/n_samples from the dataset (to ensure at least one point is covered), 
+    # or fall back to config default (0.005) if dataset size unavailable
+    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+        n_samples = env_data["X_test_unit"].shape[0]
+    elif env_data.get("X_unit") is not None:
+        n_samples = env_data["X_unit"].shape[0]
+    else:
+        n_samples = None
     
-    if missing_agents:
-        # If we have a combined policy available, this is likely a shared policy scenario
-        # (not an error, just informational)
-        if combined_policy is not None:
-            logger.info(f"\n  Info: Using shared policy for agents: {missing_agents}")
-            logger.info(f"  Found individual policies for: {list(agent_policies.keys())}")
-            logger.info(f"  Expected policies for: {expected_agent_names}")
-            logger.info(f"  Using combined/shared policy for missing agents (this is normal for shared policies)")
-            
-            # Use the combined policy for the missing agents (assuming shared policy)
-            for missing_agent in missing_agents:
-                agent_policies[missing_agent] = combined_policy
-                logger.info(f"  Assigned shared policy to {missing_agent}")
-        else:
-            # This is a real problem - no policy available
-            logger.warning(f"\n  Warning: Missing policies for agents: {missing_agents}")
-            logger.warning(f"  Found policies for: {list(agent_policies.keys())}")
-            logger.warning(f"  Expected policies for: {expected_agent_names}")
-            logger.warning(f"  Error: No combined policy available to assign to missing agents")
+    config_default = env_config.get("min_coverage_floor", 0.005)
     
-    # Disable coverage floor check during inference to allow exploration even with low coverage
-    env_config["min_coverage_floor"] = 0.0
+    if n_samples is not None and n_samples > 0:
+        # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
+        min_coverage_floor = 1.0 / n_samples
+        # Ensure it's not smaller than a reasonable minimum (use config default as lower bound)
+        # This prevents extremely small values for very large datasets
+        min_coverage_floor = max(min_coverage_floor, config_default)
+    else:
+        # Fall back to config default if dataset size unavailable
+        min_coverage_floor = config_default
+    
+    # Ensure it's non-zero
+    min_coverage_floor = max(min_coverage_floor, 1e-6)
+    
+    env_config["min_coverage_floor"] = min_coverage_floor
+    logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
+    
     env_config.update({
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
@@ -1081,6 +1284,28 @@ def extract_rules_from_policies(
         logger.info("Verbose logging enabled - showing detailed debug information")
     elif env_config.get("logging_verbosity") == "quiet":
         logger.warning("Quiet logging mode enabled - only warnings and errors will be shown")
+    
+    # Log perturbation settings to verify they're loaded correctly
+    logger.info(f"\nPerturbation settings loaded from config:")
+    logger.info(f"  use_perturbation: {env_config.get('use_perturbation', 'NOT SET')}")
+    logger.info(f"  perturbation_mode: {env_config.get('perturbation_mode', 'NOT SET')}")
+    logger.info(f"  n_perturb: {env_config.get('n_perturb', 'NOT SET')}")
+    if env_config.get('use_perturbation') and env_config.get('perturbation_mode') == 'adaptive':
+        min_points_threshold = max(1, int(0.1 * env_config.get('n_perturb', 4096)))
+        logger.info(f"  (Adaptive mode will use uniform sampling if covered points < {min_points_threshold})")
+    
+    # Respect the perturbation_mode from config (no longer overriding for inference)
+    # Users can set perturbation_mode in config to control behavior during inference
+    original_perturbation_mode = env_config.get('perturbation_mode')
+    original_use_perturbation = env_config.get('use_perturbation')
+    
+    if original_use_perturbation:
+        logger.info(f"\n✓ Using perturbation mode for inference: {original_perturbation_mode}")
+        if original_perturbation_mode == 'adaptive':
+            min_points_threshold = max(1, int(0.1 * env_config.get('n_perturb', 4096)))
+            logger.info(f"  (Adaptive mode will use uniform sampling if covered points < {min_points_threshold})")
+    else:
+        logger.info(f"\n✓ Perturbation disabled for inference (use_perturbation={original_use_perturbation})")
     
     # For class-level inference, compute cluster centroids per class
     logger.info("\nComputing cluster centroids per class for class-level inference...")
@@ -1141,10 +1366,25 @@ def extract_rules_from_policies(
         logger.warning("  This may lead to overoptimistic results. Use test data for proper evaluation.")
     
     # Create config for direct AnchorEnv creation
+    # Use test data if eval_on_test_data=True, otherwise use training data
+    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+        anchor_X_unit = env_data["X_test_unit"]
+        anchor_X_std = env_data["X_test_std"]
+        anchor_y = env_data["y_test"]
+    else:
+        anchor_X_unit = env_data["X_unit"]
+        anchor_X_std = env_data["X_std"]
+        anchor_y = env_data["y"]
+    
+    # Ensure normalize_data=False to avoid double normalization
+    # get_anchor_env_data() already returns X_unit (normalized to [0,1]) and X_std (standardized)
+    # AnchorEnv.__init__ should use these directly without re-normalizing
+    env_config["normalize_data"] = False
+    
     anchor_config = {
-        "X_unit": env_data["X_unit"],
-        "X_std": env_data["X_std"],
-        "y": env_data["y"],
+        "X_unit": anchor_X_unit,
+        "X_std": anchor_X_std,
+        "y": anchor_y,
         "feature_names": feature_names,
         "classifier": dataset_loader.get_classifier(),
         "device": device,
@@ -1153,57 +1393,119 @@ def extract_rules_from_policies(
     }
     
     # If no agent-specific policies were extracted, or if we only found some agents,
-    # use shared policy for missing agents
-    # Note: When agents_per_class > 1, we need to handle multiple agents per class
-    if not agent_policies or len(agent_policies) < len(target_classes):
-        logger.info(f"  Creating policies for all target classes...")
+    # map policies to agents properly
+    # IMPORTANT: When agents_per_class > 1, we should use individual policies for each agent,
+    # not map the same policy to all agents of a class
+    if not agent_policies or len(agent_policies) < len(target_classes) * agents_per_class:
+        logger.info(f"  Mapping policies to agents (agents_per_class={agents_per_class})...")
+        
+        # First, try to map policies directly by agent name from policy_files
+        # The policy_files dict should already have agent names as keys (e.g., "agent_0_0", "agent_0_1")
+        for agent_name in sorted(policy_files.keys()):
+            if agent_name not in agent_policies and agent_name in policies:
+                agent_policies[agent_name] = policies[agent_name]
+                logger.info(f"  Mapped policy for {agent_name}")
+        
+        # If we still have missing agents, try to map from group policies
+        # This handles cases where policies are stored by group name instead of agent name
         for group in sorted(policy_files.keys()):
-            combined_policy = policies[group]
-            
-            # Determine which class this policy belongs to
-            target_class = None
-            if group in metadata_files:
-                try:
-                    with open(metadata_files[group], 'r') as f:
-                        metadata = json.load(f)
-                        target_class = metadata.get("target_class")
-                except:
-                    pass
-            
-            # If we can't determine class from metadata, try parsing from group name
-            if target_class is None and group.startswith("agent_"):
-                try:
-                    parts = group.split("_")
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        target_class = int(parts[1])
-                except:
-                    pass
-            
-            # Map policy to all agents of the same class
-            if target_class is not None:
-                # When agents_per_class > 1, create agents like "agent_0_0", "agent_0_1", etc.
-                # When agents_per_class == 1, create agent like "agent_0"
-                if agents_per_class > 1:
-                    for k in range(agents_per_class):
-                        agent_name = f"agent_{target_class}_{k}"
+            if group not in agent_policies:
+                combined_policy = policies.get(group)
+                if combined_policy is None:
+                    continue
+                
+                # Determine which class this policy belongs to
+                target_class = None
+                if group in metadata_files:
+                    try:
+                        with open(metadata_files[group], 'r') as f:
+                            metadata = json.load(f)
+                            target_class = metadata.get("target_class")
+                    except:
+                        pass
+                
+                # If we can't determine class from metadata, try parsing from group name
+                if target_class is None and group.startswith("agent_"):
+                    try:
+                        parts = group.split("_")
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            target_class = int(parts[1])
+                            # If group name has format "agent_0_1", extract both class and agent index
+                            if len(parts) >= 3 and parts[2].isdigit():
+                                # This is already an agent name, use it directly
+                                agent_name = group
+                                if agent_name not in agent_policies:
+                                    agent_policies[agent_name] = combined_policy
+                                    logger.info(f"  Mapped policy for {agent_name} (from group)")
+                                    continue
+                    except:
+                        pass
+                
+                # Map policy to agents based on agents_per_class
+                if target_class is not None:
+                    if agents_per_class > 1:
+                        # Try to find which specific agent this policy belongs to
+                        # Check if we can determine agent index from group name or metadata
+                        agent_idx = None
+                        if group.startswith("agent_"):
+                            parts = group.split("_")
+                            if len(parts) >= 3 and parts[2].isdigit():
+                                agent_idx = int(parts[2])
+                        
+                        if agent_idx is not None:
+                            # This is a specific agent's policy
+                            agent_name = f"agent_{target_class}_{agent_idx}"
+                            if agent_name not in agent_policies:
+                                agent_policies[agent_name] = combined_policy
+                                logger.info(f"  Mapped individual policy for {agent_name} (class {target_class}, agent {agent_idx})")
+                        else:
+                            # Can't determine specific agent, map to all agents of this class as fallback
+                            # (This should be rare - individual policies should have agent indices in their names)
+                            for k in range(agents_per_class):
+                                agent_name = f"agent_{target_class}_{k}"
+                                if agent_name not in agent_policies:
+                                    agent_policies[agent_name] = combined_policy
+                                    logger.info(f"  Mapped shared policy for {agent_name} (class {target_class}, fallback)")
+                    else:
+                        # agents_per_class == 1, use simple agent name
+                        agent_name = f"agent_{target_class}"
                         if agent_name not in agent_policies:
                             agent_policies[agent_name] = combined_policy
-                            logger.info(f"  Using policy for {agent_name} (class {target_class})")
+                            logger.info(f"  Mapped policy for {agent_name}")
                 else:
-                    agent_name = f"agent_{target_class}"
-                    if agent_name not in agent_policies:
-                        agent_policies[agent_name] = combined_policy
-                        logger.info(f"  Using policy for {agent_name}")
-            else:
-                # Fallback: map to all classes if we can't determine class
-                for cls in target_classes:
-                    agent_name = f"agent_{cls}"
-                    if agent_name not in agent_policies:
-                        agent_policies[agent_name] = combined_policy
-                        logger.info(f"  Using shared policy for {agent_name}")
+                    # Fallback: map to all classes if we can't determine class
+                    for cls in target_classes:
+                        if agents_per_class > 1:
+                            for k in range(agents_per_class):
+                                agent_name = f"agent_{cls}_{k}"
+                                if agent_name not in agent_policies:
+                                    agent_policies[agent_name] = combined_policy
+                                    logger.info(f"  Mapped shared policy for {agent_name} (fallback)")
+                        else:
+                            agent_name = f"agent_{cls}"
+                            if agent_name not in agent_policies:
+                                agent_policies[agent_name] = combined_policy
+                                logger.info(f"  Mapped shared policy for {agent_name} (fallback)")
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
+        # CRITICAL FIX: Remove old naming convention agents (agent_0, agent_1) when agents_per_class > 1
+        # These are fallback mappings that shouldn't be present when we have individual agent policies
+        if agents_per_class > 1:
+            old_naming_agents = [f"agent_{cls}" for cls in target_classes]
+            agents_to_remove = [name for name in old_naming_agents if name in agent_policies]
+            # Only remove if we have the corresponding individual agents (e.g., agent_0_0, agent_0_1, etc.)
+            for old_name in agents_to_remove:
+                # Extract class from old name
+                class_num = int(old_name.split("_")[1])
+                # Check if we have individual agents for this class
+                has_individual_agents = any(
+                    name.startswith(f"agent_{class_num}_") for name in agent_policies.keys()
+                )
+                if has_individual_agents:
+                    del agent_policies[old_name]
+                    logger.info(f"  Removed old naming convention agent: {old_name} (have individual agents for class {class_num})")
+        
         logger.info(f"\nUsing individual agent policies: {list(agent_policies.keys())}")
         # Update policies dict to use agent names
         policies = agent_policies
@@ -1295,12 +1597,49 @@ def extract_rules_from_policies(
         # Track time for this class
         class_start_time = time.perf_counter()
         
-        for instance_idx in range(n_instances_per_class):
-            # Create a single-agent environment for this specific class
-            # This ensures we're running rollouts for the correct agent
-            rollout_seed = seed + instance_idx if seed is not None else None
+        # CRITICAL FIX: Sample instances from the target class data (instance-based rollouts)
+        # This matches training's extract_rules behavior where x_star_unit is set per instance
+        # Determine which dataset to sample from (test or training)
+        if eval_on_test_data:
+            class_mask = (anchor_config["y"] == target_class)
+            class_instances = np.where(class_mask)[0]
+            X_data_unit = anchor_config["X_unit"]
+            data_source_name = "test"
+        else:
+            # If not using test data, use training data (should not happen in normal inference)
+            if env_data.get("X_unit") is not None:
+                class_mask = (env_data["y"] == target_class)
+                class_instances = np.where(class_mask)[0]
+                X_data_unit = env_data["X_unit"]
+            else:
+                # Fallback: use anchor_config data
+                class_mask = (anchor_config["y"] == target_class)
+                class_instances = np.where(class_mask)[0]
+                X_data_unit = anchor_config["X_unit"]
+            data_source_name = "training"
+        
+        if len(class_instances) == 0:
+            logger.warning(f"  No instances found for class {target_class} in {data_source_name} data, skipping...")
+            continue
+        
+        # Sample instances (same approach as training)
+        n_samples = min(n_instances_per_class, len(class_instances))
+        # Use deterministic sampling for reproducibility (seed-based)
+        rng_for_sampling = np.random.default_rng(seed if seed is not None else 42)
+        sampled_indices = rng_for_sampling.choice(class_instances, size=n_samples, replace=False)
+        
+        logger.info(f"  Sampling {n_samples} instances from {data_source_name} data for class {target_class}")
+        
+        for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
+            # Get the actual instance from the dataset
+            x_instance = X_data_unit[data_instance_idx]
             
-            # Create environment config for single agent (this class only)
+            # Create environment for this specific class and agent
+            # IMPORTANT: When agents_per_class > 1, we create an environment with all agents for the class
+            # but only run rollouts for the specific agent (agent_name)
+            rollout_seed = seed + instance_idx_in_range if seed is not None else None
+            
+            # Create environment config for this class
             single_agent_config = anchor_config.copy()
             single_agent_config["target_classes"] = [target_class]  # Only this class
             
@@ -1311,6 +1650,22 @@ def extract_rules_from_policies(
                 single_agent_config["env_config"] = {}
             single_agent_config["env_config"] = single_agent_config["env_config"].copy()
             single_agent_config["env_config"]["mode"] = "inference"
+            # Ensure normalize_data=False to avoid double normalization (data is already normalized from get_anchor_env_data)
+            single_agent_config["env_config"]["normalize_data"] = False
+            
+            # IMPORTANT: Ensure agents_per_class matches the training configuration
+            # This allows the environment to create the correct agent names (agent_0_0, agent_0_1, etc.)
+            # The env_config should already have agents_per_class from the config file, but we ensure it's set
+            if "agents_per_class" not in single_agent_config["env_config"]:
+                single_agent_config["env_config"]["agents_per_class"] = agents_per_class
+            
+            # CRITICAL FIX: Ensure X_min and X_range are set in env_config for proper normalization
+            # These are needed for _unit_to_std conversion and must match training normalization
+            if "X_min" not in single_agent_config["env_config"]:
+                single_agent_config["env_config"]["X_min"] = env_config.get("X_min")
+            if "X_range" not in single_agent_config["env_config"]:
+                single_agent_config["env_config"]["X_range"] = env_config.get("X_range")
+            
             env = AnchorEnv(**single_agent_config)
             
             # Get the actual agent name from the environment
@@ -1320,16 +1675,31 @@ def extract_rules_from_policies(
             
             # First, try to use the agent_name from the outer loop if it exists in the environment
             # This is important when agents_per_class > 1 (e.g., agent_0_0, agent_0_1, etc.)
+            # The environment should have been created with agents_per_class, so it should have the correct agent names
             if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
                 if agent_name in env.possible_agents:
                     actual_agent_name = agent_name
+                    if verbose_logging:
+                        logger.info(f"  Found agent {agent_name} in environment possible_agents")
                 else:
+                    # If the specific agent doesn't exist, log available agents for debugging
+                    if verbose_logging:
+                        logger.warning(
+                            f"  Agent {agent_name} not found in environment. "
+                            f"Available agents: {env.possible_agents}. "
+                            f"Using first available agent."
+                        )
                     # Fallback to first agent if the specific agent_name doesn't exist
                     actual_agent_name = env.possible_agents[0]
             elif hasattr(env, 'agents') and len(env.agents) > 0:
                 if agent_name in env.agents:
                     actual_agent_name = agent_name
                 else:
+                    if verbose_logging:
+                        logger.warning(
+                            f"  Agent {agent_name} not found in environment.agents. "
+                            f"Available: {env.agents}. Using first available."
+                        )
                     actual_agent_name = env.agents[0]
             
             # Final fallback: construct agent name based on agents_per_class
@@ -1337,12 +1707,32 @@ def extract_rules_from_policies(
                 # If we have agent_name from outer loop, use it (environment should match)
                 if agent_name:
                     actual_agent_name = agent_name
+                    if verbose_logging:
+                        logger.info(f"  Using agent_name from outer loop: {actual_agent_name}")
                 elif agents_per_class == 1:
                     actual_agent_name = f"agent_{target_class}"
                 else:
-                    # For agents_per_class > 1, default to first agent pattern
-                    actual_agent_name = f"agent_{target_class}_0"
+                    # For agents_per_class > 1, try to extract agent index from agent_name
+                    # e.g., "agent_0_1" -> use "agent_0_1", not "agent_0_0"
+                    if agent_name and "_" in agent_name:
+                        parts = agent_name.split("_")
+                        if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                            # agent_name is already in correct format (agent_0_1)
+                            actual_agent_name = agent_name
+                        else:
+                            # Default to first agent pattern
+                            actual_agent_name = f"agent_{target_class}_0"
+                    else:
+                        actual_agent_name = f"agent_{target_class}_0"
                 logger.warning(f"  Could not determine agent name from environment, using {actual_agent_name}")
+            
+            # CRITICAL FIX: Set x_star_unit for instance-based rollout (matches training behavior)
+            # This must be set BEFORE reset() is called (which happens inside run_rollout_with_policy)
+            # Setting x_star_unit makes the rollout instance-based, using overall coverage P(x in box)
+            # instead of class-conditional coverage P(x in box | y = target_class)
+            # The environment initializes x_star_unit as a dict in __init__, so we can directly assign
+            # IMPORTANT: Make a copy to avoid reference issues
+            env.x_star_unit[actual_agent_name] = x_instance.copy()
             
             # Run rollout with raw PettingZoo environment
             episode_data = run_rollout_with_policy(
@@ -1358,7 +1748,7 @@ def extract_rules_from_policies(
             )
             
             # Debug logging for first episode of each class
-            if verbose_logging and instance_idx == 0:
+            if verbose_logging and instance_idx_in_range == 0:
                 logger.info(f"  Debug class {target_class} episode 0:")
                 logger.info(f"    actual_agent_name: {actual_agent_name}")
                 logger.info(f"    episode_data keys: {list(episode_data.keys()) if episode_data else 'empty'}")
@@ -1392,9 +1782,9 @@ def extract_rules_from_policies(
                 class_coverage = episode_data.get("class_coverage", 0.0)
                 
                 # Diagnostic: Log if metrics are zero (might indicate a problem)
-                if instance_idx < 3 and (instance_precision == 0.0 or instance_coverage == 0.0):
+                if instance_idx_in_range < 3 and (instance_precision == 0.0 or instance_coverage == 0.0):
                     logger.warning(
-                        f"  ⚠ Episode {instance_idx} for class {target_class} has zero metrics: "
+                        f"  ⚠ Episode {instance_idx_in_range} for class {target_class} has zero metrics: "
                         f"precision={instance_precision:.4f}, coverage={instance_coverage:.4f}. "
                         f"This might indicate the policy didn't find any valid boxes or the environment isn't set up correctly."
                     )
@@ -1412,8 +1802,8 @@ def extract_rules_from_policies(
                 coverage = float(instance_coverage)
             else:
                 # Log warning if episode_data is empty
-                if instance_idx == 0:
-                    logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx}")
+                if instance_idx_in_range == 0:
+                    logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx_in_range}")
                 instance_precisions.append(0.0)
                 instance_coverages.append(0.0)
                 class_precisions.append(0.0)
@@ -1448,11 +1838,24 @@ def extract_rules_from_policies(
                     
                     # Create temporary environment for rule extraction
                     # Set mode to "inference" so termination counters are reset in reset()
-                    inference_env_config = {**env_config, "mode": "inference"}
+                    # Ensure normalize_data=False to avoid double normalization
+                    inference_env_config = {**env_config, "mode": "inference", "normalize_data": False}
+                    
+                    # Use test data if eval_on_test_data=True, otherwise use training data
+                    # This ensures the coordinate space matches the rollout environment
+                    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+                        temp_X_unit = env_data["X_test_unit"]
+                        temp_X_std = env_data["X_test_std"]
+                        temp_y = env_data["y_test"]
+                    else:
+                        temp_X_unit = env_data["X_unit"]
+                        temp_X_std = env_data["X_std"]
+                        temp_y = env_data["y"]
+                    
                     temp_env = AnchorEnv(
-                        X_unit=env_data["X_unit"],
-                        X_std=env_data["X_std"],
-                        y=env_data["y"],
+                        X_unit=temp_X_unit,
+                        X_std=temp_X_std,
+                        y=temp_y,
                         feature_names=feature_names,
                         classifier=dataset_loader.get_classifier(),
                         device="cpu",
@@ -1480,7 +1883,8 @@ def extract_rules_from_policies(
             anchor_class_coverage = float(class_coverage)
             
             anchor_data = {
-                "instance_idx": instance_idx,
+                "instance_idx": instance_idx_in_range,
+                "data_instance_idx": int(data_instance_idx),
                 # Instance-level metrics
                 "instance_precision": anchor_instance_precision,
                 "instance_coverage": anchor_instance_coverage,
@@ -1560,18 +1964,22 @@ def extract_rules_from_policies(
             else:
                 class_precision_union = 0.0
         
-        results["per_class_results"][class_key] = {
+        # When agents_per_class > 1, we need to aggregate results from all agents of the same class
+        # Store per-agent results first, then aggregate at class level
+        agent_result = {
             "class": int(target_class),
+            "agent": agent_name,  # Store which agent this result is from
             "group": agent_name,
-            # Instance-level metrics (averaged across all instances)
+            # Instance-level metrics (averaged across all instances for this agent)
             "instance_precision": instance_precision,
             "instance_coverage": instance_coverage,
             "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
-            # Class-level metrics (union of all anchors for this class across all episodes)
+            # Class-level metrics (union of all anchors for this agent across all episodes)
+            # Note: This is per-agent union, not class-level union across all agents
             "class_precision": class_precision_union,
             "class_coverage": class_coverage_union,
-            # Keep averaged class-level metrics for backward compatibility (but note they're averaged, not union)
+            # Keep averaged class-level metrics for backward compatibility
             "class_precision_avg": float(np.mean(class_precisions)) if class_precisions else 0.0,
             "class_coverage_avg": float(np.mean(class_coverages)) if class_coverages else 0.0,
             "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
@@ -1592,13 +2000,126 @@ def extract_rules_from_policies(
             "class_total_time_seconds": float(class_total_time),
         }
         
-        logger.info(f"  Processed {len(anchors_list)} episodes")
+        # Aggregate results at class level when agents_per_class > 1
+        if class_key not in results["per_class_results"]:
+            # First agent for this class - initialize class-level results
+            results["per_class_results"][class_key] = {
+                "class": int(target_class),
+                "agents": [agent_name],  # Track which agents contributed
+                "per_agent_results": {agent_name: agent_result},  # Store per-agent results
+                # Initialize aggregated metrics (will be updated as we process more agents)
+                "instance_precision": instance_precision,
+                "instance_coverage": instance_coverage,
+                "class_precision": class_precision_union,
+                "class_coverage": class_coverage_union,
+                "all_anchors": anchors_list.copy(),  # Collect anchors from all agents
+                "all_rules": rules_list.copy(),
+                "total_rollout_time_seconds": total_rollout_time,
+            }
+        else:
+            # Additional agent for this class - aggregate results
+            existing = results["per_class_results"][class_key]
+            existing["agents"].append(agent_name)
+            existing["per_agent_results"][agent_name] = agent_result
+            
+            # Aggregate instance-level metrics (average across all agents)
+            n_agents = len(existing["agents"])
+            existing["instance_precision"] = (
+                (existing["instance_precision"] * (n_agents - 1) + instance_precision) / n_agents
+            )
+            existing["instance_coverage"] = (
+                (existing["instance_coverage"] * (n_agents - 1) + instance_coverage) / n_agents
+            )
+            
+            # Aggregate anchors and rules
+            existing["all_anchors"].extend(anchors_list)
+            existing["all_rules"].extend(rules_list)
+            existing["total_rollout_time_seconds"] += total_rollout_time
+            
+            # Recompute class-level union metrics from ALL anchors across ALL agents
+            # Get the appropriate dataset (test or train) based on eval_on_test_data
+            if eval_on_test_data and env_data.get("X_test_unit") is not None:
+                X_data = env_data["X_test_unit"]
+                y_data = env_data["y_test"]
+            else:
+                X_data = env_data["X_unit"]
+                y_data = env_data["y"]
+            
+            # Compute union of ALL anchors from ALL agents for this class
+            if X_data is not None and y_data is not None and len(existing["all_anchors"]) > 0:
+                n_samples = X_data.shape[0]
+                union_mask = np.zeros(n_samples, dtype=bool)
+                
+                # Build union mask from all anchors across all agents
+                for anchor_data in existing["all_anchors"]:
+                    if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                        
+                        # Check which points fall in this anchor box
+                        in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+                        union_mask |= in_box
+                
+                # Class-level coverage: fraction of class samples that are in the union
+                mask_cls = (y_data == target_class)
+                if mask_cls.sum() > 0:
+                    existing["class_coverage"] = float(union_mask[mask_cls].mean())
+                else:
+                    existing["class_coverage"] = 0.0
+                
+                # Class-level precision: fraction of points in union that belong to target class
+                if union_mask.any():
+                    y_union = y_data[union_mask]
+                    existing["class_precision"] = float((y_union == target_class).mean())
+                else:
+                    existing["class_precision"] = 0.0
+        
+        # For backward compatibility and simpler access, also store the aggregated result
+        # using the same structure as before (but now aggregated across all agents)
+        if agents_per_class == 1:
+            # Single agent per class - use the agent result directly
+            results["per_class_results"][class_key] = agent_result
+        else:
+            # Multiple agents per class - use aggregated result
+            # The aggregated result is already stored above, but add some convenience fields
+            aggregated = results["per_class_results"][class_key]
+            aggregated["unique_rules"] = list(set([
+                r for r in aggregated["all_rules"] 
+                if r and r != "any values (no tightened features)"
+            ]))
+            aggregated["unique_rules_count"] = len(aggregated["unique_rules"])
+            aggregated["n_episodes"] = len(aggregated["all_anchors"])
+            aggregated["rules"] = aggregated["all_rules"]  # All rules from all agents
+            aggregated["anchors"] = aggregated["all_anchors"]  # All anchors from all agents
+        
+        logger.info(f"  Processed {len(anchors_list)} episodes for agent {agent_name}")
         logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
-        logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
+        if agents_per_class > 1:
+            logger.info(f"  Agent-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
+            # Class-level union will be logged after all agents are processed
+        else:
+            logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
         logger.info(f"  Unique rules: {len(unique_rules)}")
         logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
-        logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
-        logger.info(f"  Total class processing time: {class_total_time:.4f}s")
+        logger.info(f"  Total rollout time for agent: {total_rollout_time:.4f}s")
+        logger.info(f"  Total agent processing time: {class_total_time:.4f}s")
+        
+        # If this is the last agent for this class, log aggregated class-level metrics
+        if agents_per_class > 1 and class_key in results["per_class_results"]:
+            aggregated = results["per_class_results"][class_key]
+            if len(aggregated.get("agents", [])) == agents_per_class:
+                # All agents for this class have been processed
+                logger.info(f"\n  {'='*60}")
+                logger.info(f"  Class {target_class} - Aggregated Results (all {agents_per_class} agents):")
+                logger.info(f"    Instance-level (avg across agents): "
+                          f"precision={aggregated['instance_precision']:.4f}, "
+                          f"coverage={aggregated['instance_coverage']:.4f}")
+                logger.info(f"    Class-level (union across all agents): "
+                          f"precision={aggregated['class_precision']:.4f}, "
+                          f"coverage={aggregated['class_coverage']:.4f}")
+                logger.info(f"    Total unique rules (across all agents): {aggregated.get('unique_rules_count', 0)}")
+                logger.info(f"    Total episodes (across all agents): {aggregated.get('n_episodes', 0)}")
+                logger.info(f"  {'='*60}")
     
     # End overall timing
     overall_end_time = time.perf_counter()
@@ -1607,6 +2128,40 @@ def extract_rules_from_policies(
     logger.info("\n" + "="*80)
     logger.info(f"Overall inference time: {overall_total_time:.4f}s")
     logger.info("="*80)
+    
+    # Load and log NashConv metrics if available
+    # Use experiment_dir parameter (already available in function scope)
+    nashconv_data = _load_nashconv_metrics(experiment_dir)
+    if nashconv_data.get("available", False):
+        logger.info("\n" + "="*80)
+        logger.info("NASH EQUILIBRIUM CONVERGENCE METRICS")
+        logger.info("="*80)
+        
+        # Training metrics
+        if nashconv_data.get("training"):
+            training_data = nashconv_data["training"]
+            if training_data:
+                final_training = training_data[-1]
+                logger.info("Training NashConv (final):")
+                logger.info(f"  NashConv sum: {final_training.get('training/nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Max exploitability: {final_training.get('training/exploitability_max', 'N/A'):.6f}")
+                if 'training/class_nashconv_sum' in final_training:
+                    logger.info(f"  Class NashConv sum: {final_training.get('training/class_nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Training step: {final_training.get('step', 'N/A')}")
+        
+        # Evaluation metrics
+        if nashconv_data.get("evaluation"):
+            eval_data = nashconv_data["evaluation"]
+            if eval_data:
+                final_eval = eval_data[-1]
+                logger.info("\nEvaluation NashConv (final):")
+                logger.info(f"  NashConv sum: {final_eval.get('evaluation/nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Max exploitability: {final_eval.get('evaluation/exploitability_max', 'N/A'):.6f}")
+                if 'evaluation/class_nashconv_sum' in final_eval:
+                    logger.info(f"  Class NashConv sum: {final_eval.get('evaluation/class_nashconv_sum', 'N/A'):.6f}")
+                logger.info(f"  Evaluation step: {final_eval.get('step', 'N/A')}")
+        
+        logger.info("="*80)
     
     # Calculate total rollout time across all classes
     total_rollout_time_all_classes = sum(
@@ -1721,8 +2276,8 @@ def main():
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=500,
-        help="Maximum steps per rollout episode"
+        default=100,
+        help="Maximum steps per rollout episode (default: 100, matches config max_cycles)"
     )
     
     parser.add_argument(
