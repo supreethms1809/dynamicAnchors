@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 def run_single_agent_rollout(
     env: SingleAgentAnchorEnv,
     model,
-    max_steps: int = 100,
+    max_steps: Optional[int] = None,  # If None, will read from env.max_cycles
     seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
@@ -74,6 +74,10 @@ def run_single_agent_rollout(
     step_count = 0
     total_reward = 0.0
     
+    # Read max_steps from env if not provided
+    if max_steps is None:
+        max_steps = env.max_cycles
+    
     # Store initial state
     initial_lower = env.lower.copy()
     initial_upper = env.upper.copy()
@@ -97,6 +101,22 @@ def run_single_agent_rollout(
     # Get final metrics
     precision, coverage, details = env._current_metrics()
     
+    # For instance-based anchors, also compute class-conditional coverage for better interpretability
+    coverage_class_conditional = 0.0
+    if env.x_star_unit is not None:  # Instance-based mode
+        # Get the mask and class labels
+        if env.eval_on_test_data:
+            y_data = env.y_test
+        else:
+            y_data = env.y
+        mask = env._mask_in_box()
+        if len(mask) == len(y_data):
+            class_mask = (y_data == env.target_class)
+            n_class_samples = class_mask.sum()
+            if n_class_samples > 0:
+                n_class_in_box = (mask & class_mask).sum()
+                coverage_class_conditional = float(n_class_in_box / n_class_samples)
+    
     # Get final bounds
     final_lower = env.lower.copy()
     final_upper = env.upper.copy()
@@ -104,7 +124,8 @@ def run_single_agent_rollout(
     episode_data = {
         "target_class": int(env.target_class),
         "precision": float(precision),
-        "coverage": float(coverage),
+        "coverage": float(coverage),  # Overall coverage P(x in box)
+        "coverage_class_conditional": float(coverage_class_conditional),  # Class-conditional coverage P(x in box | y = target_class)
         "total_reward": float(total_reward),
         "n_steps": step_count,
         "rollout_time_seconds": float(rollout_duration),
@@ -128,7 +149,7 @@ def extract_rules_single_agent(
     experiment_dir: str,
     dataset_name: str,
     max_features_in_rule: int = -1,
-    steps_per_episode: int = 100,
+    steps_per_episode: Optional[int] = None,  # If None, will read from env_config.max_cycles
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
     output_dir: Optional[str] = None,
@@ -481,112 +502,160 @@ def extract_rules_single_agent(
         # Track time for this class
         class_start_time = time.perf_counter()
         
-        for instance_idx in range(n_instances_per_class):
-            # Create environment for this class
-            rollout_seed = seed + instance_idx if seed is not None else None
+        # ========================================================================
+        # INSTANCE-BASED ROLLOUTS (boxes around specific instances)
+        # ========================================================================
+        logger.info(f"  Starting instance-based rollouts...")
+        
+        # Determine which dataset to sample from
+        if eval_on_test_data and env_data.get("X_test_unit") is not None:
+            class_mask = (env_data["y_test"] == target_class)
+            class_instances = np.where(class_mask)[0]
+            X_data_unit = env_data["X_test_unit"]
+            env_X_unit = env_data["X_test_unit"]
+            env_X_std = env_data["X_test_std"]
+            env_y = env_data["y_test"]
+            data_source_name = "test"
+        else:
+            class_mask = (env_data["y"] == target_class)
+            class_instances = np.where(class_mask)[0]
+            X_data_unit = env_data["X_unit"]
+            env_X_unit = env_data["X_unit"]
+            env_X_std = env_data["X_std"]
+            env_y = env_data["y"]
+            data_source_name = "training"
+        
+        if len(class_instances) == 0:
+            logger.warning(f"  No instances found for class {target_class} in {data_source_name} data, skipping instance-based rollouts...")
+        else:
+            # Sample instances (same approach as multi-agent)
+            n_samples = min(n_instances_per_class, len(class_instances))
+            rng_for_sampling = np.random.default_rng(seed if seed is not None else 42)
+            sampled_indices = rng_for_sampling.choice(class_instances, size=n_samples, replace=False)
             
-            # Use test data for environment if eval_on_test_data=True
-            # This ensures rollouts and metrics are computed on the same dataset
-            if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                env_X_unit = env_data["X_test_unit"]
-                env_X_std = env_data["X_test_std"]
-                env_y = env_data["y_test"]
-            else:
-                env_X_unit = env_data["X_unit"]
-                env_X_std = env_data["X_std"]
-                env_y = env_data["y"]
+            logger.info(f"  Sampling {n_samples} instances from {data_source_name} data for instance-based rollouts")
             
-            # Set mode to "inference" for rule extraction
-            inference_env_config = {**env_config, "mode": "inference"}
-            env = SingleAgentAnchorEnv(
-                X_unit=env_X_unit,
-                X_std=env_X_std,
-                y=env_y,
-                feature_names=feature_names,
-                classifier=dataset_loader.get_classifier(),
-                device=device,
-                target_class=target_class,
-                env_config=inference_env_config
-            )
-            
-            # Run rollout
-            episode_data = run_single_agent_rollout(
-                env=env,
-                model=model,
-                max_steps=steps_per_episode,
-                seed=rollout_seed
-            )
-            
-            precision = episode_data.get("precision", 0.0)
-            coverage = episode_data.get("coverage", 0.0)
-            rollout_time = episode_data.get("rollout_time_seconds", 0.0)
-            
-            precisions.append(float(precision))
-            coverages.append(float(coverage))
-            rollout_times.append(float(rollout_time))
-            
-            # Extract rule from final bounds
-            rule = "any values (no tightened features)"
-            lower = None
-            upper = None
-            lower_normalized = None
-            upper_normalized = None
-            
-            if "final_lower" in episode_data and "final_upper" in episode_data:
-                lower_normalized = np.array(episode_data["final_lower"], dtype=np.float32)
-                upper_normalized = np.array(episode_data["final_upper"], dtype=np.float32)
+            for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
+                # Get the actual instance from the dataset
+                x_instance = X_data_unit[data_instance_idx]
                 
-                # Denormalize bounds
-                X_min = env_config.get("X_min")
-                X_range = env_config.get("X_range")
-                if X_min is not None and X_range is not None:
-                    lower = (lower_normalized * X_range) + X_min
-                    upper = (upper_normalized * X_range) + X_min
-                else:
-                    lower = lower_normalized
-                    upper = upper_normalized
+                # Create environment for this class
+                rollout_seed = seed + instance_idx_in_range if seed is not None else None
                 
-                # Extract rule using environment's extract_rule method
-                # Create temporary env for rule extraction (use same data as rollout env)
-                temp_env = SingleAgentAnchorEnv(
+                # Set mode to "inference" for rule extraction
+                inference_env_config = {**env_config, "mode": "inference"}
+                env = SingleAgentAnchorEnv(
                     X_unit=env_X_unit,
                     X_std=env_X_std,
                     y=env_y,
                     feature_names=feature_names,
                     classifier=dataset_loader.get_classifier(),
-                    device="cpu",
+                    device=device,
                     target_class=target_class,
-                    env_config=env_config
+                    env_config=inference_env_config
                 )
-                temp_env.lower = lower_normalized
-                temp_env.upper = upper_normalized
                 
-                rule = temp_env.extract_rule(
-                    max_features_in_rule=max_features_in_rule,
-                    denormalize=True
+                # CRITICAL: Set x_star_unit for instance-based rollout
+                # This creates a box around the instance (instance-based mode)
+                env.x_star_unit = x_instance.copy()
+                
+                # Run rollout
+                episode_data = run_single_agent_rollout(
+                    env=env,
+                    model=model,
+                    max_steps=steps_per_episode,
+                    seed=rollout_seed
                 )
-            
-            anchor_data = {
-                "instance_idx": instance_idx,
-                "precision": float(precision),
-                "coverage": float(coverage),
-                "total_reward": float(episode_data.get("total_reward", 0.0)),
-                "n_steps": int(episode_data.get("n_steps", 0)),
-                "rule": rule,
-            }
-            
-            if lower is not None and upper is not None:
-                anchor_data.update({
-                    "lower_bounds": lower.tolist(),
-                    "upper_bounds": upper.tolist(),
-                    "box_widths": (upper - lower).tolist(),
-                    "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
-                    "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
-                    "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
-                })
-            
-            anchors_list.append(anchor_data)
-            rules_list.append(rule)
+                
+                precision = episode_data.get("precision", 0.0)
+                coverage = episode_data.get("coverage", 0.0)
+                coverage_class_conditional = episode_data.get("coverage_class_conditional", 0.0)
+                rollout_time = episode_data.get("rollout_time_seconds", 0.0)
+                
+                precisions.append(float(precision))
+                coverages.append(float(coverage))
+                rollout_times.append(float(rollout_time))
+                
+                # Log coverage diagnostics if overall coverage is low but class-conditional is reasonable
+                if instance_idx_in_range < 3 and coverage < 0.05 and coverage_class_conditional > 0.1:
+                    logger.info(
+                        f"  Episode {instance_idx_in_range}: Low overall coverage ({coverage:.4f}) but "
+                        f"reasonable class-conditional coverage ({coverage_class_conditional:.4f}). "
+                        f"This is expected if the dataset has many samples from other classes."
+                    )
+                
+                # Extract rule from final bounds
+                rule = "any values (no tightened features)"
+                lower = None
+                upper = None
+                lower_normalized = None
+                upper_normalized = None
+                
+                if "final_lower" in episode_data and "final_upper" in episode_data:
+                    lower_normalized = np.array(episode_data["final_lower"], dtype=np.float32)
+                    upper_normalized = np.array(episode_data["final_upper"], dtype=np.float32)
+                    
+                    # Denormalize bounds
+                    X_min = env_config.get("X_min")
+                    X_range = env_config.get("X_range")
+                    if X_min is not None and X_range is not None:
+                        lower = (lower_normalized * X_range) + X_min
+                        upper = (upper_normalized * X_range) + X_min
+                    else:
+                        lower = lower_normalized
+                        upper = upper_normalized
+                    
+                    # Extract rule using environment's extract_rule method
+                    # Create temporary env for rule extraction (use same data as rollout env)
+                    temp_env = SingleAgentAnchorEnv(
+                        X_unit=env_X_unit,
+                        X_std=env_X_std,
+                        y=env_y,
+                        feature_names=feature_names,
+                        classifier=dataset_loader.get_classifier(),
+                        device="cpu",
+                        target_class=target_class,
+                        env_config=env_config
+                    )
+                    temp_env.lower = lower_normalized
+                    temp_env.upper = upper_normalized
+                    
+                    # Compute initial bounds from x_instance and initial_window for correct reference
+                    initial_window = env_config.get("initial_window", 0.1)
+                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+                    
+                    rule = temp_env.extract_rule(
+                        max_features_in_rule=max_features_in_rule,
+                        initial_lower=initial_lower_normalized,
+                        initial_upper=initial_upper_normalized,
+                        denormalize=True
+                    )
+                
+                anchor_data = {
+                    "instance_idx": instance_idx_in_range,
+                    "data_instance_idx": int(data_instance_idx),
+                    "rollout_type": "instance_based",  # Flag to distinguish from class-based
+                    "precision": float(precision),
+                    "coverage": float(coverage),  # Overall coverage P(x in box)
+                    "coverage_class_conditional": float(coverage_class_conditional),  # Class-conditional coverage P(x in box | y = target_class)
+                    "total_reward": float(episode_data.get("total_reward", 0.0)),
+                    "n_steps": int(episode_data.get("n_steps", 0)),
+                    "rule": rule,
+                }
+                
+                if lower is not None and upper is not None:
+                    anchor_data.update({
+                        "lower_bounds": lower.tolist(),
+                        "upper_bounds": upper.tolist(),
+                        "box_widths": (upper - lower).tolist(),
+                        "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
+                        "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
+                        "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                    })
+                
+                anchors_list.append(anchor_data)
+                rules_list.append(rule)
         
         unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
         
@@ -597,6 +666,14 @@ def extract_rules_single_agent(
         # Compute instance-level metrics (average across all instances)
         instance_precision = float(np.mean(precisions)) if precisions else 0.0
         instance_coverage = float(np.mean(coverages)) if coverages else 0.0
+        
+        # Compute average class-conditional coverage if available
+        coverages_class_conditional = []
+        for anchor_data in anchors_list:
+            if "coverage_class_conditional" in anchor_data:
+                coverages_class_conditional.append(anchor_data["coverage_class_conditional"])
+        instance_coverage_class_conditional = float(np.mean(coverages_class_conditional)) if coverages_class_conditional else 0.0
+        
         avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
         total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
@@ -727,7 +804,8 @@ def extract_rules_single_agent(
             "class": int(target_class),
             # Instance-level metrics (averaged across all instances)
             "instance_precision": instance_precision,
-            "instance_coverage": instance_coverage,
+            "instance_coverage": instance_coverage,  # Overall coverage P(x in box)
+            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Class-conditional coverage P(x in box | y = target_class)
             "instance_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
             # Class-level metrics (union of all anchors for this class)
@@ -749,16 +827,301 @@ def extract_rules_single_agent(
             "class_total_time_seconds": float(class_total_time),
         }
         
-        logger.info(f"  Processed {len(anchors_list)} episodes")
+        logger.info(f"  Processed {len(anchors_list)} instance-based episodes")
+        # Log in order: Instance metrics, then Union metrics (will be recomputed with class-based anchors later)
         logger.info(f"  Instance-level metrics (averaged across all {len(anchors_list)} anchors):")
         logger.info(f"    Average precision: {instance_precision:.4f}, Average coverage: {instance_coverage:.4f}")
-        n_anchors_for_union = anchors_with_bounds if anchors_with_bounds > 0 else len(anchors_list)
-        logger.info(f"  Class-level metrics (class-union: union of all {n_anchors_for_union} anchors):")
-        logger.info(f"    Union precision: {class_precision:.4f}, Union coverage: {class_coverage:.4f}")
-        logger.info(f"  Unique rules (after deduplication): {len(unique_rules)}")
+        if instance_coverage_class_conditional > 0.0:
+            logger.info(f"    Class-conditional coverage: {instance_coverage_class_conditional:.4f}")
+            if instance_coverage < 0.05 and instance_coverage_class_conditional > 0.1:
+                logger.info(f"    Note: Low overall coverage is expected when dataset has many samples from other classes.")
+        logger.info(f"  Unique rules (instance-based, after deduplication): {len(unique_rules)}")
         logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
-        logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
-        logger.info(f"  Total class processing time: {class_total_time:.4f}s")
+        # Union metrics (instance-based only) - will be recomputed after class-based rollouts
+        n_anchors_for_union = anchors_with_bounds if anchors_with_bounds > 0 else len(anchors_list)
+        logger.info(f"  Union metrics (instance-based anchors only):")
+        logger.info(f"    Union precision: {class_precision:.4f}, Union coverage: {class_coverage:.4f}")
+        logger.info(f"    Note: Final union metrics (including class-based anchors) will be computed after class-based rollouts.")
+        # logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
+        # logger.info(f"  Total class processing time: {class_total_time:.4f}s")
+    
+    # ========================================================================
+    # CLASS-BASED ROLLOUTS (using k-means cluster centroids)
+    # ========================================================================
+    logger.info(f"\n{'='*80}")
+    logger.info("Starting CLASS-BASED rollouts (initialized from k-means cluster centroids)")
+    logger.info(f"{'='*80}")
+    
+    # Determine number of class-based rollouts per class
+    n_class_based_rollouts_per_class = None
+    if env_config.get("cluster_centroids_per_class") is not None:
+        max_centroids = 0
+        for cls in target_classes:
+            if cls in env_config["cluster_centroids_per_class"]:
+                max_centroids = max(max_centroids, len(env_config["cluster_centroids_per_class"][cls]))
+        n_class_based_rollouts_per_class = max(5, min(max_centroids, 10))
+        logger.info(f"  Using {n_class_based_rollouts_per_class} class-based rollouts per class (based on cluster centroids)")
+    else:
+        n_class_based_rollouts_per_class = 5
+        logger.info(f"  Using {n_class_based_rollouts_per_class} class-based rollouts per class (default, no cluster centroids)")
+    
+    # Run class-based rollouts for each class
+    for target_class in target_classes:
+        class_key = f"class_{target_class}"
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Class-based rollouts for class {target_class}")
+        logger.info(f"{'='*80}")
+        
+        # Get model for this class
+        if target_class not in models:
+            logger.warning(f"  Model for class {target_class} not found, skipping...")
+            continue
+        
+        model = models[target_class]
+        
+        # Initialize lists for class-based rollouts
+        class_based_anchors_list = []
+        class_based_rules_list = []
+        class_based_precisions = []
+        class_based_coverages = []
+        class_based_rollout_times = []
+        
+        class_based_start_time = time.perf_counter()
+        
+        # Run class-based rollouts (NOT setting x_star_unit, so environment uses cluster centroids)
+        for rollout_idx in range(n_class_based_rollouts_per_class):
+            rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
+            
+            # Use test data for environment if eval_on_test_data=True
+            if eval_on_test_data and env_data.get("X_test_unit") is not None:
+                env_X_unit = env_data["X_test_unit"]
+                env_X_std = env_data["X_test_std"]
+                env_y = env_data["y_test"]
+            else:
+                env_X_unit = env_data["X_unit"]
+                env_X_std = env_data["X_std"]
+                env_y = env_data["y"]
+            
+            # Set mode to "inference" for rule extraction
+            inference_env_config = {**env_config, "mode": "inference"}
+            env = SingleAgentAnchorEnv(
+                X_unit=env_X_unit,
+                X_std=env_X_std,
+                y=env_y,
+                feature_names=feature_names,
+                classifier=dataset_loader.get_classifier(),
+                device=device,
+                target_class=target_class,
+                env_config=inference_env_config
+            )
+            
+            # IMPORTANT: DO NOT set x_star_unit - this triggers class-based initialization
+            # The environment will use cluster_centroids_per_class when available,
+            # otherwise it will use mean centroid of the class
+            
+            # Run rollout
+            episode_data = run_single_agent_rollout(
+                env=env,
+                model=model,
+                max_steps=steps_per_episode,
+                seed=rollout_seed
+            )
+            
+            precision = episode_data.get("precision", 0.0)
+            coverage = episode_data.get("coverage", 0.0)
+            rollout_time = episode_data.get("rollout_time_seconds", 0.0)
+            
+            class_based_precisions.append(float(precision))
+            class_based_coverages.append(float(coverage))
+            class_based_rollout_times.append(float(rollout_time))
+            
+            # Extract rule from final bounds
+            rule = "any values (no tightened features)"
+            lower = None
+            upper = None
+            lower_normalized = None
+            upper_normalized = None
+            
+            if "final_lower" in episode_data and "final_upper" in episode_data:
+                lower_normalized = np.array(episode_data["final_lower"], dtype=np.float32)
+                upper_normalized = np.array(episode_data["final_upper"], dtype=np.float32)
+                
+                # Denormalize bounds
+                X_min = env_config.get("X_min")
+                X_range = env_config.get("X_range")
+                if X_min is not None and X_range is not None:
+                    lower = (lower_normalized * X_range) + X_min
+                    upper = (upper_normalized * X_range) + X_min
+                else:
+                    lower = lower_normalized
+                    upper = upper_normalized
+                
+                # Extract rule - use the box center as reference for class-based initialization
+                temp_env = SingleAgentAnchorEnv(
+                    X_unit=env_X_unit,
+                    X_std=env_X_std,
+                    y=env_y,
+                    feature_names=feature_names,
+                    classifier=dataset_loader.get_classifier(),
+                    device="cpu",
+                    target_class=target_class,
+                    env_config=env_config
+                )
+                temp_env.lower = lower_normalized
+                temp_env.upper = upper_normalized
+                
+                # For class-based, use the center of the final box as reference for initial bounds
+                initial_window = env_config.get("initial_window", 0.1)
+                box_center = (lower_normalized + upper_normalized) / 2.0
+                initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
+                initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+                
+                rule = temp_env.extract_rule(
+                    max_features_in_rule=max_features_in_rule,
+                    initial_lower=initial_lower_normalized,
+                    initial_upper=initial_upper_normalized,
+                    denormalize=True
+                )
+            
+            # Store anchor data
+            anchor_data = {
+                "rollout_type": "class_based",  # Flag to distinguish from instance-based
+                "rollout_idx": rollout_idx,
+                "precision": float(precision),
+                "coverage": float(coverage),
+                "total_reward": float(episode_data.get("total_reward", 0.0)),
+                "n_steps": int(episode_data.get("n_steps", 0)),
+                "rule": rule,
+            }
+            
+            if lower is not None and upper is not None:
+                anchor_data.update({
+                    "lower_bounds": lower.tolist(),
+                    "upper_bounds": upper.tolist(),
+                    "box_widths": (upper - lower).tolist(),
+                    "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
+                    "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
+                    "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                })
+            
+            class_based_anchors_list.append(anchor_data)
+            class_based_rules_list.append(rule)
+        
+        # Compute aggregated metrics for class-based rollouts
+        class_based_unique_rules = list(set([r for r in class_based_rules_list if r and r != "any values (no tightened features)"]))
+        class_based_end_time = time.perf_counter()
+        class_based_total_time = class_based_end_time - class_based_start_time
+        
+        class_based_precision = float(np.mean(class_based_precisions)) if class_based_precisions else 0.0
+        class_based_coverage = float(np.mean(class_based_coverages)) if class_based_coverages else 0.0
+        class_based_avg_rollout_time = float(np.mean(class_based_rollout_times)) if class_based_rollout_times else 0.0
+        class_based_total_rollout_time = float(np.sum(class_based_rollout_times)) if class_based_rollout_times else 0.0
+        
+        # Store class-based results in per_class_results
+        if class_key not in results["per_class_results"]:
+            results["per_class_results"][class_key] = {}
+        
+        # Store class-based results in a separate key for easy access
+        class_based_key = f"class_{target_class}_class_based"
+        results["per_class_results"][class_based_key] = {
+            "class": int(target_class),
+            "rollout_type": "class_based",
+            "n_episodes": len(class_based_anchors_list),
+            "precision": class_based_precision,
+            "coverage": class_based_coverage,
+            "precision_std": float(np.std(class_based_precisions)) if len(class_based_precisions) > 1 else 0.0,
+            "coverage_std": float(np.std(class_based_coverages)) if len(class_based_coverages) > 1 else 0.0,
+            "unique_rules": class_based_unique_rules,
+            "unique_rules_count": len(class_based_unique_rules),
+            "rules": class_based_rules_list,
+            "anchors": class_based_anchors_list,
+            "avg_rollout_time_seconds": class_based_avg_rollout_time,
+            "total_rollout_time_seconds": class_based_total_rollout_time,
+            "total_processing_time_seconds": float(class_based_total_time),
+        }
+        
+        logger.info(f"  Class-based rollouts completed: {len(class_based_anchors_list)} episodes")
+        logger.info(f"  Class-based metrics (averaged across all {len(class_based_anchors_list)} anchors):")
+        logger.info(f"    Average precision: {class_based_precision:.4f}, Average coverage: {class_based_coverage:.4f}")
+        logger.info(f"  Unique rules (class-based, after deduplication): {len(class_based_unique_rules)}")
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("Class-based rollouts completed")
+    logger.info(f"{'='*80}")
+    
+    # Recompute union metrics for all classes to include BOTH instance-based AND class-based anchors
+    logger.info(f"\n{'='*80}")
+    logger.info("Recomputing Union Metrics (Instance-based + Class-based anchors)")
+    logger.info(f"{'='*80}")
+    
+    # Get the appropriate dataset (test or train) based on eval_on_test_data
+    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+        X_data_union = env_data["X_test_unit"]
+        y_data_union = env_data["y_test"]
+    else:
+        X_data_union = env_data["X_unit"]
+        y_data_union = env_data["y"]
+    
+    # Recompute union metrics for each class
+    for class_key, class_data in results["per_class_results"].items():
+        target_class = class_data.get("class")
+        if target_class is None:
+            continue
+        
+        # Collect ALL anchors: instance-based + class-based
+        all_anchors_for_union = []
+        
+        # Add instance-based anchors
+        if "anchors" in class_data:
+            all_anchors_for_union.extend(class_data["anchors"])
+        
+        # Add class-based anchors if they exist (stored separately)
+        class_based_key = f"class_{target_class}_class_based"
+        if class_based_key in results.get("per_class_results", {}):
+            class_based_data = results["per_class_results"][class_based_key]
+            if "anchors" in class_based_data:
+                all_anchors_for_union.extend(class_based_data["anchors"])
+        
+        # Compute union of ALL anchors (instance-based + class-based)
+        if X_data_union is not None and y_data_union is not None and len(all_anchors_for_union) > 0:
+            n_samples = X_data_union.shape[0]
+            union_mask = np.zeros(n_samples, dtype=bool)
+            
+            # Build union mask from all anchors
+            for anchor_data in all_anchors_for_union:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data_union >= lower) & (X_data_union <= upper), axis=1)
+                    union_mask |= in_box
+            
+            # Class-level coverage: fraction of class samples that are in the union
+            mask_cls = (y_data_union == target_class)
+            if mask_cls.sum() > 0:
+                class_coverage_combined = float(union_mask[mask_cls].mean())
+            else:
+                class_coverage_combined = 0.0
+            
+            # Class-level precision: fraction of points in union that belong to target class
+            if union_mask.any():
+                y_union = y_data_union[union_mask]
+                class_precision_combined = float((y_union == target_class).mean())
+            else:
+                class_precision_combined = 0.0
+            
+            # Update class-level metrics with combined union
+            class_data["class_precision"] = class_precision_combined
+            class_data["class_coverage"] = class_coverage_combined
+            
+            # Log the final union metrics
+            n_instance_anchors = len(class_data.get("anchors", []))
+            n_class_based_anchors = len(results.get("per_class_results", {}).get(class_based_key, {}).get("anchors", []))
+            logger.info(f"\n  Class {target_class} - Final Union Metrics (Instance + Class-based):")
+            logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}")
+            logger.info(f"    Anchors used: {n_instance_anchors} instance-based + {n_class_based_anchors} class-based = {len(all_anchors_for_union)} total")
     
     # End overall timing
     overall_end_time = time.perf_counter()

@@ -325,7 +325,7 @@ def run_rollout_with_policy(
     env: AnchorEnv,
     policy: torch.nn.Module,
     agent_id: str,
-    max_steps: int = 100,
+    max_steps: Optional[int] = None,  # If None, will read from env_config.max_cycles
     device: str = "cpu",
     seed: Optional[int] = None,
     exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean"
@@ -336,17 +336,28 @@ def run_rollout_with_policy(
     policy.to(device)
     policy.eval()
     
+    # Read max_steps from env if not provided
+    if max_steps is None:
+        max_steps = env.max_cycles
+    
     # Set mode to "inference" so termination counters are reset in reset()
     if hasattr(env, 'mode'):
         env.mode = "inference"
     
     # Verify x_star_unit is set before reset
+    # Check if this is a class-based rollout (expected to not have x_star_unit)
+    is_class_based = hasattr(env, 'use_class_centroids') and env.use_class_centroids
+    
     if agent_id in env.x_star_unit:
         x_star = env.x_star_unit[agent_id]
         if verbose_logging:
             logger.debug(f"  x_star_unit set for {agent_id}: shape={x_star.shape}, mean={x_star.mean():.4f}, range=[{x_star.min():.4f}, {x_star.max():.4f}]")
     else:
-        logger.warning(f"  x_star_unit NOT set for {agent_id} before reset! This will cause class-based mode instead of instance-based.")
+        # Only warn if this is supposed to be an instance-based rollout
+        if not is_class_based:
+            logger.warning(f"  x_star_unit NOT set for {agent_id} before reset! This will cause class-based mode instead of instance-based.")
+        elif verbose_logging:
+            logger.debug(f"  x_star_unit not set for {agent_id} (expected for class-based rollout using centroids)")
     
     # Reset environment (returns dict, not TensorDict)
     obs_dict, infos_dict = env.reset(seed=seed)
@@ -370,8 +381,11 @@ def run_rollout_with_policy(
         
         # Check if x_star_unit is still set (reset should preserve it)
         has_x_star = agent_id in env.x_star_unit and env.x_star_unit[agent_id] is not None
-        if not has_x_star:
+        # Only warn if this was supposed to be an instance-based rollout
+        if not has_x_star and not is_class_based:
             logger.warning(f"  x_star_unit was lost after reset for {agent_id}! Coverage calculation will be wrong.")
+        elif not has_x_star and is_class_based and verbose_logging:
+            logger.debug(f"  x_star_unit not set for {agent_id} (expected for class-based rollout)")
         
         precision_init, coverage_init, details_init = env._current_metrics(agent_id)
         
@@ -672,7 +686,11 @@ def run_rollout_with_policy(
                 if verbose_logging:
                     logger.info(f"  Box change after step 0: lower_diff={lower_diff:.6f}, upper_diff={upper_diff:.6f}")
                 if lower_diff < 1e-6 and upper_diff < 1e-6:
-                    logger.warning(f"  Box did not change after action! Actions may not be applied correctly.")
+                    # This could indicate actions aren't being applied, but could also be very small actions
+                    # Only warn if verbose logging is enabled, otherwise it's too noisy
+                    if verbose_logging:
+                        logger.warning(f"  Box did not change after first action (diff < 1e-6). Actions may be very small or not applied correctly.")
+                    # Note: Very small actions are common, especially early in training or with certain policies
         
         step_count += 1
     
@@ -686,6 +704,25 @@ def run_rollout_with_policy(
     try:
         # Get instance-level metrics directly from environment
         instance_precision, instance_coverage, details = env._current_metrics(agent_id)
+        
+        # For instance-based anchors, also compute class-conditional coverage for better interpretability
+        # This helps understand coverage relative to the target class, not just overall dataset
+        instance_coverage_class_conditional = 0.0
+        if env.x_star_unit.get(agent_id) is not None:  # Instance-based mode
+            target_class = env._get_class_for_agent(agent_id)
+            if target_class is not None:
+                # Get the mask and class labels
+                if env.eval_on_test_data:
+                    y_data = env.y_test
+                else:
+                    y_data = env.y
+                mask = env._mask_in_box(agent_id)
+                if len(mask) == len(y_data):
+                    class_mask = (y_data == target_class)
+                    n_class_samples = class_mask.sum()
+                    if n_class_samples > 0:
+                        n_class_in_box = (mask & class_mask).sum()
+                        instance_coverage_class_conditional = float(n_class_in_box / n_class_samples)
         
         # Get class-level metrics (union of all agents for this class)
         target_class = env._get_class_for_agent(agent_id)
@@ -730,10 +767,12 @@ def run_rollout_with_policy(
         episode_data = {
             # Instance-level metrics (for this specific agent/instance)
             "instance_precision": float(instance_precision),
-            "instance_coverage": float(instance_coverage),
+            "instance_coverage": float(instance_coverage),  # Overall coverage P(x in box)
+            "instance_coverage_class_conditional": float(instance_coverage_class_conditional),  # Class-conditional coverage P(x in box | y = target_class)
             # Anchor metrics (same as instance-level for single agent)
             "anchor_precision": float(instance_precision),
             "anchor_coverage": float(instance_coverage),
+            "anchor_coverage_class_conditional": float(instance_coverage_class_conditional),
             # Class-level metrics (union of all agents for this class)
             "class_precision": float(class_precision),
             "class_coverage": float(class_coverage),
@@ -970,7 +1009,9 @@ def extract_rules_from_policies(
 
     # Resolve rollout length: if not explicitly provided, use env_config.max_cycles.
     if steps_per_episode is None:
-        steps_per_episode = int(env_config.get("max_cycles", 100))
+        steps_per_episode = int(env_config.get("max_cycles"))
+        if steps_per_episode is None:
+            raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
     
     # Check logging verbosity from config
     verbose_logging = _should_log_verbose(env_config)
@@ -1622,13 +1663,37 @@ def extract_rules_from_policies(
             logger.warning(f"  No instances found for class {target_class} in {data_source_name} data, skipping...")
             continue
         
-        # Sample instances (same approach as training)
+        # Sample instances for THIS AGENT (different agents should get different instances)
+        # When agents_per_class > 1, each agent should process different instances to ensure diversity
         n_samples = min(n_instances_per_class, len(class_instances))
-        # Use deterministic sampling for reproducibility (seed-based)
-        rng_for_sampling = np.random.default_rng(seed if seed is not None else 42)
-        sampled_indices = rng_for_sampling.choice(class_instances, size=n_samples, replace=False)
         
-        logger.info(f"  Sampling {n_samples} instances from {data_source_name} data for class {target_class}")
+        # Extract agent index from agent_name (e.g., "agent_0_1" -> agent_idx=1)
+        agent_idx = 0
+        if agents_per_class > 1 and "_" in agent_name:
+            parts = agent_name.split("_")
+            if len(parts) >= 3 and parts[2].isdigit():
+                agent_idx = int(parts[2])
+        
+        # Use deterministic sampling with agent-specific seed to ensure different agents get different instances
+        # This ensures reproducibility while maintaining diversity across agents
+        agent_specific_seed = (seed if seed is not None else 42) + agent_idx * 1000
+        rng_for_sampling = np.random.default_rng(agent_specific_seed)
+        
+        # Sample instances for this agent
+        # If we have enough instances, each agent gets a different subset
+        # Otherwise, all agents share the same instances (but this should be rare)
+        if len(class_instances) >= n_samples * agents_per_class:
+            # Enough instances: each agent gets its own subset
+            instances_per_agent = len(class_instances) // agents_per_class
+            start_idx = agent_idx * instances_per_agent
+            end_idx = start_idx + instances_per_agent
+            agent_class_instances = class_instances[start_idx:end_idx]
+            sampled_indices = rng_for_sampling.choice(agent_class_instances, size=min(n_samples, len(agent_class_instances)), replace=False)
+            logger.info(f"  Agent {agent_name} (idx={agent_idx}): Sampling {len(sampled_indices)} instances from subset [{start_idx}:{end_idx}] of {data_source_name} data for class {target_class}")
+        else:
+            # Not enough instances: all agents share (but use different seed for randomization)
+            sampled_indices = rng_for_sampling.choice(class_instances, size=n_samples, replace=False)
+            logger.info(f"  Agent {agent_name} (idx={agent_idx}): Sampling {n_samples} instances from {data_source_name} data for class {target_class} (shared pool - not enough instances for separate subsets)")
         
         for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
             # Get the actual instance from the dataset
@@ -1764,16 +1829,17 @@ def extract_rules_from_policies(
             # Initialize metrics variables
             instance_precision = 0.0
             instance_coverage = 0.0
+            instance_coverage_class_conditional = 0.0
             class_precision = 0.0
             class_coverage = 0.0
             precision = 0.0
             coverage = 0.0
             
-            # Get rollout time from episode_data
-            rollout_time = episode_data.get("rollout_time_seconds", 0.0)
-            rollout_times.append(float(rollout_time))
-            
             if episode_data:
+                # Get rollout time from episode_data
+                rollout_time = episode_data.get("rollout_time_seconds", 0.0)
+                rollout_times.append(float(rollout_time))
+                
                 # Instance-level metrics
                 instance_precision = episode_data.get("anchor_precision", episode_data.get("instance_precision", 0.0))
                 instance_coverage = episode_data.get("anchor_coverage", episode_data.get("instance_coverage", 0.0))
@@ -1781,12 +1847,24 @@ def extract_rules_from_policies(
                 class_precision = episode_data.get("class_precision", 0.0)
                 class_coverage = episode_data.get("class_coverage", 0.0)
                 
+                # Get class-conditional coverage if available
+                instance_coverage_class_conditional = episode_data.get("instance_coverage_class_conditional", episode_data.get("anchor_coverage_class_conditional", 0.0))
+                
                 # Diagnostic: Log if metrics are zero (might indicate a problem)
                 if instance_idx_in_range < 3 and (instance_precision == 0.0 or instance_coverage == 0.0):
                     logger.warning(
                         f"  ⚠ Episode {instance_idx_in_range} for class {target_class} has zero metrics: "
-                        f"precision={instance_precision:.4f}, coverage={instance_coverage:.4f}. "
+                        f"precision={instance_precision:.4f}, coverage={instance_coverage:.4f} "
+                        f"(class-conditional: {instance_coverage_class_conditional:.4f}). "
                         f"This might indicate the policy didn't find any valid boxes or the environment isn't set up correctly."
+                    )
+                
+                # Log coverage diagnostics if overall coverage is low but class-conditional is reasonable
+                if instance_coverage < 0.05 and instance_coverage_class_conditional > 0.1:
+                    logger.info(
+                        f"  Episode {instance_idx_in_range}: Low overall coverage ({instance_coverage:.4f}) but "
+                        f"reasonable class-conditional coverage ({instance_coverage_class_conditional:.4f}). "
+                        f"This is expected if the dataset has many samples from other classes."
                     )
                 
                 instance_precisions.append(float(instance_precision))
@@ -1804,6 +1882,7 @@ def extract_rules_from_policies(
                 # Log warning if episode_data is empty
                 if instance_idx_in_range == 0:
                     logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx_in_range}")
+                rollout_times.append(0.0)
                 instance_precisions.append(0.0)
                 instance_coverages.append(0.0)
                 class_precisions.append(0.0)
@@ -1869,16 +1948,25 @@ def extract_rules_from_policies(
                     temp_env.lower[temp_agent_name] = lower_normalized
                     temp_env.upper[temp_agent_name] = upper_normalized
                     
-                    # Extract rule with denormalization enabled
+                    # Compute initial bounds from x_instance and initial_window to get correct reference
+                    # This matches how the environment initializes bounds in reset()
+                    initial_window = env_config.get("initial_window", 0.1)
+                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+                    
+                    # Extract rule with denormalization enabled and correct initial bounds
                     rule = temp_env.extract_rule(
                         temp_agent_name,
                         max_features_in_rule=max_features_in_rule,
+                        initial_lower=initial_lower_normalized,
+                        initial_upper=initial_upper_normalized,
                         denormalize=True  # Denormalize to standardized feature space (mean=0, std=1)
                     )
             
             # Extract metrics for anchor_data (variables are already defined above)
             anchor_instance_precision = float(instance_precision)
             anchor_instance_coverage = float(instance_coverage)
+            anchor_instance_coverage_class_conditional = float(instance_coverage_class_conditional) if 'instance_coverage_class_conditional' in locals() else 0.0
             anchor_class_precision = float(class_precision)
             anchor_class_coverage = float(class_coverage)
             
@@ -1887,12 +1975,14 @@ def extract_rules_from_policies(
                 "data_instance_idx": int(data_instance_idx),
                 # Instance-level metrics
                 "instance_precision": anchor_instance_precision,
-                "instance_coverage": anchor_instance_coverage,
+                "instance_coverage": anchor_instance_coverage,  # Overall coverage P(x in box)
+                "instance_coverage_class_conditional": anchor_instance_coverage_class_conditional,  # Class-conditional coverage P(x in box | y = target_class)
                 # Class-level metrics
                 "class_precision": anchor_class_precision,
                 "class_coverage": anchor_class_coverage,
                 "anchor_precision": float(anchor_instance_precision),
                 "anchor_coverage": float(anchor_instance_coverage),
+                "anchor_coverage_class_conditional": float(anchor_instance_coverage_class_conditional),
                 "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
                 "rule": rule,
             }
@@ -1920,12 +2010,24 @@ def extract_rules_from_policies(
         # Compute instance-level metrics (average across all instances)
         instance_precision = float(np.mean(instance_precisions)) if instance_precisions else 0.0
         instance_coverage = float(np.mean(instance_coverages)) if instance_coverages else 0.0
+        
+        # Compute average class-conditional coverage if available
+        instance_coverages_class_conditional = []
+        for anchor_data in anchors_list:
+            if "instance_coverage_class_conditional" in anchor_data:
+                instance_coverages_class_conditional.append(anchor_data["instance_coverage_class_conditional"])
+            elif "anchor_coverage_class_conditional" in anchor_data:
+                instance_coverages_class_conditional.append(anchor_data["anchor_coverage_class_conditional"])
+        instance_coverage_class_conditional = float(np.mean(instance_coverages_class_conditional)) if instance_coverages_class_conditional else 0.0
+        
         avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
         total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
-        # Compute class-level metrics from union of all anchors across all episodes
+        # Compute class-level metrics from union of all anchors across all episodes FOR THIS AGENT
+        # NOTE: This is per-agent union (union of this agent's anchors), not class-level union across all agents
         class_precision_union = 0.0
         class_coverage_union = 0.0
+        n_class_samples = 0  # Store class sample count for weighted averaging
         
         # Get the appropriate dataset (test or train) based on eval_on_test_data
         if eval_on_test_data and env_data.get("X_test_unit") is not None:
@@ -1935,12 +2037,13 @@ def extract_rules_from_policies(
             X_data = env_data["X_unit"]
             y_data = env_data["y"]
         
-        # Compute union of all anchors for this class
+        # Compute union of all anchors FOR THIS AGENT ONLY
         if X_data is not None and y_data is not None and len(anchors_list) > 0:
             n_samples = X_data.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
             
-            # Build union mask from all anchors
+            # Build union mask from all anchors for this agent
+            # Each agent should have different anchors, so the union should be different
             for anchor_data in anchors_list:
                 if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
                     lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
@@ -1952,6 +2055,7 @@ def extract_rules_from_policies(
             
             # Class-level coverage: fraction of class samples that are in the union
             mask_cls = (y_data == target_class)
+            n_class_samples = int(mask_cls.sum())  # Store for weighted averaging
             if mask_cls.sum() > 0:
                 class_coverage_union = float(union_mask[mask_cls].mean())
             else:
@@ -1963,6 +2067,41 @@ def extract_rules_from_policies(
                 class_precision_union = float((y_union == target_class).mean())
             else:
                 class_precision_union = 0.0
+            
+            # Debug: Log anchor diversity and coverage diagnostics for this agent
+            if len(anchors_list) > 1:
+                # Check if anchors are actually different
+                anchor_centers = []
+                anchor_widths = []
+                for anchor_data in anchors_list:
+                    if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                        center = (lower + upper) / 2
+                        width = upper - lower
+                        anchor_centers.append(center)
+                        anchor_widths.append(width)
+                
+                if anchor_centers:
+                    centers_array = np.array(anchor_centers)
+                    widths_array = np.array(anchor_widths)
+                    center_std = centers_array.std(axis=0).mean()
+                    width_std = widths_array.std(axis=0).mean()
+                    avg_width = widths_array.mean(axis=0).mean()
+                    # Log if anchors are very similar (std < 0.001) which might indicate a problem
+                    if center_std < 0.001 or width_std < 0.001:
+                        logger.warning(f"  Agent {agent_name}: Anchors are very similar! center_std={center_std:.6f}, width_std={width_std:.6f}")
+                    elif verbose_logging:
+                        logger.debug(f"  Agent {agent_name}: {len(anchors_list)} anchors, center_std={center_std:.6f}, width_std={width_std:.6f}")
+                    
+                    # Log coverage diagnostics if coverage is low
+                    if class_coverage_union < 0.05:
+                        logger.warning(
+                            f"  Agent {agent_name}: Low per-agent union coverage ({class_coverage_union:.4f}). "
+                            f"Average box width: {avg_width:.4f}, "
+                            f"Total samples: {n_samples}, Class samples: {n_class_samples}, "
+                            f"Samples in union: {union_mask.sum()}"
+                        )
         
         # When agents_per_class > 1, we need to aggregate results from all agents of the same class
         # Store per-agent results first, then aggregate at class level
@@ -1972,13 +2111,15 @@ def extract_rules_from_policies(
             "group": agent_name,
             # Instance-level metrics (averaged across all instances for this agent)
             "instance_precision": instance_precision,
-            "instance_coverage": instance_coverage,
+            "instance_coverage": instance_coverage,  # Overall coverage P(x in box)
+            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Class-conditional coverage P(x in box | y = target_class)
             "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
             # Class-level metrics (union of all anchors for this agent across all episodes)
             # Note: This is per-agent union, not class-level union across all agents
             "class_precision": class_precision_union,
             "class_coverage": class_coverage_union,
+            "n_class_samples": n_class_samples,  # Store for weighted averaging in global metrics
             # Keep averaged class-level metrics for backward compatibility
             "class_precision_avg": float(np.mean(class_precisions)) if class_precisions else 0.0,
             "class_coverage_avg": float(np.mean(class_coverages)) if class_coverages else 0.0,
@@ -2010,11 +2151,13 @@ def extract_rules_from_policies(
                 # Initialize aggregated metrics (will be updated as we process more agents)
                 "instance_precision": instance_precision,
                 "instance_coverage": instance_coverage,
-                "class_precision": class_precision_union,
-                "class_coverage": class_coverage_union,
-                "all_anchors": anchors_list.copy(),  # Collect anchors from all agents
-                "all_rules": rules_list.copy(),
+                "class_precision": class_precision_union,  # Will be recomputed with class-based anchors later
+                "class_coverage": class_coverage_union,  # Will be recomputed with class-based anchors later
+                "n_class_samples": n_class_samples,  # Store for weighted averaging in global metrics
+                "all_anchors": anchors_list.copy(),  # Collect instance-based anchors from all agents
+                "all_rules": rules_list.copy(),  # Collect instance-based rules from all agents
                 "total_rollout_time_seconds": total_rollout_time,
+                "class_based_results": {},  # Will store class-based results per agent
             }
         else:
             # Additional agent for this class - aggregate results
@@ -2036,7 +2179,7 @@ def extract_rules_from_policies(
             existing["all_rules"].extend(rules_list)
             existing["total_rollout_time_seconds"] += total_rollout_time
             
-            # Recompute class-level union metrics from ALL anchors across ALL agents
+            # Recompute class-level union metrics from ALL anchors (instance-based + class-based) across ALL agents
             # Get the appropriate dataset (test or train) based on eval_on_test_data
             if eval_on_test_data and env_data.get("X_test_unit") is not None:
                 X_data = env_data["X_test_unit"]
@@ -2045,13 +2188,23 @@ def extract_rules_from_policies(
                 X_data = env_data["X_unit"]
                 y_data = env_data["y"]
             
-            # Compute union of ALL anchors from ALL agents for this class
-            if X_data is not None and y_data is not None and len(existing["all_anchors"]) > 0:
+            # Collect ALL anchors: instance-based + class-based
+            all_anchors_for_union = existing["all_anchors"].copy()  # Instance-based anchors
+            
+            # Add class-based anchors if they exist (they're stored in class_based_results nested under class_key)
+            if "class_based_results" in existing:
+                # Collect anchors from all agents' class-based results
+                for agent_cb_result in existing["class_based_results"].values():
+                    if "anchors" in agent_cb_result:
+                        all_anchors_for_union.extend(agent_cb_result["anchors"])
+            
+            # Compute union of ALL anchors (instance-based + class-based) from ALL agents for this class
+            if X_data is not None and y_data is not None and len(all_anchors_for_union) > 0:
                 n_samples = X_data.shape[0]
                 union_mask = np.zeros(n_samples, dtype=bool)
                 
-                # Build union mask from all anchors across all agents
-                for anchor_data in existing["all_anchors"]:
+                # Build union mask from all anchors (instance-based + class-based) across all agents
+                for anchor_data in all_anchors_for_union:
                     if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
                         lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
                         upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
@@ -2062,10 +2215,12 @@ def extract_rules_from_policies(
                 
                 # Class-level coverage: fraction of class samples that are in the union
                 mask_cls = (y_data == target_class)
+                n_class_samples_aggregated = int(mask_cls.sum())  # Store for weighted averaging
                 if mask_cls.sum() > 0:
                     existing["class_coverage"] = float(union_mask[mask_cls].mean())
                 else:
                     existing["class_coverage"] = 0.0
+                existing["n_class_samples"] = n_class_samples_aggregated  # Update for weighted averaging
                 
                 # Class-level precision: fraction of points in union that belong to target class
                 if union_mask.any():
@@ -2093,33 +2248,367 @@ def extract_rules_from_policies(
             aggregated["anchors"] = aggregated["all_anchors"]  # All anchors from all agents
         
         logger.info(f"  Processed {len(anchors_list)} episodes for agent {agent_name}")
+        # Log in order: Instance metrics, Class-based metrics (will be logged later), then Union metrics
         logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
+        if instance_coverage_class_conditional > 0.0:
+            logger.info(f"    Class-conditional coverage: {instance_coverage_class_conditional:.4f}")
+            if instance_coverage < 0.05 and instance_coverage_class_conditional > 0.1:
+                logger.info(f"    Note: Low overall coverage is expected when dataset has many samples from other classes.")
+        logger.info(f"  Unique rules (instance-based): {len(unique_rules)}")
+        logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
+        # Union metrics will be logged after all agents are processed (for multi-agent) or here (for single-agent)
         if agents_per_class > 1:
-            logger.info(f"  Agent-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
-            # Class-level union will be logged after all agents are processed
+            # Log per-agent union metrics with anchor count for debugging
+            logger.info(f"  Per-agent union (this agent's {len(anchors_list)} episodes) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
+            # Class-level union (across all agents) will be logged after all agents are processed
         else:
             logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
-        logger.info(f"  Unique rules: {len(unique_rules)}")
-        logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
-        logger.info(f"  Total rollout time for agent: {total_rollout_time:.4f}s")
-        logger.info(f"  Total agent processing time: {class_total_time:.4f}s")
+        # logger.info(f"  Total rollout time for agent: {total_rollout_time:.4f}s")
+        # logger.info(f"  Total agent processing time: {class_total_time:.4f}s")
         
-        # If this is the last agent for this class, log aggregated class-level metrics
+        # If this is the last agent for this class, log aggregated instance-level metrics
+        # Union metrics will be recomputed after class-based rollouts to include both instance and class-based anchors
         if agents_per_class > 1 and class_key in results["per_class_results"]:
             aggregated = results["per_class_results"][class_key]
             if len(aggregated.get("agents", [])) == agents_per_class:
-                # All agents for this class have been processed
+                # All agents for this class have been processed (instance-based rollouts)
                 logger.info(f"\n  {'='*60}")
-                logger.info(f"  Class {target_class} - Aggregated Results (all {agents_per_class} agents):")
+                logger.info(f"  Class {target_class} - Instance-Based Results (all {agents_per_class} agents):")
                 logger.info(f"    Instance-level (avg across agents): "
                           f"precision={aggregated['instance_precision']:.4f}, "
                           f"coverage={aggregated['instance_coverage']:.4f}")
-                logger.info(f"    Class-level (union across all agents): "
+                logger.info(f"    Per-agent union (instance-based anchors only): "
                           f"precision={aggregated['class_precision']:.4f}, "
                           f"coverage={aggregated['class_coverage']:.4f}")
-                logger.info(f"    Total unique rules (across all agents): {aggregated.get('unique_rules_count', 0)}")
-                logger.info(f"    Total episodes (across all agents): {aggregated.get('n_episodes', 0)}")
+                logger.info(f"    Total unique rules (instance-based, across all agents): {aggregated.get('unique_rules_count', 0)}")
+                logger.info(f"    Total episodes (instance-based, across all agents): {aggregated.get('n_episodes', 0)}")
                 logger.info(f"  {'='*60}")
+                logger.info(f"  Note: Final union metrics (including class-based anchors) will be computed after class-based rollouts.")
+    
+    # ============================================================================
+    # CLASS-BASED ROLLOUTS (using k-means cluster centroids)
+    # ============================================================================
+    logger.info(f"\n{'='*80}")
+    logger.info("Starting CLASS-BASED rollouts (initialized from k-means cluster centroids)")
+    logger.info(f"{'='*80}")
+    
+    # Determine number of class-based rollouts per agent
+    # Use cluster centroids when available, otherwise limit to a reasonable number
+    n_class_based_rollouts_per_agent = None
+    if env_config.get("cluster_centroids_per_class") is not None:
+        # Use number of cluster centroids as guidance
+        max_centroids = 0
+        for cls in target_classes:
+            if cls in env_config["cluster_centroids_per_class"]:
+                max_centroids = max(max_centroids, len(env_config["cluster_centroids_per_class"][cls]))
+        n_class_based_rollouts_per_agent = max(5, min(max_centroids, 10))  # Between 5 and 10 rollouts
+        logger.info(f"  Using {n_class_based_rollouts_per_agent} class-based rollouts per agent (based on cluster centroids)")
+    else:
+        n_class_based_rollouts_per_agent = 5
+        logger.info(f"  Using {n_class_based_rollouts_per_agent} class-based rollouts per agent (default, no cluster centroids)")
+    
+    # Run class-based rollouts for each agent/class
+    for agent_name, policy in policies.items():
+        target_class = agent_to_class.get(agent_name, target_classes[0] if target_classes else 0)
+        class_key = f"class_{target_class}"
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Class-based rollouts for class {target_class} (agent: {agent_name})")
+        logger.info(f"{'='*80}")
+        
+        # Initialize lists for class-based rollouts
+        class_based_anchors_list = []
+        class_based_rules_list = []
+        class_based_instance_precisions = []
+        class_based_instance_coverages = []
+        class_based_class_precisions = []
+        class_based_class_coverages = []
+        class_based_rollout_times = []
+        
+        class_based_start_time = time.perf_counter()
+        
+        # Run class-based rollouts (NOT setting x_star_unit, so environment uses cluster centroids)
+        for rollout_idx in range(n_class_based_rollouts_per_agent):
+            rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
+            
+            # Create environment config for this class
+            class_based_config = anchor_config.copy()
+            class_based_config["target_classes"] = [target_class]
+            
+            # Ensure env_config is properly set up
+            if "env_config" not in class_based_config:
+                class_based_config["env_config"] = {}
+            class_based_config["env_config"] = class_based_config["env_config"].copy()
+            class_based_config["env_config"]["mode"] = "inference"
+            class_based_config["env_config"]["normalize_data"] = False
+            
+            # Ensure cluster centroids are available
+            if "cluster_centroids_per_class" not in class_based_config["env_config"]:
+                class_based_config["env_config"]["cluster_centroids_per_class"] = env_config.get("cluster_centroids_per_class")
+            
+            # Ensure other required configs
+            if "agents_per_class" not in class_based_config["env_config"]:
+                class_based_config["env_config"]["agents_per_class"] = agents_per_class
+            if "X_min" not in class_based_config["env_config"]:
+                class_based_config["env_config"]["X_min"] = env_config.get("X_min")
+            if "X_range" not in class_based_config["env_config"]:
+                class_based_config["env_config"]["X_range"] = env_config.get("X_range")
+            
+            # Create environment
+            env = AnchorEnv(**class_based_config)
+            
+            # Get the actual agent name
+            actual_agent_name = None
+            if hasattr(env, 'possible_agents') and len(env.possible_agents) > 0:
+                if agent_name in env.possible_agents:
+                    actual_agent_name = agent_name
+                else:
+                    actual_agent_name = env.possible_agents[0]
+            elif hasattr(env, 'agents') and len(env.agents) > 0:
+                actual_agent_name = env.agents[0]
+            else:
+                if agents_per_class == 1:
+                    actual_agent_name = f"agent_{target_class}"
+                else:
+                    actual_agent_name = f"agent_{target_class}_0"
+            
+            # IMPORTANT: DO NOT set x_star_unit - this triggers class-based initialization
+            # The environment will use cluster_centroids_per_class when available,
+            # otherwise it will use mean centroid of the class
+            
+            # Run rollout
+            episode_data = run_rollout_with_policy(
+                env=env,
+                policy=policy,
+                agent_id=actual_agent_name,
+                max_steps=steps_per_episode,
+                device=device,
+                seed=rollout_seed,
+                exploration_mode=exploration_mode,
+                action_noise_scale=action_noise_scale,
+                verbose_logging=verbose_logging,
+            )
+            
+            # Extract metrics
+            instance_precision = 0.0
+            instance_coverage = 0.0
+            class_precision = 0.0
+            class_coverage = 0.0
+            
+            if episode_data:
+                instance_precision = episode_data.get("anchor_precision", episode_data.get("instance_precision", 0.0))
+                instance_coverage = episode_data.get("anchor_coverage", episode_data.get("instance_coverage", 0.0))
+                class_precision = episode_data.get("class_precision", 0.0)
+                class_coverage = episode_data.get("class_coverage", 0.0)
+                
+                class_based_instance_precisions.append(float(instance_precision))
+                class_based_instance_coverages.append(float(instance_coverage))
+                class_based_class_precisions.append(float(class_precision))
+                class_based_class_coverages.append(float(class_coverage))
+                
+                rollout_time = episode_data.get("rollout_time_seconds", 0.0)
+                class_based_rollout_times.append(float(rollout_time))
+            
+            # Extract rule and bounds
+            rule = "any values (no tightened features)"
+            lower = None
+            upper = None
+            lower_normalized = None
+            upper_normalized = None
+            
+            if episode_data and "final_observation" in episode_data:
+                obs = np.array(episode_data["final_observation"], dtype=np.float32)
+                if len(obs) == 2 * n_features + 2:
+                    lower_normalized = obs[:n_features].copy()
+                    upper_normalized = obs[n_features:2*n_features].copy()
+                    
+                    # Denormalize bounds
+                    X_min = env_config.get("X_min")
+                    X_range = env_config.get("X_range")
+                    if X_min is not None and X_range is not None:
+                        lower = (lower_normalized * X_range) + X_min
+                        upper = (upper_normalized * X_range) + X_min
+                    else:
+                        lower = lower_normalized
+                        upper = upper_normalized
+                    
+                    # Extract rule - use the box center as reference for class-based initialization
+                    temp_env = AnchorEnv(
+                        X_unit=anchor_config["X_unit"],
+                        X_std=anchor_config["X_std"],
+                        y=anchor_config["y"],
+                        feature_names=feature_names,
+                        classifier=dataset_loader.get_classifier(),
+                        device="cpu",
+                        target_classes=[target_class],
+                        env_config={**env_config, "mode": "inference", "normalize_data": False}
+                    )
+                    temp_agent_name = f"agent_{target_class}"
+                    temp_env.lower[temp_agent_name] = lower_normalized
+                    temp_env.upper[temp_agent_name] = upper_normalized
+                    
+                    # For class-based, use the center of the final box as reference for initial bounds
+                    # This approximates what the initial box might have been
+                    initial_window = env_config.get("initial_window", 0.1)
+                    box_center = (lower_normalized + upper_normalized) / 2.0
+                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+                    
+                    rule = temp_env.extract_rule(
+                        temp_agent_name,
+                        max_features_in_rule=max_features_in_rule,
+                        initial_lower=initial_lower_normalized,
+                        initial_upper=initial_upper_normalized,
+                        denormalize=True
+                    )
+            
+            # Store anchor data
+            anchor_data = {
+                "rollout_type": "class_based",  # Flag to distinguish from instance-based
+                "rollout_idx": rollout_idx,
+                "agent": agent_name,
+                "instance_precision": float(instance_precision),
+                "instance_coverage": float(instance_coverage),
+                "class_precision": float(class_precision),
+                "class_coverage": float(class_coverage),
+                "anchor_precision": float(instance_precision),
+                "anchor_coverage": float(instance_coverage),
+                "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
+                "rule": rule,
+            }
+            
+            if lower is not None and upper is not None:
+                anchor_data.update({
+                    "lower_bounds": lower.tolist(),
+                    "upper_bounds": upper.tolist(),
+                    "box_widths": (upper - lower).tolist(),
+                    "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
+                    "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
+                    "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                })
+            
+            class_based_anchors_list.append(anchor_data)
+            class_based_rules_list.append(rule)
+        
+        # Compute aggregated metrics for class-based rollouts
+        class_based_unique_rules = list(set([r for r in class_based_rules_list if r and r != "any values (no tightened features)"]))
+        class_based_end_time = time.perf_counter()
+        class_based_total_time = class_based_end_time - class_based_start_time
+        
+        class_based_instance_precision = float(np.mean(class_based_instance_precisions)) if class_based_instance_precisions else 0.0
+        class_based_instance_coverage = float(np.mean(class_based_instance_coverages)) if class_based_instance_coverages else 0.0
+        class_based_class_precision = float(np.mean(class_based_class_precisions)) if class_based_class_precisions else 0.0
+        class_based_class_coverage = float(np.mean(class_based_class_coverages)) if class_based_class_coverages else 0.0
+        class_based_avg_rollout_time = float(np.mean(class_based_rollout_times)) if class_based_rollout_times else 0.0
+        class_based_total_rollout_time = float(np.sum(class_based_rollout_times)) if class_based_rollout_times else 0.0
+        
+        # Store class-based results in per_class_results
+        if class_key not in results["per_class_results"]:
+            results["per_class_results"][class_key] = {}
+        
+        # Add class-based results (append to existing or create new)
+        if "class_based_results" not in results["per_class_results"][class_key]:
+            results["per_class_results"][class_key]["class_based_results"] = {}
+        
+        results["per_class_results"][class_key]["class_based_results"][agent_name] = {
+            "class": int(target_class),
+            "agent": agent_name,
+            "rollout_type": "class_based",
+            "n_episodes": len(class_based_anchors_list),
+            "instance_precision": class_based_instance_precision,
+            "instance_coverage": class_based_instance_coverage,
+            "class_precision": class_based_class_precision,
+            "class_coverage": class_based_class_coverage,
+            "instance_precision_std": float(np.std(class_based_instance_precisions)) if len(class_based_instance_precisions) > 1 else 0.0,
+            "instance_coverage_std": float(np.std(class_based_instance_coverages)) if len(class_based_instance_coverages) > 1 else 0.0,
+            "unique_rules": class_based_unique_rules,
+            "unique_rules_count": len(class_based_unique_rules),
+            "rules": class_based_rules_list,
+            "anchors": class_based_anchors_list,
+            "avg_rollout_time_seconds": class_based_avg_rollout_time,
+            "total_rollout_time_seconds": class_based_total_rollout_time,
+            "total_processing_time_seconds": float(class_based_total_time),
+        }
+        
+        logger.info(f"  Class-based rollouts completed: {len(class_based_anchors_list)} episodes")
+        logger.info(f"  Class-based - Average precision: {class_based_instance_precision:.4f}, coverage: {class_based_instance_coverage:.4f}")
+        logger.info(f"  Unique rules (class-based): {len(class_based_unique_rules)}")
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("Class-based rollouts completed")
+    logger.info(f"{'='*80}")
+    
+    # Recompute union metrics for all classes to include BOTH instance-based AND class-based anchors
+    # This gives a more complete picture of coverage
+    logger.info(f"\n{'='*80}")
+    logger.info("Recomputing Union Metrics (Instance-based + Class-based anchors)")
+    logger.info(f"{'='*80}")
+    
+    # Get the appropriate dataset (test or train) based on eval_on_test_data
+    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+        X_data_union = env_data["X_test_unit"]
+        y_data_union = env_data["y_test"]
+    else:
+        X_data_union = env_data["X_unit"]
+        y_data_union = env_data["y"]
+    
+    # Recompute union metrics for each class
+    for class_key, class_data in results["per_class_results"].items():
+        target_class = class_data.get("class")
+        if target_class is None:
+            continue
+        
+        # Collect ALL anchors: instance-based + class-based
+        all_anchors_for_union = class_data.get("all_anchors", []).copy()  # Instance-based anchors
+        
+        # Add class-based anchors if they exist
+        if "class_based_results" in class_data:
+            for agent_cb_result in class_data["class_based_results"].values():
+                if "anchors" in agent_cb_result:
+                    all_anchors_for_union.extend(agent_cb_result["anchors"])
+        
+        # Compute union of ALL anchors (instance-based + class-based)
+        if X_data_union is not None and y_data_union is not None and len(all_anchors_for_union) > 0:
+            n_samples = X_data_union.shape[0]
+            union_mask = np.zeros(n_samples, dtype=bool)
+            
+            # Build union mask from all anchors
+            for anchor_data in all_anchors_for_union:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data_union >= lower) & (X_data_union <= upper), axis=1)
+                    union_mask |= in_box
+            
+            # Class-level coverage: fraction of class samples that are in the union
+            mask_cls = (y_data_union == target_class)
+            if mask_cls.sum() > 0:
+                class_coverage_combined = float(union_mask[mask_cls].mean())
+            else:
+                class_coverage_combined = 0.0
+            
+            # Class-level precision: fraction of points in union that belong to target class
+            if union_mask.any():
+                y_union = y_data_union[union_mask]
+                class_precision_combined = float((y_union == target_class).mean())
+            else:
+                class_precision_combined = 0.0
+            
+            # Update class-level metrics with combined union
+            class_data["class_precision"] = class_precision_combined
+            class_data["class_coverage"] = class_coverage_combined
+            
+            # Log the final union metrics
+            n_instance_anchors = len(class_data.get("all_anchors", []))
+            n_class_based_anchors = sum(
+                len(agent_cb_result.get("anchors", []))
+                for agent_cb_result in class_data.get("class_based_results", {}).values()
+            )
+            logger.info(f"\n  Class {target_class} - Final Union Metrics (Instance + Class-based):")
+            logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}")
+            logger.info(f"    Anchors used: {n_instance_anchors} instance-based + {n_class_based_anchors} class-based = {len(all_anchors_for_union)} total")
     
     # End overall timing
     overall_end_time = time.perf_counter()
@@ -2130,38 +2619,76 @@ def extract_rules_from_policies(
     logger.info("="*80)
     
     # Load and log NashConv metrics if available
+    # IMPORTANT: This is purely for logging and does NOT affect inference results.
+    # If NashConv loading fails, inference continues normally.
     # Use experiment_dir parameter (already available in function scope)
-    nashconv_data = _load_nashconv_metrics(experiment_dir)
-    if nashconv_data.get("available", False):
-        logger.info("\n" + "="*80)
-        logger.info("NASH EQUILIBRIUM CONVERGENCE METRICS")
-        logger.info("="*80)
-        
-        # Training metrics
-        if nashconv_data.get("training"):
-            training_data = nashconv_data["training"]
-            if training_data:
-                final_training = training_data[-1]
-                logger.info("Training NashConv (final):")
-                logger.info(f"  NashConv sum: {final_training.get('training/nashconv_sum', 'N/A'):.6f}")
-                logger.info(f"  Max exploitability: {final_training.get('training/exploitability_max', 'N/A'):.6f}")
-                if 'training/class_nashconv_sum' in final_training:
-                    logger.info(f"  Class NashConv sum: {final_training.get('training/class_nashconv_sum', 'N/A'):.6f}")
-                logger.info(f"  Training step: {final_training.get('step', 'N/A')}")
-        
-        # Evaluation metrics
-        if nashconv_data.get("evaluation"):
-            eval_data = nashconv_data["evaluation"]
-            if eval_data:
-                final_eval = eval_data[-1]
-                logger.info("\nEvaluation NashConv (final):")
-                logger.info(f"  NashConv sum: {final_eval.get('evaluation/nashconv_sum', 'N/A'):.6f}")
-                logger.info(f"  Max exploitability: {final_eval.get('evaluation/exploitability_max', 'N/A'):.6f}")
-                if 'evaluation/class_nashconv_sum' in final_eval:
-                    logger.info(f"  Class NashConv sum: {final_eval.get('evaluation/class_nashconv_sum', 'N/A'):.6f}")
-                logger.info(f"  Evaluation step: {final_eval.get('step', 'N/A')}")
-        
-        logger.info("="*80)
+    try:
+        nashconv_data = _load_nashconv_metrics(experiment_dir)
+        if nashconv_data.get("available", False):
+            logger.info("\n" + "="*80)
+            logger.info("NASH EQUILIBRIUM CONVERGENCE METRICS")
+            logger.info("="*80)
+            
+            has_any_metrics = False
+            
+            # Training metrics
+            if nashconv_data.get("training"):
+                training_data = nashconv_data["training"]
+                if training_data:
+                    final_training = training_data[-1]
+                    nashconv_sum = final_training.get('training/nashconv_sum')
+                    exploitability_max = final_training.get('training/exploitability_max')
+                    
+                    if nashconv_sum is not None or exploitability_max is not None:
+                        has_any_metrics = True
+                        logger.info("Training NashConv (final):")
+                        if nashconv_sum is not None:
+                            logger.info(f"  NashConv sum: {nashconv_sum:.6f}")
+                        else:
+                            logger.info(f"  NashConv sum: N/A (not found in training history)")
+                        if exploitability_max is not None:
+                            logger.info(f"  Max exploitability: {exploitability_max:.6f}")
+                        else:
+                            logger.info(f"  Max exploitability: N/A (not found in training history)")
+                        if 'training/class_nashconv_sum' in final_training:
+                            logger.info(f"  Class NashConv sum: {final_training.get('training/class_nashconv_sum'):.6f}")
+                        logger.info(f"  Training step: {final_training.get('step', 'N/A')}")
+            
+            # Evaluation metrics
+            if nashconv_data.get("evaluation"):
+                eval_data = nashconv_data["evaluation"]
+                if eval_data:
+                    final_eval = eval_data[-1]
+                    nashconv_sum = final_eval.get('evaluation/nashconv_sum')
+                    exploitability_max = final_eval.get('evaluation/exploitability_max')
+                    
+                    if nashconv_sum is not None or exploitability_max is not None:
+                        has_any_metrics = True
+                        logger.info("\nEvaluation NashConv (final):")
+                        if nashconv_sum is not None:
+                            logger.info(f"  NashConv sum: {nashconv_sum:.6f}")
+                        else:
+                            logger.info(f"  NashConv sum: N/A (not found in evaluation history)")
+                        if exploitability_max is not None:
+                            logger.info(f"  Max exploitability: {exploitability_max:.6f}")
+                        else:
+                            logger.info(f"  Max exploitability: N/A (not found in evaluation history)")
+                        if 'evaluation/class_nashconv_sum' in final_eval:
+                            logger.info(f"  Class NashConv sum: {final_eval.get('evaluation/class_nashconv_sum'):.6f}")
+                        logger.info(f"  Evaluation step: {final_eval.get('step', 'N/A')}")
+            
+            if not has_any_metrics:
+                logger.info("  NashConv metrics files found but no metrics extracted.")
+                logger.info("  This may indicate the training/evaluation history files don't contain NashConv metrics.")
+                logger.info(f"  Experiment directory: {experiment_dir}")
+            
+            logger.info("="*80)
+        else:
+            logger.debug(f"NashConv metrics not available. Experiment dir: {experiment_dir}")
+    except Exception as e:
+        # NashConv loading/logging failures should NOT break inference
+        logger.warning(f"Failed to load/log NashConv metrics (non-fatal): {e}")
+        logger.debug(f"NashConv error details: {type(e).__name__}: {e}", exc_info=True)
     
     # Calculate total rollout time across all classes
     total_rollout_time_all_classes = sum(

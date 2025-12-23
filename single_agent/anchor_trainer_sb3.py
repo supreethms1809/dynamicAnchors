@@ -227,7 +227,7 @@ class AnchorTrainerSB3:
         self,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 100,
+        max_cycles: Optional[int] = None,  # If None, will read from env_config
         device: str = "cpu",
         eval_on_test_data: bool = True
     ):
@@ -270,6 +270,15 @@ class AnchorTrainerSB3:
         # Get default environment configuration
         if env_config is None:
             env_config = self._get_default_env_config()
+        
+        # Resolve episode length: if not explicitly provided, use env_config.
+        if max_cycles is None:
+            max_cycles = env_config.get("max_cycles")
+            if max_cycles is None:
+                raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
+            max_cycles = int(max_cycles)
+        else:
+            max_cycles = int(max_cycles)
         
         # Apply logging verbosity early based on config
         verbosity = env_config.get("logging_verbosity", "normal")
@@ -314,6 +323,56 @@ class AnchorTrainerSB3:
             env_config_with_data["eval_on_test_data"] = False
             logger.info(f"  Evaluation configured to use TRAINING data")
         
+        # Compute k-means centroids for diversity across episodes
+        # This ensures each episode can start from a different cluster centroid
+        # Using 10 centroids per class for diversity (same as multi-agent when agents_per_class=1)
+        n_clusters_per_class = 10
+        logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class for diversity...")
+        logger.info(f"  Note: Using {n_clusters_per_class} centroids per class for episode diversity (matching multi-agent behavior)")
+        
+        try:
+            from utils.clusters import compute_cluster_centroids_per_class
+            
+            # Always compute centroids on training data
+            X_data = env_data["X_unit"]
+            y_data = env_data["y"]
+            
+            cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                X_unit=X_data,
+                y=y_data,
+                n_clusters_per_class=n_clusters_per_class,
+                random_state=self.seed if hasattr(self, 'seed') else 42,
+                min_samples_per_cluster=1
+            )
+            
+            # Verify we have enough centroids for each class
+            for cls in target_classes:
+                if cls in cluster_centroids_per_class:
+                    n_centroids = len(cluster_centroids_per_class[cls])
+                    if n_centroids < n_clusters_per_class:
+                        logger.warning(
+                            f"   Class {cls}: Only {n_centroids} centroids computed "
+                            f"(requested {n_clusters_per_class}). "
+                            f"May not have enough samples for k-means."
+                        )
+                    else:
+                        logger.info(f"   Class {cls}: {n_centroids} centroids computed")
+                else:
+                    logger.warning(f"   Class {cls}: No centroids computed")
+            
+            # Set cluster centroids in env_config
+            env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
+            logger.info("   ✓ Cluster centroids set in environment config")
+        except ImportError as e:
+            logger.warning(f"   ⚠ Could not compute cluster centroids: {e}")
+            logger.warning(f"  Install sklearn: pip install scikit-learn")
+            logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
+            env_config_with_data["cluster_centroids_per_class"] = None
+        except Exception as e:
+            logger.warning(f"   ⚠ Error computing cluster centroids: {e}")
+            logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
+            env_config_with_data["cluster_centroids_per_class"] = None
+        
         # Create experiment folder
         timestamp = datetime.now().strftime("%y_%m_%d-%H_%M_%S")
         experiment_id = f"{self.algorithm}_single_agent_sb3_{timestamp}"
@@ -352,9 +411,11 @@ class AnchorTrainerSB3:
                     config_data = yaml.safe_load(f)
                     if config_data and "env_config" in config_data:
                         env_config = config_data["env_config"]
-                        # Also load logging_verbosity from top-level YAML if present
+                        # Also load logging_verbosity and max_cycles from top-level YAML if present
                         if "logging_verbosity" in config_data:
                             env_config["logging_verbosity"] = config_data["logging_verbosity"]
+                        if "max_cycles" in config_data:
+                            env_config["max_cycles"] = config_data["max_cycles"]
                         logger.info(f"Loaded environment config from: {config_path}")
             except Exception as e:
                 logger.warning(f"Could not load config from {config_path}: {e}. Using defaults.")
@@ -730,7 +791,7 @@ class AnchorTrainerSB3:
         experiment_dir: str,
         env_config: Optional[Dict[str, Any]] = None,
         target_classes: Optional[List[int]] = None,
-        max_cycles: int = 100,
+        max_cycles: Optional[int] = None,  # If None, will read from env_config
         device: str = "cpu",
         eval_on_test_data: bool = True
     ):
@@ -766,6 +827,15 @@ class AnchorTrainerSB3:
         if env_config is None:
             env_config = self._get_default_env_config()
         
+        # Resolve episode length: if not explicitly provided, use env_config.
+        if max_cycles is None:
+            max_cycles = env_config.get("max_cycles")
+            if max_cycles is None:
+                raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
+            max_cycles = int(max_cycles)
+        else:
+            max_cycles = int(max_cycles)
+        
         # Create environment configuration with data
         env_config_with_data = {
             **env_config,
@@ -788,6 +858,53 @@ class AnchorTrainerSB3:
             })
         else:
             env_config_with_data["eval_on_test_data"] = False
+        
+        # Compute k-means centroids for diversity (same as setup_experiment)
+        # This ensures reloaded experiments also have cluster centroids
+        n_clusters_per_class = 10
+        logger.info(f"\nComputing k-means centroids (k={n_clusters_per_class}) for each class...")
+        try:
+            from utils.clusters import compute_cluster_centroids_per_class
+            
+            # Always compute centroids on training data
+            X_data = env_data["X_unit"]
+            y_data = env_data["y"]
+            
+            cluster_centroids_per_class = compute_cluster_centroids_per_class(
+                X_unit=X_data,
+                y=y_data,
+                n_clusters_per_class=n_clusters_per_class,
+                random_state=self.seed if hasattr(self, 'seed') else 42,
+                min_samples_per_cluster=1
+            )
+            
+            # Verify we have enough centroids for each class
+            for cls in target_classes:
+                if cls in cluster_centroids_per_class:
+                    n_centroids = len(cluster_centroids_per_class[cls])
+                    if n_centroids < n_clusters_per_class:
+                        logger.warning(
+                            f"   Class {cls}: Only {n_centroids} centroids computed "
+                            f"(requested {n_clusters_per_class}). "
+                            f"May not have enough samples for k-means."
+                        )
+                    else:
+                        logger.info(f"   Class {cls}: {n_centroids} centroids computed")
+                else:
+                    logger.warning(f"   Class {cls}: No centroids computed")
+            
+            # Set cluster centroids in env_config
+            env_config_with_data["cluster_centroids_per_class"] = cluster_centroids_per_class
+            logger.info("   ✓ Cluster centroids set in environment config")
+        except ImportError as e:
+            logger.warning(f"   ⚠ Could not compute cluster centroids: {e}")
+            logger.warning(f"  Install sklearn: pip install scikit-learn")
+            logger.warning(f"  Falling back to mean centroid per class")
+            env_config_with_data["cluster_centroids_per_class"] = None
+        except Exception as e:
+            logger.warning(f"   ⚠ Error computing cluster centroids: {e}")
+            logger.warning(f"  Falling back to mean centroid per class")
+            env_config_with_data["cluster_centroids_per_class"] = None
         
         # Set up environments (without creating models)
         self.target_classes = target_classes

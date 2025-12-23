@@ -162,9 +162,12 @@ class AnchorTrainer:
         if target_classes is None:
             target_classes = list(np.unique(self.dataset_loader.y_train))
         
-        # Resolve episode length: if not explicitly provided, use env_config (or default).
+        # Resolve episode length: if not explicitly provided, use env_config.
         if max_cycles is None:
-            max_cycles = int(env_config.get("max_cycles", 100))
+            max_cycles = env_config.get("max_cycles")
+            if max_cycles is None:
+                raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
+            max_cycles = int(max_cycles)
         else:
             max_cycles = int(max_cycles)
 
@@ -482,7 +485,8 @@ class AnchorTrainer:
                     
                     # Run episode
                     step_count = 0
-                    max_steps = self.task.max_steps(env) if hasattr(self.task, 'max_steps') else 100
+                    # Read max_steps from environment config, not hardcoded default
+                    max_steps = self.task.max_steps(env) if hasattr(self.task, 'max_steps') else env.max_cycles
                     
                     # Debug: Check initial td structure - SS: REMOVE THIS DEBUG LATER
                     if episode == 0:

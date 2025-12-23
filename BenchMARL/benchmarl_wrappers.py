@@ -35,9 +35,11 @@ class AnchorTaskClass(TaskClass):
     ) -> Callable[[], EnvBase]:
         config = copy.deepcopy(self.config)
         
-        # SS: Track where this max_cycles is set. The reading from yaml is not getting passed to the environment.
-        # Below code needs fixing.
-        max_cycles = config.get("max_cycles", 100)
+        # Read max_cycles from config - no hardcoded default to ensure YAML settings are respected
+        max_cycles = config.get("max_cycles")
+        if max_cycles is None:
+            raise ValueError("max_cycles must be specified in config. Check your YAML config file.")
+        max_cycles = int(max_cycles)
 
         env_config = {k: v for k, v in config.items() if k != "max_cycles"}
         

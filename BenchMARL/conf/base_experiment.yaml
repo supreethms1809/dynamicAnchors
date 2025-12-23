@@ -54,7 +54,7 @@ max_n_iters: null
 # With max_cycles=100: 200 * 100 = 20,000 frames (200 episodes if all run to max)
 # In practice, episodes often terminate early when targets are met, so this yields ~300-400 episodes
 # This provides sufficient training while avoiding excessive compute time
-max_n_frames: 480_000
+max_n_frames: 24_000
 
 # Number of frames collected and each experiment iteration
 # CPU-optimized: Reduced batch size to prevent CPU overload and hangs

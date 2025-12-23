@@ -255,25 +255,79 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
                 f"class_prec={class_precision:.3f}, class_cov={class_coverage:.3f}, n_anchors={n_anchors})"
             )
         
-        # Extract rules
+        # Extract instance-based rules
         unique_rules = class_data.get("unique_rules", [])
         all_rules = class_data.get("rules", [])
         
-        # Count features in rules
+        # Extract class-based rules
+        class_based_results = class_data.get("class_based_results", {})
+        class_based_unique_rules = []
+        class_based_all_rules = []
+        class_based_precision = 0.0
+        class_based_coverage = 0.0
+        
+        if isinstance(class_based_results, dict):
+            if "unique_rules" in class_based_results:
+                # Single result dict (single-agent format)
+                class_based_unique_rules = class_based_results.get("unique_rules", [])
+                class_based_all_rules = class_based_results.get("rules", [])
+                class_based_precision = class_based_results.get("precision", 0.0)
+                class_based_coverage = class_based_results.get("coverage", 0.0)
+            else:
+                # Dict of agent results (multi-agent format)
+                for agent_name, agent_results in class_based_results.items():
+                    cb_unique = agent_results.get("unique_rules", [])
+                    cb_rules = agent_results.get("rules", [])
+                    class_based_unique_rules.extend(cb_unique)
+                    class_based_all_rules.extend(cb_rules)
+                    # Aggregate metrics (average across agents)
+                    # Multi-agent stores class-based metrics as "instance_precision"/"instance_coverage"
+                    # which are the average precision/coverage across class-based rollouts per agent
+                    if len(class_based_results) > 0:
+                        agent_prec = agent_results.get("instance_precision", agent_results.get("precision", 0.0))
+                        agent_cov = agent_results.get("instance_coverage", agent_results.get("coverage", 0.0))
+                        class_based_precision += agent_prec / len(class_based_results)
+                        class_based_coverage += agent_cov / len(class_based_results)
+        
+        # Count features in instance-based rules
         for rule_str in unique_rules:
+            features = extract_features_from_rule(rule_str)
+            feature_frequency.update(features)
+        
+        # Count features in class-based rules
+        for rule_str in class_based_unique_rules:
             features = extract_features_from_rule(rule_str)
             feature_frequency.update(features)
         
         class_summary = {
             "class": int(target_class),
             "agent": class_data.get("group", "unknown"),
+            # Instance-level metrics (boxes around instances)
             "instance_precision": float(instance_precision),
             "instance_coverage": float(instance_coverage),
+            # Class Union metrics (union of all instance-based anchors)
+            "class_union_precision": float(class_precision),
+            "class_union_coverage": float(class_coverage),
+            # Legacy names for backward compatibility
             "class_precision": float(class_precision),
             "class_coverage": float(class_coverage),
+            "n_class_samples": int(class_data.get("n_class_samples", 0)),  # Store for weighted averaging
             "n_total_rules": len(all_rules),
             "n_unique_rules": len(unique_rules),
-            "unique_rules": unique_rules
+            "unique_rules": unique_rules,
+            # Class-level metrics (boxes around k-means centroids)
+            "class_level_precision": float(class_based_precision),
+            "class_level_coverage": float(class_based_coverage),
+            # Legacy names for backward compatibility
+            "class_based_precision": float(class_based_precision),
+            "class_based_coverage": float(class_based_coverage),
+            "class_level_n_total_rules": len(class_based_all_rules),
+            "class_level_n_unique_rules": len(class_based_unique_rules),
+            "class_level_unique_rules": class_based_unique_rules,
+            # Legacy names
+            "class_based_n_total_rules": len(class_based_all_rules),
+            "class_based_n_unique_rules": len(class_based_unique_rules),
+            "class_based_unique_rules": class_based_unique_rules,
         }
         
         # Add stds if available
@@ -293,14 +347,26 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         all_coverages.extend([instance_coverage, class_coverage])
         all_rule_counts.append(len(all_rules))
         all_unique_rule_counts.append(len(unique_rules))
+        
+        # Also collect class-level stats (centroid-based rollouts)
+        if class_based_precision > 0 or class_based_coverage > 0:
+            all_precisions.append(class_based_precision)
+            all_coverages.append(class_based_coverage)
+            all_rule_counts.append(len(class_based_all_rules))
+            all_unique_rule_counts.append(len(class_based_unique_rules))
+    
+    # Store summary stats (no global averages - removed per user request)
+    # Only keep rule counts and feature frequency for overall stats
+    class_level_precisions = [s.get("class_level_precision", s.get("class_based_precision", 0.0)) for s in summary["per_class_summary"].values() if s.get("class_level_precision", s.get("class_based_precision", 0.0)) > 0]
+    class_level_coverages = [s.get("class_level_coverage", s.get("class_based_coverage", 0.0)) for s in summary["per_class_summary"].values() if s.get("class_level_coverage", s.get("class_based_coverage", 0.0)) > 0]
+    class_level_unique_rule_counts = [s.get("class_level_n_unique_rules", s.get("class_based_n_unique_rules", 0)) for s in summary["per_class_summary"].values()]
     
     summary["overall_stats"] = {
-        "mean_instance_precision": float(np.mean([s["instance_precision"] for s in summary["per_class_summary"].values()])),
-        "mean_instance_coverage": float(np.mean([s["instance_coverage"] for s in summary["per_class_summary"].values()])),
-        "mean_class_precision": float(np.mean([s["class_precision"] for s in summary["per_class_summary"].values()])),
-        "mean_class_coverage": float(np.mean([s["class_coverage"] for s in summary["per_class_summary"].values()])),
-        # NashConv metrics will be added later if available
+        # Rule counts and feature frequency only (no global averages)
         "total_unique_rules": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
+        "total_unique_rules_instance_based": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
+        "total_unique_rules_class_level": int(sum(class_level_unique_rule_counts)),
+        "total_unique_rules_class_based": int(sum(class_level_unique_rule_counts)),  # Legacy
         "mean_unique_rules_per_class": float(np.mean(all_unique_rule_counts)),
         "feature_frequency": dict(feature_frequency.most_common())
     }
@@ -326,8 +392,13 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     class_nums = [per_class[c]["class"] for c in classes]
     instance_prec = [per_class[c]["instance_precision"] for c in classes]
     instance_cov = [per_class[c]["instance_coverage"] for c in classes]
-    class_prec = [per_class[c]["class_precision"] for c in classes]
-    class_cov = [per_class[c]["class_coverage"] for c in classes]
+    class_union_prec = [per_class[c].get("class_union_precision", per_class[c].get("class_precision", 0.0)) for c in classes]
+    class_union_cov = [per_class[c].get("class_union_coverage", per_class[c].get("class_coverage", 0.0)) for c in classes]
+    class_level_prec = [per_class[c].get("class_level_precision", per_class[c].get("class_based_precision", 0.0)) for c in classes]
+    class_level_cov = [per_class[c].get("class_level_coverage", per_class[c].get("class_based_coverage", 0.0)) for c in classes]
+    
+    # Check if we have class-level metrics (centroid-based rollouts)
+    has_class_level = any(cl > 0 for cl in class_level_prec) or any(cl > 0 for cl in class_level_cov)
     
     # Format title with dataset name
     title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
@@ -335,21 +406,33 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     fig, ax = plt.subplots(figsize=(14, 7))
     
     x = np.arange(len(class_nums))
-    width = 0.2  # Thin bars for 4 metrics per class
+    if has_class_level:
+        width = 0.15  # Thinner bars for 6 metrics per class
+    else:
+        width = 0.2  # Thin bars for 4 metrics per class
     
-    # Plot all 4 metrics side by side for each class
-    bars1 = ax.bar(x - 1.5*width, instance_prec, width, label='Instance Precision', 
+    # Plot instance-level metrics (boxes around instances)
+    bars1 = ax.bar(x - 2.5*width, instance_prec, width, label='Instance-Level Precision', 
                    alpha=0.8, color='steelblue', edgecolor='black', linewidth=1)
-    bars2 = ax.bar(x - 0.5*width, instance_cov, width, label='Instance Coverage', 
+    bars2 = ax.bar(x - 1.5*width, instance_cov, width, label='Instance-Level Coverage', 
                    alpha=0.8, color='coral', edgecolor='black', linewidth=1)
-    bars3 = ax.bar(x + 0.5*width, class_prec, width, label='Class Precision (Union)', 
+    # Plot class union metrics (union of instance-based anchors)
+    bars3 = ax.bar(x - 0.5*width, class_union_prec, width, label='Class Union Precision', 
                    alpha=0.8, color='darkgreen', edgecolor='black', linewidth=1)
-    bars4 = ax.bar(x + 1.5*width, class_cov, width, label='Class Coverage (Union)', 
+    bars4 = ax.bar(x + 0.5*width, class_union_cov, width, label='Class Union Coverage', 
                    alpha=0.8, color='purple', edgecolor='black', linewidth=1)
+    
+    # Plot class-level metrics (centroid-based rollouts) if available
+    if has_class_level:
+        bars5 = ax.bar(x + 1.5*width, class_level_prec, width, label='Class-Level Precision', 
+                       alpha=0.8, color='orange', edgecolor='black', linewidth=1)
+        bars6 = ax.bar(x + 2.5*width, class_level_cov, width, label='Class-Level Coverage', 
+                       alpha=0.8, color='teal', edgecolor='black', linewidth=1)
     
     ax.set_xlabel('Class', fontsize=12, fontweight='bold')
     ax.set_ylabel('Value', fontsize=12, fontweight='bold')
-    ax.set_title(f'{title_prefix}: Metrics Comparison per Class', fontsize=14, fontweight='bold')
+    title_suffix = " (with Class-Level)" if has_class_level else ""
+    ax.set_title(f'{title_prefix}: Metrics Comparison per Class{title_suffix}', fontsize=14, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(class_nums)
     ax.set_ylim([0, 1.1])
@@ -357,7 +440,10 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     ax.legend(fontsize=10, loc='best', framealpha=0.9, ncol=2)
     
     # Add value labels on bars
-    for bars in [bars1, bars2, bars3, bars4]:
+    all_bars = [bars1, bars2, bars3, bars4]
+    if has_class_level:
+        all_bars.extend([bars5, bars6])
+    for bars in all_bars:
         for bar in bars:
             height = bar.get_height()
             if height > 0.05:  # Only label if bar is tall enough
@@ -386,12 +472,20 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     # Format title with dataset name
     title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    # Check if we have class-level metrics (centroid-based rollouts)
+    has_class_level = any(per_class[c].get("class_level_precision", per_class[c].get("class_based_precision", 0.0)) > 0 or 
+                         per_class[c].get("class_level_coverage", per_class[c].get("class_based_coverage", 0.0)) > 0 
+                         for c in classes)
+    
+    if has_class_level:
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(24, 7))
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     
     # Get colors for classes
     colors = plt.cm.tab10(np.linspace(0, 1, len(classes)))
     
-    # Left plot: Instance-level precision vs coverage
+    # Left plot: Instance-level precision vs coverage (boxes around instances)
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
@@ -410,7 +504,7 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     
     ax1.set_xlabel('Coverage', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax1.set_title(f'{title_prefix}: Instance-Level Precision vs Coverage Trade-off', fontsize=14, fontweight='bold')
+    ax1.set_title(f'{title_prefix}: Instance-Level Precision vs Coverage', fontsize=14, fontweight='bold')
     ax1.set_xlim([-0.05, 1.05])
     ax1.set_ylim([0.7, 1.05])
     ax1.grid(True, alpha=0.3, linestyle='--', zorder=0)
@@ -419,26 +513,28 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax1.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
     ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
     
-    # Right plot: Class-level (union) precision vs coverage
+    # Middle plot: Class Union precision vs coverage (union of instance-based anchors)
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
+        union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+        union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
         ax2.scatter(
-            class_data["class_coverage"],
-            class_data["class_precision"],
+            union_cov,
+            union_prec,
             s=300, alpha=0.8, color=colors[idx],
             marker='s', label=f'Class {cls}',
             edgecolors='black', linewidths=2, zorder=3
         )
         # Add class label
         ax2.annotate(f'C{cls}', 
-                    (class_data["class_coverage"], class_data["class_precision"]),
+                    (union_cov, union_prec),
                     xytext=(5, 5), textcoords='offset points', fontsize=11, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='black'))
     
     ax2.set_xlabel('Coverage', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax2.set_title(f'{title_prefix}: Class-Level (Union) Precision vs Coverage Trade-off', fontsize=14, fontweight='bold')
+    ax2.set_title(f'{title_prefix}: Class Union Precision vs Coverage', fontsize=14, fontweight='bold')
     ax2.set_xlim([-0.05, 1.05])
     ax2.set_ylim([0.7, 1.05])
     ax2.grid(True, alpha=0.3, linestyle='--', zorder=0)
@@ -447,78 +543,46 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax2.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
     ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
     
+    # Right plot: Class-level precision vs coverage (centroid-based rollouts, if available)
+    if has_class_level:
+        for idx, class_key in enumerate(classes):
+            class_data = per_class[class_key]
+            cls = class_data["class"]
+            cl_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+            cl_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+            if cl_prec > 0 or cl_cov > 0:
+                ax3.scatter(
+                    cl_cov,
+                    cl_prec,
+                    s=300, alpha=0.8, color=colors[idx],
+                    marker='^', label=f'Class {cls}',
+                    edgecolors='black', linewidths=2, zorder=3
+                )
+                # Add class label
+                ax3.annotate(f'C{cls}', 
+                            (cl_cov, cl_prec),
+                            xytext=(5, 5), textcoords='offset points', fontsize=11, fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='black'))
+        
+        ax3.set_xlabel('Coverage', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('Precision', fontsize=12, fontweight='bold')
+        ax3.set_title(f'{title_prefix}: Class-Level Precision vs Coverage', fontsize=14, fontweight='bold')
+        ax3.set_xlim([-0.05, 1.05])
+        ax3.set_ylim([0.7, 1.05])
+        ax3.grid(True, alpha=0.3, linestyle='--', zorder=0)
+        ax3.legend(fontsize=10, loc='best', framealpha=0.9)
+        # Add diagonal reference line (ideal: high precision, high coverage)
+        ax3.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
+        ax3.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
+    
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'precision_coverage_tradeoff.png'), dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved precision-coverage trade-off plot to {output_dir}/precision_coverage_tradeoff.png")
 
 
-def plot_global_metrics(summary: Dict, output_dir: str, dataset_name: str = ""):
-    """Plot all global metrics (precision and coverage, instance and class-level) in a single plot."""
-    if not HAS_PLOTTING:
-        return
-    
-    per_class = summary["per_class_summary"]
-    overall_stats = summary.get("overall_stats", {})
-    
-    if not per_class:
-        logger.warning("No class data available for global metrics.")
-        return
-    
-    # Format title with dataset name
-    title_prefix = f"Multi-Agent - {dataset_name.upper()}" if dataset_name else "Multi-Agent"
-    
-    # Calculate global metrics (mean across classes)
-    global_instance_precision = overall_stats.get("mean_instance_precision", 
-        np.mean([per_class[c]["instance_precision"] for c in per_class]))
-    global_instance_coverage = overall_stats.get("mean_instance_coverage",
-        np.mean([per_class[c]["instance_coverage"] for c in per_class]))
-    global_class_precision = overall_stats.get("mean_class_precision",
-        np.mean([per_class[c]["class_precision"] for c in per_class]))
-    global_class_coverage = overall_stats.get("mean_class_coverage",
-        np.mean([per_class[c]["class_coverage"] for c in per_class]))
-    
-    # Calculate standard deviations
-    instance_precisions = [per_class[c]["instance_precision"] for c in per_class]
-    instance_coverages = [per_class[c]["instance_coverage"] for c in per_class]
-    class_precisions = [per_class[c]["class_precision"] for c in per_class]
-    class_coverages = [per_class[c]["class_coverage"] for c in per_class]
-    
-    std_instance_precision = np.std(instance_precisions) if len(instance_precisions) > 1 else 0.0
-    std_instance_coverage = np.std(instance_coverages) if len(instance_coverages) > 1 else 0.0
-    std_class_precision = np.std(class_precisions) if len(class_precisions) > 1 else 0.0
-    std_class_coverage = np.std(class_coverages) if len(class_coverages) > 1 else 0.0
-    
-    # Single plot with all 4 metrics
-    fig, ax = plt.subplots(figsize=(12, 7))
-    
-    metrics = ['Instance\nPrecision', 'Instance\nCoverage', 'Class\nPrecision\n(Union)', 'Class\nCoverage\n(Union)']
-    values = [global_instance_precision, global_instance_coverage, global_class_precision, global_class_coverage]
-    stds = [std_instance_precision, std_instance_coverage, std_class_precision, std_class_coverage]
-    colors = ['steelblue', 'coral', 'darkgreen', 'purple']
-    
-    x = np.arange(len(metrics))
-    bars = ax.bar(x, values, alpha=0.8, color=colors, edgecolor='black', linewidth=1.5,
-                  yerr=stds, capsize=10, error_kw={'elinewidth': 2, 'capthick': 2})
-    
-    ax.set_ylabel('Value', fontsize=12, fontweight='bold')
-    ax.set_title(f'{title_prefix}: Global Metrics Summary', fontsize=14, fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics, fontsize=10)
-    ax.set_ylim([0, 1.1])
-    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
-    
-    # Add value labels
-    for i, (val, std) in enumerate(zip(values, stds)):
-        label = f'{val:.3f}'
-        if std > 0:
-            label += f'\n±{std:.3f}'
-        ax.text(i, val + std + 0.05, label, ha='center', va='bottom', fontsize=10, fontweight='bold')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'global_metrics.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved global metrics plot to {output_dir}/global_metrics.png")
+# REMOVED: plot_global_metrics function
+# Global metrics (averages across classes) removed per user request - not meaningful for comparison
 
 
 def plot_nashconv_convergence(nashconv_data: Dict[str, Any], output_dir: str, dataset_name: str = ""):
@@ -1339,13 +1403,8 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
         f.write(f"Total unique rules across all classes: {summary['overall_stats']['total_unique_rules']}\n")
         f.write(f"Mean unique rules per class: {summary['overall_stats']['mean_unique_rules_per_class']:.2f}\n\n")
         
-        # Overall metrics
-        f.write("OVERALL METRICS\n")
-        f.write("-"*80 + "\n")
-        f.write(f"Mean instance-level precision: {summary['overall_stats']['mean_instance_precision']:.4f}\n")
-        f.write(f"Mean instance-level coverage: {summary['overall_stats']['mean_instance_coverage']:.4f}\n")
-        f.write(f"Mean class-level precision: {summary['overall_stats']['mean_class_precision']:.4f}\n")
-        f.write(f"Mean class-level coverage: {summary['overall_stats']['mean_class_coverage']:.4f}\n\n")
+        # Overall metrics (removed global averages per user request - not meaningful for comparison)
+        # Per-class metrics are shown in the PER-CLASS DETAILS section below
         
         # NashConv metrics if available
         if 'nashconv_metrics' in summary and summary['nashconv_metrics'].get('available', False):
@@ -1390,8 +1449,13 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
             f.write(f"\nClass {class_data['class']} (Agent: {class_data.get('agent', 'unknown')}):\n")
             f.write(f"  Instance-level precision: {class_data['instance_precision']:.4f}\n")
             f.write(f"  Instance-level coverage: {class_data['instance_coverage']:.4f}\n")
-            f.write(f"  Class-level precision: {class_data['class_precision']:.4f}\n")
-            f.write(f"  Class-level coverage: {class_data['class_coverage']:.4f}\n")
+            f.write(f"  Class Union precision: {class_data.get('class_union_precision', class_data.get('class_precision', 0.0)):.4f}\n")
+            f.write(f"  Class Union coverage: {class_data.get('class_union_coverage', class_data.get('class_coverage', 0.0)):.4f}\n")
+            class_level_prec = class_data.get('class_level_precision', class_data.get('class_based_precision', 0.0))
+            class_level_cov = class_data.get('class_level_coverage', class_data.get('class_based_coverage', 0.0))
+            if class_level_prec > 0 or class_level_cov > 0:
+                f.write(f"  Class-level precision: {class_level_prec:.4f}\n")
+                f.write(f"  Class-level coverage: {class_level_cov:.4f}\n")
             f.write(f"  Total rules: {class_data['n_total_rules']}\n")
             f.write(f"  Unique rules: {class_data['n_unique_rules']}\n")
         
@@ -1498,20 +1562,12 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
         "n_classes": summary.get("n_classes", 0),
         "classes": summary.get("classes", []),
         "metrics": {
-            "instance_level": {
-                "mean_precision": overall_stats.get("mean_instance_precision", overall_stats.get("mean_precision", 0.0)),
-                "mean_coverage": overall_stats.get("mean_instance_coverage", overall_stats.get("mean_coverage", 0.0)),
-                "std_precision": overall_stats.get("std_instance_precision", overall_stats.get("std_precision", 0.0)),
-                "std_coverage": overall_stats.get("std_instance_coverage", overall_stats.get("std_coverage", 0.0)),
-            },
-            "class_level": {
-                "mean_precision": overall_stats.get("mean_class_precision", 0.0),
-                "mean_coverage": overall_stats.get("mean_class_coverage", 0.0),
-                "std_precision": overall_stats.get("std_class_precision", 0.0),
-                "std_coverage": overall_stats.get("std_class_coverage", 0.0),
-            },
+            # Global metrics (averages across classes) removed per user request
+            # Only rule counts and feature frequency are kept
             "global": {
                 "total_unique_rules": overall_stats.get("total_unique_rules", 0),
+                "total_unique_rules_instance_based": overall_stats.get("total_unique_rules_instance_based", 0),
+                "total_unique_rules_class_level": overall_stats.get("total_unique_rules_class_level", overall_stats.get("total_unique_rules_class_based", 0)),
                 "mean_unique_rules_per_class": overall_stats.get("mean_unique_rules_per_class", 0.0),
             }
         },
@@ -1735,7 +1791,7 @@ Examples:
         logger.info("Generating plots...")
         plot_metrics_comparison(summary, str(output_dir), args.dataset)
         plot_precision_coverage_tradeoff(summary, str(output_dir), args.dataset)
-        plot_global_metrics(summary, str(output_dir), args.dataset)
+        # REMOVED: plot_global_metrics - global averages removed per user request
         plot_feature_importance(summary, str(output_dir), args.dataset)
         
         # Plot NashConv convergence if available

@@ -147,8 +147,8 @@ def main():
     parser.add_argument(
         "--max_cycles",
         type=int,
-        default=100,
-        help="Maximum cycles per episode (default: 100)"
+        default=None,
+        help="Maximum cycles per episode (default: read from YAML config file)"
     )
     
     parser.add_argument(
@@ -272,7 +272,7 @@ def main():
     # Create trainer
     experiment_config = {
         "total_timesteps": args.total_timesteps,
-        "eval_freq": 500,
+        "eval_freq": 6000,
         "n_eval_episodes": 10,
         "checkpoint_freq": 12_000,
         "log_interval": 10,

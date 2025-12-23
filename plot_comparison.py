@@ -490,6 +490,17 @@ def plot_precision_coverage_comparison(
     multi_class_precisions = []
     multi_class_coverages = []
     
+    # Class-level metrics (centroid-based rollouts, only single-agent and multi-agent, NOT baseline)
+    single_class_level_precisions = []
+    single_class_level_coverages = []
+    multi_class_level_precisions = []
+    multi_class_level_coverages = []
+    # Legacy names for backward compatibility
+    single_class_based_precisions = []
+    single_class_based_coverages = []
+    multi_class_based_precisions = []
+    multi_class_based_coverages = []
+    
     logger.info(f"Extracting data for classes: {classes}")
     
     for cls in classes:
@@ -506,18 +517,28 @@ def plot_precision_coverage_comparison(
             single_inst_cov = single_data.get("instance_coverage", 0.0)
             single_instance_precisions.append(single_inst_prec)
             single_instance_coverages.append(single_inst_cov)
-            # Class-level
-            single_cls_prec = single_data.get("class_precision", 0.0)
-            single_cls_cov = single_data.get("class_coverage", 0.0)
-            single_class_precisions.append(single_cls_prec)
-            single_class_coverages.append(single_cls_cov)
-            logger.info(f"Single-agent C{cls}: inst_prec={single_inst_prec:.3f}, inst_cov={single_inst_cov:.3f}, class_prec={single_cls_prec:.3f}, class_cov={single_cls_cov:.3f}")
+            # Class Union (union of instance-based anchors)
+            single_union_prec = single_data.get("class_union_precision", single_data.get("class_precision", 0.0))
+            single_union_cov = single_data.get("class_union_coverage", single_data.get("class_coverage", 0.0))
+            single_class_precisions.append(single_union_prec)
+            single_class_coverages.append(single_union_cov)
+            # Class-level (centroid-based rollouts)
+            single_cl_prec = single_data.get("class_level_precision", single_data.get("class_based_precision", 0.0))
+            single_cl_cov = single_data.get("class_level_coverage", single_data.get("class_based_coverage", 0.0))
+            single_class_level_precisions.append(single_cl_prec)
+            single_class_level_coverages.append(single_cl_cov)
+            # Legacy names
+            single_class_based_precisions.append(single_cl_prec)
+            single_class_based_coverages.append(single_cl_cov)
+            logger.info(f"Single-agent C{cls}: inst_prec={single_inst_prec:.3f}, inst_cov={single_inst_cov:.3f}, class_union_prec={single_union_prec:.3f}, class_union_cov={single_union_cov:.3f}, class_based_prec={single_cl_prec:.3f}, class_based_cov={single_cl_cov:.3f}")
         else:
             logger.warning(f"Single-agent: No data found for class {cls}")
             single_instance_precisions.append(0.0)
             single_instance_coverages.append(0.0)
             single_class_precisions.append(0.0)
             single_class_coverages.append(0.0)
+            single_class_based_precisions.append(0.0)
+            single_class_based_coverages.append(0.0)
         
         # Find multi-agent data for this class
         multi_data = None
@@ -532,18 +553,28 @@ def plot_precision_coverage_comparison(
             multi_inst_cov = multi_data.get("instance_coverage", 0.0)
             multi_instance_precisions.append(multi_inst_prec)
             multi_instance_coverages.append(multi_inst_cov)
-            # Class-level
-            multi_cls_prec = multi_data.get("class_precision", 0.0)
-            multi_cls_cov = multi_data.get("class_coverage", 0.0)
-            multi_class_precisions.append(multi_cls_prec)
-            multi_class_coverages.append(multi_cls_cov)
-            logger.info(f"Multi-agent C{cls}: inst_prec={multi_inst_prec:.3f}, inst_cov={multi_inst_cov:.3f}, class_prec={multi_cls_prec:.3f}, class_cov={multi_cls_cov:.3f}")
+            # Class Union (union of instance-based anchors)
+            multi_union_prec = multi_data.get("class_union_precision", multi_data.get("class_precision", 0.0))
+            multi_union_cov = multi_data.get("class_union_coverage", multi_data.get("class_coverage", 0.0))
+            multi_class_precisions.append(multi_union_prec)
+            multi_class_coverages.append(multi_union_cov)
+            # Class-level (centroid-based rollouts)
+            multi_cl_prec = multi_data.get("class_level_precision", multi_data.get("class_based_precision", 0.0))
+            multi_cl_cov = multi_data.get("class_level_coverage", multi_data.get("class_based_coverage", 0.0))
+            multi_class_level_precisions.append(multi_cl_prec)
+            multi_class_level_coverages.append(multi_cl_cov)
+            # Legacy names
+            multi_class_based_precisions.append(multi_cl_prec)
+            multi_class_based_coverages.append(multi_cl_cov)
+            logger.info(f"Multi-agent C{cls}: inst_prec={multi_inst_prec:.3f}, inst_cov={multi_inst_cov:.3f}, class_union_prec={multi_union_prec:.3f}, class_union_cov={multi_union_cov:.3f}, class_based_prec={multi_cl_prec:.3f}, class_based_cov={multi_cl_cov:.3f}")
         else:
             logger.warning(f"Multi-agent: No data found for class {cls}")
             multi_instance_precisions.append(0.0)
             multi_instance_coverages.append(0.0)
             multi_class_precisions.append(0.0)
             multi_class_coverages.append(0.0)
+            multi_class_based_precisions.append(0.0)
+            multi_class_based_coverages.append(0.0)
         
         # Find baseline data for this class (INSTANCE-LEVEL ONLY)
         baseline_data = None
@@ -566,9 +597,18 @@ def plot_precision_coverage_comparison(
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    # Create four subplots: instance-level (top row), class-level (bottom row)
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    ax1_inst, ax2_inst, ax1_cls, ax2_cls = axes.flatten()
+    # Check if we have class-level metrics (centroid-based rollouts)
+    has_class_level_single = any(cl > 0 for cl in single_class_level_precisions) or any(cl > 0 for cl in single_class_level_coverages)
+    has_class_level_multi = any(cl > 0 for cl in multi_class_level_precisions) or any(cl > 0 for cl in multi_class_level_coverages)
+    has_class_level = has_class_level_single or has_class_level_multi
+    
+    # Create subplots: instance-level (top row), class union (middle row), class-level (bottom row if available)
+    if has_class_level:
+        fig, axes = plt.subplots(3, 2, figsize=(16, 18))
+        ax1_inst, ax2_inst, ax1_union, ax2_union, ax1_cl, ax2_cl = axes.flatten()
+    else:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        ax1_inst, ax2_inst, ax1_union, ax2_union = axes.flatten()
     
     x = np.arange(len(classes))
     
@@ -652,59 +692,114 @@ def plot_precision_coverage_comparison(
     ax2_inst.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax2_inst.legend(fontsize=10, framealpha=0.9)
     
-    # Bottom-left: Class-level Precision (only single-agent and multi-agent)
+    # Middle-left: Class Union Precision (union of instance-based anchors, only single-agent and multi-agent)
     bar_idx = 0
     if single_agent_summary:
-        ax1_cls.bar(x + offset_cls + bar_idx*width_cls, single_class_precisions, width_cls, 
+        ax1_union.bar(x + offset_cls + bar_idx*width_cls, single_class_precisions, width_cls, 
                    label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
         for i, val in enumerate(single_class_precisions):
             if val > 0.01:
-                ax1_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                ax1_union.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        ax1_cls.bar(x + offset_cls + bar_idx*width_cls, multi_class_precisions, width_cls, 
+        ax1_union.bar(x + offset_cls + bar_idx*width_cls, multi_class_precisions, width_cls, 
                    label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
         for i, val in enumerate(multi_class_precisions):
             if val > 0.01:
-                ax1_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                ax1_union.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    ax1_cls.set_xlabel('Class', fontsize=12, fontweight='bold')
-    ax1_cls.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax1_cls.set_title(f'{title_prefix}: Class-Level Precision (Dynamic Anchors Only)', fontsize=13, fontweight='bold')
-    ax1_cls.set_xticks(x)
-    ax1_cls.set_xticklabels([f'C{cls}' for cls in classes])
-    ax1_cls.set_ylim([0, 1.1])
-    ax1_cls.grid(True, alpha=0.3, axis='y', linestyle='--')
-    ax1_cls.legend(fontsize=10, framealpha=0.9)
+    ax1_union.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax1_union.set_ylabel('Precision', fontsize=12, fontweight='bold')
+    ax1_union.set_title(f'{title_prefix}: Class Union Precision (Union of Instance-Based Anchors)', fontsize=13, fontweight='bold')
+    ax1_union.set_xticks(x)
+    ax1_union.set_xticklabels([f'C{cls}' for cls in classes])
+    ax1_union.set_ylim([0, 1.1])
+    ax1_union.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax1_union.legend(fontsize=10, framealpha=0.9)
     
-    # Bottom-right: Class-level Coverage (only single-agent and multi-agent)
+    # Middle-right: Class Union Coverage (union of instance-based anchors, only single-agent and multi-agent)
     bar_idx = 0
     if single_agent_summary:
-        ax2_cls.bar(x + offset_cls + bar_idx*width_cls, single_class_coverages, width_cls, 
+        ax2_union.bar(x + offset_cls + bar_idx*width_cls, single_class_coverages, width_cls, 
                    label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
         for i, val in enumerate(single_class_coverages):
             if val > 0.01:
-                ax2_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                ax2_union.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
         bar_idx += 1
     if multi_agent_summary:
-        ax2_cls.bar(x + offset_cls + bar_idx*width_cls, multi_class_coverages, width_cls, 
+        ax2_union.bar(x + offset_cls + bar_idx*width_cls, multi_class_coverages, width_cls, 
                    label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
         for i, val in enumerate(multi_class_coverages):
             if val > 0.01:
-                ax2_cls.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                ax2_union.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
                             f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
     
-    ax2_cls.set_xlabel('Class', fontsize=12, fontweight='bold')
-    ax2_cls.set_ylabel('Coverage', fontsize=12, fontweight='bold')
-    ax2_cls.set_title(f'{title_prefix}: Class-Level Coverage (Dynamic Anchors Only)', fontsize=13, fontweight='bold')
-    ax2_cls.set_xticks(x)
-    ax2_cls.set_xticklabels([f'C{cls}' for cls in classes])
-    ax2_cls.set_ylim([0, 1.1])
-    ax2_cls.grid(True, alpha=0.3, axis='y', linestyle='--')
-    ax2_cls.legend(fontsize=10, framealpha=0.9)
+    ax2_union.set_xlabel('Class', fontsize=12, fontweight='bold')
+    ax2_union.set_ylabel('Coverage', fontsize=12, fontweight='bold')
+    ax2_union.set_title(f'{title_prefix}: Class Union Coverage (Union of Instance-Based Anchors)', fontsize=13, fontweight='bold')
+    ax2_union.set_xticks(x)
+    ax2_union.set_xticklabels([f'C{cls}' for cls in classes])
+    ax2_union.set_ylim([0, 1.1])
+    ax2_union.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax2_union.legend(fontsize=10, framealpha=0.9)
+    
+    # Bottom row: Class-Level Precision and Coverage (centroid-based rollouts, if available)
+    if has_class_level:
+        bar_idx = 0
+        if single_agent_summary and has_class_level_single:
+            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_precisions, width_cls, 
+                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(single_class_level_precisions):
+                if val > 0.01:
+                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            bar_idx += 1
+        if multi_agent_summary and has_class_level_multi:
+            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_precisions, width_cls, 
+                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(multi_class_level_precisions):
+                if val > 0.01:
+                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        ax1_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
+        ax1_cl.set_ylabel('Precision', fontsize=12, fontweight='bold')
+        ax1_cl.set_title(f'{title_prefix}: Class-Level Precision (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
+        ax1_cl.set_xticks(x)
+        ax1_cl.set_xticklabels([f'C{cls}' for cls in classes])
+        ax1_cl.set_ylim([0, 1.1])
+        ax1_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
+        ax1_cl.legend(fontsize=10, framealpha=0.9)
+        
+        # Bottom-right: Class-Level Coverage (centroid-based rollouts)
+        bar_idx = 0
+        if single_agent_summary and has_class_level_single:
+            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_coverages, width_cls, 
+                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(single_class_level_coverages):
+                if val > 0.01:
+                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            bar_idx += 1
+        if multi_agent_summary and has_class_level_multi:
+            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_coverages, width_cls, 
+                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(multi_class_level_coverages):
+                if val > 0.01:
+                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        ax2_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
+        ax2_cl.set_ylabel('Coverage', fontsize=12, fontweight='bold')
+        ax2_cl.set_title(f'{title_prefix}: Class-Level Coverage (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
+        ax2_cl.set_xticks(x)
+        ax2_cl.set_xticklabels([f'C{cls}' for cls in classes])
+        ax2_cl.set_ylim([0, 1.1])
+        ax2_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
+        ax2_cl.legend(fontsize=10, framealpha=0.9)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'precision_coverage_comparison.png'), dpi=300, bbox_inches='tight')
@@ -735,9 +830,12 @@ def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top
     
     for class_key, class_data in per_class.items():
         target_class = class_data.get("class", -1)
+        # Collect both instance-based and class-based rules
         unique_rules = class_data.get("unique_rules", [])
+        class_based_unique_rules = class_data.get("class_based_unique_rules", [])
+        all_unique_rules = unique_rules + class_based_unique_rules
         
-        for rule_str in unique_rules:
+        for rule_str in all_unique_rules:
             intervals = extract_feature_intervals_from_rule(rule_str)
             for feature_name, lower, upper in intervals:
                 # Global collection
@@ -1070,22 +1168,24 @@ def plot_global_metrics_subplot(ax, summary: Optional[Dict], title: str):
         np.mean([per_class[c]["class_precision"] for c in per_class]))
     global_class_coverage = overall_stats.get("mean_class_coverage",
         np.mean([per_class[c]["class_coverage"] for c in per_class]))
+    # REMOVED: Global metrics (averages across classes) - not meaningful per user request
+    # This function is kept for backward compatibility but will show empty/placeholder
+    ax.text(0.5, 0.5, 'Global metrics removed\n(not meaningful for comparison)', 
+            ha='center', va='center', transform=ax.transAxes, fontsize=11)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    return
     
-    # Calculate standard deviations
-    instance_precisions = [per_class[c]["instance_precision"] for c in per_class]
-    instance_coverages = [per_class[c]["instance_coverage"] for c in per_class]
-    class_precisions = [per_class[c]["class_precision"] for c in per_class]
-    class_coverages = [per_class[c]["class_coverage"] for c in per_class]
-    
-    std_instance_precision = np.std(instance_precisions) if len(instance_precisions) > 1 else 0.0
-    std_instance_coverage = np.std(instance_coverages) if len(instance_coverages) > 1 else 0.0
-    std_class_precision = np.std(class_precisions) if len(class_precisions) > 1 else 0.0
-    std_class_coverage = np.std(class_coverages) if len(class_coverages) > 1 else 0.0
-    
-    metrics = ['Instance\nPrecision', 'Instance\nCoverage', 'Class\nPrecision\n(Union)', 'Class\nCoverage\n(Union)']
-    values = [global_instance_precision, global_instance_coverage, global_class_precision, global_class_coverage]
-    stds = [std_instance_precision, std_instance_coverage, std_class_precision, std_class_coverage]
-    colors = ['steelblue', 'coral', 'darkgreen', 'purple']
+    # OLD CODE (commented out - kept for reference):
+    # global_class_level_precision = overall_stats.get("mean_class_level_precision", overall_stats.get("mean_class_based_precision", 0.0))
+    # global_class_level_coverage = overall_stats.get("mean_class_level_coverage", overall_stats.get("mean_class_based_coverage", 0.0))
+    # 
+    # # Calculate standard deviations
+    # instance_precisions = [per_class[c]["instance_precision"] for c in per_class]
+    # instance_coverages = [per_class[c]["instance_coverage"] for c in per_class]
+    # class_union_precisions = [per_class[c].get("class_union_precision", per_class[c].get("class_precision", 0.0)) for c in per_class]
+    # class_union_coverages = [per_class[c].get("class_union_coverage", per_class[c].get("class_coverage", 0.0)) for c in per_class]
+    # class_level_precisions = [per_class[c].get("class_level_precision", per_class[c].get("class_based_precision", 0.0)) for c in per_class if per_class[c].get("class_level_precision", per_class[c].get("class_based_precision", 0.0)) > 0]
+    # class_level_coverages = [per_class[c].get("class_level_coverage", per_class[c].get("class_based_coverage", 0.0)) for c in per_class if per_class[c].get("class_level_coverage", per_class[c].get("class_based_coverage", 0.0)) > 0]
     
     x = np.arange(len(metrics))
     bars = ax.bar(x, values, alpha=0.8, color=colors, edgecolor='black', linewidth=1.5,
@@ -1672,6 +1772,226 @@ def plot_nashconv_comparison(
     logger.info(f"Saved NashConv convergence comparison plot to {output_path}")
 
 
+def save_comparison_metrics_json(
+    single_agent_summary: Optional[Dict],
+    multi_agent_summary: Optional[Dict],
+    baseline_summary: Optional[Dict],
+    output_dir: str,
+    dataset_name: str = ""
+):
+    """
+    Save consolidated comparison metrics to JSON file for easy Excel copying.
+    
+    Saves metrics in a flat, easy-to-copy format:
+    - Baseline: average instance precision/coverage
+    - Single-agent: instance, class (union), class-based metrics, NashConv, unique rules, timing
+    - Multi-agent: instance, class (union), class-based metrics, NashConv, unique rules, timing
+    """
+    consolidated = {
+        "dataset": dataset_name,
+        "baseline": {},
+        "single_agent": {},
+        "multi_agent": {}
+    }
+    
+    # Extract baseline metrics
+    if baseline_summary:
+        baseline_overall = baseline_summary.get("overall_stats", {})
+        consolidated["baseline"] = {
+            "avg_instance_precision": baseline_overall.get("mean_instance_precision", baseline_overall.get("mean_precision", 0.0)),
+            "avg_instance_coverage": baseline_overall.get("mean_instance_coverage", baseline_overall.get("mean_coverage", 0.0)),
+            "std_instance_precision": baseline_overall.get("std_instance_precision", 0.0),
+            "std_instance_coverage": baseline_overall.get("std_instance_coverage", 0.0),
+        }
+    
+    # Extract single-agent metrics
+    if single_agent_summary:
+        sa_overall = single_agent_summary.get("overall_stats", {})
+        sa_per_class = single_agent_summary.get("per_class_summary", {})
+        
+        # Compute averages from per_class_summary (overall_stats no longer has these)
+        instance_precisions = [c.get("instance_precision", 0.0) for c in sa_per_class.values() if c.get("instance_precision", 0.0) > 0]
+        instance_coverages = [c.get("instance_coverage", 0.0) for c in sa_per_class.values() if c.get("instance_coverage", 0.0) > 0]
+        class_precisions = [c.get("class_union_precision", c.get("class_precision", 0.0)) for c in sa_per_class.values() if c.get("class_union_precision", c.get("class_precision", 0.0)) > 0]
+        class_coverages = [c.get("class_union_coverage", c.get("class_coverage", 0.0)) for c in sa_per_class.values() if c.get("class_union_coverage", c.get("class_coverage", 0.0)) > 0]
+        class_based_precisions = [c.get("class_level_precision", c.get("class_based_precision", 0.0)) for c in sa_per_class.values() if c.get("class_level_precision", c.get("class_based_precision", 0.0)) > 0]
+        class_based_coverages = [c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) for c in sa_per_class.values() if c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) > 0]
+        
+        # Calculate average rollout time
+        avg_rollout_times = []
+        total_rollout_times = []
+        for class_data in sa_per_class.values():
+            avg_time = class_data.get("avg_rollout_time_seconds", 0.0)
+            total_time = class_data.get("total_rollout_time_seconds", 0.0)
+            if avg_time > 0:
+                avg_rollout_times.append(avg_time)
+            if total_time > 0:
+                total_rollout_times.append(total_time)
+        
+        avg_rollout_time = float(np.mean(avg_rollout_times)) if avg_rollout_times else 0.0
+        total_rollout_time = float(np.sum(total_rollout_times)) if total_rollout_times else 0.0
+        
+        # Extract NashConv (typically not available for single-agent, but check anyway)
+        nashconv_metrics = single_agent_summary.get("nashconv_metrics", {})
+        nashconv_data = {}
+        if nashconv_metrics.get("available", False):
+            training_data = nashconv_metrics.get("training", [])
+            eval_data = nashconv_metrics.get("evaluation", [])
+            if training_data:
+                latest_training = training_data[-1] if training_data else {}
+                nashconv_data["training_nashconv_sum"] = latest_training.get("training/nashconv_sum", 0.0)
+                nashconv_data["training_exploitability_max"] = latest_training.get("training/exploitability_max", 0.0)
+            if eval_data:
+                latest_eval = eval_data[-1] if eval_data else {}
+                nashconv_data["evaluation_nashconv_sum"] = latest_eval.get("evaluation/nashconv_sum", 0.0)
+                nashconv_data["evaluation_exploitability_max"] = latest_eval.get("evaluation/exploitability_max", 0.0)
+        
+        consolidated["single_agent"] = {
+            "avg_instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+            "avg_instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+            "avg_class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,  # Union precision
+            "avg_class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,  # Union coverage
+            "avg_class_based_precision": float(np.mean(class_based_precisions)) if class_based_precisions else 0.0,
+            "avg_class_based_coverage": float(np.mean(class_based_coverages)) if class_based_coverages else 0.0,
+            "unique_rules_count": sa_overall.get("total_unique_rules_instance_based", sa_overall.get("total_unique_rules", 0)),
+            "unique_rules_class_based_count": sa_overall.get("total_unique_rules_class_based", 0),
+            "total_unique_rules": sa_overall.get("total_unique_rules", 0),
+            "avg_rollout_time_seconds": avg_rollout_time,
+            "total_rollout_time_seconds": total_rollout_time,
+            "nashconv": nashconv_data if nashconv_data else None
+        }
+    
+    # Extract multi-agent metrics
+    if multi_agent_summary:
+        ma_overall = multi_agent_summary.get("overall_stats", {})
+        ma_per_class = multi_agent_summary.get("per_class_summary", {})
+        
+        # Compute averages from per_class_summary (overall_stats no longer has these)
+        instance_precisions = [c.get("instance_precision", 0.0) for c in ma_per_class.values() if c.get("instance_precision", 0.0) > 0]
+        instance_coverages = [c.get("instance_coverage", 0.0) for c in ma_per_class.values() if c.get("instance_coverage", 0.0) > 0]
+        class_precisions = [c.get("class_union_precision", c.get("class_precision", 0.0)) for c in ma_per_class.values() if c.get("class_union_precision", c.get("class_precision", 0.0)) > 0]
+        class_coverages = [c.get("class_union_coverage", c.get("class_coverage", 0.0)) for c in ma_per_class.values() if c.get("class_union_coverage", c.get("class_coverage", 0.0)) > 0]
+        class_based_precisions = [c.get("class_level_precision", c.get("class_based_precision", 0.0)) for c in ma_per_class.values() if c.get("class_level_precision", c.get("class_based_precision", 0.0)) > 0]
+        class_based_coverages = [c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) for c in ma_per_class.values() if c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) > 0]
+        
+        # Calculate average rollout time
+        # For multi-agent, rollout times are stored in per_agent_results
+        avg_rollout_times = []
+        total_rollout_times = []
+        for class_data in ma_per_class.values():
+            # Check per_agent_results first (for multi-agent with agents_per_class > 1)
+            if "per_agent_results" in class_data:
+                per_agent_times = []
+                per_agent_total_times = []
+                for agent_result in class_data["per_agent_results"].values():
+                    agent_avg_time = agent_result.get("avg_rollout_time_seconds", 0.0)
+                    agent_total_time = agent_result.get("total_rollout_time_seconds", 0.0)
+                    if agent_avg_time > 0:
+                        per_agent_times.append(agent_avg_time)
+                    if agent_total_time > 0:
+                        per_agent_total_times.append(agent_total_time)
+                if per_agent_times:
+                    avg_rollout_times.extend(per_agent_times)  # Collect all agent times
+                if per_agent_total_times:
+                    total_rollout_times.extend(per_agent_total_times)
+            else:
+                # Fallback: check if rollout time is directly in class_data (for single agent per class)
+                avg_time = class_data.get("avg_rollout_time_seconds", 0.0)
+                total_time = class_data.get("total_rollout_time_seconds", 0.0)
+                if avg_time > 0:
+                    avg_rollout_times.append(avg_time)
+                if total_time > 0:
+                    total_rollout_times.append(total_time)
+        
+        avg_rollout_time = float(np.mean(avg_rollout_times)) if avg_rollout_times else 0.0
+        total_rollout_time = float(np.sum(total_rollout_times)) if total_rollout_times else 0.0
+        
+        # Extract NashConv
+        nashconv_metrics = multi_agent_summary.get("nashconv_metrics", {})
+        nashconv_data = {}
+        if nashconv_metrics.get("available", False):
+            training_data = nashconv_metrics.get("training", [])
+            eval_data = nashconv_metrics.get("evaluation", [])
+            if training_data:
+                latest_training = training_data[-1] if training_data else {}
+                nashconv_data["training_nashconv_sum"] = latest_training.get("training/nashconv_sum", 0.0)
+                nashconv_data["training_exploitability_max"] = latest_training.get("training/exploitability_max", 0.0)
+            if eval_data:
+                latest_eval = eval_data[-1] if eval_data else {}
+                nashconv_data["evaluation_nashconv_sum"] = latest_eval.get("evaluation/nashconv_sum", 0.0)
+                nashconv_data["evaluation_exploitability_max"] = latest_eval.get("evaluation/exploitability_max", 0.0)
+        
+        consolidated["multi_agent"] = {
+            "avg_instance_precision": float(np.mean(instance_precisions)) if instance_precisions else 0.0,
+            "avg_instance_coverage": float(np.mean(instance_coverages)) if instance_coverages else 0.0,
+            "avg_class_precision": float(np.mean(class_precisions)) if class_precisions else 0.0,  # Union precision
+            "avg_class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,  # Union coverage
+            "avg_class_based_precision": float(np.mean(class_based_precisions)) if class_based_precisions else 0.0,
+            "avg_class_based_coverage": float(np.mean(class_based_coverages)) if class_based_coverages else 0.0,
+            "unique_rules_count": ma_overall.get("total_unique_rules_instance_based", ma_overall.get("total_unique_rules", 0)),
+            "unique_rules_class_based_count": ma_overall.get("total_unique_rules_class_based", 0),
+            "total_unique_rules": ma_overall.get("total_unique_rules", 0),
+            "avg_rollout_time_seconds": avg_rollout_time,
+            "total_rollout_time_seconds": total_rollout_time,
+            "nashconv": nashconv_data if nashconv_data else None
+        }
+    
+    # Save to file
+    output_file = os.path.join(output_dir, 'comparison_metrics.json')
+    with open(output_file, 'w') as f:
+        json.dump(consolidated, f, indent=2)
+    
+    logger.info(f"Saved comparison metrics to {output_file}")
+    logger.info(f"\n{'='*80}")
+    logger.info("COMPARISON METRICS SUMMARY (for Excel copying):")
+    logger.info(f"{'='*80}")
+    
+    if consolidated["baseline"]:
+        logger.info(f"\nBASELINE (Static Anchors):")
+        logger.info(f"  Avg Instance Precision: {consolidated['baseline']['avg_instance_precision']:.4f}")
+        logger.info(f"  Avg Instance Coverage:  {consolidated['baseline']['avg_instance_coverage']:.4f}")
+    
+    if consolidated["single_agent"]:
+        sa = consolidated["single_agent"]
+        logger.info(f"\nSINGLE-AGENT:")
+        logger.info(f"  Avg Instance Precision: {sa['avg_instance_precision']:.4f}")
+        logger.info(f"  Avg Instance Coverage:  {sa['avg_instance_coverage']:.4f}")
+        logger.info(f"  Avg Class Precision (Union): {sa['avg_class_precision']:.4f}")
+        logger.info(f"  Avg Class Coverage (Union):  {sa['avg_class_coverage']:.4f}")
+        if sa['avg_class_based_precision'] > 0 or sa['avg_class_based_coverage'] > 0:
+            logger.info(f"  Avg Class-Based Precision: {sa['avg_class_based_precision']:.4f}")
+            logger.info(f"  Avg Class-Based Coverage:  {sa['avg_class_based_coverage']:.4f}")
+        logger.info(f"  Unique Rules (Instance-Based): {sa['unique_rules_count']}")
+        logger.info(f"  Unique Rules (Class-Based): {sa['unique_rules_class_based_count']}")
+        logger.info(f"  Avg Rollout Time (seconds): {sa['avg_rollout_time_seconds']:.4f}")
+        if sa.get('nashconv'):
+            nc = sa['nashconv']
+            logger.info(f"  NashConv (Training): {nc.get('training_nashconv_sum', 'N/A')}")
+            logger.info(f"  NashConv (Evaluation): {nc.get('evaluation_nashconv_sum', 'N/A')}")
+    
+    if consolidated["multi_agent"]:
+        ma = consolidated["multi_agent"]
+        logger.info(f"\nMULTI-AGENT:")
+        logger.info(f"  Avg Instance Precision: {ma['avg_instance_precision']:.4f}")
+        logger.info(f"  Avg Instance Coverage:  {ma['avg_instance_coverage']:.4f}")
+        logger.info(f"  Avg Class Precision (Union): {ma['avg_class_precision']:.4f}")
+        logger.info(f"  Avg Class Coverage (Union):  {ma['avg_class_coverage']:.4f}")
+        if ma['avg_class_based_precision'] > 0 or ma['avg_class_based_coverage'] > 0:
+            logger.info(f"  Avg Class-Based Precision: {ma['avg_class_based_precision']:.4f}")
+            logger.info(f"  Avg Class-Based Coverage:  {ma['avg_class_based_coverage']:.4f}")
+        logger.info(f"  Unique Rules (Instance-Based): {ma['unique_rules_count']}")
+        logger.info(f"  Unique Rules (Class-Based): {ma['unique_rules_class_based_count']}")
+        logger.info(f"  Avg Rollout Time (seconds): {ma['avg_rollout_time_seconds']:.4f}")
+        if ma.get('nashconv'):
+            nc = ma['nashconv']
+            logger.info(f"  NashConv (Training): {nc.get('training_nashconv_sum', 'N/A')}")
+            logger.info(f"  NashConv (Evaluation): {nc.get('evaluation_nashconv_sum', 'N/A')}")
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Full metrics saved to: {output_file}")
+    logger.info(f"{'='*80}\n")
+
+
 def plot_comprehensive_comparison(
     single_agent_summary: Optional[Dict],
     multi_agent_summary: Optional[Dict],
@@ -1686,28 +2006,19 @@ def plot_comprehensive_comparison(
     # Format title with dataset name
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    # Create 2x3 grid: add target achievement comparison as 5th subplot
-    fig = plt.figure(figsize=(20, 14))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    # Create 1x3 grid: Feature importance + Target achievement (removed global metrics)
+    fig = plt.figure(figsize=(20, 7))
+    gs = fig.add_gridspec(1, 3, hspace=0.3, wspace=0.3)
     
     # Create axes
-    axes = [
-        [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 2])],
-        [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1]), fig.add_subplot(gs[1, 2])]
-    ]
-    ax1, ax2, ax_eq = axes[0][0], axes[0][1], axes[0][2]  # Row 1: Feature importance + Target achievement
-    ax3, ax4, ax5 = axes[1][0], axes[1][1], axes[1][2]  # Row 2: Global metrics + empty
+    ax1 = fig.add_subplot(gs[0, 0])  # Single-agent feature importance
+    ax2 = fig.add_subplot(gs[0, 1])  # Multi-agent feature importance
+    ax_eq = fig.add_subplot(gs[0, 2])  # Equilibrium comparison
     
     # Row 1: Feature importance + Target achievement comparison
     plot_feature_importance_subplot(ax1, single_agent_summary, f'{title_prefix}: Single-Agent Feature Importance', top_n=10)
     plot_feature_importance_subplot(ax2, multi_agent_summary, f'{title_prefix}: Multi-Agent Feature Importance', top_n=10)
     plot_equilibrium_comparison(ax_eq, single_agent_summary, multi_agent_summary)
-    
-    # Row 2: Global metrics
-    plot_global_metrics_subplot(ax3, single_agent_summary, f'{title_prefix}: Single-Agent Global Metrics')
-    plot_global_metrics_subplot(ax4, multi_agent_summary, f'{title_prefix}: Multi-Agent Global Metrics')
-    # Hide 6th subplot (bottom right)
-    ax5.axis('off')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'comprehensive_comparison.png'), dpi=300, bbox_inches='tight')
@@ -1854,6 +2165,12 @@ Examples:
         logger.info(f"Plots saved to {args.output_dir}")
     else:
         logger.warning("Matplotlib not available. Skipping plot generation.")
+    
+    # Save consolidated comparison metrics to JSON for easy Excel copying
+    logger.info("\nSaving comparison metrics to JSON...")
+    save_comparison_metrics_json(
+        single_agent_summary, multi_agent_summary, baseline_summary, args.output_dir, args.dataset
+    )
 
 
 if __name__ == "__main__":

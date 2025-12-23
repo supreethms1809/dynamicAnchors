@@ -757,21 +757,58 @@ def test_rules_from_json(
     logger.info(f"  Class distribution: {np.bincount(y_data)}")
     
     # Collect all unique rules from all classes
+    # Separate instance-based and class-based rules for separate testing
     per_class_results = rules_data.get("per_class_results", {})
     all_unique_rules = set()
+    instance_based_rules = set()
+    class_based_rules = set()
     rule_to_source_classes = defaultdict(list)  # Track which classes each rule came from
+    rule_to_rollout_type = {}  # Track whether rule is instance-based or class-based
     
     for class_key, class_data in per_class_results.items():
         target_class = class_data.get("class")
+        
+        # Collect instance-based rules
         unique_rules = class_data.get("unique_rules", [])
         for rule_str in unique_rules:
             all_unique_rules.add(rule_str)
+            instance_based_rules.add(rule_str)
             rule_to_source_classes[rule_str].append(target_class)
+            rule_to_rollout_type[rule_str] = "instance_based"
+        
+        # Collect class-based rules
+        class_based_results = class_data.get("class_based_results", {})
+        if isinstance(class_based_results, dict):
+            # Check if it's a dict of results or a single result dict
+            if "unique_rules" in class_based_results:
+                # Single result dict
+                cb_unique_rules = class_based_results.get("unique_rules", [])
+                for rule_str in cb_unique_rules:
+                    all_unique_rules.add(rule_str)
+                    class_based_rules.add(rule_str)
+                    rule_to_source_classes[rule_str].append(target_class)
+                    rule_to_rollout_type[rule_str] = "class_based"
+            else:
+                # Dict of agent results (for multi-agent compatibility)
+                for agent_name, agent_results in class_based_results.items():
+                    cb_unique_rules = agent_results.get("unique_rules", [])
+                    for rule_str in cb_unique_rules:
+                        all_unique_rules.add(rule_str)
+                        class_based_rules.add(rule_str)
+                        rule_to_source_classes[rule_str].append(target_class)
+                        rule_to_rollout_type[rule_str] = "class_based"
     
     all_unique_rules = sorted(list(all_unique_rules))  # Sort for consistent ordering
+    instance_based_rules = sorted(list(instance_based_rules))
+    class_based_rules = sorted(list(class_based_rules))
     
     logger.info(f"{'='*80}")
-    logger.info(f"Testing {len(all_unique_rules)} unique rules against all classes")
+    logger.info(f"Found {len(all_unique_rules)} total unique rules")
+    logger.info(f"  Instance-based rules: {len(instance_based_rules)}")
+    logger.info(f"  Class-based rules: {len(class_based_rules)}")
+    logger.info(f"  Overlapping rules (in both): {len(set(instance_based_rules) & set(class_based_rules))}")
+    logger.info(f"{'='*80}")
+    logger.info(f"Testing all {len(all_unique_rules)} unique rules against all classes")
     logger.info(f"{'='*80}")
     
     # Get all unique classes in the dataset
@@ -798,9 +835,11 @@ def test_rules_from_json(
     rules_satisfying_both_classes = []
     
     for rule_idx, rule_str in enumerate(all_unique_rules):
+        rollout_type = rule_to_rollout_type.get(rule_str, "unknown")
         logger.info(f"{'='*80}")
         logger.info(f"Rule {rule_idx + 1}/{len(all_unique_rules)}: {rule_str[:100]}...")
         logger.info(f"{'='*80}")
+        logger.info(f"  Rollout type: {rollout_type}")
         logger.info(f"  Source classes: {rule_to_source_classes[rule_str]}")
         
         # Parse rule
@@ -820,6 +859,7 @@ def test_rules_from_json(
         rule_result = {
             "rule": rule_str,
             "rule_index": rule_idx,
+            "rollout_type": rule_to_rollout_type.get(rule_str, "unknown"),  # Track instance vs class-based
             "source_classes": rule_to_source_classes[rule_str],
             "n_conditions": len(rule_conditions),
             "conditions": [
@@ -979,9 +1019,45 @@ def test_rules_from_json(
             # Also update unique_rules to be in ranked order (top rules first)
             class_data["ranked_unique_rules"] = [r["rule"] for r in ranked_rules]
     
+    # Compute statistics by rollout type
+    instance_based_stats = {
+        "count": len(instance_based_rules),
+        "avg_precision": [],
+        "avg_coverage": []
+    }
+    class_based_stats = {
+        "count": len(class_based_rules),
+        "avg_precision": [],
+        "avg_coverage": []
+    }
+    
+    for rule_result in results["rule_results"]:
+        rollout_type = rule_result.get("rollout_type", "unknown")
+        for class_key, class_res in rule_result.get("per_class_results", {}).items():
+            precision = class_res.get("rule_precision", 0.0)
+            coverage = class_res.get("rule_coverage", 0.0)
+            if rollout_type == "instance_based":
+                instance_based_stats["avg_precision"].append(precision)
+                instance_based_stats["avg_coverage"].append(coverage)
+            elif rollout_type == "class_based":
+                class_based_stats["avg_precision"].append(precision)
+                class_based_stats["avg_coverage"].append(coverage)
+    
     # Summary
     results["summary"] = {
         "total_rules": len(all_unique_rules),
+        "instance_based_rules": len(instance_based_rules),
+        "class_based_rules": len(class_based_rules),
+        "instance_based_stats": {
+            "count": instance_based_stats["count"],
+            "avg_precision": float(np.mean(instance_based_stats["avg_precision"])) if instance_based_stats["avg_precision"] else 0.0,
+            "avg_coverage": float(np.mean(instance_based_stats["avg_coverage"])) if instance_based_stats["avg_coverage"] else 0.0,
+        },
+        "class_based_stats": {
+            "count": class_based_stats["count"],
+            "avg_precision": float(np.mean(class_based_stats["avg_precision"])) if class_based_stats["avg_precision"] else 0.0,
+            "avg_coverage": float(np.mean(class_based_stats["avg_coverage"])) if class_based_stats["avg_coverage"] else 0.0,
+        },
         "rules_satisfying_multiple_classes": len(rules_satisfying_both_classes),
         "rules_satisfying_both_classes": rules_satisfying_both_classes
     }
@@ -990,6 +1066,18 @@ def test_rules_from_json(
     logger.info(f"SUMMARY")
     logger.info(f"{'='*80}")
     logger.info(f"Total unique rules tested: {len(all_unique_rules)}")
+    logger.info(f"  Instance-based rules: {len(instance_based_rules)}")
+    logger.info(f"  Class-based rules: {len(class_based_rules)}")
+    logger.info(f"  Overlapping (in both): {len(set(instance_based_rules) & set(class_based_rules))}")
+    logger.info(f"")
+    logger.info(f"Instance-based rule statistics:")
+    logger.info(f"  Average precision: {results['summary']['instance_based_stats']['avg_precision']:.4f}")
+    logger.info(f"  Average coverage: {results['summary']['instance_based_stats']['avg_coverage']:.4f}")
+    logger.info(f"")
+    logger.info(f"Class-based rule statistics:")
+    logger.info(f"  Average precision: {results['summary']['class_based_stats']['avg_precision']:.4f}")
+    logger.info(f"  Average coverage: {results['summary']['class_based_stats']['avg_coverage']:.4f}")
+    logger.info(f"")
     logger.info(f"Rules satisfying multiple classes: {len(rules_satisfying_both_classes)}")
     
     if rules_satisfying_both_classes:

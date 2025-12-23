@@ -17,8 +17,8 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 
 # Environment configuration dictionary
 env_config:
-  precision_target: 0.99
-  coverage_target: 0.8
+  precision_target: 0.95  # Reduced from 0.99 to allow boxes to expand more for better coverage
+  coverage_target: 0.5
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
@@ -32,12 +32,12 @@ env_config:
   min_coverage_floor: 0.1  # Increased from 0.005 to 0.01 to prevent boxes from becoming too small
   js_penalty_weight: 0.05
   # Episode length (kept here so it is passed directly into AnchorEnv.__init__)
-  max_cycles: 100
+  max_cycles: 200  # Increased from 100 to allow boxes more time to expand for better coverage
 
   # Stabilization-based early termination (per-agent)
   enable_stability_termination: true
-  stability_window: 10
-  stability_min_steps: 20
+  stability_window: 20  # Increased from 10 to require more stable steps before early termination
+  stability_min_steps: 50  # Increased from 20 to prevent premature termination during expansion phase
   stability_precision_tol: 1e-3
   stability_coverage_tol: 1e-3
   stability_drift_tol: 1e-3
@@ -92,7 +92,7 @@ logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
 
 # Maximum number of steps per episode (source of truth is env_config.max_cycles; kept here for backward compatibility)
 # If your task wrapper reads only the top-level max_cycles, keep both in sync.
-max_cycles: 100
+max_cycles: 200  # Increased from 100 to allow boxes more time to expand for better coverage
 
 # Termination reason counters: disable overused reasons
 # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes

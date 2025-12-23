@@ -116,13 +116,13 @@ class AnchorEnv(ParallelEnv):
         # IMPORTANT: Default should match config file (0.3), but kept at 0.1 for backward compatibility
         # Config file sets coverage_target: 0.3, so this default should rarely be used
         self.coverage_target = env_config.get("coverage_target", 0.1)  # Config default is 0.3
-        if self.coverage_target == 0.1 and "coverage_target" not in env_config:
-            logger.warning(
-                f"coverage_target not found in env_config, using default 0.1. "
-                f"Expected value from config: 0.3. Check if config is being passed correctly."
-            )
-        else:
-            logger.info(f"coverage_target set to: {self.coverage_target} (from config: {env_config.get('coverage_target', 'NOT SET')})")
+        # if self.coverage_target == 0.1 and "coverage_target" not in env_config:
+        #     logger.warning(
+        #         f"coverage_target not found in env_config, using default 0.1. "
+        #         f"Expected value from config: 0.3. Check if config is being passed correctly."
+        #     )
+        # else:
+        #     logger.info(f"coverage_target set to: {self.coverage_target} (from config: {env_config.get('coverage_target', 'NOT SET')})")
         self.precision_target = env_config.get("precision_target", 0.95)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
@@ -140,11 +140,11 @@ class AnchorEnv(ParallelEnv):
         self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
         self.n_perturb = env_config.get("n_perturb", 1024)
         
-        # Log perturbation settings during initialization
-        logger.info(f"AnchorEnv initialized with perturbation settings: "
-                   f"use_perturbation={self.use_perturbation}, "
-                   f"perturbation_mode={self.perturbation_mode}, "
-                   f"n_perturb={self.n_perturb}")
+        # # Log perturbation settings during initialization
+        # logger.info(f"AnchorEnv initialized with perturbation settings: "
+        #            f"use_perturbation={self.use_perturbation}, "
+        #            f"perturbation_mode={self.perturbation_mode}, "
+        #            f"n_perturb={self.n_perturb}")
         if self.use_perturbation and self.perturbation_mode == "adaptive":
             min_points_threshold = max(1, int(0.1 * self.n_perturb))
             # logger.info(f"  Adaptive mode threshold: will use uniform sampling if covered points < {min_points_threshold}")
@@ -227,7 +227,11 @@ class AnchorEnv(ParallelEnv):
         self.box_history = {}
         self.coverage_floor_hits = {}
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 100)
+        # Read max_cycles from config - no hardcoded default to ensure YAML settings are respected
+        self.max_cycles = env_config.get("max_cycles")
+        if self.max_cycles is None:
+            raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
+        self.max_cycles = int(self.max_cycles)
 
         # -----------------------------
         # Stabilization-based early termination (per-agent)
@@ -318,16 +322,34 @@ class AnchorEnv(ParallelEnv):
         return None
 
     def _get_class_centroid(self, agent: str) -> Optional[np.ndarray]:
+        """
+        Get centroid for an agent, ensuring different agents per class get different centroids.
+        
+        When agents_per_class > 1, each agent should get a different centroid/instance to ensure
+        policy diversity. This is achieved by:
+        1. Using agent index to deterministically assign centroids/instances
+        2. When centroids/instances are available, cycling through them based on agent index
+        3. When falling back to class data, sampling different instances for each agent
+        """
         target_class = self._get_class_for_agent(agent)
         if target_class is None:
             return None
+        
+        # Extract agent index from agent name (e.g., "agent_0_1" -> 1, "agent_0" -> 0)
+        agent_idx = 0
+        if self.agents_per_class > 1 and "_" in agent:
+            parts = agent.split("_")
+            if len(parts) >= 3 and parts[2].isdigit():
+                agent_idx = int(parts[2])
         
         # Use precomputed cluster centroids if its class level
         if self.cluster_centroids_per_class is not None:
             if target_class in self.cluster_centroids_per_class:
                 centroids = self.cluster_centroids_per_class[target_class]
                 if len(centroids) > 0:
-                    centroid_idx = self.rng.integers(0, len(centroids))
+                    # Assign centroids deterministically based on agent index to ensure diversity
+                    # Cycle through available centroids if we have more agents than centroids
+                    centroid_idx = agent_idx % len(centroids)
                     return np.array(centroids[centroid_idx], dtype=np.float32)
         
         # Use fixed instances if its instance level
@@ -335,10 +357,13 @@ class AnchorEnv(ParallelEnv):
             if target_class in self.fixed_instances_per_class:
                 instances = self.fixed_instances_per_class[target_class]
                 if len(instances) > 0:
-                    instance_idx = self.rng.integers(0, len(instances))
+                    # Assign instances deterministically based on agent index to ensure diversity
+                    # Cycle through available instances if we have more agents than instances
+                    instance_idx = agent_idx % len(instances)
                     return np.array(instances[instance_idx], dtype=np.float32)
         
-        # Fallback:Compute mean centroid from class data
+        # Fallback: Sample different instances from class data for each agent
+        # This ensures different agents get different starting points even without precomputed centroids
         X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
         y_data = self.y_test if self.eval_on_test_data else self.y
         
@@ -348,7 +373,37 @@ class AnchorEnv(ParallelEnv):
             return None
         
         class_data = X_data[class_mask]
-        centroid = np.mean(class_data, axis=0).astype(np.float32)
+        class_indices = np.where(class_mask)[0]
+        
+        # If we have enough instances, assign different instances to different agents
+        # Otherwise, fall back to mean centroid (but this should be rare)
+        if len(class_data) >= self.agents_per_class:
+            # Assign instances to agents deterministically to ensure diversity
+            # Each agent gets a different subset of instances
+            instances_per_agent = len(class_data) // self.agents_per_class
+            start_idx = agent_idx * instances_per_agent
+            end_idx = start_idx + instances_per_agent if agent_idx < self.agents_per_class - 1 else len(class_data)
+            agent_instances = class_data[start_idx:end_idx]
+            
+            # Randomly sample from agent's assigned subset for exploration across episodes
+            # This ensures each agent always gets a different instance from other agents
+            # while still having randomness for exploration
+            if len(agent_instances) > 0:
+                instance_idx = self.rng.integers(0, len(agent_instances))
+                centroid = agent_instances[instance_idx].astype(np.float32)
+            else:
+                # Fallback (shouldn't happen)
+                centroid = class_data[agent_idx % len(class_data)].astype(np.float32)
+        else:
+            # Not enough instances: use mean centroid (fallback)
+            # Log warning if this happens with multiple agents per class
+            if self.agents_per_class > 1:
+                logger.warning(
+                    f"Class {target_class} has only {len(class_data)} instances but {self.agents_per_class} agents. "
+                    f"All agents will use the same mean centroid. Consider using cluster_centroids_per_class or "
+                    f"fixed_instances_per_class to ensure diversity."
+                )
+            centroid = np.mean(class_data, axis=0).astype(np.float32)
         
         return centroid
     
@@ -1812,7 +1867,9 @@ class AnchorEnv(ParallelEnv):
         if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
             tightened = np.array([], dtype=int)
         else:
-            tightened = np.where(current_width < initial_width_ref * 0.97)[0]
+            # Use more lenient thresholds (matching single-agent version) to include more features in rules
+            # This helps rules cover more samples by being less restrictive about what counts as "tightened"
+            tightened = np.where(current_width < initial_width_ref * 0.95)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.98)[0]
             if tightened.size == 0:
@@ -1820,26 +1877,26 @@ class AnchorEnv(ParallelEnv):
             
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_96 = 0.96 * self.X_range
-                    tightened = np.where(current_width < threshold_96)[0]
+                    threshold_90 = 0.90 * self.X_range
+                    tightened = np.where(current_width < threshold_90)[0]
                 else:
-                    tightened = np.where(current_width < 0.96)[0]
+                    tightened = np.where(current_width < 0.90)[0]
             
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_95 = 0.95 * self.X_range
-                    tightened = np.where(current_width < threshold_95)[0]
+                    threshold_85 = 0.85 * self.X_range
+                    tightened = np.where(current_width < threshold_85)[0]
                 else:
-                    tightened = np.where(current_width < 0.95)[0]
+                    tightened = np.where(current_width < 0.85)[0]
             
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_90 = 0.9 * self.X_range
-                    if np.all(initial_width_ref >= threshold_90):
-                        tightened = np.where(current_width < threshold_90)[0]
+                    threshold_80 = 0.8 * self.X_range
+                    if np.all(initial_width_ref >= threshold_80):
+                        tightened = np.where(current_width < threshold_80)[0]
                 else:
-                    if np.all(initial_width_ref >= 0.9):
-                        tightened = np.where(current_width < 0.9)[0]
+                    if np.all(initial_width_ref >= 0.8):
+                        tightened = np.where(current_width < 0.8)[0]
             
             # Final fallback: any feature that tightened
             if tightened.size == 0:

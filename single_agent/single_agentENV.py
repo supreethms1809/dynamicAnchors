@@ -207,7 +207,11 @@ class SingleAgentAnchorEnv(Env):
         self.box_history = []
         self.coverage_floor_hits = 0
         self.timestep = None
-        self.max_cycles = env_config.get("max_cycles", 100)
+        # Read max_cycles from config - no hardcoded default to ensure YAML settings are respected
+        self.max_cycles = env_config.get("max_cycles")
+        if self.max_cycles is None:
+            raise ValueError("max_cycles must be specified in env_config. Check your YAML config file.")
+        self.max_cycles = int(self.max_cycles)
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
