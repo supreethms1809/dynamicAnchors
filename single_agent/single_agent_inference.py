@@ -381,14 +381,29 @@ def extract_rules_single_agent(
     try:
         from utils.clusters import compute_cluster_centroids_per_class
         
+        # Use full dataset (train + test) for clustering when test data is available
+        # This provides better cluster representation and stability
+        # Clustering is initialization, not training, so using test data is acceptable
+        if eval_on_test_data and env_data.get("X_test_unit") is not None:
+            # Combine train and test data for clustering
+            X_cluster = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            y_cluster = np.concatenate([env_data["y"], env_data["y_test"]])
+            logger.info("  Using FULL dataset (train + test) for clustering")
+            logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(X_cluster)}")
+        else:
+            # Fallback to training data only if test data not available
+            X_cluster = env_data["X_unit"]
+            y_cluster = env_data["y"]
+            logger.info("  Using TRAINING data for clustering (test data not available)")
+        
         # Use multiple clusters for diversity across episodes
         # Use at least one cluster per instance, but cap at 10 for efficiency
         n_clusters_per_class = min(10, n_instances_per_class)
         logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity across episodes")
         
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
-            X_unit=env_data["X_unit"],
-            y=env_data["y"],
+            X_unit=X_cluster,
+            y=y_cluster,
             n_clusters_per_class=n_clusters_per_class,
             random_state=seed if seed is not None else 42
         )
@@ -829,19 +844,25 @@ def extract_rules_single_agent(
         
         logger.info(f"  Processed {len(anchors_list)} instance-based episodes")
         # Log in order: Instance metrics, then Union metrics (will be recomputed with class-based anchors later)
-        logger.info(f"  Instance-level metrics (averaged across all {len(anchors_list)} anchors):")
-        logger.info(f"    Average precision: {instance_precision:.4f}, Average coverage: {instance_coverage:.4f}")
+        logger.info(f"\n  {'='*60}")
+        logger.info(f"  Class {target_class} - INSTANCE-BASED Results:")
+        logger.info(f"  {'='*60}")
+        logger.info(f"  Instance-Level Metrics (averaged across all {len(anchors_list)} instance-based anchors):")
+        logger.info(f"    Precision: {instance_precision:.4f}")
+        logger.info(f"    Coverage:  {instance_coverage:.4f}")
         if instance_coverage_class_conditional > 0.0:
             logger.info(f"    Class-conditional coverage: {instance_coverage_class_conditional:.4f}")
             if instance_coverage < 0.05 and instance_coverage_class_conditional > 0.1:
                 logger.info(f"    Note: Low overall coverage is expected when dataset has many samples from other classes.")
         logger.info(f"  Unique rules (instance-based, after deduplication): {len(unique_rules)}")
         logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
-        # Union metrics (instance-based only) - will be recomputed after class-based rollouts
+        # Union metrics (instance-based only) - temporary, will be overwritten with class-based union after class-based rollouts
         n_anchors_for_union = anchors_with_bounds if anchors_with_bounds > 0 else len(anchors_list)
-        logger.info(f"  Union metrics (instance-based anchors only):")
-        logger.info(f"    Union precision: {class_precision:.4f}, Union coverage: {class_coverage:.4f}")
-        logger.info(f"    Note: Final union metrics (including class-based anchors) will be computed after class-based rollouts.")
+        logger.info(f"  Class Union Metrics (temporary - union of {n_anchors_for_union} instance-based anchors):")
+        logger.info(f"    Precision: {class_precision:.4f}")
+        logger.info(f"    Coverage:  {class_coverage:.4f}")
+        logger.info(f"    Note: These will be overwritten with class-based union metrics after class-based rollouts.")
+        logger.info(f"  {'='*60}")
         # logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
         # logger.info(f"  Total class processing time: {class_total_time:.4f}s")
     
@@ -893,18 +914,38 @@ def extract_rules_single_agent(
         for rollout_idx in range(n_class_based_rollouts_per_class):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # Use test data for environment if eval_on_test_data=True
+            # CRITICAL: Use FULL dataset (train + test) for class-based rollouts to match clustering
+            # This ensures consistency: centroids are computed from full dataset, so rollouts should use full dataset too
+            # This matches multi-agent behavior and provides better coverage
             if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                env_X_unit = env_data["X_test_unit"]
-                env_X_std = env_data["X_test_std"]
-                env_y = env_data["y_test"]
+                # Combine train and test data for class-based rollouts (matching clustering approach)
+                env_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                env_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                env_y = np.concatenate([env_data["y"], env_data["y_test"]])
+                # When using full dataset, set eval_on_test_data=False so metrics are computed on full dataset
+                # (The full dataset includes test data, so this is still valid for evaluation)
+                use_full_dataset = True
+                if rollout_idx == 0:  # Log once per class
+                    logger.info(f"  Using FULL dataset (train + test) for class-based rollouts (matching clustering approach)")
+                    logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(env_y)}")
             else:
+                # Fallback to training data only if test data not available
                 env_X_unit = env_data["X_unit"]
                 env_X_std = env_data["X_std"]
                 env_y = env_data["y"]
+                use_full_dataset = False
+                if rollout_idx == 0:  # Log once per class
+                    logger.info(f"  Using TRAINING data only for class-based rollouts (test data not available)")
             
             # Set mode to "inference" for rule extraction
-            inference_env_config = {**env_config, "mode": "inference"}
+            # CRITICAL: Ensure use_class_centroids is True for class-based rollouts
+            # When using full dataset, set eval_on_test_data=False so metrics are computed on the full dataset
+            inference_env_config = {
+                **env_config, 
+                "mode": "inference",
+                "use_class_centroids": True,  # Explicitly enable class-based initialization
+                "eval_on_test_data": False if use_full_dataset else eval_on_test_data  # Use full dataset for metrics when using full dataset
+            }
             env = SingleAgentAnchorEnv(
                 X_unit=env_X_unit,
                 X_std=env_X_std,
@@ -919,6 +960,25 @@ def extract_rules_single_agent(
             # IMPORTANT: DO NOT set x_star_unit - this triggers class-based initialization
             # The environment will use cluster_centroids_per_class when available,
             # otherwise it will use mean centroid of the class
+            # Verify that x_star_unit is None (should be by default)
+            if env.x_star_unit is not None:
+                logger.warning(f"  WARNING: x_star_unit is set for class-based rollout {rollout_idx}! This will cause instance-based mode instead.")
+                logger.warning(f"    x_star_unit shape: {env.x_star_unit.shape if isinstance(env.x_star_unit, np.ndarray) else type(env.x_star_unit)}")
+                # Force it to None for class-based mode
+                env.x_star_unit = None
+            
+            # Verify use_class_centroids is enabled
+            if not env.use_class_centroids:
+                logger.warning(f"  WARNING: use_class_centroids is False for class-based rollout {rollout_idx}! This will cause full-space initialization.")
+                env.use_class_centroids = True
+            
+            # Debug: Log centroid selection
+            if rollout_idx == 0:  # Only log for first rollout to avoid spam
+                centroid = env._get_class_centroid()
+                if centroid is not None:
+                    logger.debug(f"  Class-based rollout {rollout_idx}: Using centroid (shape={centroid.shape}, mean={centroid.mean():.4f})")
+                else:
+                    logger.warning(f"  Class-based rollout {rollout_idx}: No centroid available! Will use full-space initialization.")
             
             # Run rollout
             episode_data = run_single_agent_rollout(
@@ -931,6 +991,13 @@ def extract_rules_single_agent(
             precision = episode_data.get("precision", 0.0)
             coverage = episode_data.get("coverage", 0.0)
             rollout_time = episode_data.get("rollout_time_seconds", 0.0)
+            
+            # Debug logging for first few rollouts
+            if rollout_idx < 3:
+                logger.debug(f"  Class-based rollout {rollout_idx}: precision={precision:.4f}, coverage={coverage:.4f}")
+                if precision == 0.0 or coverage == 0.0:
+                    logger.debug(f"    Final bounds: lower={env.lower[:3] if hasattr(env, 'lower') else 'N/A'}, upper={env.upper[:3] if hasattr(env, 'upper') else 'N/A'} (first 3 dims)")
+                    logger.debug(f"    Box volume: {np.prod(env.upper - env.lower) if hasattr(env, 'lower') and hasattr(env, 'upper') else 'N/A'}")
             
             class_based_precisions.append(float(precision))
             class_based_coverages.append(float(coverage))
@@ -1022,7 +1089,15 @@ def extract_rules_single_agent(
         if class_key not in results["per_class_results"]:
             results["per_class_results"][class_key] = {}
         
-        # Store class-based results in a separate key for easy access
+        # CRITICAL: Add class-based metrics to the main class entry (for consistency with multi-agent)
+        # This allows the summary script to find them easily
+        results["per_class_results"][class_key]["class_level_precision"] = class_based_precision
+        results["per_class_results"][class_key]["class_level_coverage"] = class_based_coverage
+        # Legacy names for backward compatibility
+        results["per_class_results"][class_key]["class_based_precision"] = class_based_precision
+        results["per_class_results"][class_key]["class_based_coverage"] = class_based_coverage
+        
+        # Also store class-based results in a separate key for easy access (kept for backward compatibility)
         class_based_key = f"class_{target_class}_class_based"
         results["per_class_results"][class_based_key] = {
             "class": int(target_class),
@@ -1041,18 +1116,24 @@ def extract_rules_single_agent(
             "total_processing_time_seconds": float(class_based_total_time),
         }
         
-        logger.info(f"  Class-based rollouts completed: {len(class_based_anchors_list)} episodes")
-        logger.info(f"  Class-based metrics (averaged across all {len(class_based_anchors_list)} anchors):")
-        logger.info(f"    Average precision: {class_based_precision:.4f}, Average coverage: {class_based_coverage:.4f}")
+        logger.info(f"\n  {'='*60}")
+        logger.info(f"  Class {target_class} - CLASS-BASED Results (Centroid-Based Rollouts):")
+        logger.info(f"  {'='*60}")
+        logger.info(f"  Class-Based Metrics (averaged across all {len(class_based_anchors_list)} class-based anchors):")
+        logger.info(f"    Precision: {class_based_precision:.4f}")
+        logger.info(f"    Coverage:  {class_based_coverage:.4f}")
         logger.info(f"  Unique rules (class-based, after deduplication): {len(class_based_unique_rules)}")
+        logger.info(f"  Average rollout time per episode: {class_based_avg_rollout_time:.4f}s")
+        logger.info(f"  {'='*60}")
     
     logger.info(f"\n{'='*80}")
     logger.info("Class-based rollouts completed")
     logger.info(f"{'='*80}")
     
-    # Recompute union metrics for all classes to include BOTH instance-based AND class-based anchors
+    # Recompute union metrics for all classes using ONLY class-based anchors
+    # This represents the smallest set of general rules that explain the class structure
     logger.info(f"\n{'='*80}")
-    logger.info("Recomputing Union Metrics (Instance-based + Class-based anchors)")
+    logger.info("Recomputing Class Union Metrics (Class-based anchors only)")
     logger.info(f"{'='*80}")
     
     # Get the appropriate dataset (test or train) based on eval_on_test_data
@@ -1069,21 +1150,20 @@ def extract_rules_single_agent(
         if target_class is None:
             continue
         
-        # Collect ALL anchors: instance-based + class-based
+        # Collect ONLY class-based anchors (represent class structure, not instance-specific patterns)
         all_anchors_for_union = []
+        class_based_unique_rules = []
         
-        # Add instance-based anchors
-        if "anchors" in class_data:
-            all_anchors_for_union.extend(class_data["anchors"])
-        
-        # Add class-based anchors if they exist (stored separately)
+        # Get class-based anchors and rules (stored separately)
         class_based_key = f"class_{target_class}_class_based"
         if class_based_key in results.get("per_class_results", {}):
             class_based_data = results["per_class_results"][class_based_key]
             if "anchors" in class_based_data:
                 all_anchors_for_union.extend(class_based_data["anchors"])
+            if "unique_rules" in class_based_data:
+                class_based_unique_rules = class_based_data["unique_rules"]
         
-        # Compute union of ALL anchors (instance-based + class-based)
+        # Compute union of class-based anchors only (smallest set of general rules)
         if X_data_union is not None and y_data_union is not None and len(all_anchors_for_union) > 0:
             n_samples = X_data_union.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
@@ -1112,16 +1192,37 @@ def extract_rules_single_agent(
             else:
                 class_precision_combined = 0.0
             
-            # Update class-level metrics with combined union
+            # Update class-level metrics with class-based union only
             class_data["class_precision"] = class_precision_combined
             class_data["class_coverage"] = class_coverage_combined
             
             # Log the final union metrics
-            n_instance_anchors = len(class_data.get("anchors", []))
-            n_class_based_anchors = len(results.get("per_class_results", {}).get(class_based_key, {}).get("anchors", []))
-            logger.info(f"\n  Class {target_class} - Final Union Metrics (Instance + Class-based):")
-            logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}")
-            logger.info(f"    Anchors used: {n_instance_anchors} instance-based + {n_class_based_anchors} class-based = {len(all_anchors_for_union)} total")
+            n_class_based_anchors = len(all_anchors_for_union)
+            n_unique_rules = len(class_based_unique_rules)
+            logger.info(f"\n  {'='*60}")
+            logger.info(f"  Class {target_class} - CLASS UNION Results (Union of Class-Based Anchors Only):")
+            logger.info(f"  {'='*60}")
+            logger.info(f"  Class Union Metrics (union of {n_class_based_anchors} class-based anchors):")
+            logger.info(f"    Precision: {class_precision_combined:.4f}")
+            logger.info(f"    Coverage:  {class_coverage_combined:.4f}")
+            logger.info(f"    Unique Rules: {n_unique_rules}")
+            logger.info(f"    Note: Represents the smallest set of general rules that explain the class structure")
+            
+            # Log the actual rules
+            if class_based_unique_rules:
+                logger.info(f"\n  Class {target_class} - Class-Based Union Rules:")
+                for i, rule in enumerate(class_based_unique_rules, 1):
+                    logger.info(f"    Rule {i}: {rule}")
+            else:
+                logger.info(f"\n  Class {target_class} - No unique rules found in class-based anchors")
+            
+            logger.info(f"  {'='*60}")
+        else:
+            # No class-based anchors available - set union metrics to 0.0
+            if len(all_anchors_for_union) == 0:
+                logger.warning(f"  Class {target_class}: No class-based anchors found. Class union metrics set to 0.0")
+                class_data["class_precision"] = 0.0
+                class_data["class_coverage"] = 0.0
     
     # End overall timing
     overall_end_time = time.perf_counter()

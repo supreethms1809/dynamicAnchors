@@ -138,7 +138,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     per_class_results = rules_data.get("per_class_results", {})
     
     summary = {
-        "n_classes": len(per_class_results),
+        "n_classes": 0,  # Will be set after counting unique classes (excluding _class_based entries)
         "classes": [],
         "per_class_summary": {},
         "overall_stats": {},
@@ -159,9 +159,23 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     all_unique_rule_counts = []
     feature_frequency = Counter()
     
+    # Track processed classes to avoid duplicates
+    processed_classes = set()
+    
     for class_key, class_data in per_class_results.items():
+        # Skip class-based result keys (they're stored separately, not as actual classes)
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            continue
+        
         target_class = class_data.get("class", -1)
-        summary["classes"].append(target_class)
+        # Only add if we haven't seen this class before (prevent duplicates)
+        if target_class not in processed_classes:
+            summary["classes"].append(target_class)
+            processed_classes.add(target_class)
+        
+        # Debug: Log available keys for this class
+        logger.debug(f"Processing class {target_class} (key: {class_key}). "
+                    f"Available keys: {list(class_data.keys())[:15]}...")
         
         # Extract instance-level metrics (average across all instances)
         instance_precision = class_data.get("instance_precision", class_data.get("precision", 0.0))
@@ -194,19 +208,111 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         all_rules = class_data.get("rules", [])
         
         # Extract class-level rules (centroid-based rollouts)
-        class_level_results = class_data.get("class_based_results", {})
+        # Check for class-based results in multiple places (in order of preference):
+        # 1. Directly in class_data as "class_level_precision"/"class_based_precision" (current format, matches multi-agent)
+        # 2. Inside class_data as "class_based_results" (legacy format)
+        # 3. As a separate key "class_{target_class}_class_based" in per_class_results (fallback format)
         class_level_unique_rules = []
         class_level_all_rules = []
         class_level_precision = 0.0
         class_level_coverage = 0.0
         
-        if isinstance(class_level_results, dict):
-            if "unique_rules" in class_level_results:
-                # Single result dict (single-agent format)
-                class_level_unique_rules = class_level_results.get("unique_rules", [])
-                class_level_all_rules = class_level_results.get("rules", [])
-                class_level_precision = class_level_results.get("precision", 0.0)
-                class_level_coverage = class_level_results.get("coverage", 0.0)
+        # First, check if class_level_precision/class_based_precision exist directly in class_data (current format)
+        # Use None as default to distinguish between "not found" and "found but 0.0"
+        class_level_precision = class_data.get("class_level_precision")
+        if class_level_precision is None:
+            class_level_precision = class_data.get("class_based_precision")
+        if class_level_precision is None:
+            class_level_precision = 0.0
+        
+        class_level_coverage = class_data.get("class_level_coverage")
+        if class_level_coverage is None:
+            class_level_coverage = class_data.get("class_based_coverage")
+        if class_level_coverage is None:
+            class_level_coverage = 0.0
+        
+        # Track if we found keys in main entry (even if values are 0.0)
+        found_prec_key = "class_level_precision" in class_data or "class_based_precision" in class_data
+        found_cov_key = "class_level_coverage" in class_data or "class_based_coverage" in class_data
+        
+        # Debug: Log what we found
+        if found_prec_key or found_cov_key:
+            logger.info(f"  Class {target_class}: Found class-based metrics in main entry: "
+                       f"class_level_precision={class_level_precision:.4f}, "
+                       f"class_level_coverage={class_level_coverage:.4f}")
+        else:
+            logger.info(f"  Class {target_class}: No class-based metrics in main entry. "
+                       f"Will check separate key. Keys available: {list(class_data.keys())[:15]}...")
+        
+        # If precision/coverage found, try to get rules from the same place or separate key
+        if class_level_precision > 0.0 or class_level_coverage > 0.0:
+            # Try to get rules from class_based_results nested dict (if exists)
+            class_level_results = class_data.get("class_based_results", {})
+            if isinstance(class_level_results, dict) and class_level_results:
+                if "unique_rules" in class_level_results:
+                    class_level_unique_rules = class_level_results.get("unique_rules", [])
+                    class_level_all_rules = class_level_results.get("rules", [])
+        
+        # If not found in main class_data, check nested class_based_results (legacy format)
+        if (class_level_precision == 0.0 and class_level_coverage == 0.0) or (not class_level_unique_rules and not class_level_all_rules):
+            class_level_results = class_data.get("class_based_results", {})
+            if isinstance(class_level_results, dict) and class_level_results:
+                if "unique_rules" in class_level_results:
+                    # Single result dict (single-agent format)
+                    class_level_unique_rules = class_level_results.get("unique_rules", [])
+                    class_level_all_rules = class_level_results.get("rules", [])
+                    class_level_precision = class_level_results.get("precision", class_level_precision)
+                    class_level_coverage = class_level_results.get("coverage", class_level_coverage)
+        
+        # CRITICAL: Always check separate class-based key if it exists
+        # The separate key is the authoritative source for class-based metrics
+        # Check it first, then use main entry as fallback
+        class_based_key = f"class_{target_class}_class_based"
+        
+        # Always check separate key if it exists (it's the authoritative source)
+        if class_based_key in per_class_results:
+            class_based_data = per_class_results[class_based_key]
+            logger.info(f"  Class {target_class}: Found separate class-based key '{class_based_key}'. "
+                       f"Reading precision/coverage from it.")
+            logger.info(f"    Separate key has keys: {list(class_based_data.keys())[:15]}...")
+            
+            # Try to get rules first
+            if not class_level_unique_rules and not class_level_all_rules:
+                class_level_unique_rules = class_based_data.get("unique_rules", [])
+                class_level_all_rules = class_based_data.get("rules", [])
+            
+            # Try to get precision/coverage - check multiple possible keys
+            prec_from_separate = class_based_data.get("precision")
+            if prec_from_separate is None:
+                prec_from_separate = class_based_data.get("class_level_precision")
+            if prec_from_separate is None:
+                prec_from_separate = class_based_data.get("class_based_precision")
+            
+            cov_from_separate = class_based_data.get("coverage")
+            if cov_from_separate is None:
+                cov_from_separate = class_based_data.get("class_level_coverage")
+            if cov_from_separate is None:
+                cov_from_separate = class_based_data.get("class_based_coverage")
+            
+            # Always update from separate key if we found non-None values
+            # This ensures we use the separate key values even if main entry has 0.0
+            # The separate key is the authoritative source for class-based metrics
+            if prec_from_separate is not None:
+                # Always use separate key value (even if it's 0.0) since it's the authoritative source
+                class_level_precision = float(prec_from_separate)
+                logger.info(f"    Updated class_level_precision from separate key: {class_level_precision:.4f}")
+            if cov_from_separate is not None:
+                # Always use separate key value (even if it's 0.0) since it's the authoritative source
+                class_level_coverage = float(cov_from_separate)
+                logger.info(f"    Updated class_level_coverage from separate key: {class_level_coverage:.4f}")
+            
+            logger.info(f"  Class {target_class}: Final values after reading from separate key: "
+                       f"class_level_precision={class_level_precision:.4f}, "
+                       f"class_level_coverage={class_level_coverage:.4f}")
+        else:
+            logger.info(f"  Class {target_class}: Separate class-based key '{class_based_key}' not found. "
+                       f"Available keys ending with '_class_based': "
+                       f"{[k for k in per_class_results.keys() if k.endswith('_class_based')]}")
         
         # Count features in instance-based rules
         for rule_str in unique_rules:
@@ -268,7 +374,12 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         if "n_episodes" in class_data:
             class_summary["n_episodes"] = int(class_data.get("n_episodes", 0))
         
-        summary["per_class_summary"][class_key] = class_summary
+        # CRITICAL: Double-check that we're not adding _class_based entries
+        # This should never happen due to the skip check at line 167, but add safeguard anyway
+        if not (class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based"):
+            summary["per_class_summary"][class_key] = class_summary
+        else:
+            logger.warning(f"Skipping _class_based entry '{class_key}' - should have been filtered earlier!")
         
         # Collect for overall stats (using instance-level for overall stats)
         all_precisions.append(instance_precision)
@@ -287,19 +398,32 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     
     # Store summary stats (no global averages - removed per user request)
     # Only keep rule counts and feature frequency for overall stats
-    class_level_unique_rule_counts = [s.get("class_level_n_unique_rules", s.get("class_based_n_unique_rules", 0)) for s in summary["per_class_summary"].values()]
+    # Filter out _class_based entries when counting rules
+    per_class_summary_filtered = {
+        k: v for k, v in summary["per_class_summary"].items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
+    class_level_unique_rule_counts = [s.get("class_level_n_unique_rules", s.get("class_based_n_unique_rules", 0)) for s in per_class_summary_filtered.values()]
+    
+    # Also count class-based rules from separate keys if they exist (in per_class_results, not per_class_summary)
+    for class_key, class_data in per_class_results.items():
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            class_level_unique_rule_counts.append(class_data.get("unique_rules_count", len(class_data.get("unique_rules", []))))
     
     summary["overall_stats"] = {
         # Rule counts and feature frequency only (no global averages)
         "total_unique_rules": int(sum(all_unique_rule_counts)),
-        "total_unique_rules_instance_based": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
+        "total_unique_rules_instance_based": int(sum([s["n_unique_rules"] for s in per_class_summary_filtered.values()])),
         "total_unique_rules_class_level": int(sum(class_level_unique_rule_counts)),
         "total_unique_rules_class_based": int(sum(class_level_unique_rule_counts)),  # Legacy
         "mean_unique_rules_per_class": float(np.mean(all_unique_rule_counts)) if all_unique_rule_counts else 0.0,
         "feature_frequency": dict(feature_frequency.most_common())
     }
     
-    summary["classes"] = sorted(summary["classes"])
+    # Deduplicate and sort classes list (in case of any duplicates)
+    summary["classes"] = sorted(list(set(summary["classes"])))
+    # Set n_classes to the number of unique classes (not counting _class_based entries)
+    summary["n_classes"] = len(summary["classes"])
     
     return summary
 
@@ -309,7 +433,12 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     
     if not classes:
@@ -390,7 +519,12 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     
     if not classes:
@@ -496,7 +630,12 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     
     # Collect feature intervals per class and globally
     feature_intervals_global: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
@@ -1216,9 +1355,14 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
         # Per-class details
         f.write("PER-CLASS DETAILS\n")
         f.write("-"*80 + "\n")
-        for class_key in sorted(summary['per_class_summary'].keys(), 
-                               key=lambda x: summary['per_class_summary'][x]['class']):
-            class_data = summary['per_class_summary'][class_key]
+        # Filter out _class_based entries - only show main class entries
+        per_class_filtered = {
+            k: v for k, v in summary['per_class_summary'].items() 
+            if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+        }
+        for class_key in sorted(per_class_filtered.keys(), 
+                               key=lambda x: per_class_filtered[x]['class']):
+            class_data = per_class_filtered[class_key]
             f.write(f"\nClass {class_data['class']}:\n")
             f.write(f"  Instance-Level (Average Across Instances):\n")
             f.write(f"    Precision: {class_data['instance_precision']:.4f}")
@@ -1360,8 +1504,13 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
     
     # Add per-class metrics
     per_class_summary = summary.get("per_class_summary", {})
+    # Filter out _class_based entries - only process main class entries
+    per_class_filtered = {
+        k: v for k, v in per_class_summary.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     total_rollout_time = 0.0
-    for class_key, class_data in per_class_summary.items():
+    for class_key, class_data in per_class_filtered.items():
         cls = class_data.get("class", -1)
         class_timing = {
             "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),

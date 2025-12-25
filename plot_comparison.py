@@ -506,11 +506,22 @@ def plot_precision_coverage_comparison(
     for cls in classes:
         # Find single-agent data for this class
         single_data = None
+        single_class_based_data = None
         if single_per_class:
             for class_key, class_data in single_per_class.items():
+                # Skip class_based entries when looking for main class data
+                if class_key.endswith("_class_based"):
+                    continue
                 if class_data.get("class") == cls:
                     single_data = class_data
                     break
+            
+            # Also look for separate class-based entry (format: class_{cls}_class_based) as fallback
+            class_based_key = f"class_{cls}_class_based"
+            if class_based_key in single_per_class:
+                single_class_based_data = single_per_class[class_based_key]
+                logger.debug(f"Found separate class-based entry for single-agent class {cls}: {class_based_key}")
+        
         if single_data:
             # Instance-level
             single_inst_prec = single_data.get("instance_precision", 0.0)
@@ -522,15 +533,47 @@ def plot_precision_coverage_comparison(
             single_union_cov = single_data.get("class_union_coverage", single_data.get("class_coverage", 0.0))
             single_class_precisions.append(single_union_prec)
             single_class_coverages.append(single_union_cov)
-            # Class-level (centroid-based rollouts)
+            
+            # Class-level (centroid-based rollouts) - check main class entry first (current format)
             single_cl_prec = single_data.get("class_level_precision", single_data.get("class_based_precision", 0.0))
             single_cl_cov = single_data.get("class_level_coverage", single_data.get("class_based_coverage", 0.0))
+            
+            # If not found in main class data, check separate class_based entry (fallback format)
+            if (single_cl_prec == 0.0 and single_cl_cov == 0.0) and single_class_based_data:
+                single_cl_prec = single_class_based_data.get("precision", single_class_based_data.get("class_level_precision", single_class_based_data.get("class_based_precision", 0.0)))
+                single_cl_cov = single_class_based_data.get("coverage", single_class_based_data.get("class_level_coverage", single_class_based_data.get("class_based_coverage", 0.0)))
+                logger.debug(f"  Using class-based data from separate entry: prec={single_cl_prec:.3f}, cov={single_cl_cov:.3f}")
+            
+            # Also check class_based_results nested dict (legacy format)
+            if (single_cl_prec == 0.0 and single_cl_cov == 0.0) and "class_based_results" in single_data:
+                class_based_results = single_data.get("class_based_results", {})
+                if isinstance(class_based_results, dict):
+                    # Handle both single dict and nested dict formats
+                    if "precision" in class_based_results:
+                        single_cl_prec = class_based_results.get("precision", class_based_results.get("class_level_precision", 0.0))
+                        single_cl_cov = class_based_results.get("coverage", class_based_results.get("class_level_coverage", 0.0))
+                    else:
+                        # Nested dict format (multi-agent style)
+                        for agent_result in class_based_results.values():
+                            if isinstance(agent_result, dict) and "instance_precision" in agent_result:
+                                single_cl_prec = agent_result.get("instance_precision", agent_result.get("precision", 0.0))
+                                single_cl_cov = agent_result.get("instance_coverage", agent_result.get("coverage", 0.0))
+                                break
+                    logger.debug(f"  Using class-based data from nested class_based_results: prec={single_cl_prec:.3f}, cov={single_cl_cov:.3f}")
+            
             single_class_level_precisions.append(single_cl_prec)
             single_class_level_coverages.append(single_cl_cov)
             # Legacy names
             single_class_based_precisions.append(single_cl_prec)
             single_class_based_coverages.append(single_cl_cov)
             logger.info(f"Single-agent C{cls}: inst_prec={single_inst_prec:.3f}, inst_cov={single_inst_cov:.3f}, class_union_prec={single_union_prec:.3f}, class_union_cov={single_union_cov:.3f}, class_based_prec={single_cl_prec:.3f}, class_based_cov={single_cl_cov:.3f}")
+            # Debug: Check if class-based keys exist
+            if single_cl_prec > 0.0 or single_cl_cov > 0.0:
+                logger.debug(f"  Single-agent C{cls}: Found class-based data (prec={single_cl_prec:.3f}, cov={single_cl_cov:.3f})")
+            elif "class_level_precision" in single_data or "class_based_precision" in single_data or single_class_based_data:
+                logger.debug(f"  Single-agent C{cls}: Class-based keys exist but values are 0.0")
+            else:
+                logger.debug(f"  Single-agent C{cls}: No class-based keys found (keys: {list(single_data.keys())})")
         else:
             logger.warning(f"Single-agent: No data found for class {cls}")
             single_instance_precisions.append(0.0)
@@ -539,6 +582,9 @@ def plot_precision_coverage_comparison(
             single_class_coverages.append(0.0)
             single_class_based_precisions.append(0.0)
             single_class_based_coverages.append(0.0)
+            # Also append to class_level lists for consistency
+            single_class_level_precisions.append(0.0)
+            single_class_level_coverages.append(0.0)
         
         # Find multi-agent data for this class
         multi_data = None
@@ -598,16 +644,26 @@ def plot_precision_coverage_comparison(
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
     # Check if we have class-level metrics (centroid-based rollouts)
-    has_class_level_single = any(cl > 0 for cl in single_class_level_precisions) or any(cl > 0 for cl in single_class_level_coverages)
-    has_class_level_multi = any(cl > 0 for cl in multi_class_level_precisions) or any(cl > 0 for cl in multi_class_level_coverages)
+    # Show if we have summary data and extracted values (even if some are 0.0)
+    has_class_level_single = single_agent_summary is not None and len(single_class_level_precisions) == len(classes)
+    has_class_level_multi = multi_agent_summary is not None and len(multi_class_level_precisions) == len(classes)
     has_class_level = has_class_level_single or has_class_level_multi
     
-    # Create subplots: instance-level (top row), class union (middle row), class-level (bottom row if available)
+    # Debug logging
+    if single_agent_summary:
+        logger.info(f"Single-agent class-based data: {len(single_class_level_precisions)} precisions, {len(single_class_level_coverages)} coverages for {len(classes)} classes")
+        logger.info(f"  Values: prec={single_class_level_precisions}, cov={single_class_level_coverages}")
+        logger.info(f"  Will show: {has_class_level_single}")
+    
+    # Create subplots: instance-based (row 1), class-based (row 2), union-based (row 3)
+    # Reordered as requested: instance -> class-based -> union
     if has_class_level:
         fig, axes = plt.subplots(3, 2, figsize=(16, 18))
-        ax1_inst, ax2_inst, ax1_union, ax2_union, ax1_cl, ax2_cl = axes.flatten()
+        # Row 1: Instance-based, Row 2: Class-based, Row 3: Union
+        ax1_inst, ax2_inst, ax1_cl, ax2_cl, ax1_union, ax2_union = axes.flatten()
     else:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        # Row 1: Instance-based, Row 2: Union (no class-based available)
         ax1_inst, ax2_inst, ax1_union, ax2_union = axes.flatten()
     
     x = np.arange(len(classes))
@@ -692,7 +748,64 @@ def plot_precision_coverage_comparison(
     ax2_inst.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax2_inst.legend(fontsize=10, framealpha=0.9)
     
-    # Middle-left: Class Union Precision (union of instance-based anchors, only single-agent and multi-agent)
+    # Row 2: Class-Based Precision and Coverage (centroid-based rollouts, if available)
+    # This is now row 2 (middle row) after reordering
+    if has_class_level:
+        bar_idx = 0
+        if single_agent_summary and has_class_level_single:
+            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_precisions, width_cls, 
+                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(single_class_level_precisions):
+                if val > 0.01:
+                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            bar_idx += 1
+        if multi_agent_summary and has_class_level_multi:
+            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_precisions, width_cls, 
+                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(multi_class_level_precisions):
+                if val > 0.01:
+                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        ax1_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
+        ax1_cl.set_ylabel('Precision', fontsize=12, fontweight='bold')
+        ax1_cl.set_title(f'{title_prefix}: Class-Based Precision (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
+        ax1_cl.set_xticks(x)
+        ax1_cl.set_xticklabels([f'C{cls}' for cls in classes])
+        ax1_cl.set_ylim([0, 1.1])
+        ax1_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
+        ax1_cl.legend(fontsize=10, framealpha=0.9)
+        
+        # Row 2-right: Class-Based Coverage (centroid-based rollouts)
+        bar_idx = 0
+        if single_agent_summary and has_class_level_single:
+            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_coverages, width_cls, 
+                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(single_class_level_coverages):
+                if val > 0.01:
+                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+            bar_idx += 1
+        if multi_agent_summary and has_class_level_multi:
+            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_coverages, width_cls, 
+                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
+            for i, val in enumerate(multi_class_level_coverages):
+                if val > 0.01:
+                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
+                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        ax2_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
+        ax2_cl.set_ylabel('Coverage', fontsize=12, fontweight='bold')
+        ax2_cl.set_title(f'{title_prefix}: Class-Based Coverage (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
+        ax2_cl.set_xticks(x)
+        ax2_cl.set_xticklabels([f'C{cls}' for cls in classes])
+        ax2_cl.set_ylim([0, 1.1])
+        ax2_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
+        ax2_cl.legend(fontsize=10, framealpha=0.9)
+    
+    # Row 3: Class Union Precision and Coverage (union of instance-based anchors, only single-agent and multi-agent)
+    # This is now row 3 (bottom row) after reordering
     bar_idx = 0
     if single_agent_summary:
         ax1_union.bar(x + offset_cls + bar_idx*width_cls, single_class_precisions, width_cls, 
@@ -719,7 +832,7 @@ def plot_precision_coverage_comparison(
     ax1_union.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax1_union.legend(fontsize=10, framealpha=0.9)
     
-    # Middle-right: Class Union Coverage (union of instance-based anchors, only single-agent and multi-agent)
+    # Row 3-right: Class Union Coverage (union of instance-based anchors, only single-agent and multi-agent)
     bar_idx = 0
     if single_agent_summary:
         ax2_union.bar(x + offset_cls + bar_idx*width_cls, single_class_coverages, width_cls, 
@@ -745,61 +858,6 @@ def plot_precision_coverage_comparison(
     ax2_union.set_ylim([0, 1.1])
     ax2_union.grid(True, alpha=0.3, axis='y', linestyle='--')
     ax2_union.legend(fontsize=10, framealpha=0.9)
-    
-    # Bottom row: Class-Level Precision and Coverage (centroid-based rollouts, if available)
-    if has_class_level:
-        bar_idx = 0
-        if single_agent_summary and has_class_level_single:
-            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_precisions, width_cls, 
-                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
-            for i, val in enumerate(single_class_level_precisions):
-                if val > 0.01:
-                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
-                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-            bar_idx += 1
-        if multi_agent_summary and has_class_level_multi:
-            ax1_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_precisions, width_cls, 
-                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
-            for i, val in enumerate(multi_class_level_precisions):
-                if val > 0.01:
-                    ax1_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
-                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-        
-        ax1_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
-        ax1_cl.set_ylabel('Precision', fontsize=12, fontweight='bold')
-        ax1_cl.set_title(f'{title_prefix}: Class-Level Precision (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
-        ax1_cl.set_xticks(x)
-        ax1_cl.set_xticklabels([f'C{cls}' for cls in classes])
-        ax1_cl.set_ylim([0, 1.1])
-        ax1_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
-        ax1_cl.legend(fontsize=10, framealpha=0.9)
-        
-        # Bottom-right: Class-Level Coverage (centroid-based rollouts)
-        bar_idx = 0
-        if single_agent_summary and has_class_level_single:
-            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, single_class_level_coverages, width_cls, 
-                      label='Single-Agent', alpha=0.8, color='steelblue', edgecolor='black', linewidth=1.5)
-            for i, val in enumerate(single_class_level_coverages):
-                if val > 0.01:
-                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
-                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-            bar_idx += 1
-        if multi_agent_summary and has_class_level_multi:
-            ax2_cl.bar(x + offset_cls + bar_idx*width_cls, multi_class_level_coverages, width_cls, 
-                      label='Multi-Agent', alpha=0.8, color='coral', edgecolor='black', linewidth=1.5)
-            for i, val in enumerate(multi_class_level_coverages):
-                if val > 0.01:
-                    ax2_cl.text(x[i] + offset_cls + bar_idx*width_cls + width_cls/2, val + 0.02,
-                               f'{val:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-        
-        ax2_cl.set_xlabel('Class', fontsize=12, fontweight='bold')
-        ax2_cl.set_ylabel('Coverage', fontsize=12, fontweight='bold')
-        ax2_cl.set_title(f'{title_prefix}: Class-Level Coverage (Centroid-Based Rollouts)', fontsize=13, fontweight='bold')
-        ax2_cl.set_xticks(x)
-        ax2_cl.set_xticklabels([f'C{cls}' for cls in classes])
-        ax2_cl.set_ylim([0, 1.1])
-        ax2_cl.grid(True, alpha=0.3, axis='y', linestyle='--')
-        ax2_cl.legend(fontsize=10, framealpha=0.9)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'precision_coverage_comparison.png'), dpi=300, bbox_inches='tight')
@@ -1648,6 +1706,11 @@ def plot_nashconv_comparison(
     """
     Plot NashConv convergence comparison (only for multi-agent, as single-agent doesn't have NashConv).
     
+    Improved version that:
+    - Shows informative messages when data is missing
+    - Uses flexible layout based on available data
+    - Combines training and evaluation on same plots for comparison
+    
     Args:
         multi_agent_summary: Multi-agent summary dictionary (may contain nashconv_metrics)
         output_dir: Output directory for the plot
@@ -1665,15 +1728,44 @@ def plot_nashconv_comparison(
         logger.debug("NashConv data not available in multi-agent summary, skipping plot")
         return
     
+    training_data = nashconv_data.get("training", []) or []
+    eval_data = nashconv_data.get("evaluation", []) or []
+    
+    # Log what data is available
+    logger.info(f"NashConv data available: Training={len(training_data)} points, Evaluation={len(eval_data)} points")
+    if not training_data:
+        logger.warning("⚠ Training NashConv data is missing. This could mean:")
+        logger.warning("  1. Training history was not logged properly")
+        logger.warning("  2. training_history.json file is missing or empty")
+        logger.warning("  3. NashConv metrics were not computed during training")
+    
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # Determine layout based on available data
+    has_training = len(training_data) > 0
+    has_eval = len(eval_data) > 0
+    
+    if not has_training and not has_eval:
+        logger.warning("⚠ No NashConv data available (neither training nor evaluation), skipping plot")
+        return
+    
+    # Create flexible layout: if both exist, use 2x2; if only one, use 1x2
+    if has_training and has_eval:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        ax1, ax2, ax3, ax4 = axes.flatten()
+    elif has_training:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        ax1, ax2 = axes.flatten()
+        ax3, ax4 = None, None
+    else:  # has_eval only
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        ax3, ax4 = axes.flatten()
+        ax1, ax2 = None, None
+    
     fig.suptitle(f"{title_prefix}: Nash Equilibrium Convergence Metrics", fontsize=14, fontweight='bold')
     
     # Plot 1: Training NashConv Sum
-    ax1 = axes[0, 0]
-    training_data = nashconv_data.get("training", [])
-    if training_data:
+    if ax1 and training_data:
         # Use total_frames if available (more accurate), otherwise use step, otherwise use index
         x_values = []
         for i, e in enumerate(training_data):
@@ -1701,10 +1793,15 @@ def plot_nashconv_comparison(
         ax1.legend()
         if nashconv_sums:
             ax1.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    elif ax1:
+        ax1.text(0.5, 0.5, 'Training NashConv data\nnot available', 
+                ha='center', va='center', transform=ax1.transAxes, 
+                fontsize=12, color='gray', style='italic')
+        ax1.set_title('Training NashConv Convergence (No Data)')
+        ax1.axis('off')
     
     # Plot 2: Training Exploitability Max
-    ax2 = axes[0, 1]
-    if training_data:
+    if ax2 and training_data:
         # Use same x_values as Plot 1 for consistency
         x_values = []
         for i, e in enumerate(training_data):
@@ -1730,39 +1827,79 @@ def plot_nashconv_comparison(
         ax2.set_title(f'Training Max Exploitability ({len(training_data)} data point{"s" if len(training_data) > 1 else ""})')
         ax2.grid(True, alpha=0.3)
         ax2.legend()
+    elif ax2:
+        ax2.text(0.5, 0.5, 'Training Exploitability data\nnot available', 
+                ha='center', va='center', transform=ax2.transAxes, 
+                fontsize=12, color='gray', style='italic')
+        ax2.set_title('Training Max Exploitability (No Data)')
+        ax2.axis('off')
     
     # Plot 3: Evaluation NashConv Sum
-    ax3 = axes[1, 0]
-    eval_data = nashconv_data.get("evaluation", [])
-    if eval_data:
-        eval_steps = [e.get("step", i) for i, e in enumerate(eval_data)]
+    if ax3 and eval_data:
+        eval_steps = []
+        for i, e in enumerate(eval_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                eval_steps.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                eval_steps.append(e["step"])
+            else:
+                eval_steps.append(i)
+        
         eval_nashconv_sums = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
-        ax3.plot(eval_steps, eval_nashconv_sums, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
-        ax3.set_xlabel('Evaluation Step')
+        
+        # If only one data point, use scatter plot
+        if len(eval_data) == 1:
+            ax3.scatter(eval_steps, eval_nashconv_sums, s=100, color='r', marker='^', label='Evaluation NashConv', zorder=3)
+            ax3.text(eval_steps[0], eval_nashconv_sums[0] + 0.01, f'{eval_nashconv_sums[0]:.6f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        else:
+            ax3.plot(eval_steps, eval_nashconv_sums, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
+        
+        ax3.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
         ax3.set_ylabel('NashConv Sum')
-        ax3.set_title('Evaluation NashConv Convergence')
+        ax3.set_title(f'Evaluation NashConv Convergence ({len(eval_data)} data point{"s" if len(eval_data) > 1 else ""})')
         ax3.grid(True, alpha=0.3)
         ax3.legend()
         if eval_nashconv_sums:
             ax3.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+    elif ax3:
+        ax3.text(0.5, 0.5, 'Evaluation NashConv data\nnot available', 
+                ha='center', va='center', transform=ax3.transAxes, 
+                fontsize=12, color='gray', style='italic')
+        ax3.set_title('Evaluation NashConv Convergence (No Data)')
+        ax3.axis('off')
     
     # Plot 4: Evaluation Exploitability Max
-    ax4 = axes[1, 1]
-    if eval_data:
+    if ax4 and eval_data:
+        eval_steps = []
+        for i, e in enumerate(eval_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                eval_steps.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                eval_steps.append(e["step"])
+            else:
+                eval_steps.append(i)
+        
         eval_exploitability_max = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
-        ax4.plot(eval_steps, eval_exploitability_max, 'm-', marker='d', linewidth=2, markersize=4, label='Max Exploitability')
-        ax4.set_xlabel('Evaluation Step')
+        
+        # If only one data point, use scatter plot
+        if len(eval_data) == 1:
+            ax4.scatter(eval_steps, eval_exploitability_max, s=100, color='m', marker='d', label='Max Exploitability', zorder=3)
+            ax4.text(eval_steps[0], eval_exploitability_max[0] + 0.01, f'{eval_exploitability_max[0]:.6f}', 
+                    ha='center', va='bottom', fontsize=9, fontweight='bold')
+        else:
+            ax4.plot(eval_steps, eval_exploitability_max, 'm-', marker='d', linewidth=2, markersize=4, label='Max Exploitability')
+        
+        ax4.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
         ax4.set_ylabel('Max Exploitability')
-        ax4.set_title('Evaluation Max Exploitability')
+        ax4.set_title(f'Evaluation Max Exploitability ({len(eval_data)} data point{"s" if len(eval_data) > 1 else ""})')
         ax4.grid(True, alpha=0.3)
         ax4.legend()
-    
-    # Hide empty subplots
-    if not training_data:
-        ax1.axis('off')
-        ax2.axis('off')
-    if not eval_data:
-        ax3.axis('off')
+    elif ax4:
+        ax4.text(0.5, 0.5, 'Evaluation Exploitability data\nnot available', 
+                ha='center', va='center', transform=ax4.transAxes, 
+                fontsize=12, color='gray', style='italic')
+        ax4.set_title('Evaluation Max Exploitability (No Data)')
         ax4.axis('off')
     
     plt.tight_layout()
@@ -1770,6 +1907,82 @@ def plot_nashconv_comparison(
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved NashConv convergence comparison plot to {output_path}")
+    
+    # Also create a combined plot showing training vs evaluation for direct comparison
+    if has_training and has_eval:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f"{title_prefix}: Training vs Evaluation NashConv Comparison", fontsize=14, fontweight='bold')
+        
+        # Combined NashConv Sum plot
+        ax1 = axes[0]
+        
+        # Prepare training data
+        train_x = []
+        for i, e in enumerate(training_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                train_x.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                train_x.append(e["step"])
+            else:
+                train_x.append(i)
+        train_nashconv = [e.get("training/nashconv_sum", 0.0) for e in training_data]
+        
+        # Prepare evaluation data
+        eval_x = []
+        for i, e in enumerate(eval_data):
+            if "total_frames" in e and e["total_frames"] is not None:
+                eval_x.append(e["total_frames"])
+            elif "step" in e and e["step"] is not None:
+                eval_x.append(e["step"])
+            else:
+                eval_x.append(i)
+        eval_nashconv = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
+        
+        # Plot both on same axes
+        if len(train_nashconv) == 1:
+            ax1.scatter(train_x, train_nashconv, s=100, color='b', marker='o', label='Training', zorder=3)
+        else:
+            ax1.plot(train_x, train_nashconv, 'b-', marker='o', linewidth=2, markersize=4, label='Training NashConv')
+        
+        if len(eval_nashconv) == 1:
+            ax1.scatter(eval_x, eval_nashconv, s=100, color='r', marker='^', label='Evaluation', zorder=3)
+        else:
+            ax1.plot(eval_x, eval_nashconv, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
+        
+        ax1.set_xlabel('Step/Frames')
+        ax1.set_ylabel('NashConv Sum')
+        ax1.set_title('NashConv Sum: Training vs Evaluation')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        ax1.axhline(y=0.01, color='gray', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+        
+        # Combined Exploitability plot
+        ax2 = axes[1]
+        
+        train_exploit = [e.get("training/exploitability_max", 0.0) for e in training_data]
+        eval_exploit = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
+        
+        if len(train_exploit) == 1:
+            ax2.scatter(train_x, train_exploit, s=100, color='g', marker='s', label='Training', zorder=3)
+        else:
+            ax2.plot(train_x, train_exploit, 'g-', marker='s', linewidth=2, markersize=4, label='Training Max Exploitability')
+        
+        if len(eval_exploit) == 1:
+            ax2.scatter(eval_x, eval_exploit, s=100, color='m', marker='d', label='Evaluation', zorder=3)
+        else:
+            ax2.plot(eval_x, eval_exploit, 'm-', marker='d', linewidth=2, markersize=4, label='Evaluation Max Exploitability')
+        
+        ax2.set_xlabel('Step/Frames')
+        ax2.set_ylabel('Max Exploitability')
+        ax2.set_title('Max Exploitability: Training vs Evaluation')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        plt.tight_layout()
+        combined_path = Path(output_dir) / "nashconv_training_vs_evaluation.png"
+        plt.savefig(combined_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved combined Training vs Evaluation NashConv plot to {combined_path}")
 
 
 def save_comparison_metrics_json(
@@ -1814,8 +2027,33 @@ def save_comparison_metrics_json(
         instance_coverages = [c.get("instance_coverage", 0.0) for c in sa_per_class.values() if c.get("instance_coverage", 0.0) > 0]
         class_precisions = [c.get("class_union_precision", c.get("class_precision", 0.0)) for c in sa_per_class.values() if c.get("class_union_precision", c.get("class_precision", 0.0)) > 0]
         class_coverages = [c.get("class_union_coverage", c.get("class_coverage", 0.0)) for c in sa_per_class.values() if c.get("class_union_coverage", c.get("class_coverage", 0.0)) > 0]
-        class_based_precisions = [c.get("class_level_precision", c.get("class_based_precision", 0.0)) for c in sa_per_class.values() if c.get("class_level_precision", c.get("class_based_precision", 0.0)) > 0]
-        class_based_coverages = [c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) for c in sa_per_class.values() if c.get("class_level_coverage", c.get("class_based_coverage", 0.0)) > 0]
+        
+        # For class-based metrics, check if keys exist (even if values are 0.0)
+        # Also check for class_{class}_class_based entries in per_class_results
+        class_based_precisions = []
+        class_based_coverages = []
+        has_class_based_data = False
+        
+        # Check per_class_summary for class-based metrics
+        for class_data in sa_per_class.values():
+            # Check for class_level_precision/coverage or class_based_precision/coverage
+            if "class_level_precision" in class_data or "class_based_precision" in class_data:
+                has_class_based_data = True
+                prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+                cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+                class_based_precisions.append(prec)
+                class_based_coverages.append(cov)
+        
+        # Also check if there are separate class_{class}_class_based entries
+        # These might be in per_class_results if the summary structure is different
+        if not has_class_based_data:
+            # Try checking overall_stats for class-based rule counts as indicator
+            if sa_overall.get("total_unique_rules_class_based", 0) > 0:
+                has_class_based_data = True
+                # If we have class-based rules but no metrics, set to 0.0
+                if not class_based_precisions:
+                    class_based_precisions = [0.0]
+                    class_based_coverages = [0.0]
         
         # Calculate average rollout time
         avg_rollout_times = []
@@ -1853,6 +2091,7 @@ def save_comparison_metrics_json(
             "avg_class_coverage": float(np.mean(class_coverages)) if class_coverages else 0.0,  # Union coverage
             "avg_class_based_precision": float(np.mean(class_based_precisions)) if class_based_precisions else 0.0,
             "avg_class_based_coverage": float(np.mean(class_based_coverages)) if class_based_coverages else 0.0,
+            "has_class_based_data": has_class_based_data,  # Flag to indicate if class-based data exists
             "unique_rules_count": sa_overall.get("total_unique_rules_instance_based", sa_overall.get("total_unique_rules", 0)),
             "unique_rules_class_based_count": sa_overall.get("total_unique_rules_class_based", 0),
             "total_unique_rules": sa_overall.get("total_unique_rules", 0),
@@ -1958,9 +2197,13 @@ def save_comparison_metrics_json(
         logger.info(f"  Avg Instance Coverage:  {sa['avg_instance_coverage']:.4f}")
         logger.info(f"  Avg Class Precision (Union): {sa['avg_class_precision']:.4f}")
         logger.info(f"  Avg Class Coverage (Union):  {sa['avg_class_coverage']:.4f}")
-        if sa['avg_class_based_precision'] > 0 or sa['avg_class_based_coverage'] > 0:
+        # Always log class-based metrics if data exists (even if values are 0.0)
+        if sa.get('has_class_based_data', False) or sa['unique_rules_class_based_count'] > 0:
             logger.info(f"  Avg Class-Based Precision: {sa['avg_class_based_precision']:.4f}")
             logger.info(f"  Avg Class-Based Coverage:  {sa['avg_class_based_coverage']:.4f}")
+        else:
+            logger.info(f"  Avg Class-Based Precision: N/A (no class-based data)")
+            logger.info(f"  Avg Class-Based Coverage:  N/A (no class-based data)")
         logger.info(f"  Unique Rules (Instance-Based): {sa['unique_rules_count']}")
         logger.info(f"  Unique Rules (Class-Based): {sa['unique_rules_class_based_count']}")
         logger.info(f"  Avg Rollout Time (seconds): {sa['avg_rollout_time_seconds']:.4f}")

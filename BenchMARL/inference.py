@@ -1353,6 +1353,21 @@ def extract_rules_from_policies(
     try:
         from utils.clusters import compute_cluster_centroids_per_class
         
+        # Use full dataset (train + test) for clustering when test data is available
+        # This provides better cluster representation and stability
+        # Clustering is initialization, not training, so using test data is acceptable
+        if eval_on_test_data and env_data.get("X_test_unit") is not None:
+            # Combine train and test data for clustering
+            X_cluster = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            y_cluster = np.concatenate([env_data["y"], env_data["y_test"]])
+            logger.info("  Using FULL dataset (train + test) for clustering")
+            logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(X_cluster)}")
+        else:
+            # Fallback to training data only if test data not available
+            X_cluster = env_data["X_unit"]
+            y_cluster = env_data["y"]
+            logger.info("  Using TRAINING data for clustering (test data not available)")
+        
         if agents_per_class > 1:
             n_clusters_per_class = agents_per_class * 10
             logger.info(f"  Using {n_clusters_per_class} clusters per class ({n_clusters_per_class // agents_per_class} per agent) for k-means clustering")
@@ -1361,8 +1376,8 @@ def extract_rules_from_policies(
             logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity (matching training and single-agent behavior)")
         
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
-            X_unit=env_data["X_unit"],
-            y=env_data["y"],
+            X_unit=X_cluster,
+            y=y_cluster,
             n_clusters_per_class=n_clusters_per_class,
             random_state=seed if seed is not None else 42
         )
@@ -2151,8 +2166,8 @@ def extract_rules_from_policies(
                 # Initialize aggregated metrics (will be updated as we process more agents)
                 "instance_precision": instance_precision,
                 "instance_coverage": instance_coverage,
-                "class_precision": class_precision_union,  # Will be recomputed with class-based anchors later
-                "class_coverage": class_coverage_union,  # Will be recomputed with class-based anchors later
+                "class_precision": class_precision_union,  # Temporary - will be overwritten with class-based union only
+                "class_coverage": class_coverage_union,  # Temporary - will be overwritten with class-based union only
                 "n_class_samples": n_class_samples,  # Store for weighted averaging in global metrics
                 "all_anchors": anchors_list.copy(),  # Collect instance-based anchors from all agents
                 "all_rules": rules_list.copy(),  # Collect instance-based rules from all agents
@@ -2267,7 +2282,7 @@ def extract_rules_from_policies(
         # logger.info(f"  Total agent processing time: {class_total_time:.4f}s")
         
         # If this is the last agent for this class, log aggregated instance-level metrics
-        # Union metrics will be recomputed after class-based rollouts to include both instance and class-based anchors
+        # Union metrics will be recomputed after class-based rollouts using ONLY class-based anchors
         if agents_per_class > 1 and class_key in results["per_class_results"]:
             aggregated = results["per_class_results"][class_key]
             if len(aggregated.get("agents", [])) == agents_per_class:
@@ -2283,7 +2298,7 @@ def extract_rules_from_policies(
                 logger.info(f"    Total unique rules (instance-based, across all agents): {aggregated.get('unique_rules_count', 0)}")
                 logger.info(f"    Total episodes (instance-based, across all agents): {aggregated.get('n_episodes', 0)}")
                 logger.info(f"  {'='*60}")
-                logger.info(f"  Note: Final union metrics (including class-based anchors) will be computed after class-based rollouts.")
+                logger.info(f"  Note: Final union metrics (using class-based anchors only) will be computed after class-based rollouts.")
     
     # ============================================================================
     # CLASS-BASED ROLLOUTS (using k-means cluster centroids)
@@ -2538,10 +2553,10 @@ def extract_rules_from_policies(
     logger.info("Class-based rollouts completed")
     logger.info(f"{'='*80}")
     
-    # Recompute union metrics for all classes to include BOTH instance-based AND class-based anchors
-    # This gives a more complete picture of coverage
+    # Recompute union metrics for all classes using ONLY class-based anchors
+    # This represents the smallest set of general rules that explain the class structure
     logger.info(f"\n{'='*80}")
-    logger.info("Recomputing Union Metrics (Instance-based + Class-based anchors)")
+    logger.info("Recomputing Class Union Metrics (Class-based anchors only)")
     logger.info(f"{'='*80}")
     
     # Get the appropriate dataset (test or train) based on eval_on_test_data
@@ -2558,16 +2573,27 @@ def extract_rules_from_policies(
         if target_class is None:
             continue
         
-        # Collect ALL anchors: instance-based + class-based
-        all_anchors_for_union = class_data.get("all_anchors", []).copy()  # Instance-based anchors
+        # Collect ONLY class-based anchors (represent class structure, not instance-specific patterns)
+        all_anchors_for_union = []
+        class_based_unique_rules = []
         
-        # Add class-based anchors if they exist
+        # Get class-based anchors and rules if they exist
         if "class_based_results" in class_data:
             for agent_cb_result in class_data["class_based_results"].values():
                 if "anchors" in agent_cb_result:
                     all_anchors_for_union.extend(agent_cb_result["anchors"])
+                if "unique_rules" in agent_cb_result:
+                    # Collect unique rules from all agents (will deduplicate later)
+                    class_based_unique_rules.extend(agent_cb_result["unique_rules"])
         
-        # Compute union of ALL anchors (instance-based + class-based)
+        # Deduplicate rules across all agents
+        if class_based_unique_rules:
+            class_based_unique_rules = list(set([
+                r for r in class_based_unique_rules 
+                if r and r != "any values (no tightened features)"
+            ]))
+        
+        # Compute union of class-based anchors only (smallest set of general rules)
         if X_data_union is not None and y_data_union is not None and len(all_anchors_for_union) > 0:
             n_samples = X_data_union.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
@@ -2596,19 +2622,32 @@ def extract_rules_from_policies(
             else:
                 class_precision_combined = 0.0
             
-            # Update class-level metrics with combined union
+            # Update class-level metrics with class-based union only
             class_data["class_precision"] = class_precision_combined
             class_data["class_coverage"] = class_coverage_combined
             
             # Log the final union metrics
-            n_instance_anchors = len(class_data.get("all_anchors", []))
-            n_class_based_anchors = sum(
-                len(agent_cb_result.get("anchors", []))
-                for agent_cb_result in class_data.get("class_based_results", {}).values()
-            )
-            logger.info(f"\n  Class {target_class} - Final Union Metrics (Instance + Class-based):")
+            n_class_based_anchors = len(all_anchors_for_union)
+            n_unique_rules = len(class_based_unique_rules)
+            logger.info(f"\n  Class {target_class} - Final Union Metrics (Class-Based Anchors Only):")
             logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}")
-            logger.info(f"    Anchors used: {n_instance_anchors} instance-based + {n_class_based_anchors} class-based = {len(all_anchors_for_union)} total")
+            logger.info(f"    Anchors used: {n_class_based_anchors} class-based anchors")
+            logger.info(f"    Unique Rules: {n_unique_rules}")
+            logger.info(f"    Note: Represents the smallest set of general rules that explain the class structure")
+            
+            # Log the actual rules
+            if class_based_unique_rules:
+                logger.info(f"\n  Class {target_class} - Class-Based Union Rules:")
+                for i, rule in enumerate(class_based_unique_rules, 1):
+                    logger.info(f"    Rule {i}: {rule}")
+            else:
+                logger.info(f"\n  Class {target_class} - No unique rules found in class-based anchors")
+        else:
+            # No class-based anchors available - set union metrics to 0.0
+            if len(all_anchors_for_union) == 0:
+                logger.warning(f"  Class {target_class}: No class-based anchors found. Class union metrics set to 0.0")
+                class_data["class_precision"] = 0.0
+                class_data["class_coverage"] = 0.0
     
     # End overall timing
     overall_end_time = time.perf_counter()

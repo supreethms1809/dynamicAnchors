@@ -766,7 +766,13 @@ def test_rules_from_json(
     rule_to_rollout_type = {}  # Track whether rule is instance-based or class-based
     
     for class_key, class_data in per_class_results.items():
+        # Skip separate class-based keys (we'll process them separately)
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            continue
+        
         target_class = class_data.get("class")
+        if target_class is None:
+            continue
         
         # Collect instance-based rules
         unique_rules = class_data.get("unique_rules", [])
@@ -776,7 +782,7 @@ def test_rules_from_json(
             rule_to_source_classes[rule_str].append(target_class)
             rule_to_rollout_type[rule_str] = "instance_based"
         
-        # Collect class-based rules
+        # Collect class-based rules from nested dict (legacy format)
         class_based_results = class_data.get("class_based_results", {})
         if isinstance(class_based_results, dict):
             # Check if it's a dict of results or a single result dict
@@ -797,6 +803,27 @@ def test_rules_from_json(
                         class_based_rules.add(rule_str)
                         rule_to_source_classes[rule_str].append(target_class)
                         rule_to_rollout_type[rule_str] = "class_based"
+    
+    # CRITICAL: Also collect class-based rules from separate keys (current format)
+    # Inference saves class-based rules in separate class_{class}_class_based keys
+    for class_key, class_data in per_class_results.items():
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            target_class = class_data.get("class")
+            if target_class is None:
+                # Try to extract from key name
+                if class_key.endswith("_class_based"):
+                    try:
+                        target_class = int(class_key.replace("class_", "").replace("_class_based", ""))
+                    except ValueError:
+                        continue
+            
+            # Collect class-based rules from separate key
+            cb_unique_rules = class_data.get("unique_rules", [])
+            for rule_str in cb_unique_rules:
+                all_unique_rules.add(rule_str)
+                class_based_rules.add(rule_str)
+                rule_to_source_classes[rule_str].append(target_class)
+                rule_to_rollout_type[rule_str] = "class_based"
     
     all_unique_rules = sorted(list(all_unique_rules))  # Sort for consistent ordering
     instance_based_rules = sorted(list(instance_based_rules))
@@ -1344,14 +1371,35 @@ Examples:
             class_key = f"class_{target_class}"
             if class_key in inference_per_class_results:
                 inference_data = inference_per_class_results[class_key]
+                
+                logger.info(f"\n  {'='*60}")
+                logger.info(f"  Class {target_class} - Inference Metrics Summary:")
+                logger.info(f"  {'='*60}")
+                
+                # Instance-level metrics (averaged across instance-based anchors)
                 if "instance_precision" in inference_data:
-                    logger.info(f"  Instance-level metrics (from inference on {metrics_data_source}):")
+                    logger.info(f"  Instance-Level Metrics (averaged across instance-based anchors, from inference on {metrics_data_source}):")
                     logger.info(f"    Precision: {inference_data['instance_precision']:.4f}")
-                    logger.info(f"    Coverage: {inference_data['instance_coverage']:.4f}")
-                if "class_precision" in inference_data:
-                    logger.info(f"  Class-level metrics (from inference on {metrics_data_source}):")
-                    logger.info(f"    Precision: {inference_data['class_precision']:.4f}")
-                    logger.info(f"    Coverage: {inference_data['class_coverage']:.4f}")
+                    logger.info(f"    Coverage:  {inference_data['instance_coverage']:.4f}")
+                
+                # Class-based metrics (averaged across class-based anchors from centroid-based rollouts)
+                if "class_level_precision" in inference_data or "class_based_precision" in inference_data:
+                    class_based_prec = inference_data.get("class_level_precision", inference_data.get("class_based_precision", 0.0))
+                    class_based_cov = inference_data.get("class_level_coverage", inference_data.get("class_based_coverage", 0.0))
+                    if class_based_prec > 0.0 or class_based_cov > 0.0:
+                        logger.info(f"  Class-Based Metrics (averaged across class-based anchors, from inference on {metrics_data_source}):")
+                        logger.info(f"    Precision: {class_based_prec:.4f}")
+                        logger.info(f"    Coverage:  {class_based_cov:.4f}")
+                
+                # Class union metrics (union of all anchors: instance-based + class-based)
+                if "class_precision" in inference_data or "class_union_precision" in inference_data:
+                    union_prec = inference_data.get("class_union_precision", inference_data.get("class_precision", 0.0))
+                    union_cov = inference_data.get("class_union_coverage", inference_data.get("class_coverage", 0.0))
+                    logger.info(f"  Class Union Metrics (union of all anchors, from inference on {metrics_data_source}):")
+                    logger.info(f"    Precision: {union_prec:.4f}")
+                    logger.info(f"    Coverage:  {union_cov:.4f}")
+                
+                logger.info(f"  {'='*60}")
         
         logger.info(f"{'='*80}")
         logger.info("Rule testing complete!")
