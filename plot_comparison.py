@@ -528,7 +528,7 @@ def plot_precision_coverage_comparison(
             single_inst_cov = single_data.get("instance_coverage", 0.0)
             single_instance_precisions.append(single_inst_prec)
             single_instance_coverages.append(single_inst_cov)
-            # Class Union (union of instance-based anchors)
+            # Class Union (union of class-based anchors only)
             single_union_prec = single_data.get("class_union_precision", single_data.get("class_precision", 0.0))
             single_union_cov = single_data.get("class_union_coverage", single_data.get("class_coverage", 0.0))
             single_class_precisions.append(single_union_prec)
@@ -590,6 +590,9 @@ def plot_precision_coverage_comparison(
         multi_data = None
         if multi_per_class:
             for class_key, class_data in multi_per_class.items():
+                # Skip class_based entries when looking for main class data
+                if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+                    continue
                 if class_data.get("class") == cls:
                     multi_data = class_data
                     break
@@ -599,7 +602,7 @@ def plot_precision_coverage_comparison(
             multi_inst_cov = multi_data.get("instance_coverage", 0.0)
             multi_instance_precisions.append(multi_inst_prec)
             multi_instance_coverages.append(multi_inst_cov)
-            # Class Union (union of instance-based anchors)
+            # Class Union (union of class-based anchors only)
             multi_union_prec = multi_data.get("class_union_precision", multi_data.get("class_precision", 0.0))
             multi_union_cov = multi_data.get("class_union_coverage", multi_data.get("class_coverage", 0.0))
             multi_class_precisions.append(multi_union_prec)
@@ -825,7 +828,7 @@ def plot_precision_coverage_comparison(
     
     ax1_union.set_xlabel('Class', fontsize=12, fontweight='bold')
     ax1_union.set_ylabel('Precision', fontsize=12, fontweight='bold')
-    ax1_union.set_title(f'{title_prefix}: Class Union Precision (Union of Instance-Based Anchors)', fontsize=13, fontweight='bold')
+    ax1_union.set_title(f'{title_prefix}: Class Union Precision (Union of Class-Based Anchors Only)', fontsize=13, fontweight='bold')
     ax1_union.set_xticks(x)
     ax1_union.set_xticklabels([f'C{cls}' for cls in classes])
     ax1_union.set_ylim([0, 1.1])
@@ -852,7 +855,7 @@ def plot_precision_coverage_comparison(
     
     ax2_union.set_xlabel('Class', fontsize=12, fontweight='bold')
     ax2_union.set_ylabel('Coverage', fontsize=12, fontweight='bold')
-    ax2_union.set_title(f'{title_prefix}: Class Union Coverage (Union of Instance-Based Anchors)', fontsize=13, fontweight='bold')
+    ax2_union.set_title(f'{title_prefix}: Class Union Coverage (Union of Class-Based Anchors Only)', fontsize=13, fontweight='bold')
     ax2_union.set_xticks(x)
     ax2_union.set_xticklabels([f'C{cls}' for cls in classes])
     ax2_union.set_ylim([0, 1.1])
@@ -878,7 +881,12 @@ def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top
         ax.set_title(title, fontsize=11, fontweight='bold')
         return
     
-    per_class = summary.get("per_class_summary", {})
+    per_class_full = summary.get("per_class_summary", {})
+    # Filter out _class_based entries - only use main class entries
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     
     # Collect feature intervals per class and globally
     feature_intervals_global: Dict[str, List[Tuple[float, float]]] = defaultdict(list)

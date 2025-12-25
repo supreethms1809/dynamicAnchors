@@ -326,6 +326,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         
         class_summary = {
             "class": int(target_class),
+            "agent": "unknown",  # Single-agent doesn't have multiple agents
             # Instance-level metrics (boxes around instances)
             "instance_precision": float(instance_precision),
             "instance_coverage": float(instance_coverage),
@@ -337,6 +338,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
             "class_coverage": float(class_coverage),
             "precision": float(instance_precision),
             "coverage": float(instance_coverage),
+            "n_class_samples": int(class_data.get("n_class_samples", 0)),  # Store for weighted averaging (if available)
             "n_total_rules": len(all_rules),
             "n_unique_rules": len(unique_rules),
             "unique_rules": unique_rules,
@@ -473,7 +475,7 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
                    alpha=0.8, color='steelblue', edgecolor='black', linewidth=1)
     bars2 = ax.bar(x - 1.5*width, instance_cov, width, label='Instance-Level Coverage', 
                    alpha=0.8, color='coral', edgecolor='black', linewidth=1)
-    # Plot class union metrics (union of instance-based anchors)
+    # Plot class union metrics (union of class-based anchors only)
     bars3 = ax.bar(x - 0.5*width, class_union_prec, width, label='Class Union Precision', 
                    alpha=0.8, color='darkgreen', edgecolor='black', linewidth=1)
     bars4 = ax.bar(x + 0.5*width, class_union_cov, width, label='Class Union Coverage', 
@@ -567,7 +569,7 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax1.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
     ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
     
-    # Right plot: Class Union precision vs coverage (union of instance-based anchors)
+    # Right plot: Class Union precision vs coverage (union of class-based anchors only)
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
@@ -1364,7 +1366,7 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
                                key=lambda x: per_class_filtered[x]['class']):
             class_data = per_class_filtered[class_key]
             f.write(f"\nClass {class_data['class']}:\n")
-            f.write(f"  Instance-Level (Average Across Instances):\n")
+            f.write(f"  Instance-Based (Average Across Instances):\n")
             f.write(f"    Precision: {class_data['instance_precision']:.4f}")
             if "instance_precision_std" in class_data:
                 f.write(f" ± {class_data['instance_precision_std']:.4f}")
@@ -1373,15 +1375,18 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
             if "instance_coverage_std" in class_data:
                 f.write(f" ± {class_data['instance_coverage_std']:.4f}")
             f.write("\n")
-            f.write(f"  Class-Level (Union of All Anchors):\n")
-            f.write(f"    Precision: {class_data['class_precision']:.4f}")
-            if "class_precision_std" in class_data:
-                f.write(f" ± {class_data['class_precision_std']:.4f}")
-            f.write("\n")
-            f.write(f"    Coverage: {class_data['class_coverage']:.4f}")
-            if "class_coverage_std" in class_data:
-                f.write(f" ± {class_data['class_coverage_std']:.4f}")
-            f.write("\n")
+            f.write(f"  Class Union (Union of Class-Based Anchors Only):\n")
+            class_union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+            class_union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
+            f.write(f"    Precision: {class_union_prec:.4f}\n")
+            f.write(f"    Coverage: {class_union_cov:.4f}\n")
+            # Class-Based metrics (centroid-based rollouts)
+            class_based_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+            class_based_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+            if class_based_prec > 0.0 or class_based_cov > 0.0:
+                f.write(f"  Class-Based (Centroid-Based Rollouts):\n")
+                f.write(f"    Precision: {class_based_prec:.4f}\n")
+                f.write(f"    Coverage: {class_based_cov:.4f}\n")
             f.write(f"  Total rules: {class_data['n_total_rules']}\n")
             f.write(f"  Unique rules: {class_data['n_unique_rules']}\n")
             if "n_episodes" in class_data:
@@ -1519,11 +1524,25 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
         }
         total_rollout_time += class_timing.get("total_rollout_time_seconds", 0.0)
         
+        # Extract all three metric types
+        instance_prec = class_data.get("instance_precision", 0.0)
+        instance_cov = class_data.get("instance_coverage", 0.0)
+        class_union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+        class_union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
+        class_based_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+        class_based_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+        
         consolidated["per_class"][f"class_{cls}"] = {
-            "instance_precision": class_data.get("instance_precision", 0.0),
-            "instance_coverage": class_data.get("instance_coverage", 0.0),
-            "class_precision": class_data.get("class_precision", 0.0),
-            "class_coverage": class_data.get("class_coverage", 0.0),
+            "instance_precision": instance_prec,
+            "instance_coverage": instance_cov,
+            "class_union_precision": class_union_prec,
+            "class_union_coverage": class_union_cov,
+            # Legacy fields for backward compatibility
+            "class_precision": class_union_prec,
+            "class_coverage": class_union_cov,
+            # Class-based metrics (centroid-based rollouts)
+            "class_based_precision": class_based_prec,
+            "class_based_coverage": class_based_cov,
             "n_unique_rules": class_data.get("n_unique_rules", 0),
             "timing": class_timing
         }

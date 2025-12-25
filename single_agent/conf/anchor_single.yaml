@@ -21,7 +21,7 @@ env_config:
   
   # Reward weight parameters
   alpha: 0.7              # Weight for precision gain component
-  beta: 0.6               # Weight for coverage gain component
+  beta: 1.0               # Weight for coverage gain component
   gamma: 0.1              # Weight for overlap penalty
   precision_blend_lambda: 0.5
   drift_penalty_weight: 0.05

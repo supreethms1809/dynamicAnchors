@@ -100,7 +100,7 @@ def load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any
     
     return nashconv_data
 
-# Set up logging
+# Set up logging (will be reconfigured in main() with file handler)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -184,7 +184,8 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
             # Read and print output line by line in real-time
             for line in process.stdout:
                 line = line.rstrip()
-                print(line, flush=True)  # Print immediately
+                print(line, flush=True)  # Print immediately to console
+                logger.info(line)  # Also log to file
                 output_lines.append(line)
             
             # Wait for process to complete
@@ -200,14 +201,30 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
             logger.info(f"✓ {description} completed successfully")
             return True, output
         else:
-            # Show output in real-time without capturing
-            result = subprocess.run(
+            # Show output in real-time while also logging to file
+            # Use Popen to capture output for logging while still showing in real-time
+            process = subprocess.Popen(
                 cmd,
                 cwd=cwd,
-                check=True,
-                capture_output=False,  # Show output in real-time
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
             )
+            
+            # Stream output in real-time and log to file
+            for line in process.stdout:
+                line = line.rstrip()
+                print(line, flush=True)  # Print immediately to console
+                logger.info(line)  # Also log to file
+            
+            return_code = process.wait()
+            
+            if return_code != 0:
+                logger.error(f"✗ {description} failed with return code {return_code}")
+                return False, None
+            
             logger.info(f"✓ {description} completed successfully")
             return True, None
     except subprocess.CalledProcessError as e:
@@ -294,7 +311,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 64_000,
+    total_timesteps: int = 240_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -975,19 +992,31 @@ def run_summarize_and_plot(
     Returns:
         True if successful, False otherwise
     """
-    # Resolve paths relative to project root
-    summarize_script = PROJECT_ROOT / "BenchMARL" / "summarize_and_plot_rules.py"
+    # Detect if this is a single-agent or multi-agent rules file
+    rules_file_path = Path(rules_file)
+    is_single_agent = "single_agent" in rules_file_path.name.lower()
+    
+    # Choose the correct summarize script
+    if is_single_agent:
+        summarize_script = PROJECT_ROOT / "single_agent" / "summarize_and_plot_rules_single.py"
+        working_dir = str(PROJECT_ROOT)  # Run from project root for single-agent
+        script_name = "single_agent/summarize_and_plot_rules_single.py"
+    else:
+        summarize_script = PROJECT_ROOT / "BenchMARL" / "summarize_and_plot_rules.py"
+        working_dir = str(PROJECT_ROOT / "BenchMARL")  # Run from BenchMARL directory
+        script_name = "summarize_and_plot_rules.py"
+    
     if not summarize_script.exists():
         logger.error(f"✗ Summarize script not found: {summarize_script}")
         return False
     
     # Make paths absolute
-    rules_file_abs = str(Path(rules_file).resolve())
+    rules_file_abs = str(rules_file_path.resolve())
     output_dir_abs = str(Path(output_dir).resolve()) if output_dir else None
     
     cmd = [
         sys.executable,
-        "summarize_and_plot_rules.py",  # Use relative path since we'll run from BenchMARL directory
+        script_name,  # Use relative or absolute path depending on working directory
         "--rules_file", rules_file_abs,  # Use absolute path for rules_file
         "--dataset", dataset,
         "--seed", str(seed),
@@ -1008,9 +1037,8 @@ def run_summarize_and_plot(
             else:
                 cmd.extend([f"--{key}", str(value)])
     
-    # Run from BenchMARL directory so relative config paths work
-    benchmarl_dir = str(PROJECT_ROOT / "BenchMARL")
-    success, _ = run_command(cmd, f"Summarize and Plot: {dataset}", cwd=benchmarl_dir)
+    # Run from appropriate directory
+    success, _ = run_command(cmd, f"Summarize and Plot ({'Single-Agent' if is_single_agent else 'Multi-Agent'}): {dataset}", cwd=working_dir)
     return success
 
 
@@ -1161,11 +1189,17 @@ def create_consolidated_metrics_json(
                             "std_precision": sa_stats.get("std_precision", sa_stats.get("std_instance_precision", 0.0)),
                             "std_coverage": sa_stats.get("std_coverage", sa_stats.get("std_instance_coverage", 0.0)),
                         },
-                        "class_level": {
+                        "class_union": {  # Class union metrics (union of class-based anchors only)
                             "mean_precision": sa_stats.get("mean_class_precision", 0.0),
                             "mean_coverage": sa_stats.get("mean_class_coverage", 0.0),
                             "std_precision": sa_stats.get("std_class_precision", 0.0),
                             "std_coverage": sa_stats.get("std_class_coverage", 0.0),
+                        },
+                        "class_based": {  # Class-based metrics (centroid-based rollouts)
+                            "mean_precision": sa_stats.get("mean_class_based_precision", sa_stats.get("mean_class_level_precision", 0.0)),
+                            "mean_coverage": sa_stats.get("mean_class_based_coverage", sa_stats.get("mean_class_level_coverage", 0.0)),
+                            "std_precision": sa_stats.get("std_class_based_precision", 0.0),
+                            "std_coverage": sa_stats.get("std_class_based_coverage", 0.0),
                         },
                         "global": {
                             "total_unique_rules": sa_stats.get("total_unique_rules", 0),
@@ -1178,13 +1212,32 @@ def create_consolidated_metrics_json(
                 
                 # Add per-class metrics
                 per_class_summary = sa_summary.get("per_class_summary", {})
-                for class_key, class_data in per_class_summary.items():
+                # Filter out _class_based entries - only process main class entries
+                per_class_filtered = {
+                    k: v for k, v in per_class_summary.items() 
+                    if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+                }
+                for class_key, class_data in per_class_filtered.items():
                     cls = class_data.get("class", -1)
+                    # Extract all three metric types
+                    instance_prec = class_data.get("instance_precision", 0.0)
+                    instance_cov = class_data.get("instance_coverage", 0.0)
+                    class_union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+                    class_union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
+                    class_based_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+                    class_based_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+                    
                     consolidated["single_agent"]["per_class"][f"class_{cls}"] = {
-                        "instance_precision": class_data.get("instance_precision", 0.0),
-                        "instance_coverage": class_data.get("instance_coverage", 0.0),
-                        "class_precision": class_data.get("class_precision", 0.0),
-                        "class_coverage": class_data.get("class_coverage", 0.0),
+                        "instance_precision": instance_prec,
+                        "instance_coverage": instance_cov,
+                        "class_union_precision": class_union_prec,
+                        "class_union_coverage": class_union_cov,
+                        # Legacy fields for backward compatibility
+                        "class_precision": class_union_prec,
+                        "class_coverage": class_union_cov,
+                        # Class-based metrics (centroid-based rollouts)
+                        "class_based_precision": class_based_prec,
+                        "class_based_coverage": class_based_cov,
                         "n_unique_rules": class_data.get("n_unique_rules", 0),
                         "timing": {
                             "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
@@ -1306,11 +1359,17 @@ def create_consolidated_metrics_json(
                             "std_precision": ma_stats.get("std_instance_precision", 0.0),
                             "std_coverage": ma_stats.get("std_instance_coverage", 0.0),
                         },
-                        "class_level": {
+                        "class_union": {  # Class union metrics (union of class-based anchors only)
                             "mean_precision": ma_stats.get("mean_class_precision", 0.0),
                             "mean_coverage": ma_stats.get("mean_class_coverage", 0.0),
                             "std_precision": ma_stats.get("std_class_precision", 0.0),
                             "std_coverage": ma_stats.get("std_class_coverage", 0.0),
+                        },
+                        "class_based": {  # Class-based metrics (centroid-based rollouts)
+                            "mean_precision": ma_stats.get("mean_class_based_precision", ma_stats.get("mean_class_level_precision", 0.0)),
+                            "mean_coverage": ma_stats.get("mean_class_based_coverage", ma_stats.get("mean_class_level_coverage", 0.0)),
+                            "std_precision": ma_stats.get("std_class_based_precision", 0.0),
+                            "std_coverage": ma_stats.get("std_class_based_coverage", 0.0),
                         },
                         "global": {
                             "total_unique_rules": ma_stats.get("total_unique_rules", 0),
@@ -1323,13 +1382,32 @@ def create_consolidated_metrics_json(
                 
                 # Add per-class metrics
                 per_class_summary = ma_summary.get("per_class_summary", {})
-                for class_key, class_data in per_class_summary.items():
+                # Filter out _class_based entries - only process main class entries
+                per_class_filtered = {
+                    k: v for k, v in per_class_summary.items() 
+                    if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+                }
+                for class_key, class_data in per_class_filtered.items():
                     cls = class_data.get("class", -1)
+                    # Extract all three metric types
+                    instance_prec = class_data.get("instance_precision", 0.0)
+                    instance_cov = class_data.get("instance_coverage", 0.0)
+                    class_union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+                    class_union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
+                    class_based_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+                    class_based_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+                    
                     consolidated["multi_agent"]["per_class"][f"class_{cls}"] = {
-                        "instance_precision": class_data.get("instance_precision", 0.0),
-                        "instance_coverage": class_data.get("instance_coverage", 0.0),
-                        "class_precision": class_data.get("class_precision", 0.0),
-                        "class_coverage": class_data.get("class_coverage", 0.0),
+                        "instance_precision": instance_prec,
+                        "instance_coverage": instance_cov,
+                        "class_union_precision": class_union_prec,
+                        "class_union_coverage": class_union_cov,
+                        # Legacy fields for backward compatibility
+                        "class_precision": class_union_prec,
+                        "class_coverage": class_union_cov,
+                        # Class-based metrics (centroid-based rollouts)
+                        "class_based_precision": class_based_prec,
+                        "class_based_coverage": class_based_cov,
                         "n_unique_rules": class_data.get("n_unique_rules", 0),
                         "timing": {
                             "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
@@ -1541,7 +1619,8 @@ def create_comparison_summary(
         # Track seen classes to avoid duplicates
         seen_classes = set()
         for class_key, class_data in sa_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             class_val = class_data.get("class")
             # Only process each class once (in case there are duplicate entries)
@@ -1576,7 +1655,8 @@ def create_comparison_summary(
         # Track seen classes to avoid duplicates (skip _class_based entries)
         seen_classes_cb = set()
         for class_key, class_data in sa_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             class_val = class_data.get("class")
             # Only process each class once
@@ -1611,7 +1691,8 @@ def create_comparison_summary(
         # Track seen classes to avoid duplicates
         seen_classes = set()
         for class_key, class_data in ma_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             class_val = class_data.get("class")
             # Only process each class once (in case there are duplicate entries)
@@ -1645,7 +1726,8 @@ def create_comparison_summary(
         # Track seen classes to avoid duplicates (skip _class_based entries)
         seen_classes_cb = set()
         for class_key, class_data in ma_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             class_val = class_data.get("class")
             # Only process each class once
@@ -1665,10 +1747,10 @@ def create_comparison_summary(
     
     if sa_stats and ma_stats:
         comparison["comparison"] = {
-            # Instance-level comparison
+            # Instance-based comparison
             "instance_precision_diff": sa_instance_precision - ma_instance_precision,
             "instance_coverage_diff": sa_instance_coverage - ma_instance_coverage,
-            # Class-level comparison (Union)
+            # Class union comparison (Union of Class-Based Anchors Only)
             "class_precision_diff": sa_class_precision - ma_class_precision,
             "class_coverage_diff": sa_class_coverage - ma_class_coverage,
             # Class-based comparison (centroid-based rollouts)
@@ -1787,7 +1869,7 @@ def create_comparison_summary(
         baseline_instance_coverage = baseline_stats.get("mean_coverage", 0.0)
         baseline_total_time = baseline_timing.get("total_rollout_time_seconds", 0.0)
         logger.info(f"Baseline (Static Anchors):")
-        logger.info(f"  Instance-Level - Precision: {baseline_instance_precision:.4f}, Coverage: {baseline_instance_coverage:.4f}")
+        logger.info(f"  Instance-Based - Precision: {baseline_instance_precision:.4f}, Coverage: {baseline_instance_coverage:.4f}")
         if baseline_total_time > 0:
             logger.info(f"  Timing - Total Rollout Time: {baseline_total_time:.4f}s")
     if sa_stats:
@@ -1797,8 +1879,10 @@ def create_comparison_summary(
         sa_per_class = comparison.get("single_agent", {}).get("per_class_summary", {})
         has_class_based_data = False
         if sa_per_class:
-            # Check if any class has class-based metrics
-            for class_data in sa_per_class.values():
+            # Check if any class has class-based metrics (filter out _class_based entries)
+            for class_key, class_data in sa_per_class.items():
+                if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+                    continue
                 if "class_level_precision" in class_data or "class_based_precision" in class_data:
                     has_class_based_data = True
                     break
@@ -1807,8 +1891,8 @@ def create_comparison_summary(
                 has_class_based_data = True
         
         logger.info(f"Single-Agent:")
-        logger.info(f"  Instance-Level - Precision: {sa_instance_precision:.4f}, Coverage: {sa_instance_coverage:.4f}")
-        logger.info(f"  Class-Level (Union) - Precision: {sa_class_precision:.4f}, Coverage: {sa_class_coverage:.4f}")
+        logger.info(f"  Instance-Based - Precision: {sa_instance_precision:.4f}, Coverage: {sa_instance_coverage:.4f}")
+        logger.info(f"  Class Union (Union of Class-Based Anchors Only) - Precision: {sa_class_precision:.4f}, Coverage: {sa_class_coverage:.4f}")
         if has_class_based_data or sa_stats.get("total_unique_rules_class_based", 0) > 0:
             logger.info(f"  Class-Based - Precision: {sa_class_based_precision:.4f}, Coverage: {sa_class_based_coverage:.4f}")
         else:
@@ -1824,8 +1908,10 @@ def create_comparison_summary(
         ma_per_class = comparison.get("multi_agent", {}).get("per_class_summary", {})
         has_class_based_data = False
         if ma_per_class:
-            # Check if any class has class-based metrics
-            for class_data in ma_per_class.values():
+            # Check if any class has class-based metrics (filter out _class_based entries)
+            for class_key, class_data in ma_per_class.items():
+                if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+                    continue
                 if "class_level_precision" in class_data or "class_based_precision" in class_data:
                     prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
                     cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
@@ -1837,8 +1923,8 @@ def create_comparison_summary(
                 has_class_based_data = True
         
         logger.info(f"Multi-Agent:")
-        logger.info(f"  Instance-Level - Precision: {ma_instance_precision:.4f}, Coverage: {ma_instance_coverage:.4f}")
-        logger.info(f"  Class-Level - Precision: {ma_class_precision:.4f}, Coverage: {ma_class_coverage:.4f}")
+        logger.info(f"  Instance-Based - Precision: {ma_instance_precision:.4f}, Coverage: {ma_instance_coverage:.4f}")
+        logger.info(f"  Class Union (Union of Class-Based Anchors Only) - Precision: {ma_class_precision:.4f}, Coverage: {ma_class_coverage:.4f}")
         if has_class_based_data or ma_stats.get("total_unique_rules_class_based", 0) > 0:
             logger.info(f"  Class-Based - Precision: {ma_class_based_precision:.4f}, Coverage: {ma_class_based_coverage:.4f}")
         else:
@@ -1868,8 +1954,8 @@ def create_comparison_summary(
     
     if comparison["comparison"]:
         logger.info(f"Differences (Single - Multi):")
-        logger.info(f"  Instance-Level - Precision: {comparison['comparison']['instance_precision_diff']:.4f}, Coverage: {comparison['comparison']['instance_coverage_diff']:.4f}")
-        logger.info(f"  Class-Level (Union) - Precision: {comparison['comparison']['class_precision_diff']:.4f}, Coverage: {comparison['comparison']['class_coverage_diff']:.4f}")
+        logger.info(f"  Instance-Based - Precision: {comparison['comparison']['instance_precision_diff']:.4f}, Coverage: {comparison['comparison']['instance_coverage_diff']:.4f}")
+        logger.info(f"  Class Union (Union of Class-Based Anchors Only) - Precision: {comparison['comparison']['class_precision_diff']:.4f}, Coverage: {comparison['comparison']['class_coverage_diff']:.4f}")
         if "class_based_precision_diff" in comparison["comparison"]:
             logger.info(f"  Class-Based - Precision: {comparison['comparison']['class_based_precision_diff']:.4f}, Coverage: {comparison['comparison']['class_based_coverage_diff']:.4f}")
         logger.info(f"  Rules (Instance-Based): {comparison['comparison']['rules_diff']}")
@@ -1919,7 +2005,8 @@ def create_comparison_summary(
         logger.info(f"\nSingle-Agent Class Union Rules:")
         seen_classes_sa = set()
         for class_key, class_data in sa_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             target_class = class_data.get("class")
             if target_class is not None and target_class not in seen_classes_sa:
@@ -1949,7 +2036,8 @@ def create_comparison_summary(
         logger.info(f"\nMulti-Agent Class Union Rules:")
         seen_classes_ma = set()
         for class_key, class_data in ma_per_class.items():
-            if class_key.endswith("_class_based"):
+            # Skip class-based result keys (they're stored separately, not as actual classes)
+            if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
                 continue
             target_class = class_data.get("class")
             if target_class is not None and target_class not in seen_classes_ma:
@@ -2160,17 +2248,7 @@ Examples:
         # Already determined above
         pass
     
-    logger.info(f"\n{'='*80}")
-    logger.info("COMPLETE PIPELINE: SINGLE-AGENT vs MULTI-AGENT COMPARISON")
-    logger.info(f"{'='*80}")
-    logger.info(f"Dataset: {args.dataset}")
-    logger.info(f"Single-Agent Algorithm: {single_agent_algorithm.upper()}")
-    logger.info(f"Multi-Agent Algorithm: {multi_agent_algorithm.upper()}")
-    logger.info(f"Seed: {args.seed}")
-    logger.info(f"Device: {args.device}")
-    logger.info(f"{'='*80}\n")
-    
-    # Set up output directories
+    # Set up output directories first (needed for log file location)
     if args.output_dir is None:
         # Add datetime stamp to prevent overwriting previous results
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2181,6 +2259,41 @@ Examples:
     
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Set up file logging to save all output to a log file
+    log_file = output_path / "pipeline_run.log"
+    # Remove existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Console handler (stderr)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler (write to log file)
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Capture more detail in file
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # Set root logger level
+    logging.root.setLevel(logging.INFO)
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("COMPLETE PIPELINE: SINGLE-AGENT vs MULTI-AGENT COMPARISON")
+    logger.info(f"{'='*80}")
+    logger.info(f"Dataset: {args.dataset}")
+    logger.info(f"Single-Agent Algorithm: {single_agent_algorithm.upper()}")
+    logger.info(f"Multi-Agent Algorithm: {multi_agent_algorithm.upper()}")
+    logger.info(f"Seed: {args.seed}")
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Logging all output to: {log_file}")
+    logger.info(f"Results will be saved to: {args.output_dir}")
+    logger.info(f"{'='*80}\n")
     
     # Track paths for comparison
     single_agent_experiment_dir = None
@@ -2582,6 +2695,7 @@ Examples:
     logger.info("PIPELINE COMPLETE!")
     logger.info(f"{'='*80}")
     logger.info(f"Results saved to: {args.output_dir}")
+    logger.info(f"Complete log saved to: {log_file}")
     logger.info(f"{'='*80}\n")
 
 

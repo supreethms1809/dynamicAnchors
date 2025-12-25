@@ -208,7 +208,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     per_class_results = rules_data.get("per_class_results", {})
     
     summary = {
-        "n_classes": len(per_class_results),
+        "n_classes": 0,  # Will be set after counting unique classes (excluding _class_based entries)
         "classes": [],
         "per_class_summary": {},
         "overall_stats": {},
@@ -222,13 +222,26 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     
     all_precisions = []
     all_coverages = []
+    all_class_precisions = []
+    all_class_coverages = []
     all_rule_counts = []
     all_unique_rule_counts = []
     feature_frequency = Counter()
     
+    # Track processed classes to avoid duplicates
+    processed_classes = set()
+    
     for class_key, class_data in per_class_results.items():
+        # Skip class-based result keys (they're stored separately, not as actual classes)
+        # Multi-agent doesn't typically create separate _class_based entries, but check anyway
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            continue
+        
         target_class = class_data.get("class", -1)
-        summary["classes"].append(target_class)
+        # Only add if we haven't seen this class before (prevent duplicates)
+        if target_class not in processed_classes:
+            summary["classes"].append(target_class)
+            processed_classes.add(target_class)
         
         # Extract metrics - handle both formats:
         # Multi-agent: instance_precision, instance_coverage, class_precision, class_coverage
@@ -340,11 +353,18 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         if "class_coverage_std" in class_data:
             class_summary["class_coverage_std"] = float(class_data.get("class_coverage_std", 0.0))
         
-        summary["per_class_summary"][class_key] = class_summary
+        # CRITICAL: Double-check that we're not adding _class_based entries
+        # This should never happen due to the skip check above, but add safeguard anyway
+        if not (class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based"):
+            summary["per_class_summary"][class_key] = class_summary
+        else:
+            logger.warning(f"Skipping _class_based entry '{class_key}' - should have been filtered earlier!")
         
-        # Collect for overall stats
-        all_precisions.extend([instance_precision, class_precision])
-        all_coverages.extend([instance_coverage, class_coverage])
+        # Collect for overall stats (using instance-level for overall stats)
+        all_precisions.append(instance_precision)
+        all_coverages.append(instance_coverage)
+        all_class_precisions.append(class_precision)
+        all_class_coverages.append(class_coverage)
         all_rule_counts.append(len(all_rules))
         all_unique_rule_counts.append(len(unique_rules))
         
@@ -357,21 +377,27 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
     
     # Store summary stats (no global averages - removed per user request)
     # Only keep rule counts and feature frequency for overall stats
-    class_level_precisions = [s.get("class_level_precision", s.get("class_based_precision", 0.0)) for s in summary["per_class_summary"].values() if s.get("class_level_precision", s.get("class_based_precision", 0.0)) > 0]
-    class_level_coverages = [s.get("class_level_coverage", s.get("class_based_coverage", 0.0)) for s in summary["per_class_summary"].values() if s.get("class_level_coverage", s.get("class_based_coverage", 0.0)) > 0]
-    class_level_unique_rule_counts = [s.get("class_level_n_unique_rules", s.get("class_based_n_unique_rules", 0)) for s in summary["per_class_summary"].values()]
+    # Filter out _class_based entries when counting rules
+    per_class_summary_filtered = {
+        k: v for k, v in summary["per_class_summary"].items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
+    class_level_unique_rule_counts = [s.get("class_level_n_unique_rules", s.get("class_based_n_unique_rules", 0)) for s in per_class_summary_filtered.values()]
     
     summary["overall_stats"] = {
         # Rule counts and feature frequency only (no global averages)
-        "total_unique_rules": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
-        "total_unique_rules_instance_based": int(sum([s["n_unique_rules"] for s in summary["per_class_summary"].values()])),
+        "total_unique_rules": int(sum(all_unique_rule_counts)),
+        "total_unique_rules_instance_based": int(sum([s["n_unique_rules"] for s in per_class_summary_filtered.values()])),
         "total_unique_rules_class_level": int(sum(class_level_unique_rule_counts)),
         "total_unique_rules_class_based": int(sum(class_level_unique_rule_counts)),  # Legacy
-        "mean_unique_rules_per_class": float(np.mean(all_unique_rule_counts)),
+        "mean_unique_rules_per_class": float(np.mean(all_unique_rule_counts)) if all_unique_rule_counts else 0.0,
         "feature_frequency": dict(feature_frequency.most_common())
     }
     
-    summary["classes"] = sorted(summary["classes"])
+    # Deduplicate and sort classes list (in case of any duplicates)
+    summary["classes"] = sorted(list(set(summary["classes"])))
+    # Set n_classes to the number of unique classes (not counting _class_based entries)
+    summary["n_classes"] = len(summary["classes"])
     
     return summary
 
@@ -381,7 +407,12 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     
     if not classes:
@@ -416,7 +447,7 @@ def plot_metrics_comparison(summary: Dict, output_dir: str, dataset_name: str = 
                    alpha=0.8, color='steelblue', edgecolor='black', linewidth=1)
     bars2 = ax.bar(x - 1.5*width, instance_cov, width, label='Instance-Level Coverage', 
                    alpha=0.8, color='coral', edgecolor='black', linewidth=1)
-    # Plot class union metrics (union of instance-based anchors)
+    # Plot class union metrics (union of class-based anchors only)
     bars3 = ax.bar(x - 0.5*width, class_union_prec, width, label='Class Union Precision', 
                    alpha=0.8, color='darkgreen', edgecolor='black', linewidth=1)
     bars4 = ax.bar(x + 0.5*width, class_union_cov, width, label='Class Union Coverage', 
@@ -462,7 +493,12 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     classes = sorted(per_class.keys(), key=lambda x: per_class[x]["class"])
     
     if not classes:
@@ -513,7 +549,7 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax1.plot([0, 1], [1, 1], 'k--', alpha=0.3, linewidth=1, label='Ideal (Precision=1.0)')
     ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.3, linewidth=1)
     
-    # Middle plot: Class Union precision vs coverage (union of instance-based anchors)
+    # Middle plot: Class Union precision vs coverage (union of class-based anchors only)
     for idx, class_key in enumerate(classes):
         class_data = per_class[class_key]
         cls = class_data["class"]
@@ -694,7 +730,12 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
     if not HAS_PLOTTING:
         return
     
-    per_class = summary["per_class_summary"]
+    # Filter out _class_based entries - only use main class entries
+    per_class_full = summary["per_class_summary"]
+    per_class = {
+        k: v for k, v in per_class_full.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     
     # Collect feature intervals per class and globally
     feature_intervals_global: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
@@ -1443,19 +1484,29 @@ def generate_summary_report(summary: Dict, test_results: Optional[Dict] = None, 
         # Per-class details
         f.write("PER-CLASS DETAILS\n")
         f.write("-"*80 + "\n")
-        for class_key in sorted(summary['per_class_summary'].keys(), 
-                               key=lambda x: summary['per_class_summary'][x]['class']):
-            class_data = summary['per_class_summary'][class_key]
+        # Filter out _class_based entries - only show main class entries
+        per_class_filtered = {
+            k: v for k, v in summary['per_class_summary'].items() 
+            if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+        }
+        for class_key in sorted(per_class_filtered.keys(), 
+                               key=lambda x: per_class_filtered[x]['class']):
+            class_data = per_class_filtered[class_key]
             f.write(f"\nClass {class_data['class']} (Agent: {class_data.get('agent', 'unknown')}):\n")
-            f.write(f"  Instance-level precision: {class_data['instance_precision']:.4f}\n")
-            f.write(f"  Instance-level coverage: {class_data['instance_coverage']:.4f}\n")
-            f.write(f"  Class Union precision: {class_data.get('class_union_precision', class_data.get('class_precision', 0.0)):.4f}\n")
-            f.write(f"  Class Union coverage: {class_data.get('class_union_coverage', class_data.get('class_coverage', 0.0)):.4f}\n")
-            class_level_prec = class_data.get('class_level_precision', class_data.get('class_based_precision', 0.0))
-            class_level_cov = class_data.get('class_level_coverage', class_data.get('class_based_coverage', 0.0))
-            if class_level_prec > 0 or class_level_cov > 0:
-                f.write(f"  Class-level precision: {class_level_prec:.4f}\n")
-                f.write(f"  Class-level coverage: {class_level_cov:.4f}\n")
+            f.write(f"  Instance-Based (Average Across Instances):\n")
+            f.write(f"    Precision: {class_data['instance_precision']:.4f}\n")
+            f.write(f"    Coverage: {class_data['instance_coverage']:.4f}\n")
+            class_union_prec = class_data.get('class_union_precision', class_data.get('class_precision', 0.0))
+            class_union_cov = class_data.get('class_union_coverage', class_data.get('class_coverage', 0.0))
+            f.write(f"  Class Union (Union of Class-Based Anchors Only):\n")
+            f.write(f"    Precision: {class_union_prec:.4f}\n")
+            f.write(f"    Coverage: {class_union_cov:.4f}\n")
+            class_based_prec = class_data.get('class_level_precision', class_data.get('class_based_precision', 0.0))
+            class_based_cov = class_data.get('class_level_coverage', class_data.get('class_based_coverage', 0.0))
+            if class_based_prec > 0.0 or class_based_cov > 0.0:
+                f.write(f"  Class-Based (Centroid-Based Rollouts):\n")
+                f.write(f"    Precision: {class_based_prec:.4f}\n")
+                f.write(f"    Coverage: {class_based_cov:.4f}\n")
             f.write(f"  Total rules: {class_data['n_total_rules']}\n")
             f.write(f"  Unique rules: {class_data['n_unique_rules']}\n")
         
@@ -1576,8 +1627,13 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
     
     # Add per-class metrics
     per_class_summary = summary.get("per_class_summary", {})
+    # Filter out _class_based entries - only process main class entries
+    per_class_filtered = {
+        k: v for k, v in per_class_summary.items() 
+        if not k.endswith('_class_based') and v.get('rollout_type') != 'class_based'
+    }
     total_rollout_time = 0.0
-    for class_key, class_data in per_class_summary.items():
+    for class_key, class_data in per_class_filtered.items():
         cls = class_data.get("class", -1)
         class_timing = {
             "avg_rollout_time_seconds": class_data.get("avg_rollout_time_seconds", 0.0),
@@ -1586,11 +1642,25 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
         }
         total_rollout_time += class_timing.get("total_rollout_time_seconds", 0.0)
         
+        # Extract all three metric types
+        instance_prec = class_data.get("instance_precision", 0.0)
+        instance_cov = class_data.get("instance_coverage", 0.0)
+        class_union_prec = class_data.get("class_union_precision", class_data.get("class_precision", 0.0))
+        class_union_cov = class_data.get("class_union_coverage", class_data.get("class_coverage", 0.0))
+        class_based_prec = class_data.get("class_level_precision", class_data.get("class_based_precision", 0.0))
+        class_based_cov = class_data.get("class_level_coverage", class_data.get("class_based_coverage", 0.0))
+        
         consolidated["per_class"][f"class_{cls}"] = {
-            "instance_precision": class_data.get("instance_precision", 0.0),
-            "instance_coverage": class_data.get("instance_coverage", 0.0),
-            "class_precision": class_data.get("class_precision", 0.0),
-            "class_coverage": class_data.get("class_coverage", 0.0),
+            "instance_precision": instance_prec,
+            "instance_coverage": instance_cov,
+            "class_union_precision": class_union_prec,
+            "class_union_coverage": class_union_cov,
+            # Legacy fields for backward compatibility
+            "class_precision": class_union_prec,
+            "class_coverage": class_union_cov,
+            # Class-based metrics (centroid-based rollouts)
+            "class_based_precision": class_based_prec,
+            "class_based_coverage": class_based_cov,
             "n_unique_rules": class_data.get("n_unique_rules", 0),
             "timing": class_timing
         }
