@@ -100,9 +100,10 @@ def load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any
     
     return nashconv_data
 
-# Set up logging (will be reconfigured in main() with file handler)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Set up basic logging (will be reconfigured in main() with file handler)
+# Don't use basicConfig here to avoid duplicate handlers - we'll configure in main()
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # Get the project root directory (where this script is located)
 SCRIPT_DIR = Path(__file__).parent.absolute()
@@ -184,8 +185,8 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
             # Read and print output line by line in real-time
             for line in process.stdout:
                 line = line.rstrip()
-                print(line, flush=True)  # Print immediately to console
-                logger.info(line)  # Also log to file
+                print(line, flush=True)  # Print immediately to console (subprocess output)
+                logger.debug(line)  # Log to file only (don't duplicate to console)
                 output_lines.append(line)
             
             # Wait for process to complete
@@ -216,8 +217,8 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
             # Stream output in real-time and log to file
             for line in process.stdout:
                 line = line.rstrip()
-                print(line, flush=True)  # Print immediately to console
-                logger.info(line)  # Also log to file
+                print(line, flush=True)  # Print immediately to console (subprocess output)
+                logger.debug(line)  # Log to file only (don't duplicate to console)
             
             return_code = process.wait()
             
@@ -2262,13 +2263,19 @@ Examples:
     
     # Set up file logging to save all output to a log file
     log_file = output_path / "pipeline_run.log"
-    # Remove existing handlers to avoid duplicates
+    
+    # Remove ALL existing handlers from root logger and our logger to avoid duplicates
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
     logger.handlers.clear()
+    
+    # Prevent propagation to root logger to avoid duplicate output
+    logger.propagate = False
     
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # Console handler (stderr)
+    # Console handler (stderr) - for logger messages only
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
