@@ -376,7 +376,6 @@ class AnchorTrainerSB3:
         # Sample instances per class for instance-based training (mixed initialization)
         training_instance_ratio = env_config_with_data.get("training_instance_ratio", 0.3)
         if training_instance_ratio > 0.0:
-            import numpy as np
             np.random.seed(self.seed if hasattr(self, 'seed') else 42)
             
             # Sample instances per class for instance-based training
