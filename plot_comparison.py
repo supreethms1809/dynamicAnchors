@@ -1199,7 +1199,19 @@ def plot_equilibrium_comparison(ax, single_agent_summary: Optional[Dict], multi_
                 ha='center', va='top', fontsize=8, transform=ax.get_xaxis_transform())
     
     ax.set_ylabel('Target Achievement Fraction', fontsize=10, fontweight='bold')
-    ax.set_title('Target Achievement Comparison\n(All classes meet targets: P≥0.95, C≥0.50)', 
+    
+    # Extract actual target values from equilibrium metrics (they're stored there)
+    # Use values from single_eq or multi_eq, whichever is available
+    actual_precision_target = precision_target
+    actual_coverage_target = coverage_target
+    if single_eq:
+        actual_precision_target = single_eq.get("precision_target", precision_target)
+        actual_coverage_target = single_eq.get("coverage_target", coverage_target)
+    elif multi_eq:
+        actual_precision_target = multi_eq.get("precision_target", precision_target)
+        actual_coverage_target = multi_eq.get("coverage_target", coverage_target)
+    
+    ax.set_title(f'Target Achievement Comparison\n(All classes meet targets: P≥{actual_precision_target:.2f}, C≥{actual_coverage_target:.2f})', 
                  fontsize=11, fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(methods, fontsize=10, fontweight='bold')
@@ -1749,7 +1761,7 @@ def plot_nashconv_comparison(
     
     title_prefix = f"{dataset_name.upper()}" if dataset_name else ""
     
-    # Determine layout based on available data
+    # Determine what data is available
     has_training = len(training_data) > 0
     has_eval = len(eval_data) > 0
     
@@ -1757,166 +1769,8 @@ def plot_nashconv_comparison(
         logger.warning("⚠ No NashConv data available (neither training nor evaluation), skipping plot")
         return
     
-    # Create flexible layout: if both exist, use 2x2; if only one, use 1x2
-    if has_training and has_eval:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        ax1, ax2, ax3, ax4 = axes.flatten()
-    elif has_training:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        ax1, ax2 = axes.flatten()
-        ax3, ax4 = None, None
-    else:  # has_eval only
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        ax3, ax4 = axes.flatten()
-        ax1, ax2 = None, None
-    
-    fig.suptitle(f"{title_prefix}: Nash Equilibrium Convergence Metrics", fontsize=14, fontweight='bold')
-    
-    # Plot 1: Training NashConv Sum
-    if ax1 and training_data:
-        # Use total_frames if available (more accurate), otherwise use step, otherwise use index
-        x_values = []
-        for i, e in enumerate(training_data):
-            if "total_frames" in e and e["total_frames"] is not None:
-                x_values.append(e["total_frames"])
-            elif "step" in e and e["step"] is not None:
-                x_values.append(e["step"])
-            else:
-                x_values.append(i)
-        
-        nashconv_sums = [e.get("training/nashconv_sum", 0.0) for e in training_data]
-        
-        # If only one data point, use scatter plot instead of line plot
-        if len(training_data) == 1:
-            ax1.scatter(x_values, nashconv_sums, s=100, color='b', marker='o', label='Training NashConv', zorder=3)
-            ax1.text(x_values[0], nashconv_sums[0] + 0.01, f'{nashconv_sums[0]:.6f}', 
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-        else:
-            ax1.plot(x_values, nashconv_sums, 'b-', marker='o', linewidth=2, markersize=4, label='Training NashConv')
-        
-        ax1.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
-        ax1.set_ylabel('NashConv Sum')
-        ax1.set_title(f'Training NashConv Convergence ({len(training_data)} data point{"s" if len(training_data) > 1 else ""})')
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-        if nashconv_sums:
-            ax1.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
-    elif ax1:
-        ax1.text(0.5, 0.5, 'Training NashConv data\nnot available', 
-                ha='center', va='center', transform=ax1.transAxes, 
-                fontsize=12, color='gray', style='italic')
-        ax1.set_title('Training NashConv Convergence (No Data)')
-        ax1.axis('off')
-    
-    # Plot 2: Training Exploitability Max
-    if ax2 and training_data:
-        # Use same x_values as Plot 1 for consistency
-        x_values = []
-        for i, e in enumerate(training_data):
-            if "total_frames" in e and e["total_frames"] is not None:
-                x_values.append(e["total_frames"])
-            elif "step" in e and e["step"] is not None:
-                x_values.append(e["step"])
-            else:
-                x_values.append(i)
-        
-        exploitability_max = [e.get("training/exploitability_max", 0.0) for e in training_data]
-        
-        # If only one data point, use scatter plot instead of line plot
-        if len(training_data) == 1:
-            ax2.scatter(x_values, exploitability_max, s=100, color='g', marker='s', label='Max Exploitability', zorder=3)
-            ax2.text(x_values[0], exploitability_max[0] + 0.01, f'{exploitability_max[0]:.6f}', 
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-        else:
-            ax2.plot(x_values, exploitability_max, 'g-', marker='s', linewidth=2, markersize=4, label='Max Exploitability')
-        
-        ax2.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
-        ax2.set_ylabel('Max Exploitability')
-        ax2.set_title(f'Training Max Exploitability ({len(training_data)} data point{"s" if len(training_data) > 1 else ""})')
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
-    elif ax2:
-        ax2.text(0.5, 0.5, 'Training Exploitability data\nnot available', 
-                ha='center', va='center', transform=ax2.transAxes, 
-                fontsize=12, color='gray', style='italic')
-        ax2.set_title('Training Max Exploitability (No Data)')
-        ax2.axis('off')
-    
-    # Plot 3: Evaluation NashConv Sum
-    if ax3 and eval_data:
-        eval_steps = []
-        for i, e in enumerate(eval_data):
-            if "total_frames" in e and e["total_frames"] is not None:
-                eval_steps.append(e["total_frames"])
-            elif "step" in e and e["step"] is not None:
-                eval_steps.append(e["step"])
-            else:
-                eval_steps.append(i)
-        
-        eval_nashconv_sums = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
-        
-        # If only one data point, use scatter plot
-        if len(eval_data) == 1:
-            ax3.scatter(eval_steps, eval_nashconv_sums, s=100, color='r', marker='^', label='Evaluation NashConv', zorder=3)
-            ax3.text(eval_steps[0], eval_nashconv_sums[0] + 0.01, f'{eval_nashconv_sums[0]:.6f}', 
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-        else:
-            ax3.plot(eval_steps, eval_nashconv_sums, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
-        
-        ax3.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
-        ax3.set_ylabel('NashConv Sum')
-        ax3.set_title(f'Evaluation NashConv Convergence ({len(eval_data)} data point{"s" if len(eval_data) > 1 else ""})')
-        ax3.grid(True, alpha=0.3)
-        ax3.legend()
-        if eval_nashconv_sums:
-            ax3.axhline(y=0.01, color='r', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
-    elif ax3:
-        ax3.text(0.5, 0.5, 'Evaluation NashConv data\nnot available', 
-                ha='center', va='center', transform=ax3.transAxes, 
-                fontsize=12, color='gray', style='italic')
-        ax3.set_title('Evaluation NashConv Convergence (No Data)')
-        ax3.axis('off')
-    
-    # Plot 4: Evaluation Exploitability Max
-    if ax4 and eval_data:
-        eval_steps = []
-        for i, e in enumerate(eval_data):
-            if "total_frames" in e and e["total_frames"] is not None:
-                eval_steps.append(e["total_frames"])
-            elif "step" in e and e["step"] is not None:
-                eval_steps.append(e["step"])
-            else:
-                eval_steps.append(i)
-        
-        eval_exploitability_max = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
-        
-        # If only one data point, use scatter plot
-        if len(eval_data) == 1:
-            ax4.scatter(eval_steps, eval_exploitability_max, s=100, color='m', marker='d', label='Max Exploitability', zorder=3)
-            ax4.text(eval_steps[0], eval_exploitability_max[0] + 0.01, f'{eval_exploitability_max[0]:.6f}', 
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-        else:
-            ax4.plot(eval_steps, eval_exploitability_max, 'm-', marker='d', linewidth=2, markersize=4, label='Max Exploitability')
-        
-        ax4.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
-        ax4.set_ylabel('Max Exploitability')
-        ax4.set_title(f'Evaluation Max Exploitability ({len(eval_data)} data point{"s" if len(eval_data) > 1 else ""})')
-        ax4.grid(True, alpha=0.3)
-        ax4.legend()
-    elif ax4:
-        ax4.text(0.5, 0.5, 'Evaluation Exploitability data\nnot available', 
-                ha='center', va='center', transform=ax4.transAxes, 
-                fontsize=12, color='gray', style='italic')
-        ax4.set_title('Evaluation Max Exploitability (No Data)')
-        ax4.axis('off')
-    
-    plt.tight_layout()
-    output_path = Path(output_dir) / "nashconv_convergence_comparison.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved NashConv convergence comparison plot to {output_path}")
-    
-    # Also create a combined plot showing training vs evaluation for direct comparison
+    # Only create the training vs evaluation comparison plot (more useful than separate 2x2 grid)
+    # This shows both training and evaluation on the same axes for direct comparison
     if has_training and has_eval:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle(f"{title_prefix}: Training vs Evaluation NashConv Comparison", fontsize=14, fontweight='bold')
@@ -1990,7 +1844,88 @@ def plot_nashconv_comparison(
         combined_path = Path(output_dir) / "nashconv_training_vs_evaluation.png"
         plt.savefig(combined_path, dpi=300, bbox_inches='tight')
         plt.close()
-        logger.info(f"Saved combined Training vs Evaluation NashConv plot to {combined_path}")
+        logger.info(f"Saved Training vs Evaluation NashConv plot to {combined_path}")
+    else:
+        # If only one type of data is available, create a simple plot
+        logger.info(f"Only {'training' if has_training else 'evaluation'} NashConv data available, creating single plot")
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        fig.suptitle(f"{title_prefix}: {'Training' if has_training else 'Evaluation'} NashConv Metrics", fontsize=14, fontweight='bold')
+        
+        if has_training:
+            # Plot training data only
+            train_x = []
+            for i, e in enumerate(training_data):
+                if "total_frames" in e and e["total_frames"] is not None:
+                    train_x.append(e["total_frames"])
+                elif "step" in e and e["step"] is not None:
+                    train_x.append(e["step"])
+                else:
+                    train_x.append(i)
+            train_nashconv = [e.get("training/nashconv_sum", 0.0) for e in training_data]
+            train_exploit = [e.get("training/exploitability_max", 0.0) for e in training_data]
+            
+            ax1, ax2 = axes[0], axes[1]
+            if len(train_nashconv) == 1:
+                ax1.scatter(train_x, train_nashconv, s=100, color='b', marker='o', label='Training NashConv', zorder=3)
+            else:
+                ax1.plot(train_x, train_nashconv, 'b-', marker='o', linewidth=2, markersize=4, label='Training NashConv')
+            ax1.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
+            ax1.set_ylabel('NashConv Sum')
+            ax1.set_title('Training NashConv Sum')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            ax1.axhline(y=0.01, color='gray', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+            
+            if len(train_exploit) == 1:
+                ax2.scatter(train_x, train_exploit, s=100, color='g', marker='s', label='Training Max Exploitability', zorder=3)
+            else:
+                ax2.plot(train_x, train_exploit, 'g-', marker='s', linewidth=2, markersize=4, label='Training Max Exploitability')
+            ax2.set_xlabel('Training Frames' if any("total_frames" in e for e in training_data) else 'Training Step')
+            ax2.set_ylabel('Max Exploitability')
+            ax2.set_title('Training Max Exploitability')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+        
+        elif has_eval:
+            # Plot evaluation data only
+            eval_x = []
+            for i, e in enumerate(eval_data):
+                if "total_frames" in e and e["total_frames"] is not None:
+                    eval_x.append(e["total_frames"])
+                elif "step" in e and e["step"] is not None:
+                    eval_x.append(e["step"])
+                else:
+                    eval_x.append(i)
+            eval_nashconv = [e.get("evaluation/nashconv_sum", 0.0) for e in eval_data]
+            eval_exploit = [e.get("evaluation/exploitability_max", 0.0) for e in eval_data]
+            
+            ax1, ax2 = axes[0], axes[1]
+            if len(eval_nashconv) == 1:
+                ax1.scatter(eval_x, eval_nashconv, s=100, color='r', marker='^', label='Evaluation NashConv', zorder=3)
+            else:
+                ax1.plot(eval_x, eval_nashconv, 'r-', marker='^', linewidth=2, markersize=4, label='Evaluation NashConv')
+            ax1.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
+            ax1.set_ylabel('NashConv Sum')
+            ax1.set_title('Evaluation NashConv Sum')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+            ax1.axhline(y=0.01, color='gray', linestyle='--', alpha=0.5, label='ε=0.01 threshold')
+            
+            if len(eval_exploit) == 1:
+                ax2.scatter(eval_x, eval_exploit, s=100, color='m', marker='d', label='Evaluation Max Exploitability', zorder=3)
+            else:
+                ax2.plot(eval_x, eval_exploit, 'm-', marker='d', linewidth=2, markersize=4, label='Evaluation Max Exploitability')
+            ax2.set_xlabel('Evaluation Frames' if any("total_frames" in e for e in eval_data) else 'Evaluation Step')
+            ax2.set_ylabel('Max Exploitability')
+            ax2.set_title('Evaluation Max Exploitability')
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+        
+        plt.tight_layout()
+        single_path = Path(output_dir) / "nashconv_training_vs_evaluation.png"
+        plt.savefig(single_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {'Training' if has_training else 'Evaluation'} NashConv plot to {single_path}")
 
 
 def save_comparison_metrics_json(
@@ -2248,7 +2183,9 @@ def plot_comprehensive_comparison(
     multi_agent_summary: Optional[Dict],
     output_dir: str,
     dataset_name: str = "",
-    baseline_summary: Optional[Dict] = None
+    baseline_summary: Optional[Dict] = None,
+    precision_target: float = 0.95,
+    coverage_target: float = 0.1
 ):
     """Plot comprehensive comparison with 5 subplots (2x3 grid: 2 rows, 3 columns)."""
     if not HAS_PLOTTING:
@@ -2269,7 +2206,7 @@ def plot_comprehensive_comparison(
     # Row 1: Feature importance + Target achievement comparison
     plot_feature_importance_subplot(ax1, single_agent_summary, f'{title_prefix}: Single-Agent Feature Importance', top_n=10)
     plot_feature_importance_subplot(ax2, multi_agent_summary, f'{title_prefix}: Multi-Agent Feature Importance', top_n=10)
-    plot_equilibrium_comparison(ax_eq, single_agent_summary, multi_agent_summary)
+    plot_equilibrium_comparison(ax_eq, single_agent_summary, multi_agent_summary, precision_target, coverage_target)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'comprehensive_comparison.png'), dpi=300, bbox_inches='tight')

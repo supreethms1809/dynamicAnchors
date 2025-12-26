@@ -18,7 +18,7 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 # Environment configuration dictionary
 env_config:
   precision_target: 0.95  # Reduced from 0.99 to allow boxes to expand more for better coverage
-  coverage_target: 0.4
+  coverage_target: 0.2
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
@@ -84,6 +84,9 @@ env_config:
   # If provided, a random instance is sampled as centroid for each episode reset
   # If None, mean centroid is computed from class data
   fixed_instances_per_class: null
+  # Training initialization: ratio of instance-based vs centroid-based episodes
+  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.3 = 30% instance-based, 70% centroid-based
+  training_instance_ratio: 0.3  # Recommended: 0.3 (30% instance-based, 70% centroid-based)
 
 # Logging verbosity control
 # Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs

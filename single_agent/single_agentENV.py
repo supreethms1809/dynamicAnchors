@@ -135,6 +135,8 @@ class SingleAgentAnchorEnv(Env):
         self.initial_window = env_config.get("initial_window", 0.1)
         self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
+        self.training_instances_per_class = env_config.get("training_instances_per_class", None)
+        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.3)
         self.use_random_sampling = env_config.get("use_random_sampling", False)
         self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
         
@@ -562,6 +564,26 @@ class SingleAgentAnchorEnv(Env):
         # but accumulate across episodes to track usage and disable overused reasons.
         
         self.timestep = 0
+        
+        # Mixed initialization during training: randomly choose between instance-based and centroid-based
+        use_instance_based = False
+        if self.mode == "training" and self.training_instances_per_class is not None and self.training_instance_ratio > 0.0:
+            # Randomly decide whether to use instance-based or centroid-based
+            use_instance_based = self.rng.random() < self.training_instance_ratio
+            
+            if use_instance_based and self.target_class in self.training_instances_per_class:
+                # Instance-based: randomly select an instance from training instances
+                instances = self.training_instances_per_class[self.target_class]
+                if len(instances) > 0:
+                    instance_idx = self.rng.integers(0, len(instances))
+                    instance = np.array(instances[instance_idx], dtype=np.float32)
+                    self.x_star_unit = instance
+                    logger.debug(f"Training: Using instance-based initialization (instance {instance_idx}/{len(instances)})")
+                else:
+                    use_instance_based = False  # Fall back to centroid-based if no instances
+            else:
+                # Centroid-based: clear x_star_unit
+                self.x_star_unit = None
         
         # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
         if self.x_star_unit is not None:

@@ -2346,9 +2346,35 @@ def extract_rules_from_policies(
         for rollout_idx in range(n_class_based_rollouts_per_agent):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # Create environment config for this class
+            # CRITICAL: Use FULL dataset (train + test) for class-based rollouts
+            # Class-based rules should express a particular class of the full dataset
+            # This ensures rules are evaluated on the complete class distribution
+            if env_data.get("X_test_unit") is not None:
+                # Combine train and test data for class-based rollouts (full dataset)
+                full_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                full_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                full_y = np.concatenate([env_data["y"], env_data["y_test"]])
+                use_full_dataset = True
+                if rollout_idx == 0:  # Log once per class
+                    logger.info(f"  Using FULL dataset (train + test) for class-based rollouts")
+                    logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(full_y)}")
+                    logger.info(f"    Note: Class-based rules should express the class across the full dataset")
+            else:
+                # Fallback to training data only if test data not available
+                full_X_unit = env_data["X_unit"]
+                full_X_std = env_data["X_std"]
+                full_y = env_data["y"]
+                use_full_dataset = False
+                if rollout_idx == 0:  # Log once per class
+                    logger.info(f"  Using TRAINING data only for class-based rollouts (test data not available)")
+            
+            # Create environment config for this class with full dataset
             class_based_config = anchor_config.copy()
             class_based_config["target_classes"] = [target_class]
+            # Override with full dataset
+            class_based_config["X_unit"] = full_X_unit
+            class_based_config["X_std"] = full_X_std
+            class_based_config["y"] = full_y
             
             # Ensure env_config is properly set up
             if "env_config" not in class_based_config:
@@ -2356,6 +2382,8 @@ def extract_rules_from_policies(
             class_based_config["env_config"] = class_based_config["env_config"].copy()
             class_based_config["env_config"]["mode"] = "inference"
             class_based_config["env_config"]["normalize_data"] = False
+            # When using full dataset, set eval_on_test_data=False so metrics are computed on full dataset
+            class_based_config["env_config"]["eval_on_test_data"] = False if use_full_dataset else eval_on_test_data
             
             # Ensure cluster centroids are available
             if "cluster_centroids_per_class" not in class_based_config["env_config"]:
@@ -2559,13 +2587,20 @@ def extract_rules_from_policies(
     logger.info("Recomputing Class Union Metrics (Class-based anchors only)")
     logger.info(f"{'='*80}")
     
-    # Get the appropriate dataset (test or train) based on eval_on_test_data
-    if eval_on_test_data and env_data.get("X_test_unit") is not None:
-        X_data_union = env_data["X_test_unit"]
-        y_data_union = env_data["y_test"]
+    # CRITICAL: Use FULL dataset (train + test) for class union metrics
+    # Class union metrics represent rules that express a particular class of the full dataset
+    # This ensures consistency with class-based rollouts which also use full dataset
+    if env_data.get("X_test_unit") is not None:
+        # Use full dataset (train + test) for class union metrics
+        X_data_union = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+        y_data_union = np.concatenate([env_data["y"], env_data["y_test"]])
+        logger.info(f"  Using FULL dataset (train + test) for class union metrics")
+        logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(y_data_union)}")
     else:
+        # Fallback to training data only if test data not available
         X_data_union = env_data["X_unit"]
         y_data_union = env_data["y"]
+        logger.info(f"  Using TRAINING data only for class union metrics (test data not available)")
     
     # Recompute union metrics for each class
     for class_key, class_data in results["per_class_results"].items():
@@ -2625,6 +2660,11 @@ def extract_rules_from_policies(
             # Update class-level metrics with class-based union only
             class_data["class_precision"] = class_precision_combined
             class_data["class_coverage"] = class_coverage_combined
+            
+            # CRITICAL: Store union rules in class_data so they can be accessed later
+            # These are the deduplicated class-based rules that form the union
+            class_data["class_level_unique_rules"] = class_based_unique_rules
+            class_data["class_union_unique_rules"] = class_based_unique_rules  # Alias for clarity
             
             # Log the final union metrics
             n_class_based_anchors = len(all_anchors_for_union)

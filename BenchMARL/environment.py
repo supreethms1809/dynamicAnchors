@@ -158,6 +158,8 @@ class AnchorEnv(ParallelEnv):
         self.initial_window = env_config.get("initial_window", 0.1)
         self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
+        self.training_instances_per_class = env_config.get("training_instances_per_class", None)
+        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.3)
         self.use_random_sampling = env_config.get("use_random_sampling", False)
         self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
         
@@ -719,7 +721,41 @@ class AnchorEnv(ParallelEnv):
         observations = {}
         infos = {}
         
+        # Mixed initialization during training: randomly choose between instance-based and centroid-based
+        # For each agent, decide whether to use instance-based or centroid-based
         for agent in self.agents:
+            use_instance_based = False
+            if self.mode == "training" and self.training_instances_per_class is not None and self.training_instance_ratio > 0.0:
+                # Randomly decide whether to use instance-based or centroid-based for this agent
+                use_instance_based = self.rng.random() < self.training_instance_ratio
+                
+                if use_instance_based:
+                    target_class = self._get_class_for_agent(agent)
+                    if target_class is not None and target_class in self.training_instances_per_class:
+                        # Instance-based: randomly select an instance from training instances
+                        instances = self.training_instances_per_class[target_class]
+                        if len(instances) > 0:
+                            # Extract agent index for diversity (different agents get different instances)
+                            agent_idx = 0
+                            if self.agents_per_class > 1 and "_" in agent:
+                                parts = agent.split("_")
+                                if len(parts) >= 3 and parts[2].isdigit():
+                                    agent_idx = int(parts[2])
+                            
+                            # Cycle through instances based on agent index, then add randomness
+                            instance_idx = (agent_idx + self.rng.integers(0, len(instances))) % len(instances)
+                            instance = np.array(instances[instance_idx], dtype=np.float32)
+                            self.x_star_unit[agent] = instance
+                            logger.debug(f"Training: Agent {agent} using instance-based initialization (instance {instance_idx}/{len(instances)})")
+                        else:
+                            use_instance_based = False  # Fall back to centroid-based if no instances
+                    else:
+                        use_instance_based = False  # Fall back to centroid-based if class not found
+                else:
+                    # Centroid-based: clear x_star_unit for this agent
+                    if agent in self.x_star_unit:
+                        del self.x_star_unit[agent]
+            
             if self.x_star_unit.get(agent) is not None:
                 w = self.initial_window
                 centroid = self.x_star_unit[agent]

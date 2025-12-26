@@ -258,6 +258,44 @@ class AnchorTrainer:
             logger.warning(f"  Falling back to mean centroid per class (all episodes will start from same point)")
             env_config_with_data["cluster_centroids_per_class"] = None
         
+        # Sample instances per class for instance-based training (mixed initialization)
+        training_instance_ratio = env_config_with_data.get("training_instance_ratio", 0.3)
+        if training_instance_ratio > 0.0:
+            import numpy as np
+            np.random.seed(self.seed if hasattr(self, 'seed') else 42)
+            
+            # Sample instances per class for instance-based training
+            # Use enough instances to support the instance ratio (e.g., 20-30 instances per class)
+            n_instances_per_class = max(20, int(10 / training_instance_ratio))  # Ensure enough instances
+            training_instances_per_class = {}
+            
+            logger.info(f"\nSampling instances per class for instance-based training...")
+            logger.info(f"  Training instance ratio: {training_instance_ratio:.1%} ({(1-training_instance_ratio):.1%} centroid-based)")
+            logger.info(f"  Sampling {n_instances_per_class} instances per class")
+            
+            for cls in target_classes:
+                class_mask = (y_data == cls)
+                class_indices = np.where(class_mask)[0]
+                
+                if len(class_indices) >= n_instances_per_class:
+                    # Randomly sample instances
+                    selected_indices = np.random.choice(class_indices, size=n_instances_per_class, replace=False)
+                    training_instances_per_class[cls] = X_data[selected_indices].tolist()
+                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled")
+                elif len(class_indices) > 0:
+                    # Use all available instances if fewer than requested
+                    training_instances_per_class[cls] = X_data[class_indices].tolist()
+                    logger.info(f"   Class {cls}: {len(class_indices)} instances sampled (all available)")
+                else:
+                    logger.warning(f"   Class {cls}: No instances available for sampling")
+            
+            # Store training instances in env_config
+            env_config_with_data["training_instances_per_class"] = training_instances_per_class
+            logger.info("   Training instances set in environment config")
+        else:
+            env_config_with_data["training_instances_per_class"] = None
+            logger.info("   Training instance ratio is 0.0 - using centroid-based initialization only")
+        
         # Create the anchor configuration.
         anchor_config = {
             "X_unit": env_data["X_unit"],
