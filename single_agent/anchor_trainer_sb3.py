@@ -345,8 +345,12 @@ class AnchorTrainerSB3:
                 min_samples_per_cluster=1
             )
             
-            # Verify we have enough centroids for each class
+            # Verify we have enough centroids for each class and log class statistics
             for cls in target_classes:
+                class_mask = (y_data == cls)
+                n_class_samples = class_mask.sum()
+                logger.info(f"   Class {cls}: {n_class_samples} training samples")
+                
                 if cls in cluster_centroids_per_class:
                     n_centroids = len(cluster_centroids_per_class[cls])
                     if n_centroids < n_clusters_per_class:
@@ -390,18 +394,24 @@ class AnchorTrainerSB3:
             for cls in target_classes:
                 class_mask = (y_data == cls)
                 class_indices = np.where(class_mask)[0]
+                n_class_samples = len(class_indices)
+                
+                logger.info(f"   Class {cls}: {n_class_samples} training samples available")
                 
                 if len(class_indices) >= n_instances_per_class:
                     # Randomly sample instances
                     selected_indices = np.random.choice(class_indices, size=n_instances_per_class, replace=False)
                     training_instances_per_class[cls] = X_data[selected_indices].tolist()
-                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled")
+                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled from {n_class_samples} available")
                 elif len(class_indices) > 0:
                     # Use all available instances if fewer than requested
                     training_instances_per_class[cls] = X_data[class_indices].tolist()
-                    logger.info(f"   Class {cls}: {len(class_indices)} instances sampled (all available)")
+                    logger.warning(
+                        f"   Class {cls}: Only {len(class_indices)} instances available "
+                        f"(requested {n_instances_per_class}). Using all available instances."
+                    )
                 else:
-                    logger.warning(f"   Class {cls}: No instances available for sampling")
+                    logger.error(f"   Class {cls}: No instances available for sampling! This will cause initialization failures.")
             
             # Store training instances in env_config
             env_config_with_data["training_instances_per_class"] = training_instances_per_class
@@ -511,6 +521,14 @@ class AnchorTrainerSB3:
     ):
         """Set up training and evaluation environments for each class."""
         logger.info(f"\nCreating environments for {len(target_classes)} classes...")
+        
+        # Log class data statistics before creating environments
+        y_data = env_data["y"]
+        for cls in target_classes:
+            class_mask = (y_data == cls)
+            n_class_samples = class_mask.sum()
+            logger.info(f"  Class {cls}: {n_class_samples} training samples")
+        
         for target_class in target_classes:
             logger.info(f"  Setting up class {target_class}...")
             
@@ -915,8 +933,12 @@ class AnchorTrainerSB3:
                 min_samples_per_cluster=1
             )
             
-            # Verify we have enough centroids for each class
+            # Verify we have enough centroids for each class and log class statistics
             for cls in target_classes:
+                class_mask = (y_data == cls)
+                n_class_samples = class_mask.sum()
+                logger.info(f"   Class {cls}: {n_class_samples} training samples")
+                
                 if cls in cluster_centroids_per_class:
                     n_centroids = len(cluster_centroids_per_class[cls])
                     if n_centroids < n_clusters_per_class:
