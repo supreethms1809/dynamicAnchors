@@ -260,39 +260,81 @@ class AnchorTrainer:
         
         # Sample instances per class for instance-based training (mixed initialization)
         training_instance_ratio = env_config_with_data.get("training_instance_ratio", 0.3)
+        use_adaptive_ratios = env_config_with_data.get("use_adaptive_instance_ratios", True)  # Enable by default
+        
         if training_instance_ratio > 0.0:
             np.random.seed(self.seed if hasattr(self, 'seed') else 42)
             
-            # Sample instances per class for instance-based training
-            # Use enough instances to support the instance ratio (e.g., 20-30 instances per class)
-            n_instances_per_class = max(20, int(10 / training_instance_ratio))  # Ensure enough instances
+            # Compute class-specific ratios based on class imbalance (if adaptive mode enabled)
+            training_instance_ratios_per_class = {}
+            if use_adaptive_ratios and len(target_classes) > 1:
+                # Compute class counts
+                class_counts = {cls: (y_data == cls).sum() for cls in target_classes}
+                min_count = min(class_counts.values())
+                max_count = max(class_counts.values())
+                imbalance_ratio = max_count / min_count if min_count > 0 else 1.0
+                
+                # Use warning level so these important setup messages show even in quiet mode
+                logger.warning(f"\nComputing adaptive class-specific training instance ratios...")
+                logger.warning(f"  Class imbalance ratio: {imbalance_ratio:.2f}:1 (max/min)")
+                logger.warning(f"  Base ratio: {training_instance_ratio:.1%}")
+                
+                # Only use adaptive ratios if there's significant imbalance (> 1.5:1)
+                if imbalance_ratio > 1.5:
+                    for cls in target_classes:
+                        count = class_counts[cls]
+                        # Higher ratio for minority classes (inversely proportional to class size)
+                        # Use square root scaling to avoid extreme ratios
+                        size_factor = (max_count / count) ** 0.5 if count > 0 else 1.0
+                        adaptive_ratio = training_instance_ratio * size_factor
+                        # Cap at reasonable maximum (40%) to avoid overfitting
+                        adaptive_ratio = min(0.4, max(training_instance_ratio, adaptive_ratio))
+                        training_instance_ratios_per_class[cls] = adaptive_ratio
+                        
+                        minority_status = "minority" if count < min_count * 1.5 else "majority"
+                        logger.warning(f"   Class {cls}: {count} samples ({minority_status}) → ratio: {adaptive_ratio:.1%}")
+                else:
+                    # Balanced dataset - use same ratio for all classes
+                    logger.warning(f"  Dataset is relatively balanced - using uniform ratio for all classes")
+                    for cls in target_classes:
+                        training_instance_ratios_per_class[cls] = training_instance_ratio
+            else:
+                # Use uniform ratio for all classes
+                for cls in target_classes:
+                    training_instance_ratios_per_class[cls] = training_instance_ratio
+            
+            # Sample instances per class (use max ratio to ensure enough instances)
+            max_ratio = max(training_instance_ratios_per_class.values())
+            n_instances_per_class = max(20, int(10 / max_ratio))  # Ensure enough instances
             training_instances_per_class = {}
             
             logger.info(f"\nSampling instances per class for instance-based training...")
-            logger.info(f"  Training instance ratio: {training_instance_ratio:.1%} ({(1-training_instance_ratio):.1%} centroid-based)")
-            logger.info(f"  Sampling {n_instances_per_class} instances per class")
+            logger.info(f"  Sampling {n_instances_per_class} instances per class (based on max ratio: {max_ratio:.1%})")
             
             for cls in target_classes:
                 class_mask = (y_data == cls)
                 class_indices = np.where(class_mask)[0]
+                class_ratio = training_instance_ratios_per_class[cls]
                 
                 if len(class_indices) >= n_instances_per_class:
                     # Randomly sample instances
                     selected_indices = np.random.choice(class_indices, size=n_instances_per_class, replace=False)
                     training_instances_per_class[cls] = X_data[selected_indices].tolist()
-                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled")
+                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled (ratio: {class_ratio:.1%})")
                 elif len(class_indices) > 0:
                     # Use all available instances if fewer than requested
                     training_instances_per_class[cls] = X_data[class_indices].tolist()
-                    logger.info(f"   Class {cls}: {len(class_indices)} instances sampled (all available)")
+                    logger.info(f"   Class {cls}: {len(class_indices)} instances sampled (all available, ratio: {class_ratio:.1%})")
                 else:
                     logger.warning(f"   Class {cls}: No instances available for sampling")
             
-            # Store training instances in env_config
+            # Store training instances and class-specific ratios in env_config
             env_config_with_data["training_instances_per_class"] = training_instances_per_class
-            logger.info("   Training instances set in environment config")
+            env_config_with_data["training_instance_ratios_per_class"] = training_instance_ratios_per_class
+            logger.info("   ✓ Training instances and class-specific ratios set in environment config")
         else:
             env_config_with_data["training_instances_per_class"] = None
+            env_config_with_data["training_instance_ratios_per_class"] = None
             logger.info("   Training instance ratio is 0.0 - using centroid-based initialization only")
         
         # Create the anchor configuration.
@@ -311,11 +353,15 @@ class AnchorTrainer:
         self.task = AnchorTask.ANCHOR.get_task(config=anchor_config)
         
         # SS Bug: Check if the collec_anchor_data is actually working
+        # Get NashConv threshold from config (default: 0.01)
+        nashconv_threshold = env_config.get("nashconv_threshold", 0.01)
+        
         self.callback = AnchorMetricsCallback(
             log_training_metrics=True, 
             log_evaluation_metrics=True,
             save_to_file=True,
-            collect_anchor_data=True
+            collect_anchor_data=True,
+            nashconv_threshold=nashconv_threshold
         )
         self.experiment = Experiment(
             config=self.experiment_config,

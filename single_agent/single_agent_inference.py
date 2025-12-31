@@ -1080,8 +1080,62 @@ def extract_rules_single_agent(
         class_based_end_time = time.perf_counter()
         class_based_total_time = class_based_end_time - class_based_start_time
         
-        class_based_precision = float(np.mean(class_based_precisions)) if class_based_precisions else 0.0
-        class_based_coverage = float(np.mean(class_based_coverages)) if class_based_coverages else 0.0
+        # CRITICAL: Filter low-precision anchors before computing average
+        # We only trust high-precision anchors, so average should reflect quality of trusted anchors only
+        # This matches the filtering used for union computation
+        precision_target = env_config.get("precision_target", 0.95)
+        precision_threshold = precision_target * 0.8
+        
+        # Get dataset for recomputing precision (same as used for union)
+        if env_data.get("X_test_unit") is not None:
+            X_data_filter = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            y_data_filter = np.concatenate([env_data["y"], env_data["y_test"]])
+        else:
+            X_data_filter = env_data["X_unit"]
+            y_data_filter = env_data["y"]
+        
+        # Filter anchors by recomputing precision on actual dataset
+        filtered_class_based_precisions = []
+        filtered_class_based_coverages = []
+        filtered_class_based_anchors = []
+        
+        if X_data_filter is not None and y_data_filter is not None:
+            for anchor_data in class_based_anchors_list:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data_filter >= lower) & (X_data_filter <= upper), axis=1)
+                    
+                    if in_box.sum() > 0:
+                        # Compute actual precision on the dataset
+                        y_in_box = y_data_filter[in_box]
+                        actual_precision = float((y_in_box == target_class).mean())
+                        
+                        # Only include high-precision anchors in average
+                        if actual_precision >= precision_threshold:
+                            filtered_class_based_precisions.append(actual_precision)
+                            # Use stored coverage (or recompute if needed)
+                            anchor_coverage = anchor_data.get("coverage", 0.0)
+                            filtered_class_based_coverages.append(anchor_coverage)
+                            filtered_class_based_anchors.append(anchor_data)
+        
+        # Compute average of filtered high-precision anchors only
+        # This represents the quality of anchors we actually trust and use
+        if filtered_class_based_precisions:
+            class_based_precision = float(np.mean(filtered_class_based_precisions))
+            class_based_coverage = float(np.mean(filtered_class_based_coverages))
+            logger.info(f"  Class {target_class}: Filtered {len(filtered_class_based_precisions)}/{len(class_based_precisions)} "
+                       f"high-precision anchors (threshold={precision_threshold:.3f})")
+            logger.info(f"  Average precision of filtered anchors: {class_based_precision:.4f}")
+        else:
+            # Fallback: if no anchors pass filter, use all anchors (but log warning)
+            class_based_precision = float(np.mean(class_based_precisions)) if class_based_precisions else 0.0
+            class_based_coverage = float(np.mean(class_based_coverages)) if class_based_coverages else 0.0
+            logger.warning(f"  Class {target_class}: No anchors passed precision filter (threshold={precision_threshold:.3f}), "
+                          f"using average of all {len(class_based_precisions)} anchors: {class_based_precision:.4f}")
+        
         class_based_avg_rollout_time = float(np.mean(class_based_rollout_times)) if class_based_rollout_times else 0.0
         class_based_total_rollout_time = float(np.sum(class_based_rollout_times)) if class_based_rollout_times else 0.0
         
@@ -1091,11 +1145,15 @@ def extract_rules_single_agent(
         
         # CRITICAL: Add class-based metrics to the main class entry (for consistency with multi-agent)
         # This allows the summary script to find them easily
+        # Store average of FILTERED high-precision anchors only
         results["per_class_results"][class_key]["class_level_precision"] = class_based_precision
         results["per_class_results"][class_key]["class_level_coverage"] = class_based_coverage
         # Legacy names for backward compatibility
         results["per_class_results"][class_key]["class_based_precision"] = class_based_precision
         results["per_class_results"][class_key]["class_based_coverage"] = class_based_coverage
+        # Store count of filtered vs total anchors for transparency
+        results["per_class_results"][class_key]["class_based_n_filtered"] = len(filtered_class_based_precisions)
+        results["per_class_results"][class_key]["class_based_n_total"] = len(class_based_precisions)
         
         # Also store class-based results in a separate key for easy access (kept for backward compatibility)
         class_based_key = f"class_{target_class}_class_based"
@@ -1170,13 +1228,67 @@ def extract_rules_single_agent(
             if "unique_rules" in class_based_data:
                 class_based_unique_rules = class_based_data["unique_rules"]
         
+        # Filter anchors by precision threshold before computing union
+        # This ensures we only include high-quality rules in the union
+        # Use the same precision threshold as used during training/inference
+        # precision_threshold = precision_target * 0.8 (same as in environment.py)
+        precision_target = env_config.get("precision_target", 0.95)
+        precision_threshold = precision_target * 0.8
+        filtered_anchors_for_union = []
+        filtered_rules_for_union = []
+        
+        # CRITICAL: Recompute precision on actual dataset for filtering
+        # The stored instance_precision uses perturbation sampling which may not match actual dataset precision
+        if X_data_union is not None and y_data_union is not None:
+            for anchor_data in all_anchors_for_union:
+                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
+                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+                    
+                    # Check which points fall in this anchor box
+                    in_box = np.all((X_data_union >= lower) & (X_data_union <= upper), axis=1)
+                    
+                    if in_box.sum() > 0:
+                        # Compute actual precision on the dataset
+                        y_in_box = y_data_union[in_box]
+                        actual_precision = float((y_in_box == target_class).mean())
+                        
+                        # Use actual precision for filtering, not stored instance_precision
+                        if actual_precision >= precision_threshold:
+                            filtered_anchors_for_union.append(anchor_data)
+                            # Also track the corresponding rule if available
+                            rule = anchor_data.get("rule", "")
+                            if rule and rule != "any values (no tightened features)":
+                                filtered_rules_for_union.append(rule)
+                    else:
+                        # No samples in box - skip this anchor
+                        continue
+        else:
+            # Fallback: use stored precision if dataset not available
+            logger.warning(f"  Class {target_class} - Cannot recompute precision on dataset, using stored values")
+            for anchor_data in all_anchors_for_union:
+                # Get precision from anchor data (prefer instance_precision, fallback to anchor_precision)
+                anchor_precision = anchor_data.get("instance_precision", anchor_data.get("anchor_precision", 0.0))
+                
+                if anchor_precision >= precision_threshold:
+                    filtered_anchors_for_union.append(anchor_data)
+                    # Also track the corresponding rule if available
+                    rule = anchor_data.get("rule", "")
+                    if rule and rule != "any values (no tightened features)":
+                        filtered_rules_for_union.append(rule)
+        
+        # Update class_based_unique_rules to only include rules from high-precision anchors
+        if filtered_rules_for_union:
+            class_based_unique_rules = list(set(filtered_rules_for_union))
+        
         # Compute union of class-based anchors only (smallest set of general rules)
-        if X_data_union is not None and y_data_union is not None and len(all_anchors_for_union) > 0:
+        # Use filtered anchors instead of all anchors
+        if X_data_union is not None and y_data_union is not None and len(filtered_anchors_for_union) > 0:
             n_samples = X_data_union.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
             
-            # Build union mask from all anchors
-            for anchor_data in all_anchors_for_union:
+            # Build union mask from filtered high-precision anchors only
+            for anchor_data in filtered_anchors_for_union:
                 if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
                     lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
                     upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
@@ -1209,7 +1321,7 @@ def extract_rules_single_agent(
             class_data["class_union_unique_rules"] = class_based_unique_rules  # Alias for clarity
             
             # Log the final union metrics
-            n_class_based_anchors = len(all_anchors_for_union)
+            n_class_based_anchors = len(filtered_anchors_for_union)
             n_unique_rules = len(class_based_unique_rules)
             logger.info(f"\n  {'='*60}")
             logger.info(f"  Class {target_class} - CLASS UNION Results (Union of Class-Based Anchors Only):")

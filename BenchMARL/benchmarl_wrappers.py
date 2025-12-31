@@ -135,7 +135,7 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -172,12 +172,15 @@ class AnchorMetricsCallback(Callback):
         # Equilibrium evaluation: track if all classes meet targets
         self.equilibrium_eval_mode = True  # If True, save best model when all classes meet targets
         self.best_equilibrium_score = -float('inf')  # Track best equilibrium score (min class score when all meet targets)
+        self.best_equilibrium_nashconv = float('inf')  # Track best NashConv for equilibrium models (lower is better)
         
         # NashConv/exploitability computation settings
         self.compute_nashconv = compute_nashconv  # Whether to compute NashConv during evaluation
         self.nashconv_batch_size = nashconv_batch_size  # Batch size for best response computation
         self.nashconv_lr = nashconv_lr  # Learning rate for gradient ascent
         self.nashconv_steps = nashconv_steps  # Number of gradient ascent steps
+        self.nashconv_threshold = nashconv_threshold  # ε-Nash threshold for model selection (default: 0.01)
+        self.best_eval_nashconv = float('inf')  # Track best NashConv for aggregate models (lower is better)
         
         # Experiment reference (will be set by BenchMARL)
         self.experiment = None
@@ -1642,23 +1645,90 @@ class AnchorMetricsCallback(Callback):
                     save_model = False
                     save_reason = ""
                     
-                    # Strategy 1: Equilibrium-based (all classes meet targets)
+                    # Get NashConv from aggregated metrics (if available)
+                    nashconv_sum = aggregated.get("evaluation/nashconv_sum", float('inf'))
+                    nashconv_available = nashconv_sum != float('inf')
+                    
+                    # Strategy 1: Equilibrium-based (all classes meet targets) with NashConv check
                     if self.equilibrium_eval_mode and all_classes_meet_targets:
                         # Check if this is better than previous equilibrium
                         if class_scores:
                             min_class_score = min(s for _, _, s in class_scores.values())
-                            if not hasattr(self, 'best_equilibrium_score') or min_class_score > self.best_equilibrium_score:
-                                save_model = True
-                                save_reason = "equilibrium"
-                                self.best_equilibrium_score = min_class_score
-                                logger.info(f"  ✓ New equilibrium checkpoint! Min class score: {min_class_score:.4f}")
+                            
+                            # Check NashConv if available
+                            if nashconv_available:
+                                # Prefer models with NashConv <= threshold (ε-Nash equilibrium)
+                                if nashconv_sum <= self.nashconv_threshold:
+                                    # NashConv is acceptable - save if score improved or NashConv improved
+                                    score_improved = min_class_score > self.best_equilibrium_score
+                                    nashconv_improved = nashconv_sum < self.best_equilibrium_nashconv
+                                    
+                                    if score_improved or (not hasattr(self, 'best_equilibrium_score') or 
+                                                          (abs(min_class_score - self.best_equilibrium_score) < 0.01 and nashconv_improved)):
+                                        save_model = True
+                                        save_reason = "equilibrium"
+                                        self.best_equilibrium_score = min_class_score
+                                        self.best_equilibrium_nashconv = nashconv_sum
+                                        logger.info(
+                                            f"  ✓ New equilibrium checkpoint! "
+                                            f"Min class score: {min_class_score:.4f}, "
+                                            f"NashConv: {nashconv_sum:.6f} (≤ {self.nashconv_threshold:.3f})"
+                                        )
+                                else:
+                                    # NashConv above threshold - only save if NashConv improved significantly
+                                    # and we don't have a good equilibrium model yet
+                                    if (not hasattr(self, 'best_equilibrium_nashconv') or 
+                                        self.best_equilibrium_nashconv > self.nashconv_threshold):
+                                        # No good equilibrium model yet - save if NashConv improved
+                                        if nashconv_sum < self.best_equilibrium_nashconv:
+                                            save_model = True
+                                            save_reason = "equilibrium_improving"
+                                            self.best_equilibrium_score = min_class_score
+                                            self.best_equilibrium_nashconv = nashconv_sum
+                                            logger.info(
+                                                f"  ✓ New equilibrium checkpoint (improving NashConv)! "
+                                                f"Min class score: {min_class_score:.4f}, "
+                                                f"NashConv: {nashconv_sum:.6f} (target: ≤ {self.nashconv_threshold:.3f})"
+                                            )
+                            else:
+                                # NashConv not available - fallback to score-based selection
+                                if not hasattr(self, 'best_equilibrium_score') or min_class_score > self.best_equilibrium_score:
+                                    save_model = True
+                                    save_reason = "equilibrium"
+                                    self.best_equilibrium_score = min_class_score
+                                    logger.info(
+                                        f"  ✓ New equilibrium checkpoint! "
+                                        f"Min class score: {min_class_score:.4f} "
+                                        f"(NashConv not available)"
+                                    )
                     
-                    # Strategy 2: Global aggregate (fallback or if equilibrium not reached)
+                    # Strategy 2: Global aggregate (fallback or if equilibrium not reached) with NashConv tiebreaker
                     eval_score = precision + coverage  # Combined score
-                    if not save_model and eval_score > self.best_eval_score:
-                        save_model = True
-                        save_reason = "aggregate"
-                        self.best_eval_score = eval_score
+                    if not save_model:
+                        score_improved = eval_score > self.best_eval_score
+                        nashconv_improved = (nashconv_available and 
+                                            hasattr(self, 'best_eval_nashconv') and 
+                                            nashconv_sum < self.best_eval_nashconv)
+                        
+                        if score_improved:
+                            save_model = True
+                            save_reason = "aggregate"
+                            self.best_eval_score = eval_score
+                            if nashconv_available:
+                                self.best_eval_nashconv = nashconv_sum
+                        elif (nashconv_available and 
+                              hasattr(self, 'best_eval_score') and 
+                              abs(eval_score - self.best_eval_score) < 0.01 and  # Score within 0.01
+                              nashconv_improved):
+                            # Tiebreaker: prefer lower NashConv when scores are similar
+                            save_model = True
+                            save_reason = "aggregate_nashconv"
+                            self.best_eval_nashconv = nashconv_sum
+                            logger.info(
+                                f"  ✓ New best model (NashConv tiebreaker)! "
+                                f"Score: {eval_score:.4f} (similar to {self.best_eval_score:.4f}), "
+                                f"NashConv: {nashconv_sum:.6f} (improved from {self.best_eval_nashconv:.6f})"
+                            )
                     
                     # Strategy 3: Per-class best (optional - save if any class improves)
                     if class_scores:
@@ -1678,18 +1748,41 @@ class AnchorMetricsCallback(Callback):
                             self.best_model_path = best_model_path
                             
                             if save_reason == "equilibrium":
+                                nashconv_info = ""
+                                if nashconv_available:
+                                    nashconv_info = f", NashConv: {nashconv_sum:.6f}"
                                 logger.info(
                                     f"  ✓ New best model saved (EQUILIBRIUM)! "
                                     f"All classes meet targets. "
-                                    f"Global: P={precision:.4f}, C={coverage:.4f}"
+                                    f"Global: P={precision:.4f}, C={coverage:.4f}{nashconv_info}"
                                 )
                                 if class_scores:
                                     for class_id, (p, c, s) in sorted(class_scores.items()):
                                         logger.info(f"    Class {class_id}: P={p:.4f}, C={c:.4f}, Score={s:.4f}")
+                            elif save_reason == "equilibrium_improving":
+                                logger.info(
+                                    f"  ✓ New best model saved (EQUILIBRIUM - improving NashConv)! "
+                                    f"All classes meet targets. "
+                                    f"Global: P={precision:.4f}, C={coverage:.4f}, "
+                                    f"NashConv: {nashconv_sum:.6f} (target: ≤ {self.nashconv_threshold:.3f})"
+                                )
+                                if class_scores:
+                                    for class_id, (p, c, s) in sorted(class_scores.items()):
+                                        logger.info(f"    Class {class_id}: P={p:.4f}, C={c:.4f}, Score={s:.4f}")
+                            elif save_reason == "aggregate_nashconv":
+                                logger.info(
+                                    f"  ✓ New best model saved (NashConv tiebreaker)! "
+                                    f"Score: {eval_score:.4f}, "
+                                    f"Precision: {precision:.4f}, Coverage: {coverage:.4f}, "
+                                    f"NashConv: {nashconv_sum:.6f}"
+                                )
                             else:
+                                nashconv_info = ""
+                                if nashconv_available:
+                                    nashconv_info = f", NashConv: {nashconv_sum:.6f}"
                                 logger.info(
                                     f"  ✓ New best model saved! (Score: {eval_score:.4f}, "
-                                    f"Precision: {precision:.4f}, Coverage: {coverage:.4f})"
+                                    f"Precision: {precision:.4f}, Coverage: {coverage:.4f}{nashconv_info})"
                                 )
                             logger.info(f"    Best model path: {best_model_path}")
                         except Exception as e:

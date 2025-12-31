@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.2
+  coverage_target: 0.5
   
   # Data perturbation settings
   use_perturbation: True
@@ -22,10 +22,10 @@ env_config:
   # Reward weight parameters
   alpha: 0.7              # Weight for precision gain component
   beta: 1.0               # Weight for coverage gain component
-  gamma: 0.1              # Weight for overlap penalty
+  gamma: 0.02              # Weight for overlap penalty
   precision_blend_lambda: 0.5
-  drift_penalty_weight: 0.05
-  js_penalty_weight: 0.05
+  drift_penalty_weight: 0.01
+  js_penalty_weight: 0.01
   min_coverage_floor: 0.1
   
   # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
@@ -53,8 +53,10 @@ env_config:
   fixed_instances_per_class: null
   use_random_sampling: false
   # Training initialization: ratio of instance-based vs centroid-based episodes
-  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.3 = 30% instance-based, 70% centroid-based
-  training_instance_ratio: 0.3  # Recommended: 0.3 (30% instance-based, 70% centroid-based)
+  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% centroid-based
+  training_instance_ratio: 0.1  # 10% instance-based (prediction matching), 90% class-based (class correctness)
+  # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
+  use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
   
   # Evaluation settings
   eval_on_test_data: true

@@ -136,7 +136,8 @@ class SingleAgentAnchorEnv(Env):
         self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
         self.training_instances_per_class = env_config.get("training_instances_per_class", None)
-        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.3)
+        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.3)  # Base ratio (fallback)
+        self.training_instance_ratios_per_class = env_config.get("training_instance_ratios_per_class", None)  # Class-specific ratios
         self.use_random_sampling = env_config.get("use_random_sampling", False)
         self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
         
@@ -200,6 +201,10 @@ class SingleAgentAnchorEnv(Env):
                 self.x_star_unit = x_star_unit_config
         else:
             self.x_star_unit = None
+        
+        # Store original prediction for instance-based anchors (matches original Anchor paper)
+        # Value: original prediction (int) for the instance
+        self.original_prediction = None
 
         # Single agent: use direct variables instead of dictionaries
         self.lower = None
@@ -372,6 +377,26 @@ class SingleAgentAnchorEnv(Env):
         # - Class-based (x_star_unit not set): Class-conditional coverage P(x in box | y = target_class)
         is_instance_based = self.x_star_unit is not None
         
+        # If instance-based and original prediction not stored, compute it now
+        if is_instance_based and self.original_prediction is None:
+            if isinstance(self.x_star_unit, np.ndarray):
+                x_star = self.x_star_unit
+            else:
+                x_star = np.array(self.x_star_unit, dtype=np.float32)
+            x_star_std = self._unit_to_std(x_star.reshape(1, -1))[0]
+            
+            if hasattr(self.classifier, 'eval'):
+                self.classifier.eval()
+            if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+                self.classifier.model.eval()
+            
+            with torch.no_grad():
+                instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
+                logits = self.classifier(instance_tensor)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                self.original_prediction = int(np.argmax(probs))
+                logger.debug(f"SingleAgent: Computed original prediction {self.original_prediction} for instance-based anchor")
+        
         if is_instance_based:
             # Instance-based mode: Overall coverage P(x in box)
             # This matches the original Anchor paper definition
@@ -499,16 +524,36 @@ class SingleAgentAnchorEnv(Env):
         preds = probs.argmax(axis=1)
         positive_idx = (preds == self.target_class)
         
-        # Precision: P(y = target_class | x in box)
-        # When ground truth labels are available, use them directly
-        # When labels are not available (uniform sampling), use model predictions as proxy
-        if y_eval is None:
-            # Uniform sampling: no ground truth labels, use model predictions as proxy
-            hard_precision = float(positive_idx.mean())
+        # Precision calculation depends on mode:
+        # - Instance-based: P(prediction matches original instance | anchor conditions hold) - matches original Anchor paper
+        # - Class-based: P(y = target_class | x in box) - measures class correctness
+        if is_instance_based:
+            # Instance-based mode: Match original Anchor paper definition
+            # Precision = fraction of samples where prediction matches original instance's prediction
+            if self.original_prediction is not None:
+                matches_original = (preds == self.original_prediction)
+                hard_precision = float(matches_original.mean())
+                logger.debug(f"SingleAgent: Instance-based precision (prediction matching): {hard_precision:.4f} "
+                           f"(original prediction: {self.original_prediction}, target class: {self.target_class})")
+            else:
+                # Fallback: if original prediction not stored, use class-based precision
+                logger.warning(f"SingleAgent: Original prediction not found for instance-based anchor, "
+                             f"falling back to class-based precision calculation")
+                if y_eval is None:
+                    hard_precision = float(positive_idx.mean())
+                else:
+                    hard_precision = float((y_eval == self.target_class).mean())
         else:
-            # Bootstrap/empirical sampling: ground truth labels available
-            # Precision = fraction of samples in box that are actually target class
-            hard_precision = float((y_eval == self.target_class).mean())
+            # Class-based mode: P(y = target_class | x in box)
+            # When ground truth labels are available, use them directly
+            # When labels are not available (uniform sampling), use model predictions as proxy
+            if y_eval is None:
+                # Uniform sampling: no ground truth labels, use model predictions as proxy
+                hard_precision = float(positive_idx.mean())
+            else:
+                # Bootstrap/empirical sampling: ground truth labels available
+                # Precision = fraction of samples in box that are actually target class
+                hard_precision = float((y_eval == self.target_class).mean())
 
         avg_prob = float(probs[:, self.target_class].mean())
         precision_proxy = (
@@ -567,9 +612,16 @@ class SingleAgentAnchorEnv(Env):
         
         # Mixed initialization during training: randomly choose between instance-based and centroid-based
         use_instance_based = False
-        if self.mode == "training" and self.training_instances_per_class is not None and self.training_instance_ratio > 0.0:
+        if self.mode == "training" and self.training_instances_per_class is not None:
+            # Get class-specific ratio if available, otherwise use base ratio
+            if (self.training_instance_ratios_per_class is not None and 
+                self.target_class in self.training_instance_ratios_per_class):
+                class_ratio = self.training_instance_ratios_per_class[self.target_class]
+            else:
+                class_ratio = self.training_instance_ratio
+            
             # Randomly decide whether to use instance-based or centroid-based
-            use_instance_based = self.rng.random() < self.training_instance_ratio
+            use_instance_based = class_ratio > 0.0 and self.rng.random() < class_ratio
             
             if use_instance_based and self.target_class in self.training_instances_per_class:
                 # Instance-based: randomly select an instance from training instances
@@ -578,12 +630,15 @@ class SingleAgentAnchorEnv(Env):
                     instance_idx = self.rng.integers(0, len(instances))
                     instance = np.array(instances[instance_idx], dtype=np.float32)
                     self.x_star_unit = instance
-                    logger.debug(f"Training: Using instance-based initialization (instance {instance_idx}/{len(instances)})")
+                    ratio_info = f" (ratio: {class_ratio:.1%})" if 'class_ratio' in locals() else ""
+                    logger.debug(f"Training: Using instance-based initialization (instance {instance_idx}/{len(instances)}{ratio_info})")
                 else:
                     use_instance_based = False  # Fall back to centroid-based if no instances
             else:
                 # Centroid-based: clear x_star_unit
                 self.x_star_unit = None
+                # Also clear original prediction when switching to class-based
+                self.original_prediction = None
         
         # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
         if self.x_star_unit is not None:
@@ -594,6 +649,25 @@ class SingleAgentAnchorEnv(Env):
                 centroid = np.array(self.x_star_unit, dtype=np.float32)
             self.lower = np.clip(centroid - w, 0.0, 1.0).astype(np.float32)
             self.upper = np.clip(centroid + w, 0.0, 1.0).astype(np.float32)
+            
+            # Compute and store original prediction for instance-based anchors (matches original Anchor paper)
+            # This is used for precision calculation: P(prediction matches original | anchor conditions hold)
+            if self.original_prediction is None:
+                # Convert instance from unit space to standardized space for prediction
+                x_star_std = self._unit_to_std(centroid.reshape(1, -1))[0]
+                
+                # Get prediction for original instance
+                if hasattr(self.classifier, 'eval'):
+                    self.classifier.eval()
+                if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+                    self.classifier.model.eval()
+                
+                with torch.no_grad():
+                    instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
+                    logits = self.classifier(instance_tensor)
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                    self.original_prediction = int(np.argmax(probs))
+                    logger.debug(f"SingleAgent: Stored original prediction {self.original_prediction} for instance-based anchor")
         # Priority 2: Use class centroid if enabled (for class-based)
         elif self.use_class_centroids:
             centroid = self._get_class_centroid()
