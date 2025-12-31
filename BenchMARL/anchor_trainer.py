@@ -171,13 +171,38 @@ class AnchorTrainer:
         else:
             max_cycles = int(max_cycles)
 
+        # CRITICAL: Set min_coverage_floor dynamically to ensure box always covers at least the anchor instance
+        # Use 1/n_samples from the dataset (to ensure at least one point is covered), 
+        # or fall back to config default if dataset size unavailable
+        # This prevents the coverage floor from being too high and blocking expansion during training
+        n_samples = env_data["X_unit"].shape[0] if env_data.get("X_unit") is not None else None
+        config_default = env_config.get("min_coverage_floor", 0.005)
+        
+        if n_samples is not None and n_samples > 0:
+            # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
+            # For instance-based anchors, initial coverage is typically 0.001-0.002, so we need
+            # a floor that's lower than that to allow expansion
+            min_coverage_floor = 1.0 / n_samples
+            # Use a very small lower bound (1e-6) instead of config_default to avoid blocking expansion
+            # The config_default (0.005) is too high for instance-based anchors
+            min_coverage_floor = max(min_coverage_floor, 1e-6)
+        else:
+            # Fall back to config default if dataset size unavailable
+            min_coverage_floor = config_default
+        
+        # Ensure it's non-zero
+        min_coverage_floor = max(min_coverage_floor, 1e-6)
+        
         # Create the environment configuration with the data.
         env_config_with_data = {
             **env_config,
             "X_min": env_data["X_min"],
             "X_range": env_data["X_range"],
             "max_cycles": max_cycles,  # Ensure max_cycles is in env_config for the environment
+            "min_coverage_floor": min_coverage_floor,  # Override with dynamic value
         }
+        
+        logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} for training (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
         
         if eval_on_test_data:
             if env_data.get("X_test_unit") is None or env_data.get("X_test_std") is None or env_data.get("y_test") is None:
@@ -222,12 +247,16 @@ class AnchorTrainer:
             X_data = env_data["X_unit"]
             y_data = env_data["y"]
             
+            # Use adaptive clustering: adjust cluster count based on dataset size
+            # and check for scattered data distribution
             cluster_centroids_per_class = compute_cluster_centroids_per_class(
                 X_unit=X_data,
                 y=y_data,
                 n_clusters_per_class=n_clusters_per_class,
                 random_state=self.seed if hasattr(self, 'seed') else 42,
-                min_samples_per_cluster=1
+                min_samples_per_cluster=1,
+                auto_adapt_clusters=True,  # Adapt cluster count to dataset size
+                check_data_scatter=True    # Check if data is scattered (use mean if so)
             )
             
             # Verify we have enough centroids for each class
@@ -287,8 +316,10 @@ class AnchorTrainer:
                         # Use square root scaling to avoid extreme ratios
                         size_factor = (max_count / count) ** 0.5 if count > 0 else 1.0
                         adaptive_ratio = training_instance_ratio * size_factor
-                        # Cap at reasonable maximum (40%) to avoid overfitting
-                        adaptive_ratio = min(0.4, max(training_instance_ratio, adaptive_ratio))
+                        # Ensure ratio is at least the base ratio, but don't cap it (respect user's configuration)
+                        adaptive_ratio = max(training_instance_ratio, adaptive_ratio)
+                        # Cap at 1.0 (100%) maximum since ratio represents probability
+                        adaptive_ratio = min(1.0, adaptive_ratio)
                         training_instance_ratios_per_class[cls] = adaptive_ratio
                         
                         minority_status = "minority" if count < min_count * 1.5 else "majority"
@@ -310,21 +341,64 @@ class AnchorTrainer:
             
             logger.info(f"\nSampling instances per class for instance-based training...")
             logger.info(f"  Sampling {n_instances_per_class} instances per class (based on max ratio: {max_ratio:.1%})")
+            logger.info(f"  CRITICAL: Filtering instances where classifier prediction matches target_class")
+            logger.info(f"  This ensures original_prediction == target_class for instance-based anchors")
+            
+            # Get classifier to filter instances by prediction
+            classifier = self.dataset_loader.get_classifier()
+            classifier.eval()
+            from utils.device_utils import get_device_str
+            device_str = get_device_str(device) if device != "auto" else "cpu"
+            device_torch = torch.device(device_str)
             
             for cls in target_classes:
                 class_mask = (y_data == cls)
                 class_indices = np.where(class_mask)[0]
                 class_ratio = training_instance_ratios_per_class[cls]
                 
-                if len(class_indices) >= n_instances_per_class:
-                    # Randomly sample instances
-                    selected_indices = np.random.choice(class_indices, size=n_instances_per_class, replace=False)
-                    training_instances_per_class[cls] = X_data[selected_indices].tolist()
-                    logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled (ratio: {class_ratio:.1%})")
-                elif len(class_indices) > 0:
-                    # Use all available instances if fewer than requested
-                    training_instances_per_class[cls] = X_data[class_indices].tolist()
-                    logger.info(f"   Class {cls}: {len(class_indices)} instances sampled (all available, ratio: {class_ratio:.1%})")
+                logger.info(f"   Class {cls}: {len(class_indices)} training samples available (ratio: {class_ratio:.1%})")
+                
+                # CRITICAL FIX: Filter instances where classifier prediction matches target_class
+                # This ensures original_prediction == target_class, preventing precision calculation issues
+                if len(class_indices) > 0:
+                    # Get predictions for all class instances
+                    X_class_std = env_data["X_std"][class_indices]
+                    with torch.no_grad():
+                        X_tensor = torch.from_numpy(X_class_std.astype(np.float32)).to(device_torch)
+                        logits = classifier(X_tensor)
+                        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                        predictions = np.argmax(probs, axis=1)
+                    
+                    # Filter: keep only instances where prediction matches target_class
+                    prediction_match_mask = (predictions == cls)
+                    matching_indices = class_indices[prediction_match_mask]
+                    n_matching = len(matching_indices)
+                    
+                    logger.info(f"   Class {cls}: {n_matching}/{len(class_indices)} instances have prediction matching target_class")
+                    
+                    if n_matching == 0:
+                        logger.warning(
+                            f"   Class {cls}: No instances found where classifier prediction matches target_class! "
+                            f"This will cause issues with instance-based anchors. "
+                            f"Falling back to all instances (may cause low precision)."
+                        )
+                        matching_indices = class_indices  # Fallback to all instances
+                        n_matching = len(matching_indices)
+                    
+                    if n_matching >= n_instances_per_class:
+                        # Randomly sample from matching instances
+                        selected_indices = np.random.choice(matching_indices, size=n_instances_per_class, replace=False)
+                        training_instances_per_class[cls] = X_data[selected_indices].tolist()
+                        logger.info(f"   Class {cls}: {n_instances_per_class} instances sampled from {n_matching} matching instances (ratio: {class_ratio:.1%})")
+                    elif n_matching > 0:
+                        # Use all matching instances if fewer than requested
+                        training_instances_per_class[cls] = X_data[matching_indices].tolist()
+                        logger.warning(
+                            f"   Class {cls}: Only {n_matching} matching instances available "
+                            f"(requested {n_instances_per_class}). Using all matching instances (ratio: {class_ratio:.1%})."
+                        )
+                    else:
+                        logger.error(f"   Class {cls}: No matching instances available for sampling! This will cause initialization failures.")
                 else:
                     logger.warning(f"   Class {cls}: No instances available for sampling")
             

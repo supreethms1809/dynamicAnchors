@@ -357,7 +357,32 @@ class AnchorEnv(ParallelEnv):
                     # Assign centroids deterministically based on agent index to ensure diversity
                     # Cycle through available centroids if we have more agents than centroids
                     centroid_idx = agent_idx % len(centroids)
-                    return np.array(centroids[centroid_idx], dtype=np.float32)
+                    centroid = np.array(centroids[centroid_idx], dtype=np.float32)
+                    
+                    # CRITICAL FIX: For scattered data, centroids might be mean centroids (not actual data points)
+                    # Check if centroid is close to any actual data point. If not, use the nearest data point instead.
+                    X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
+                    y_data = self.y_test if self.eval_on_test_data else self.y
+                    class_mask = (y_data == target_class)
+                    
+                    if class_mask.sum() > 0:
+                        class_data = X_data[class_mask]
+                        # Find nearest data point to centroid
+                        distances = np.linalg.norm(class_data - centroid, axis=1)
+                        nearest_idx = np.argmin(distances)
+                        nearest_point = class_data[nearest_idx]
+                        
+                        # If centroid is far from nearest point (distance > threshold), use the data point instead
+                        # This handles the case where scattered data produces mean centroids far from actual data
+                        max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
+                        if distances[nearest_idx] > max_distance_threshold:
+                            logger.debug(
+                                f"Agent {agent}: Centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
+                                f"Using nearest data point instead to ensure non-zero coverage."
+                            )
+                            return nearest_point.astype(np.float32)
+                    
+                    return centroid
         
         # Use fixed instances if its instance level
         if self.fixed_instances_per_class is not None:
@@ -410,7 +435,25 @@ class AnchorEnv(ParallelEnv):
                     f"All agents will use the same mean centroid. Consider using cluster_centroids_per_class or "
                     f"fixed_instances_per_class to ensure diversity."
                 )
-            centroid = np.mean(class_data, axis=0).astype(np.float32)
+            mean_centroid = np.mean(class_data, axis=0).astype(np.float32)
+            
+            # CRITICAL FIX: For scattered data, mean centroid might be far from actual data points
+            # Find nearest data point and use it if mean is too far
+            distances = np.linalg.norm(class_data - mean_centroid, axis=1)
+            nearest_idx = np.argmin(distances)
+            nearest_point = class_data[nearest_idx]
+            
+            # If mean centroid is far from nearest point, use the data point instead
+            # This ensures we always start from an actual data point with non-zero coverage
+            max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
+            if distances[nearest_idx] > max_distance_threshold:
+                logger.debug(
+                    f"Agent {agent}: Mean centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
+                    f"Using nearest data point instead to ensure non-zero coverage."
+                )
+                return nearest_point.astype(np.float32)
+            
+            centroid = mean_centroid
         
         return centroid
     
@@ -600,6 +643,16 @@ class AnchorEnv(ParallelEnv):
                     low = max(0.0, mid - width / 2.0)
                     up = min(1.0, mid + width / 2.0)
                     U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                
+                # CRITICAL FIX: For instance-based anchors, always include the original instance
+                # This ensures precision calculation includes at least one point (the instance itself)
+                # that matches the original prediction, preventing precision from being incorrectly 0.0
+                if is_instance_based and self.x_star_unit.get(agent) is not None:
+                    x_star_unit = np.array(self.x_star_unit[agent], dtype=np.float32).reshape(1, -1)
+                    # Prepend the original instance to the uniform samples
+                    U = np.vstack([x_star_unit, U])
+                    n_samp = n_samp + 1
+                
                 X_eval = self._unit_to_std(U)
                 y_eval = None
                 n_points = int(n_samp)
@@ -630,6 +683,16 @@ class AnchorEnv(ParallelEnv):
                         low = max(0.0, mid - width / 2.0)
                         up = min(1.0, mid + width / 2.0)
                         U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                    
+                    # CRITICAL FIX: For instance-based anchors, always include the original instance
+                    # This ensures precision calculation includes at least one point (the instance itself)
+                    # that matches the original prediction, preventing precision from being incorrectly 0.0
+                    if is_instance_based and self.x_star_unit.get(agent) is not None:
+                        x_star_unit = np.array(self.x_star_unit[agent], dtype=np.float32).reshape(1, -1)
+                        # Prepend the original instance to the uniform samples
+                        U = np.vstack([x_star_unit, U])
+                        n_samp = n_samp + 1
+                    
                     X_eval = self._unit_to_std(U)
                     y_eval = None
                     n_points = int(n_samp)
@@ -797,6 +860,10 @@ class AnchorEnv(ParallelEnv):
                             # Cycle through instances based on agent index, then add randomness
                             instance_idx = (agent_idx + self.rng.integers(0, len(instances))) % len(instances)
                             instance = np.array(instances[instance_idx], dtype=np.float32)
+                            # CRITICAL: Reset original_prediction when selecting a new instance
+                            # This ensures we recompute it for the new instance, not reuse from previous episode
+                            if agent in self.original_predictions:
+                                del self.original_predictions[agent]
                             self.x_star_unit[agent] = instance
                             ratio_info = f" (ratio: {class_ratio:.1%})" if target_class is not None else ""
                             logger.debug(f"Training: Agent {agent} using instance-based initialization (instance {instance_idx}/{len(instances)}{ratio_info})")
@@ -836,7 +903,15 @@ class AnchorEnv(ParallelEnv):
                         probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
                         original_pred = int(np.argmax(probs))
                         self.original_predictions[agent] = original_pred
-                        logger.debug(f"Agent {agent}: Stored original prediction {original_pred} for instance-based anchor")
+                        # CRITICAL VALIDATION: Verify original_prediction matches target_class
+                        # This should be true after filtering instances by prediction, but check as safety
+                        if original_pred != target_class:
+                            logger.warning(
+                                f"Agent {agent}: original_prediction ({original_pred}) != target_class ({target_class})! "
+                                f"This may cause precision calculation issues. "
+                                f"Instance should have been filtered during training instance selection."
+                            )
+                        logger.debug(f"Agent {agent}: Stored original prediction {original_pred} for instance-based anchor (target_class={target_class})")
             # Use class centroid if enabled
             elif self.use_class_centroids:
                 centroid = self._get_class_centroid(agent)
@@ -921,11 +996,79 @@ class AnchorEnv(ParallelEnv):
         upper_changes = upper_deltas * max_delta
         self.upper[agent] = np.clip(self.upper[agent] + upper_changes, self.lower[agent] + self.min_width, 1.0)
         
+        # CRITICAL: For instance-based anchors, ensure box always covers x_star_unit FIRST
+        # This must happen BEFORE min_width adjustment to prevent the box from moving away
+        if agent in self.x_star_unit and self.x_star_unit[agent] is not None:
+            x_star = self.x_star_unit[agent]
+            if isinstance(x_star, np.ndarray):
+                x_star_arr = x_star
+            else:
+                x_star_arr = np.array(x_star, dtype=np.float32)
+            
+            # Ensure box covers x_star_unit in all dimensions
+            for f in range(self.n_features):
+                if x_star_arr[f] < self.lower[agent][f]:
+                    # Anchor is below lower bound: expand lower to include it
+                    self.lower[agent][f] = max(0.0, x_star_arr[f] - self.min_width / 2.0)
+                    # Ensure upper is still above lower + min_width
+                    if self.upper[agent][f] < self.lower[agent][f] + self.min_width:
+                        self.upper[agent][f] = min(1.0, self.lower[agent][f] + self.min_width)
+                elif x_star_arr[f] > self.upper[agent][f]:
+                    # Anchor is above upper bound: expand upper to include it
+                    self.upper[agent][f] = min(1.0, x_star_arr[f] + self.min_width / 2.0)
+                    # Ensure lower is still below upper - min_width
+                    if self.lower[agent][f] > self.upper[agent][f] - self.min_width:
+                        self.lower[agent][f] = max(0.0, self.upper[agent][f] - self.min_width)
+                # Ensure x_star_unit is within bounds (safety check)
+                if x_star_arr[f] < self.lower[agent][f] or x_star_arr[f] > self.upper[agent][f]:
+                    # If still outside, center box around x_star_unit
+                    self.lower[agent][f] = max(0.0, x_star_arr[f] - self.min_width / 2.0)
+                    self.upper[agent][f] = min(1.0, self.lower[agent][f] + self.min_width)
+                    # If upper was clipped, adjust lower
+                    if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
+                        self.upper[agent][f] = min(1.0, x_star_arr[f] + self.min_width / 2.0)
+                        self.lower[agent][f] = max(0.0, self.upper[agent][f] - self.min_width)
+        
+        # Now ensure min_width constraint is satisfied (AFTER ensuring x_star_unit is covered)
         for f in range(self.n_features):
             if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
-                mid = 0.5 * (self.upper[agent][f] + self.lower[agent][f])
+                # If x_star_unit exists, try to center around it while maintaining min_width
+                if agent in self.x_star_unit and self.x_star_unit[agent] is not None:
+                    x_star = self.x_star_unit[agent]
+                    if isinstance(x_star, np.ndarray):
+                        x_star_arr = x_star
+                    else:
+                        x_star_arr = np.array(x_star, dtype=np.float32)
+                    # Center around x_star_unit
+                    mid = x_star_arr[f]
+                else:
+                    # No x_star_unit, use box center
+                    mid = 0.5 * (self.upper[agent][f] + self.lower[agent][f])
+                
                 self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
                 self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
+                # If upper was clipped, adjust lower
+                if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
+                    if self.upper[agent][f] >= 1.0:
+                        self.lower[agent][f] = max(0.0, 1.0 - self.min_width)
+                        self.upper[agent][f] = 1.0
+                    elif self.lower[agent][f] <= 0.0:
+                        self.lower[agent][f] = 0.0
+                        self.upper[agent][f] = min(1.0, self.min_width)
+                
+                # Final safety check: ensure x_star_unit is still in box
+                if agent in self.x_star_unit and self.x_star_unit[agent] is not None:
+                    x_star = self.x_star_unit[agent]
+                    if isinstance(x_star, np.ndarray):
+                        x_star_arr = x_star
+                    else:
+                        x_star_arr = np.array(x_star, dtype=np.float32)
+                    if x_star_arr[f] < self.lower[agent][f]:
+                        self.lower[agent][f] = max(0.0, x_star_arr[f] - self.min_width / 2.0)
+                        self.upper[agent][f] = min(1.0, self.lower[agent][f] + self.min_width)
+                    elif x_star_arr[f] > self.upper[agent][f]:
+                        self.upper[agent][f] = min(1.0, x_star_arr[f] + self.min_width / 2.0)
+                        self.lower[agent][f] = max(0.0, self.upper[agent][f] - self.min_width)
         
         # SS: Debugging (disable later)
         # Debug: Log if action was applied (only for first call per agent)
@@ -966,6 +1109,8 @@ class AnchorEnv(ParallelEnv):
         for agent in self.agents:
             if agent not in actions:
                 # Agent did not act in this step; keep its box unchanged
+                precision, coverage, details = self._current_metrics(agent)
+            else:
                 precision, coverage, details = self._current_metrics(agent)
                 metrics_cache[agent] = (precision, coverage, details)
                 
@@ -1028,6 +1173,37 @@ class AnchorEnv(ParallelEnv):
                 self._apply_continuous_action(agent, action)
             else:
                 self._apply_action(agent, int(action))
+            
+            # CRITICAL VALIDATION: Ensure box is valid (lower <= upper in all dimensions)
+            # This prevents coverage from being 0.0 due to invalid boxes
+            for f in range(self.n_features):
+                if self.lower[agent][f] > self.upper[agent][f]:
+                    logger.warning(
+                        f"  ⚠ Invalid box detected for {agent}: lower[{f}]={self.lower[agent][f]:.6f} > upper[{f}]={self.upper[agent][f]:.6f}. "
+                        f"Fixing by centering around x_star_unit if available."
+                    )
+                    # Fix invalid box
+                    if agent in self.x_star_unit and self.x_star_unit[agent] is not None:
+                        x_star = self.x_star_unit[agent]
+                        if isinstance(x_star, np.ndarray):
+                            x_star_arr = x_star
+                        else:
+                            x_star_arr = np.array(x_star, dtype=np.float32)
+                        # Center around x_star_unit
+                        mid = x_star_arr[f]
+                    else:
+                        # No x_star_unit, use midpoint
+                        mid = 0.5 * (self.lower[agent][f] + self.upper[agent][f])
+                    
+                    self.lower[agent][f] = max(0.0, mid - self.min_width / 2.0)
+                    self.upper[agent][f] = min(1.0, mid + self.min_width / 2.0)
+                    if self.upper[agent][f] - self.lower[agent][f] < self.min_width:
+                        if self.upper[agent][f] >= 1.0:
+                            self.lower[agent][f] = max(0.0, 1.0 - self.min_width)
+                            self.upper[agent][f] = 1.0
+                        else:
+                            self.lower[agent][f] = 0.0
+                            self.upper[agent][f] = min(1.0, self.min_width)
             
             precision, coverage, details = self._current_metrics(agent)
             

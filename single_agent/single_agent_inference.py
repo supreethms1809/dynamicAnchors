@@ -152,6 +152,7 @@ def extract_rules_single_agent(
     steps_per_episode: Optional[int] = None,  # If None, will read from env_config.max_cycles
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
+    coverage_on_all_data: bool = False,  # If True, compute coverage on all data (train+test combined, matches baseline)
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu"
@@ -401,11 +402,15 @@ def extract_rules_single_agent(
         n_clusters_per_class = min(10, n_instances_per_class)
         logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity across episodes")
         
+        # Use adaptive clustering: adjust cluster count based on dataset size
+        # and check for scattered data distribution
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
             X_unit=X_cluster,
             y=y_cluster,
             n_clusters_per_class=n_clusters_per_class,
-            random_state=seed if seed is not None else 42
+            random_state=seed if seed is not None else 42,
+            auto_adapt_clusters=True,  # Adapt cluster count to dataset size
+            check_data_scatter=True    # Check if data is scattered (use mean if so)
         )
         logger.info(f"  ✓ Cluster centroids computed successfully!")
         for cls in target_classes:
@@ -558,7 +563,64 @@ def extract_rules_single_agent(
                 rollout_seed = seed + instance_idx_in_range if seed is not None else None
                 
                 # Set mode to "inference" for rule extraction
-                inference_env_config = {**env_config, "mode": "inference"}
+                # If coverage_on_all_data is True, compute coverage on all data (train+test combined, matches baseline)
+                # Otherwise, use eval_on_test_data setting
+                if coverage_on_all_data:
+                    # Combine train and test data for coverage calculation (matches baseline behavior)
+                    X_all_unit = np.vstack([env_data["X_unit"], env_data.get("X_test_unit", [])])
+                    X_all_std = np.vstack([env_data["X_std"], env_data.get("X_test_std", [])])
+                    y_all = np.concatenate([env_data["y"], env_data.get("y_test", [])])
+                    env_X_unit = X_all_unit
+                    env_X_std = X_all_std
+                    env_y = y_all
+                    env_eval_on_test = False  # Use combined data, not test-only
+                else:
+                    env_eval_on_test = eval_on_test_data
+                
+                # CRITICAL: Set min_coverage_floor dynamically to ensure box always covers at least the anchor instance
+                # Use 1/n_samples from the dataset (to ensure at least one point is covered), 
+                # or fall back to config default (0.005) if dataset size unavailable
+                # This prevents the coverage floor from being too high and blocking expansion
+                if env_eval_on_test and env_data.get("X_test_unit") is not None:
+                    n_samples = env_data["X_test_unit"].shape[0]
+                elif coverage_on_all_data and env_data.get("X_test_unit") is not None:
+                    n_samples = env_data["X_unit"].shape[0] + env_data["X_test_unit"].shape[0]
+                elif env_data.get("X_unit") is not None:
+                    n_samples = env_data["X_unit"].shape[0]
+                else:
+                    n_samples = None
+                
+                config_default = env_config.get("min_coverage_floor", 0.005)
+                
+                if n_samples is not None and n_samples > 0:
+                    # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
+                    # For instance-based anchors, initial coverage is typically 0.001-0.002, so we need
+                    # a floor that's lower than that to allow expansion
+                    min_coverage_floor = 1.0 / n_samples
+                    # Use a very small lower bound (1e-6) instead of config_default to avoid blocking expansion
+                    # The config_default (0.005) is too high for instance-based anchors
+                    min_coverage_floor = max(min_coverage_floor, 1e-6)
+                else:
+                    # Fall back to config default if dataset size unavailable
+                    min_coverage_floor = config_default
+                
+                # Ensure it's non-zero
+                min_coverage_floor = max(min_coverage_floor, 1e-6)
+                
+                inference_env_config = {
+                    **env_config, 
+                    "mode": "inference",
+                    "eval_on_test_data": env_eval_on_test,
+                    "min_coverage_floor": min_coverage_floor  # Override with dynamic value
+                }
+                logger.debug(f"  Set min_coverage_floor={min_coverage_floor:.6f} (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
+                # Add test data to env_config if needed (for eval_on_test_data mode)
+                if env_eval_on_test and not coverage_on_all_data:
+                    inference_env_config.update({
+                        "X_test_unit": env_data.get("X_test_unit"),
+                        "X_test_std": env_data.get("X_test_std"),
+                        "y_test": env_data.get("y_test")
+                    })
                 env = SingleAgentAnchorEnv(
                     X_unit=env_X_unit,
                     X_std=env_X_std,
@@ -692,9 +754,13 @@ def extract_rules_single_agent(
         avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
         total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
-        # Compute class-level metrics (union of all anchors for this class)
-        class_precision = 0.0
-        class_coverage = 0.0
+        # NOTE: Class-level (class-union) metrics will be computed later using class-based anchors only
+        # We do NOT compute union of instance-based anchors here - that's not one of our three metrics:
+        # 1. Instance-based = average of instance-based rollouts
+        # 2. Class-based = average of class-based rollouts  
+        # 3. Class-union = union of class-based rules (computed later, no new rollouts)
+        class_precision = 0.0  # Will be set later from class-based union
+        class_coverage = 0.0   # Will be set later from class-based union
         anchors_with_bounds = 0  # Initialize to track anchors used in union computation
         
         # Get the appropriate dataset (test or train) based on eval_on_test_data
@@ -714,12 +780,10 @@ def extract_rules_single_agent(
                 logger.info(f"  Computing class-level metrics on TRAIN data (eval_on_test_data=False)")
         
         # Compute union of all anchors for this class
-        # NOTE: This uses ALL anchors (including duplicates), not just unique rules.
-        # The test script uses unique rules, which may give slightly different results
-        # due to denormalization rounding. Both are valid but measure different things:
-        # - Inference (all anchors): Shows coverage of all generated anchors
-        # - Test script (unique rules): Shows coverage of deduplicated rules after denormalization
-        if X_data is not None and y_data is not None and len(anchors_list) > 0:
+        # SKIPPED: We do NOT compute union of instance-based anchors here.
+        # The union of instance-based anchors is NOT one of our three metrics.
+        # Class-union metrics will be computed later from class-based rules only.
+        if False:  # Disabled - union of instance-based anchors is not one of our metrics
             n_samples = X_data.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
             
@@ -819,8 +883,8 @@ def extract_rules_single_agent(
             "class": int(target_class),
             # Instance-level metrics (averaged across all instances)
             "instance_precision": instance_precision,
-            "instance_coverage": instance_coverage,  # Overall coverage P(x in box)
-            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Class-conditional coverage P(x in box | y = target_class)
+            "instance_coverage": instance_coverage,  # Class-conditional coverage P(x in box | y = target_class) for instance-based anchors (more meaningful than overall coverage)
+            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Same as instance_coverage (kept for backward compatibility)
             "instance_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
             # Class-level metrics (union of all anchors for this class)
@@ -847,21 +911,42 @@ def extract_rules_single_agent(
         logger.info(f"\n  {'='*60}")
         logger.info(f"  Class {target_class} - INSTANCE-BASED Results:")
         logger.info(f"  {'='*60}")
+        # Determine data source for logging
+        coverage_data_source = "all (train+test)" if coverage_on_all_data else data_source
         logger.info(f"  Instance-Level Metrics (averaged across all {len(anchors_list)} instance-based anchors):")
         logger.info(f"    Precision: {instance_precision:.4f}")
-        logger.info(f"    Coverage:  {instance_coverage:.4f}")
+        logger.info(f"    Coverage:  {instance_coverage:.4f} (overall: P(x in box) on {coverage_data_source} data)")
         if instance_coverage_class_conditional > 0.0:
-            logger.info(f"    Class-conditional coverage: {instance_coverage_class_conditional:.4f}")
-            if instance_coverage < 0.05 and instance_coverage_class_conditional > 0.1:
-                logger.info(f"    Note: Low overall coverage is expected when dataset has many samples from other classes.")
+            logger.info(f"    Class-conditional coverage: {instance_coverage_class_conditional:.4f} (P(x in box | y = target_class))")
+        
+        # Debug: Log box sizes to understand why coverage is low
+        if anchors_list and len(anchors_list) > 0:
+            box_volumes = [a.get("box_volume", 0.0) for a in anchors_list if "box_volume" in a]
+            if box_volumes:
+                avg_box_volume = float(np.mean(box_volumes))
+                min_box_volume = float(np.min(box_volumes))
+                max_box_volume = float(np.max(box_volumes))
+                logger.info(f"    Box volumes (normalized space): avg={avg_box_volume:.6f}, min={min_box_volume:.6f}, max={max_box_volume:.6f}")
+                
+                # Check if boxes are suspiciously small
+                if avg_box_volume < 1e-6:
+                    logger.warning(f"    WARNING: Box volumes are extremely small! This suggests anchors may be collapsing.")
+                    # Log first anchor's bounds for debugging
+                    if "lower_bounds_normalized" in anchors_list[0] and "upper_bounds_normalized" in anchors_list[0]:
+                        lower = np.array(anchors_list[0]["lower_bounds_normalized"])
+                        upper = np.array(anchors_list[0]["upper_bounds_normalized"])
+                        widths = upper - lower
+                        logger.warning(f"    Sample anchor widths (first 5 features): {widths[:5]}")
+                        logger.warning(f"    Sample anchor widths (min/max): {widths.min():.6f} / {widths.max():.6f}")
         logger.info(f"  Unique rules (instance-based, after deduplication): {len(unique_rules)}")
         logger.info(f"  Average rollout time per episode: {avg_rollout_time:.4f}s")
         # Union metrics (instance-based only) - temporary, will be overwritten with class-based union after class-based rollouts
-        n_anchors_for_union = anchors_with_bounds if anchors_with_bounds > 0 else len(anchors_list)
-        logger.info(f"  Class Union Metrics (temporary - union of {n_anchors_for_union} instance-based anchors):")
-        logger.info(f"    Precision: {class_precision:.4f}")
-        logger.info(f"    Coverage:  {class_coverage:.4f}")
-        logger.info(f"    Note: These will be overwritten with class-based union metrics after class-based rollouts.")
+        # NOTE: class_precision and class_coverage are set to 0.0 here
+        # They will be properly computed later from class-based union metrics (lines 1331-1360)
+        # The three metrics are:
+        # 1. Instance-based = average (computed above)
+        # 2. Class-based = average (will be computed from class-based rollouts)
+        # 3. Class-union = union of class-based rules (will be computed later)
         logger.info(f"  {'='*60}")
         # logger.info(f"  Total rollout time for class: {total_rollout_time:.4f}s")
         # logger.info(f"  Total class processing time: {class_total_time:.4f}s")
@@ -1613,6 +1698,13 @@ def main():
     )
     
     parser.add_argument(
+        "--coverage_on_all_data",
+        action="store_true",
+        help="If True, compute coverage on all data (train+test combined, matches baseline anchor-exp behavior). "
+             "Baseline uses all training data for coverage (no train/test split), so this ensures fair comparison."
+    )
+    
+    parser.add_argument(
         "--compare_with_multiagent",
         type=str,
         default=None,
@@ -1651,6 +1743,7 @@ def main():
         steps_per_episode=args.steps_per_episode,
         n_instances_per_class=args.n_instances_per_class,
         eval_on_test_data=not args.eval_on_train_data,
+        coverage_on_all_data=args.coverage_on_all_data,
         output_dir=args.output_dir,
         seed=args.seed,
         device=args.device

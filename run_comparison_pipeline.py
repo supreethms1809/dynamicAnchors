@@ -312,7 +312,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 60_000,
+    total_timesteps: int = 120_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -2221,6 +2221,13 @@ Examples:
         help="Output directory for multi-agent results"
     )
     
+    parser.add_argument(
+        "--coverage_on_all_data",
+        action="store_true",
+        help="If True, compute coverage on all data (train+test combined, matches baseline anchor-exp behavior). "
+             "Baseline uses all training data for coverage (no train/test split), so this ensures fair comparison."
+    )
+    
     args = parser.parse_args()
     
     # Determine single-agent algorithm from multi-agent algorithm
@@ -2394,7 +2401,8 @@ Examples:
                 max_features_in_rule=args.max_features_in_rule,
                 steps_per_episode=args.steps_per_episode,
                 n_instances_per_class=args.n_instances_per_class,
-                device=args.device
+                device=args.device,
+                coverage_on_all_data=args.coverage_on_all_data
             )
         else:
             # Try to find existing rules file
@@ -2488,7 +2496,8 @@ Examples:
                 max_features_in_rule=args.max_features_in_rule,
                 steps_per_episode=args.steps_per_episode,
                 n_instances_per_class=args.n_instances_per_class,
-                device=args.device
+                device=args.device,
+                coverage_on_all_data=args.coverage_on_all_data
             )
         elif args.skip_inference:
             logger.info("Inference skipped (--skip_inference). Looking for existing rules file...")

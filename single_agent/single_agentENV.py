@@ -243,9 +243,40 @@ class SingleAgentAnchorEnv(Env):
         else:
             X_eval_unit = self.X_unit
         
+        # FIX: Ensure we have valid data and box bounds
+        if X_eval_unit is None or X_eval_unit.shape[0] == 0:
+            logger.warning(f"SingleAgent: X_eval_unit is None or empty in _mask_in_box (eval_on_test_data={self.eval_on_test_data})")
+            return np.zeros(0, dtype=bool)
+        
+        if self.lower is None or self.upper is None:
+            logger.warning(f"SingleAgent: Box bounds are None in _mask_in_box")
+            return np.zeros(X_eval_unit.shape[0], dtype=bool)
+        
+        # FIX: Verify that box bounds are in normalized space [0, 1]
+        # This ensures the mask computation uses the same normalized space as the data
+        lower = self.lower
+        upper = self.upper
+        
+        # Debug: Log if box bounds are outside [0, 1] range (indicates normalization issue)
+        if np.any(lower < 0) or np.any(lower > 1) or np.any(upper < 0) or np.any(upper > 1):
+            logger.warning(
+                f"SingleAgent: Box bounds outside [0, 1] range in _mask_in_box. "
+                f"lower range: [{lower.min():.3f}, {lower.max():.3f}], "
+                f"upper range: [{upper.min():.3f}, {upper.max():.3f}]. "
+                f"This may indicate a normalization mismatch."
+            )
+        
+        # Ensure bounds have correct shape
+        if lower.shape[0] != self.n_features or upper.shape[0] != self.n_features:
+            logger.error(
+                f"SingleAgent: Box bounds shape mismatch in _mask_in_box. "
+                f"lower.shape={lower.shape}, upper.shape={upper.shape}, n_features={self.n_features}"
+            )
+            return np.zeros(X_eval_unit.shape[0], dtype=bool)
+        
         conds = []
         for j in range(self.n_features):
-            conds.append((X_eval_unit[:, j] >= self.lower[j]) & (X_eval_unit[:, j] <= self.upper[j]))
+            conds.append((X_eval_unit[:, j] >= lower[j]) & (X_eval_unit[:, j] <= upper[j]))
         mask = np.logical_and.reduce(conds) if conds else np.ones(X_eval_unit.shape[0], dtype=bool)
         return mask
 
@@ -273,7 +304,32 @@ class SingleAgentAnchorEnv(Env):
                 if len(centroids) > 0:
                     # Sample a random centroid if multiple available
                     centroid_idx = self.rng.integers(0, len(centroids))
-                    return np.array(centroids[centroid_idx], dtype=np.float32)
+                    centroid = np.array(centroids[centroid_idx], dtype=np.float32)
+                    
+                    # CRITICAL FIX: For scattered data, centroids might be mean centroids (not actual data points)
+                    # Check if centroid is close to any actual data point. If not, use the nearest data point instead.
+                    X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
+                    y_data = self.y_test if self.eval_on_test_data else self.y
+                    class_mask = (y_data == self.target_class)
+                    
+                    if class_mask.sum() > 0:
+                        class_data = X_data[class_mask]
+                        # Find nearest data point to centroid
+                        distances = np.linalg.norm(class_data - centroid, axis=1)
+                        nearest_idx = np.argmin(distances)
+                        nearest_point = class_data[nearest_idx]
+                        
+                        # If centroid is far from nearest point (distance > threshold), use the data point instead
+                        # This handles the case where scattered data produces mean centroids far from actual data
+                        max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
+                        if distances[nearest_idx] > max_distance_threshold:
+                            logger.debug(
+                                f"SingleAgent: Centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
+                                f"Using nearest data point instead to ensure non-zero coverage."
+                            )
+                            return nearest_point.astype(np.float32)
+                    
+                    return centroid
         
         # Priority 2: Use fixed instances (sample one as centroid)
         if self.fixed_instances_per_class is not None:
@@ -293,9 +349,25 @@ class SingleAgentAnchorEnv(Env):
             return None
         
         class_data = X_data[class_mask]
-        centroid = np.mean(class_data, axis=0).astype(np.float32)
+        mean_centroid = np.mean(class_data, axis=0).astype(np.float32)
         
-        return centroid
+        # CRITICAL FIX: For scattered data, mean centroid might be far from actual data points
+        # Find nearest data point and use it if mean is too far
+        distances = np.linalg.norm(class_data - mean_centroid, axis=1)
+        nearest_idx = np.argmin(distances)
+        nearest_point = class_data[nearest_idx]
+        
+        # If mean centroid is far from nearest point, use the data point instead
+        # This ensures we always start from an actual data point with non-zero coverage
+        max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
+        if distances[nearest_idx] > max_distance_threshold:
+            logger.debug(
+                f"SingleAgent: Mean centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
+                f"Using nearest data point instead to ensure non-zero coverage."
+            )
+            return nearest_point.astype(np.float32)
+        
+        return mean_centroid
     
     def _compute_box_from_centroid(self, centroid: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
@@ -343,7 +415,14 @@ class SingleAgentAnchorEnv(Env):
             for f in np.where(min_width_mask)[0]:
                 half_width = self.min_width / 2.0
                 lower[f] = np.clip(centroid[f] - half_width, 0.0, 1.0 - self.min_width)
-                upper[f] = np.clip(lower[f] + self.min_width, self.min_width, 1.0)
+                # CRITICAL FIX: Ensure upper >= lower + min_width after clipping
+                # If lower + min_width > 1.0, adjust lower instead to maintain min_width
+                if lower[f] + self.min_width > 1.0:
+                    lower[f] = max(0.0, 1.0 - self.min_width)
+                upper[f] = min(1.0, lower[f] + self.min_width)
+                # Final validation: ensure width >= min_width
+                if upper[f] - lower[f] < self.min_width:
+                    upper[f] = min(1.0, lower[f] + self.min_width)
         
         return lower.astype(np.float32), upper.astype(np.float32)
 
@@ -401,6 +480,17 @@ class SingleAgentAnchorEnv(Env):
             # Instance-based mode: Overall coverage P(x in box)
             # This matches the original Anchor paper definition
             coverage = float(mask.mean())
+            
+            # Debug logging for very low coverage to help diagnose issues
+            n_covered = int(mask.sum())
+            n_total = len(mask)
+            if coverage < 0.0001 and n_total > 0:
+                logger.debug(
+                    f"SingleAgent: Very low instance-based coverage={coverage:.6f} "
+                    f"({n_covered}/{n_total} samples covered). "
+                    f"Box bounds: lower={self.lower[:3].tolist()}..., upper={self.upper[:3].tolist()}... "
+                    f"(first 3 dims), box volume={np.prod(self.upper - self.lower):.6f}"
+                )
         else:
             # Class-based mode: Class-conditional coverage P(x in box | y = target_class)
             # This is the fraction of target class samples that fall within the box
@@ -477,6 +567,16 @@ class SingleAgentAnchorEnv(Env):
                     low = max(0.0, mid - width / 2.0)
                     up = min(1.0, mid + width / 2.0)
                     U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                
+                # CRITICAL FIX: For instance-based anchors, always include the original instance
+                # This ensures precision calculation includes at least one point (the instance itself)
+                # that matches the original prediction, preventing precision from being incorrectly 0.0
+                if is_instance_based and self.x_star_unit is not None:
+                    x_star_unit = np.array(self.x_star_unit, dtype=np.float32).reshape(1, -1)
+                    # Prepend the original instance to the uniform samples
+                    U = np.vstack([x_star_unit, U])
+                    n_samp = n_samp + 1
+                
                 X_eval = self._unit_to_std(U)
                 y_eval = None
                 n_points = int(n_samp)
@@ -503,7 +603,17 @@ class SingleAgentAnchorEnv(Env):
                         mid = 0.5 * (low + up)
                         low = max(0.0, mid - width / 2.0)
                         up = min(1.0, mid + width / 2.0)
-                    U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                        U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
+                    
+                    # CRITICAL FIX: For instance-based anchors, always include the original instance
+                    # This ensures precision calculation includes at least one point (the instance itself)
+                    # that matches the original prediction, preventing precision from being incorrectly 0.0
+                    if is_instance_based and self.x_star_unit is not None:
+                        x_star_unit = np.array(self.x_star_unit, dtype=np.float32).reshape(1, -1)
+                        # Prepend the original instance to the uniform samples
+                        U = np.vstack([x_star_unit, U])
+                        n_samp = n_samp + 1
+                    
                     X_eval = self._unit_to_std(U)
                     y_eval = None
                     n_points = int(n_samp)
@@ -629,6 +739,9 @@ class SingleAgentAnchorEnv(Env):
                 if len(instances) > 0:
                     instance_idx = self.rng.integers(0, len(instances))
                     instance = np.array(instances[instance_idx], dtype=np.float32)
+                    # CRITICAL: Reset original_prediction when selecting a new instance
+                    # This ensures we recompute it for the new instance, not reuse from previous episode
+                    self.original_prediction = None
                     self.x_star_unit = instance
                     ratio_info = f" (ratio: {class_ratio:.1%})" if 'class_ratio' in locals() else ""
                     logger.debug(f"Training: Using instance-based initialization (instance {instance_idx}/{len(instances)}{ratio_info})")
@@ -667,7 +780,15 @@ class SingleAgentAnchorEnv(Env):
                     logits = self.classifier(instance_tensor)
                     probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
                     self.original_prediction = int(np.argmax(probs))
-                    logger.debug(f"SingleAgent: Stored original prediction {self.original_prediction} for instance-based anchor")
+                    # CRITICAL VALIDATION: Verify original_prediction matches target_class
+                    # This should be true after filtering instances by prediction, but check as safety
+                    if self.original_prediction != self.target_class:
+                        logger.warning(
+                            f"SingleAgent: original_prediction ({self.original_prediction}) != target_class ({self.target_class})! "
+                            f"This may cause precision calculation issues. "
+                            f"Instance should have been filtered during training instance selection."
+                        )
+                    logger.debug(f"SingleAgent: Stored original prediction {self.original_prediction} for instance-based anchor (target_class={self.target_class})")
         # Priority 2: Use class centroid if enabled (for class-based)
         elif self.use_class_centroids:
             centroid = self._get_class_centroid()
@@ -757,11 +878,76 @@ class SingleAgentAnchorEnv(Env):
         upper_changes = upper_deltas * max_delta
         self.upper = np.clip(self.upper + upper_changes, self.lower + self.min_width, 1.0)
         
+        # CRITICAL: For instance-based anchors, ensure box always covers x_star_unit FIRST
+        # This must happen BEFORE min_width adjustment to prevent the box from moving away
+        if self.x_star_unit is not None:
+            if isinstance(self.x_star_unit, np.ndarray):
+                x_star = self.x_star_unit
+            else:
+                x_star = np.array(self.x_star_unit, dtype=np.float32)
+            
+            # Ensure box covers x_star_unit in all dimensions
+            for f in range(self.n_features):
+                if x_star[f] < self.lower[f]:
+                    # Anchor is below lower bound: expand lower to include it
+                    self.lower[f] = max(0.0, x_star[f] - self.min_width / 2.0)
+                    # Ensure upper is still above lower + min_width
+                    if self.upper[f] < self.lower[f] + self.min_width:
+                        self.upper[f] = min(1.0, self.lower[f] + self.min_width)
+                elif x_star[f] > self.upper[f]:
+                    # Anchor is above upper bound: expand upper to include it
+                    self.upper[f] = min(1.0, x_star[f] + self.min_width / 2.0)
+                    # Ensure lower is still below upper - min_width
+                    if self.lower[f] > self.upper[f] - self.min_width:
+                        self.lower[f] = max(0.0, self.upper[f] - self.min_width)
+                # Ensure x_star_unit is within bounds (safety check)
+                if x_star[f] < self.lower[f] or x_star[f] > self.upper[f]:
+                    # If still outside, center box around x_star_unit
+                    self.lower[f] = max(0.0, x_star[f] - self.min_width / 2.0)
+                    self.upper[f] = min(1.0, self.lower[f] + self.min_width)
+                    # If upper was clipped, adjust lower
+                    if self.upper[f] - self.lower[f] < self.min_width:
+                        self.upper[f] = min(1.0, x_star[f] + self.min_width / 2.0)
+                        self.lower[f] = max(0.0, self.upper[f] - self.min_width)
+        
+        # Now ensure min_width constraint is satisfied (AFTER ensuring x_star_unit is covered)
         for f in range(self.n_features):
             if self.upper[f] - self.lower[f] < self.min_width:
-                mid = 0.5 * (self.upper[f] + self.lower[f])
+                # If x_star_unit exists, try to center around it while maintaining min_width
+                if self.x_star_unit is not None:
+                    if isinstance(self.x_star_unit, np.ndarray):
+                        x_star = self.x_star_unit
+                    else:
+                        x_star = np.array(self.x_star_unit, dtype=np.float32)
+                    # Center around x_star_unit
+                    mid = x_star[f]
+                else:
+                    # No x_star_unit, use box center
+                    mid = 0.5 * (self.upper[f] + self.lower[f])
+                
                 self.lower[f] = max(0.0, mid - self.min_width / 2.0)
                 self.upper[f] = min(1.0, mid + self.min_width / 2.0)
+                # If upper was clipped, adjust lower
+                if self.upper[f] - self.lower[f] < self.min_width:
+                    if self.upper[f] >= 1.0:
+                        self.lower[f] = max(0.0, 1.0 - self.min_width)
+                        self.upper[f] = 1.0
+                    elif self.lower[f] <= 0.0:
+                        self.lower[f] = 0.0
+                        self.upper[f] = min(1.0, self.min_width)
+                
+                # Final safety check: ensure x_star_unit is still in box
+                if self.x_star_unit is not None:
+                    if isinstance(self.x_star_unit, np.ndarray):
+                        x_star = self.x_star_unit
+                    else:
+                        x_star = np.array(self.x_star_unit, dtype=np.float32)
+                    if x_star[f] < self.lower[f]:
+                        self.lower[f] = max(0.0, x_star[f] - self.min_width / 2.0)
+                        self.upper[f] = min(1.0, self.lower[f] + self.min_width)
+                    elif x_star[f] > self.upper[f]:
+                        self.upper[f] = min(1.0, x_star[f] + self.min_width / 2.0)
+                        self.lower[f] = max(0.0, self.upper[f] - self.min_width)
         
         # Debug: Log if action was applied (only for first call)
         if not hasattr(self, '_action_debug_logged'):
@@ -811,6 +997,36 @@ class SingleAgentAnchorEnv(Env):
         # Apply continuous action (always continuous for single-agent)
         self._apply_continuous_action(action)
         
+        # CRITICAL VALIDATION: Ensure box is valid (lower <= upper in all dimensions)
+        # This prevents coverage from being 0.0 due to invalid boxes
+        for f in range(self.n_features):
+            if self.lower[f] > self.upper[f]:
+                logger.warning(
+                    f"  ⚠ Invalid box detected: lower[{f}]={self.lower[f]:.6f} > upper[{f}]={self.upper[f]:.6f}. "
+                    f"Fixing by centering around x_star_unit if available."
+                )
+                # Fix invalid box
+                if self.x_star_unit is not None:
+                    if isinstance(self.x_star_unit, np.ndarray):
+                        x_star = self.x_star_unit
+                    else:
+                        x_star = np.array(self.x_star_unit, dtype=np.float32)
+                    # Center around x_star_unit
+                    mid = x_star[f]
+                else:
+                    # No x_star_unit, use midpoint
+                    mid = 0.5 * (self.lower[f] + self.upper[f])
+                
+                self.lower[f] = max(0.0, mid - self.min_width / 2.0)
+                self.upper[f] = min(1.0, mid + self.min_width / 2.0)
+                if self.upper[f] - self.lower[f] < self.min_width:
+                    if self.upper[f] >= 1.0:
+                        self.lower[f] = max(0.0, 1.0 - self.min_width)
+                        self.upper[f] = 1.0
+                    else:
+                        self.lower[f] = 0.0
+                        self.upper[f] = min(1.0, self.min_width)
+        
         precision, coverage, details = self._current_metrics()
 
         if not np.isfinite(precision):
@@ -858,8 +1074,10 @@ class SingleAgentAnchorEnv(Env):
         
         min_denominator = max(prev_coverage, 1e-6)
         coverage_gain_normalized = coverage_gain / min_denominator
-        coverage_gain_scaled = coverage_gain_normalized * 0.5
-        coverage_gain_scaled = np.clip(coverage_gain_scaled, -0.5, 0.5)
+        # INCREASED coverage gain scaling from 0.5 to 1.0 to give stronger signal for coverage expansion
+        # This helps agents learn to expand boxes to achieve higher coverage
+        coverage_gain_scaled = coverage_gain_normalized * 1.0  # Increased from 0.5 to 1.0
+        coverage_gain_scaled = np.clip(coverage_gain_scaled, -1.0, 1.0)  # Increased clip range from ±0.5 to ±1.0
         coverage_gain_for_reward = coverage_gain_scaled
         
         if not np.isfinite(coverage_gain_for_reward):

@@ -828,6 +828,7 @@ def extract_rules_from_policies(
     steps_per_episode: Optional[int] = None,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
+    coverage_on_all_data: bool = False,  # If True, compute coverage on all data (train+test combined, matches baseline)
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu",
@@ -1299,10 +1300,12 @@ def extract_rules_from_policies(
     
     if n_samples is not None and n_samples > 0:
         # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
+        # For instance-based anchors, initial coverage is typically 0.001-0.002, so we need
+        # a floor that's lower than that to allow expansion
         min_coverage_floor = 1.0 / n_samples
-        # Ensure it's not smaller than a reasonable minimum (use config default as lower bound)
-        # This prevents extremely small values for very large datasets
-        min_coverage_floor = max(min_coverage_floor, config_default)
+        # Use a very small lower bound (1e-6) instead of config_default to avoid blocking expansion
+        # The config_default (0.005) is too high for instance-based anchors
+        min_coverage_floor = max(min_coverage_floor, 1e-6)
     else:
         # Fall back to config default if dataset size unavailable
         min_coverage_floor = config_default
@@ -1375,11 +1378,15 @@ def extract_rules_from_policies(
             n_clusters_per_class = min(10, n_instances_per_class)
             logger.info(f"  Using {n_clusters_per_class} clusters per class for diversity (matching training and single-agent behavior)")
         
+        # Use adaptive clustering: adjust cluster count based on dataset size
+        # and check for scattered data distribution
         cluster_centroids_per_class = compute_cluster_centroids_per_class(
             X_unit=X_cluster,
             y=y_cluster,
             n_clusters_per_class=n_clusters_per_class,
-            random_state=seed if seed is not None else 42
+            random_state=seed if seed is not None else 42,
+            auto_adapt_clusters=True,  # Adapt cluster count to dataset size
+            check_data_scatter=True    # Check if data is scattered (use mean if so)
         )
         logger.info(f"  Cluster centroids computed successfully!")
         for cls in target_classes:
@@ -1407,7 +1414,14 @@ def extract_rules_from_policies(
         logger.info("Verbose logging enabled - showing detailed debug information")
     
     # Always use test data for inference (unless explicitly overridden)
-    if eval_on_test_data:
+    if coverage_on_all_data:
+        # When coverage_on_all_data=True, we use combined data for coverage but still need to set eval_on_test_data=False
+        # since we're providing combined data directly to the environment
+        env_config.update({
+            "eval_on_test_data": False,  # Use combined data, not test-only
+        })
+        logger.info("Using ALL data (train+test combined) for coverage calculation (matches baseline)")
+    elif eval_on_test_data:
         if env_data.get("X_test_unit") is None:
             raise ValueError("Test data not available for evaluation. Inference requires test data.")
         env_config.update({
@@ -1422,8 +1436,14 @@ def extract_rules_from_policies(
         logger.warning("  This may lead to overoptimistic results. Use test data for proper evaluation.")
     
     # Create config for direct AnchorEnv creation
-    # Use test data if eval_on_test_data=True, otherwise use training data
-    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+    # If coverage_on_all_data is True, combine train and test data (matches baseline behavior)
+    if coverage_on_all_data:
+        # Combine train and test data for coverage calculation (matches baseline)
+        anchor_X_unit = np.vstack([env_data["X_unit"], env_data.get("X_test_unit", [])])
+        anchor_X_std = np.vstack([env_data["X_std"], env_data.get("X_test_std", [])])
+        anchor_y = np.concatenate([env_data["y"], env_data.get("y_test", [])])
+        logger.info(f"Using ALL data (train+test combined) for coverage calculation: {len(anchor_y)} samples")
+    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
         anchor_X_unit = env_data["X_test_unit"]
         anchor_X_std = env_data["X_test_std"]
         anchor_y = env_data["y_test"]
@@ -1587,6 +1607,7 @@ def extract_rules_from_policies(
             "target_classes": target_classes,
             "max_features_in_rule": max_features_in_rule,
             "eval_on_test_data": eval_on_test_data,
+            "coverage_on_all_data": coverage_on_all_data,
             "n_instances_per_class": n_instances_per_class,
             "steps_per_episode": steps_per_episode,
         },
@@ -2038,22 +2059,21 @@ def extract_rules_from_policies(
         avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
         total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
-        # Compute class-level metrics from union of all anchors across all episodes FOR THIS AGENT
-        # NOTE: This is per-agent union (union of this agent's anchors), not class-level union across all agents
-        class_precision_union = 0.0
-        class_coverage_union = 0.0
+        # NOTE: Class-level (class-union) metrics will be computed later using class-based anchors only
+        # The three metrics are:
+        # 1. Instance-based = average of instance-based rollouts (computed above)
+        # 2. Class-based = average of class-based rollouts (will be computed later)
+        # 3. Class-union = union of class-based rules (will be computed later, no new rollouts)
+        # 
+        # We do NOT compute union of instance-based anchors here - that's not one of our three metrics.
+        class_precision_union = 0.0  # Will be set later from class-based union
+        class_coverage_union = 0.0   # Will be set later from class-based union
         n_class_samples = 0  # Store class sample count for weighted averaging
         
-        # Get the appropriate dataset (test or train) based on eval_on_test_data
-        if eval_on_test_data and env_data.get("X_test_unit") is not None:
-            X_data = env_data["X_test_unit"]
-            y_data = env_data["y_test"]
-        else:
-            X_data = env_data["X_unit"]
-            y_data = env_data["y"]
-        
-        # Compute union of all anchors FOR THIS AGENT ONLY
-        if X_data is not None and y_data is not None and len(anchors_list) > 0:
+        # SKIP: We do NOT compute union of instance-based anchors here
+        # The union of instance-based anchors is NOT one of our three metrics.
+        # Class-union metrics will be computed later from class-based rules only.
+        if False:  # Disabled - union of instance-based anchors is not one of our metrics
             n_samples = X_data.shape[0]
             union_mask = np.zeros(n_samples, dtype=bool)
             
@@ -2126,8 +2146,8 @@ def extract_rules_from_policies(
             "group": agent_name,
             # Instance-level metrics (averaged across all instances for this agent)
             "instance_precision": instance_precision,
-            "instance_coverage": instance_coverage,  # Overall coverage P(x in box)
-            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Class-conditional coverage P(x in box | y = target_class)
+            "instance_coverage": instance_coverage,  # Class-conditional coverage P(x in box | y = target_class) for instance-based anchors (more meaningful than overall coverage)
+            "instance_coverage_class_conditional": instance_coverage_class_conditional,  # Same as instance_coverage (kept for backward compatibility)
             "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
             "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
             # Class-level metrics (union of all anchors for this agent across all episodes)
@@ -2194,55 +2214,19 @@ def extract_rules_from_policies(
             existing["all_rules"].extend(rules_list)
             existing["total_rollout_time_seconds"] += total_rollout_time
             
-            # Recompute class-level union metrics from ALL anchors (instance-based + class-based) across ALL agents
-            # Get the appropriate dataset (test or train) based on eval_on_test_data
-            if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                X_data = env_data["X_test_unit"]
-                y_data = env_data["y_test"]
-            else:
-                X_data = env_data["X_unit"]
-                y_data = env_data["y"]
+            # NOTE: Class-level (class-union) metrics will be computed later using class-based anchors only
+            # We do NOT compute union of instance-based anchors here - that's not one of our three metrics.
+            # The class_precision/class_coverage stored here are temporary and will be overwritten
+            # with class-based union metrics after class-based rollouts complete (see line ~2795)
+            # 
+            # The three metrics are:
+            # 1. Instance-based = average (already computed above)
+            # 2. Class-based = average (will be computed from class-based rollouts)
+            # 3. Class-union = union of class-based rules (will be computed later, no new rollouts)
             
-            # Collect ALL anchors: instance-based + class-based
-            all_anchors_for_union = existing["all_anchors"].copy()  # Instance-based anchors
-            
-            # Add class-based anchors if they exist (they're stored in class_based_results nested under class_key)
-            if "class_based_results" in existing:
-                # Collect anchors from all agents' class-based results
-                for agent_cb_result in existing["class_based_results"].values():
-                    if "anchors" in agent_cb_result:
-                        all_anchors_for_union.extend(agent_cb_result["anchors"])
-            
-            # Compute union of ALL anchors (instance-based + class-based) from ALL agents for this class
-            if X_data is not None and y_data is not None and len(all_anchors_for_union) > 0:
-                n_samples = X_data.shape[0]
-                union_mask = np.zeros(n_samples, dtype=bool)
-                
-                # Build union mask from all anchors (instance-based + class-based) across all agents
-                for anchor_data in all_anchors_for_union:
-                    if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                        
-                        # Check which points fall in this anchor box
-                        in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
-                        union_mask |= in_box
-                
-                # Class-level coverage: fraction of class samples that are in the union
-                mask_cls = (y_data == target_class)
-                n_class_samples_aggregated = int(mask_cls.sum())  # Store for weighted averaging
-                if mask_cls.sum() > 0:
-                    existing["class_coverage"] = float(union_mask[mask_cls].mean())
-                else:
-                    existing["class_coverage"] = 0.0
-                existing["n_class_samples"] = n_class_samples_aggregated  # Update for weighted averaging
-                
-                # Class-level precision: fraction of points in union that belong to target class
-                if union_mask.any():
-                    y_union = y_data[union_mask]
-                    existing["class_precision"] = float((y_union == target_class).mean())
-                else:
-                    existing["class_precision"] = 0.0
+            # Keep class_precision/class_coverage as 0.0 for now - they'll be set from class-based union later
+            existing["class_precision"] = 0.0  # Temporary, will be overwritten with class-based union
+            existing["class_coverage"] = 0.0   # Temporary, will be overwritten with class-based union
         
         # For backward compatibility and simpler access, also store the aggregated result
         # using the same structure as before (but now aggregated across all agents)
@@ -3029,6 +3013,13 @@ def main():
     )
     
     parser.add_argument(
+        "--coverage_on_all_data",
+        action="store_true",
+        help="If True, compute coverage on all data (train+test combined, matches baseline anchor-exp behavior). "
+             "Baseline uses all training data for coverage (no train/test split), so this ensures fair comparison."
+    )
+    
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -3097,6 +3088,7 @@ def main():
         steps_per_episode=args.steps_per_episode,
         n_instances_per_class=args.n_instances_per_class,
         eval_on_test_data=use_test_data,
+        coverage_on_all_data=args.coverage_on_all_data,
         output_dir=args.output_dir,
         seed=args.seed,
         device=args.device,

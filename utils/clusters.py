@@ -18,7 +18,9 @@ def compute_cluster_centroids_per_class(
     y: np.ndarray,
     n_clusters_per_class: int = 10,
     random_state: int = 42,
-    min_samples_per_cluster: int = 1
+    min_samples_per_cluster: int = 1,
+    auto_adapt_clusters: bool = True,
+    check_data_scatter: bool = True
 ) -> Dict[int, np.ndarray]:
     """
     Compute cluster centroids for each class using KMeans clustering.
@@ -35,9 +37,11 @@ def compute_cluster_centroids_per_class(
     Args:
         X_unit: Data in unit space [0, 1], shape (n_samples, n_features)
         y: Class labels, shape (n_samples,)
-        n_clusters_per_class: Number of clusters to find per class
+        n_clusters_per_class: Number of clusters to find per class (max, will be adapted for small datasets)
         random_state: Random seed for reproducibility
         min_samples_per_cluster: Minimum samples required to form a cluster
+        auto_adapt_clusters: If True, adapt cluster count based on dataset size (recommended)
+        check_data_scatter: If True, check if data is scattered and use mean if so (recommended)
         
     Returns:
         Dictionary mapping class -> array of cluster centroids (n_clusters, n_features)
@@ -45,6 +49,16 @@ def compute_cluster_centroids_per_class(
     Note:
         Cluster centroids are used when x_star_unit is None (class-based training).
         For instance-based training, set x_star_unit directly on AnchorEnv.
+        
+        Adaptive clustering:
+        - Small datasets (< 20 samples): Use mean centroid only
+        - Small-medium (20-50): Use 1-2 clusters
+        - Medium (50-200): Use sqrt(n_samples) or n_samples/20
+        - Large (> 200): Use requested number (default 10)
+        
+        Scatter detection:
+        - If data is uniformly distributed (low variance), uses mean centroid
+        - Prevents meaningless clustering on scattered data
     """
     if not SKLEARN_AVAILABLE:
         raise ImportError(
@@ -91,10 +105,60 @@ def compute_cluster_centroids_per_class(
             # This is safe and won't cause k-means issues
             pass  # KMeans can handle constant features, but we'll use a more robust approach
         
-        # Determine number of clusters (can't have more clusters than samples)
-        n_clusters = min(n_clusters_per_class, len(X_cls))
+        # ADAPTIVE CLUSTER COUNT: Adjust based on dataset size
+        # For small datasets, using too many clusters doesn't make sense
+        # For scattered data, clustering may not be meaningful
+        n_samples = len(X_cls)
         
-        if n_clusters < min_samples_per_cluster:
+        if auto_adapt_clusters:
+            # Adaptive cluster count based on dataset size
+            if n_samples < 20:
+                # Very small dataset: use mean centroid only
+                n_clusters = 1
+            elif n_samples < 50:
+                # Small dataset: use 1-2 clusters
+                n_clusters = min(2, n_clusters_per_class)
+            elif n_samples < 100:
+                # Medium-small: use sqrt(n_samples) or max 5 clusters
+                n_clusters = min(int(np.sqrt(n_samples)), 5, n_clusters_per_class)
+            elif n_samples < 200:
+                # Medium: use n_samples/20 or max 10 clusters
+                n_clusters = min(max(5, n_samples // 20), n_clusters_per_class)
+            else:
+                # Large dataset: use requested number (default 10)
+                n_clusters = n_clusters_per_class
+        else:
+            # Use requested number, but cap at number of samples
+            n_clusters = min(n_clusters_per_class, n_samples)
+        
+        # Ensure we have enough samples per cluster
+        n_clusters = min(n_clusters, n_samples // max(1, min_samples_per_cluster))
+        n_clusters = max(1, n_clusters)  # At least 1 cluster
+        
+        # CHECK DATA SCATTER: If data is uniformly distributed, clustering may not be meaningful
+        # Use coefficient of variation of distances to centroid as a proxy for scatter
+        use_clustering = True
+        if check_data_scatter and n_clusters > 1 and n_samples >= 10:
+            try:
+                # Quick check: compute mean centroid and check variance of distances
+                mean_centroid = X_cls.mean(axis=0, keepdims=True)
+                distances_to_mean = np.linalg.norm(X_cls - mean_centroid, axis=1)
+                cv_distances = np.std(distances_to_mean) / (np.mean(distances_to_mean) + 1e-10)
+                
+                # If coefficient of variation is very low (< 0.1), data is very uniform/scattered
+                # This suggests clustering may not find meaningful structure
+                if cv_distances < 0.1:
+                    import warnings
+                    warnings.warn(
+                        f"Class {cls}: Data appears uniformly distributed (CV={cv_distances:.4f} < 0.1). "
+                        f"Clustering may not be meaningful. Using mean centroid instead."
+                    )
+                    use_clustering = False
+            except Exception:
+                # If scatter check fails, proceed with clustering
+                pass
+        
+        if n_clusters < min_samples_per_cluster or not use_clustering:
             # Not enough samples for clustering, use mean as single centroid
             centroid = X_cls.mean(axis=0, keepdims=True)
             centroids_per_class[cls] = centroid.astype(np.float32)
