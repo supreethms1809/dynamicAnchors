@@ -270,10 +270,14 @@ def main():
         logger.info("\nUsing existing classifier from dataset_loader")
     
     # Create trainer
+    # CRITICAL: More frequent evaluations to catch better models and detect overfitting
+    # - eval_freq: Evaluate every 2000-3000 steps (was 6000) to get more frequent snapshots
+    # - n_eval_episodes: Use 20+ episodes (was 10) for better statistical reliability
+    # - This helps catch good models early and track if training rewards improve but eval rewards degrade
     experiment_config = {
         "total_timesteps": args.total_timesteps,
-        "eval_freq": 6000,
-        "n_eval_episodes": 10,
+        "eval_freq": 3000,  # Increased frequency: every 3000 steps (was 6000) for better model selection
+        "n_eval_episodes": 20,  # More episodes for better statistics (was 10)
         "checkpoint_freq": 12_000,
         "log_interval": 10,
         "tensorboard_log": True,

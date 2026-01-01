@@ -6,12 +6,17 @@ This script reads extracted rules from a single-agent SB3 inference JSON file an
 against a dataset to find all samples that satisfy each rule.
 
 Usage:
-    python single_agent/test_extracted_rules_single.py --rules_file <path_to_extracted_rules_single_agent.json> --dataset <dataset_name> [--use_train_data]
+    python single_agent/test_extracted_rules_single.py --rules_file <path_to_extracted_rules_single_agent.json> --dataset <dataset_name> [--use_train_data] [--use_full_dataset]
 
 Example:
     python single_agent/test_extracted_rules_single.py \
         --rules_file output/single_agent_sb3_breast_cancer_ddpg/training/.../inference/extracted_rules_single_agent.json \
         --dataset breast_cancer
+    
+    # Test on full dataset (train + test combined)
+    python single_agent/test_extracted_rules_single.py \
+        --rules_file output/single_agent_sb3_breast_cancer_ddpg/training/.../inference/extracted_rules_single_agent.json \
+        --dataset breast_cancer --use_full_dataset
 """
 
 import sys
@@ -276,6 +281,9 @@ def analyze_rule_overlaps_detailed(
     unique_rules_per_class = {}
     for class_key, class_data in per_class_results.items():
         target_class = class_data.get("class")
+        # Skip if target_class is None (invalid class data)
+        if target_class is None:
+            continue
         unique_rules = class_data.get("unique_rules", [])
         # Filter out overlapping rules
         non_overlapping = [
@@ -378,7 +386,15 @@ def analyze_missed_samples(
     
     # For each class, collect all rules and check coverage
     for class_key, class_data in per_class_results.items():
+        # Skip class-based result keys (they're stored separately, not as actual classes)
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            continue
+        
         target_class = class_data.get("class")
+        # Skip if target_class is None (invalid class data)
+        if target_class is None:
+            continue
+        
         unique_rules = class_data.get("unique_rules", [])
         
         # Get all samples for this class
@@ -667,6 +683,7 @@ def test_rules_from_json(
     rules_file: str,
     dataset_name: str,
     use_test_data: bool = True,
+    use_full_dataset: bool = False,
     seed: int = 42,
     precision_threshold: float = 0.9,
     max_rules_per_class: int = -1,
@@ -679,6 +696,7 @@ def test_rules_from_json(
         rules_file: Path to extracted_rules_single_agent.json file
         dataset_name: Name of the dataset to test against
         use_test_data: If True, test on test data; if False, test on training data
+        use_full_dataset: If True, test on full dataset (train + test combined); overrides use_test_data
         seed: Random seed for dataset loading
         precision_threshold: Minimum rule-level precision for a rule to be considered in global explanations
         max_rules_per_class: Maximum number of rules to select per class for global explanations (-1 = no limit)
@@ -692,7 +710,10 @@ def test_rules_from_json(
     logger.info("="*80)
     logger.info(f"Rules file: {rules_file}")
     logger.info(f"Dataset: {dataset_name}")
-    logger.info(f"Data split: {'test' if use_test_data else 'training'}")
+    if use_full_dataset:
+        logger.info(f"Data split: full (train + test combined)")
+    else:
+        logger.info(f"Data split: {'test' if use_test_data else 'training'}")
     logger.info("="*80)
     
     # Load rules from JSON
@@ -742,7 +763,13 @@ def test_rules_from_json(
     
     # Get data (in standardized feature space, matching the denormalized rules)
     # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)
-    if use_test_data:
+    if use_full_dataset:
+        # Combine train and test data for full dataset evaluation
+        X_data = np.vstack([dataset_loader.X_train_scaled, dataset_loader.X_test_scaled])
+        y_data = np.concatenate([dataset_loader.y_train, dataset_loader.y_test])
+        data_type = "full (train + test)"
+        logger.info(f"✓ Loaded full dataset: {len(dataset_loader.y_train)} training + {len(dataset_loader.y_test)} test = {X_data.shape[0]} total samples")
+    elif use_test_data:
         X_data = dataset_loader.X_test_scaled  # Standardized feature space (matches rule space)
         y_data = dataset_loader.y_test
         data_type = "test"
@@ -1213,6 +1240,9 @@ Examples:
   
   # Test rules on training data
   python single_agent/test_extracted_rules.py --rules_file path/to/extracted_rules_single_agent.json --dataset breast_cancer --use_train_data
+  
+  # Test rules on full dataset (train + test combined)
+  python single_agent/test_extracted_rules.py --rules_file path/to/extracted_rules_single_agent.json --dataset breast_cancer --use_full_dataset
         """
     )
     
@@ -1262,6 +1292,12 @@ Examples:
         "--use_train_data",
         action="store_true",
         help="Test on training data instead of test data (default: test data)"
+    )
+    
+    parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        help="Test on full dataset (train + test combined) instead of just test or train data (default: False)"
     )
     
     
@@ -1324,7 +1360,8 @@ Examples:
         results = test_rules_from_json(
             rules_file=args.rules_file,
             dataset_name=args.dataset,
-            use_test_data=not args.use_train_data,
+            use_test_data=not args.use_train_data if not args.use_full_dataset else False,
+            use_full_dataset=args.use_full_dataset,
             seed=args.seed,
             precision_threshold=args.precision_threshold,
             max_rules_per_class=args.max_rules_per_class,

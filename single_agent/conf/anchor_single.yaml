@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.2
+  coverage_target: 0.5
   
   # Data perturbation settings
   use_perturbation: True
@@ -54,29 +54,27 @@ env_config:
   use_random_sampling: false
   # Training initialization: ratio of instance-based vs centroid-based episodes
   # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% centroid-based
-  training_instance_ratio: 1.0  # 10% instance-based (prediction matching), 90% class-based (class correctness)
+  training_instance_ratio: 0.4  # 10% instance-based (prediction matching), 90% class-based (class correctness)
   # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
   use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
   
   # Evaluation settings
-  # Set to false to use training data for evaluation (matches baseline behavior)
+  # RECOMMENDED: Set to true to evaluate on test data during training for better model selection
+  # This helps catch models that generalize well and avoids overfitting to training data
   # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
-  eval_on_test_data: false
+  eval_on_test_data: true  # Changed to true for better model selection based on generalization
   
   # Episode length (kept here so it is passed directly into SingleAgentAnchorEnv.__init__)
   max_cycles: 500  # Increased from 100 to allow boxes more time to expand for better coverage
+  
+  # Termination reason counters: disable overused reasons
+  # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
+  max_termination_count_both_targets: -1
+  max_termination_count_high_precision: 200
+  max_termination_count_both_close: 100
+  max_termination_count_excellent_precision: 100
 
 # Logging verbosity control
 # Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs
 # Controls logging in training, inference, and environment during rollouts
 logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
-
-# Maximum number of steps per episode
-max_cycles: 500  # Increased from 100 to allow boxes more time to expand for better coverage
-
-# Termination reason counters: disable overused reasons
-# Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
-max_termination_count_both_targets: -1
-max_termination_count_high_precision: 200
-max_termination_count_both_close: 50
-max_termination_count_excellent_precision: 30

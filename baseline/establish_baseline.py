@@ -647,6 +647,116 @@ def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[
     return conditions
 
 
+def compute_anchor_metrics_on_full_dataset(
+    anchor_rule: Any,
+    X_full: np.ndarray,
+    y_full: np.ndarray,
+    original_instance: np.ndarray,
+    original_prediction: int,
+    feature_names: List[str],
+    X_train: np.ndarray,
+    classifier: nn.Module,
+    device: torch.device,
+    explainer: Optional[Any] = None
+) -> Tuple[float, float]:
+    """
+    Compute precision and coverage for a single anchor on the full dataset.
+    
+    This follows the original Anchors paper methodology:
+    - Precision: Of all instances in the full dataset that satisfy the anchor,
+                  what fraction have the same prediction as the original instance?
+                  Formula: P(f(x) = f(x_original) | x satisfies anchor)
+    - Coverage: What fraction of instances in the full dataset satisfy the anchor?
+                Formula: P(x satisfies anchor)
+    
+    Note: If anchor-exp returns only feature names (without bounds) due to discretization,
+    this function may not be able to parse the anchor conditions and will return (0.0, 0.0).
+    In such cases, the anchor-exp library's original precision/coverage (computed using
+    perturbation sampling) may still be available in the results under "precision_original"
+    and "coverage_original".
+    
+    Args:
+        anchor_rule: Anchor rule from anchor-exp (can be string, list, or other format)
+        X_full: Full dataset (train + test combined) in original feature space
+        y_full: Labels for full dataset (not used for precision, but kept for consistency)
+        original_instance: The instance that this anchor explains
+        original_prediction: The model's prediction for the original instance
+        feature_names: List of feature names
+        X_train: Training data to get feature ranges for handling -inf/+inf
+        classifier: Trained classifier model
+        device: Device to run classifier on
+        explainer: Optional anchor-exp explainer for proper discretization
+    
+    Returns:
+        Tuple of (precision, coverage) on the full dataset
+    """
+    # Parse anchor rule to get conditions
+    conditions = parse_anchor_rule(anchor_rule, feature_names)
+    
+    # If no valid conditions, anchor matches no instances
+    if len(conditions) == 0:
+        return 0.0, 0.0
+    
+    # Compute feature ranges from training data (for handling -inf/+inf)
+    feature_mins = X_train.min(axis=0)
+    feature_maxs = X_train.max(axis=0)
+    
+    # Build feature name to index mapping
+    feature_to_idx = {name: idx for idx, name in enumerate(feature_names)}
+    
+    # Determine which instances satisfy the anchor
+    # An instance satisfies the anchor if it satisfies ALL conditions
+    anchor_mask = np.ones(X_full.shape[0], dtype=bool)
+    
+    for feature_name, lower, upper in conditions:
+        if feature_name not in feature_to_idx:
+            # Feature not found - anchor matches no instances
+            anchor_mask = np.zeros(X_full.shape[0], dtype=bool)
+            break
+        
+        feat_idx = feature_to_idx[feature_name]
+        feature_values = X_full[:, feat_idx]
+        
+        # Replace -inf with feature min and +inf with feature max
+        cond_lower = lower if lower != float('-inf') else feature_mins[feat_idx]
+        cond_upper = upper if upper != float('inf') else feature_maxs[feat_idx]
+        
+        # Check if values satisfy this condition [lower, upper] (inclusive)
+        condition_mask = (feature_values >= cond_lower) & (feature_values <= cond_upper)
+        anchor_mask = anchor_mask & condition_mask
+    
+    # Coverage: fraction of instances in full dataset that satisfy the anchor
+    n_total = len(X_full)
+    n_in_anchor = anchor_mask.sum()
+    if n_total == 0:
+        coverage = 0.0
+    else:
+        coverage = float(n_in_anchor / n_total)
+    
+    # Precision: fraction of instances that satisfy anchor and have same prediction as original
+    if n_in_anchor == 0:
+        # No instances satisfy the anchor
+        precision = 0.0
+    else:
+        # Get predictions for all instances that satisfy the anchor
+        X_in_anchor = X_full[anchor_mask]
+        classifier.eval()
+        with torch.no_grad():
+            X_tensor = torch.from_numpy(X_in_anchor.astype(np.float32)).to(device)
+            logits = classifier(X_tensor)
+            predictions = logits.argmax(dim=1).cpu().numpy()
+        
+        # Count how many have the same prediction as the original instance
+        n_matching_pred = (predictions == original_prediction).sum()
+        precision = float(n_matching_pred / n_in_anchor)
+    
+    # Sanity checks
+    assert 0.0 <= precision <= 1.0, f"Precision {precision} out of range [0, 1]"
+    assert 0.0 <= coverage <= 1.0, f"Coverage {coverage} out of range [0, 1]"
+    
+    return precision, coverage
+
+
 def compute_class_union_metrics(
     anchor_rules: List[Any],
     X_data: np.ndarray,
@@ -1119,6 +1229,14 @@ def run_static_anchors(
     print("  - Each instance gets its own anchor explanation")
     print("  - Results (precision/coverage) are aggregated (averaged) by class")
     print("  - Unlike Dynamic Anchors, which produce ONE unified anchor per class")
+    print("")
+    print("METRICS CALCULATION:")
+    print("  Following original Anchors paper methodology:")
+    print("  - Instances are sampled from the FULL dataset (train + test)")
+    print("  - Precision and coverage are computed on the FULL dataset (train + test)")
+    print("  - Precision: P(f(x) = f(x_original) | x satisfies anchor)")
+    print("  - Coverage: P(x satisfies anchor)")
+    print("  - Average precision/coverage computed across all anchors")
     print("="*80)
     
     try:
@@ -1152,17 +1270,26 @@ def run_static_anchors(
     results = {}
     unique_classes = np.unique(y_test)
     
+    # Combine train and test to get full dataset for computing metrics AND sampling instances
+    # CRITICAL: Sample from full dataset (train + test) to ensure we have enough instances
+    # and to match single-agent/multi-agent which also use full dataset
+    X_full = np.vstack([X_train, X_test])
+    y_full = np.hstack([y_train, y_test])
+    
     # Start overall timing
     overall_start_time = time.perf_counter()
     
     for cls in unique_classes:
-        idx_cls = np.where(y_test == cls)[0]
-        if idx_cls.size == 0:
+        # Sample from FULL dataset (train + test) instead of just test set
+        # This ensures we have enough instances and matches single-agent/multi-agent behavior
+        idx_cls_full = np.where(y_full == cls)[0]
+        if idx_cls_full.size == 0:
             continue
         
-        # Sample instances
-        np.random.seed(seed)
-        sel = np.random.choice(idx_cls, size=min(n_instances_per_class, idx_cls.size), replace=False)
+        # Sample instances from full dataset
+        # Use same random number generator API as single-agent for consistency
+        rng = np.random.default_rng(seed)
+        sel_full = rng.choice(idx_cls_full, size=min(n_instances_per_class, idx_cls_full.size), replace=False)
         
         class_results = []
         rollout_times = []
@@ -1170,12 +1297,26 @@ def run_static_anchors(
         # Track time for this class
         class_start_time = time.perf_counter()
         
-        for i in sel:
+        # Get predictions for all instances in full dataset (needed for precision calculation)
+        classifier.eval()
+        with torch.no_grad():
+            X_full_tensor = torch.from_numpy(X_full.astype(np.float32)).to(device)
+            full_logits = classifier(X_full_tensor)
+            full_predictions = full_logits.argmax(dim=1).cpu().numpy()
+        
+        # sel_full contains indices into X_full (which is [X_train; X_test])
+        # No offset needed since we're already using full dataset indices
+        
+        for full_idx in sel_full:
             # Start timing this instance explanation
             instance_start_time = time.perf_counter()
             
+            # Get instance from full dataset (X_full = [X_train; X_test])
+            instance = X_full[full_idx]
+            original_prediction = full_predictions[full_idx]
+            
             exp = explainer.explain_instance(
-                X_test[i], 
+                instance, 
                 predict_labels, 
                 threshold=anchor_threshold,
             )
@@ -1191,10 +1332,6 @@ def run_static_anchors(
                 except Exception:
                     return 0.0
             
-            # Extract precision/coverage
-            prec_val = _metric(getattr(exp, 'precision', 0.0))
-            cov_val = _metric(getattr(exp, 'coverage', 0.0))
-            
             # Extract anchor rule
             anchor_names = []
             if hasattr(exp, 'names'):
@@ -1209,10 +1346,30 @@ def run_static_anchors(
                 except Exception:
                     anchor_names = []
             
+            # Recompute precision and coverage on full dataset following original anchors paper methodology
+            prec_full, cov_full = compute_anchor_metrics_on_full_dataset(
+                anchor_rule=anchor_names,
+                X_full=X_full,
+                y_full=y_full,
+                original_instance=instance,
+                original_prediction=original_prediction,
+                feature_names=feature_names,
+                X_train=X_train,
+                classifier=classifier,
+                device=device,
+                explainer=explainer
+            )
+            
+            # Keep original values from anchor-exp for reference, but use recomputed ones for averaging
+            prec_original = _metric(getattr(exp, 'precision', 0.0))
+            cov_original = _metric(getattr(exp, 'coverage', 0.0))
+            
             class_results.append({
-                "instance_idx": int(i),
-                "precision": prec_val,
-                "coverage": cov_val,
+                "instance_idx": int(full_idx),  # Index in full dataset
+                "precision": prec_full,  # Use precision computed on full dataset
+                "coverage": cov_full,    # Use coverage computed on full dataset
+                "precision_original": prec_original,  # Keep original for reference
+                "coverage_original": cov_original,    # Keep original for reference
                 "anchor": anchor_names,
                 "rollout_time_seconds": float(instance_duration),
             })
@@ -1257,10 +1414,11 @@ def run_static_anchors(
                 if none_count > 0 or empty_count > 0:
                     print(f"    Found {none_count} None anchors and {empty_count} empty string anchors")
             
+            # Compute class-level union metrics on full dataset
             class_prec, class_cov = compute_class_union_metrics(
                 anchor_rules=anchor_rules,
-                X_data=X_test,
-                y_data=y_test,
+                X_data=X_full,  # Use full dataset instead of just test
+                y_data=y_full,  # Use full dataset labels
                 target_class=cls,
                 feature_names=feature_names,
                 X_train=X_train,
@@ -1291,7 +1449,11 @@ def run_static_anchors(
             }
             
             print(f"\nClass {cls} ({class_names[cls] if cls < len(class_names) else cls}):")
-            print(f"  Instance-level (avg across {len(class_results)} instances):")
+            n_actual = len(class_results)
+            if n_actual < n_instances_per_class:
+                print(f"  Instance-level (avg across {n_actual} instances, limited by full dataset size; requested {n_instances_per_class}):")
+            else:
+                print(f"  Instance-level (avg across {n_actual} instances from full dataset):")
             print(f"    Avg Precision: {avg_prec:.3f}")
             print(f"    Avg Coverage:  {avg_cov:.3f}")
             print(f"    Average rollout time per instance: {avg_rollout_time:.4f}s")

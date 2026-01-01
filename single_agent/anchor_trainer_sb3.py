@@ -190,8 +190,8 @@ class AnchorTrainerSB3:
         """Get default experiment configuration."""
         return {
             "total_timesteps": 72_000,
-            "eval_freq": 48_000,
-            "n_eval_episodes": 4,
+            "eval_freq": 3000,  # More frequent evaluations to catch better models (was 48_000)
+            "n_eval_episodes": 20,  # More episodes for better statistics (was 4)
             "checkpoint_freq": 48_000,
             "log_interval": 10,
             "tensorboard_log": True,

@@ -312,7 +312,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 120_000,
+    total_timesteps: int = 240_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -439,8 +439,15 @@ def run_single_agent_inference(
     dataset: str,
     max_features_in_rule: int = -1,
     steps_per_episode: int = 100,
-    n_instances_per_class: int = 20,
+    n_instances_per_class: int = 10,  # Number of instances to sample
+    n_rollouts_per_instance: int = 10,  # Number of rollouts per instance
     device: str = "cpu",
+    filter_by_prediction: bool = False,  # Default False for fair comparison with baseline
+    use_prediction_routing: bool = True,  # Default True: route instances to policies based on classifier predictions (realistic evaluation). If False, use ground truth labels (traditional evaluation).
+    use_weighted_average: bool = False,  # Default False: use simple arithmetic mean (same as baseline) for fair comparison following original Anchors paper
+    filter_low_quality_rollouts: bool = True,  # Default True: filter low-quality rollouts (matches baseline filtering)
+    min_precision_threshold: Optional[float] = None,  # Default: precision_target * 0.8
+    min_coverage_threshold: float = 0.01,  # Default: 0.01
     **kwargs
 ) -> Optional[str]:
     """
@@ -451,8 +458,15 @@ def run_single_agent_inference(
         dataset: Dataset name
         max_features_in_rule: Maximum features in rules
         steps_per_episode: Steps per episode
-        n_instances_per_class: Instances per class
+        n_instances_per_class: Number of instances to sample per class (default: 10)
+        n_rollouts_per_instance: Number of rollouts to run per instance (default: 20)
         device: Device to use
+        filter_by_prediction: If True, filter instances by classifier prediction (default: False for fair comparison)
+        use_prediction_routing: If True (default), route instances to policies based on classifier predictions (realistic evaluation). If False, use ground truth labels (traditional evaluation).
+        use_weighted_average: If True, use coverage-weighted average (default: False for fair comparison with baseline)
+        filter_low_quality_rollouts: If True, filter out low-quality rollouts before averaging (default: True)
+        min_precision_threshold: Minimum precision threshold for keeping rollouts (default: precision_target * 0.8)
+        min_coverage_threshold: Minimum coverage threshold for keeping rollouts (default: 0.01)
         **kwargs: Additional arguments
     
     Returns:
@@ -474,6 +488,28 @@ def run_single_agent_inference(
         "--n_instances_per_class", str(n_instances_per_class),
         "--device", device,
     ]
+    
+    # Add filter_by_prediction flag (use --no_filter_by_prediction if False)
+    if not filter_by_prediction:
+        cmd.append("--no_filter_by_prediction")
+    
+    # Add use_prediction_routing flag
+    if use_prediction_routing:
+        cmd.append("--use_prediction_routing")
+    
+    # Add use_weighted_average flag
+    if use_weighted_average:
+        cmd.append("--use_weighted_average")
+    
+    # Add filter_low_quality_rollouts flag (use --no_filter_low_quality_rollouts if False)
+    if not filter_low_quality_rollouts:
+        cmd.append("--no_filter_low_quality_rollouts")
+    
+    # Add threshold arguments if provided
+    if min_precision_threshold is not None:
+        cmd.extend(["--min_precision_threshold", str(min_precision_threshold)])
+    if min_coverage_threshold != 0.01:  # Only add if different from default
+        cmd.extend(["--min_coverage_threshold", str(min_coverage_threshold)])
     
     # Add additional arguments
     for key, value in kwargs.items():
@@ -2224,8 +2260,28 @@ Examples:
     parser.add_argument(
         "--coverage_on_all_data",
         action="store_true",
-        help="If True, compute coverage on all data (train+test combined, matches baseline anchor-exp behavior). "
-             "Baseline uses all training data for coverage (no train/test split), so this ensures fair comparison."
+        help="If True, use full dataset (train+test) during rollouts. "
+             "NOTE: Final metrics are ALWAYS computed on full dataset following original Anchors paper methodology, "
+             "regardless of this flag. This flag only affects the dataset used during rollout environment evaluation. "
+             "Default behavior in pipeline: True (passed explicitly for consistency with baseline)."
+    )
+    
+    parser.add_argument(
+        "--use_prediction_routing",
+        action="store_true",
+        default=True,
+        help="If True (default), route instances to policies based on classifier predictions (realistic evaluation). "
+             "If False, use ground truth labels (traditional evaluation). "
+             "When enabled, instances are sampled from all classes and routed to policies based on their predicted class. "
+             "This provides a more realistic evaluation scenario where we don't know the ground truth class."
+    )
+    
+    parser.add_argument(
+        "--no_prediction_routing",
+        action="store_false",
+        dest="use_prediction_routing",
+        help="Disable prediction routing (equivalent to --use_prediction_routing=False). "
+             "Use traditional evaluation mode with ground truth labels for routing."
     )
     
     args = parser.parse_args()
@@ -2394,15 +2450,28 @@ Examples:
                         logger.info(f"Found existing experiment directory (old structure): {single_agent_experiment_dir}")
         
         # Inference
+        # CRITICAL: Use same configuration as baseline for fair comparison following original Anchors paper methodology
+        # Both baseline and single-agent now compute metrics on full dataset (train + test)
+        # For fair comparison: use same n_instances_per_class, simple average (not weighted), same filtering
         if not args.skip_inference and single_agent_experiment_dir:
             single_agent_rules_file = run_single_agent_inference(
                 experiment_dir=single_agent_experiment_dir,
                 dataset=args.dataset,
                 max_features_in_rule=args.max_features_in_rule,
                 steps_per_episode=args.steps_per_episode,
-                n_instances_per_class=args.n_instances_per_class,
+                n_instances_per_class=args.n_instances_per_class,  # Use same as baseline (default: 20)
+                n_rollouts_per_instance=10,  # Run 20 rollouts per instance (total: 200 rollouts per class)
                 device=args.device,
-                coverage_on_all_data=args.coverage_on_all_data
+                # NOTE: coverage_on_all_data doesn't affect final metrics anymore since we always recompute on full dataset
+                # But pass it through for consistency in rollout environment behavior
+                coverage_on_all_data=True,  # Use full dataset for environment during rollouts (matches baseline behavior)
+                sample_from_full_dataset=True,  # Sample instances from full dataset (train + test) to match baseline
+                filter_by_prediction=False,  # Disable prediction filtering for fair comparison with baseline
+                use_prediction_routing=args.use_prediction_routing,  # Route instances based on classifier predictions if enabled
+                use_weighted_average=False,  # Use simple arithmetic mean (same as baseline) for fair comparison
+                filter_low_quality_rollouts=True,  # Filter to keep only high-quality rollouts (matches baseline filtering)
+                min_precision_threshold=None,  # Use default: precision_target * 0.8 (same as baseline)
+                min_coverage_threshold=0.01  # Minimum coverage threshold (same as baseline default)
             )
         else:
             # Try to find existing rules file
@@ -2417,7 +2486,8 @@ Examples:
             run_single_agent_test(
                 rules_file=single_agent_rules_file,
                 dataset=args.dataset,
-                seed=args.seed
+                seed=args.seed,
+                use_full_dataset=True  # Use full dataset (train + test) for testing rules
             )
         
         # Summarize and plot
