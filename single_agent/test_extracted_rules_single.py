@@ -304,7 +304,7 @@ def analyze_rule_overlaps_detailed(
         logger.info(f"{'='*80}")
         for idx, overlap_info in enumerate(overlap_analysis["rule_overlaps"], 1):
             logger.info(f"Overlapping Rule {idx}:")
-            logger.info(f"  Rule: {overlap_info['rule'][:100]}{'...' if len(overlap_info['rule']) > 100 else ''}")
+            logger.info(f"  Rule: {overlap_info['rule']}")
             logger.info(f"  Source classes (where rule was extracted): {overlap_info['source_classes']}")
             logger.info(f"  Satisfies classes: {overlap_info['satisfies_classes']}")
             logger.info(f"  Total samples satisfying: {overlap_info['total_samples_satisfying']}")
@@ -324,7 +324,7 @@ def analyze_rule_overlaps_detailed(
             logger.info(f"  Number of overlapping rules: {pair_info['n_overlapping_rules']}")
             logger.info(f"  Overlapping rules:")
             for rule_idx, rule_str in enumerate(pair_info['overlapping_rules'], 1):
-                logger.info(f"    {rule_idx}. {rule_str[:80]}{'...' if len(rule_str) > 80 else ''}")
+                logger.info(f"    {rule_idx}. {rule_str}")
     
     # Log unique rules per class
     logger.info(f"{'='*80}")
@@ -336,7 +336,7 @@ def analyze_rule_overlaps_detailed(
         if unique_rules:
             logger.info(f"  {len(unique_rules)} unique rule(s):")
             for rule_idx, rule_str in enumerate(unique_rules, 1):
-                logger.info(f"    {rule_idx}. {rule_str[:80]}{'...' if len(rule_str) > 80 else ''}")
+                logger.info(f"    {rule_idx}. {rule_str}")
         else:
             logger.info(f"  No unique rules (all rules overlap with other classes)")
     
@@ -891,7 +891,7 @@ def test_rules_from_json(
     for rule_idx, rule_str in enumerate(all_unique_rules):
         rollout_type = rule_to_rollout_type.get(rule_str, "unknown")
         logger.info(f"{'='*80}")
-        logger.info(f"Rule {rule_idx + 1}/{len(all_unique_rules)}: {rule_str[:100]}...")
+        logger.info(f"Rule {rule_idx + 1}/{len(all_unique_rules)}: {rule_str}")
         logger.info(f"{'='*80}")
         logger.info(f"  Rollout type: {rollout_type}")
         logger.info(f"  Source classes: {rule_to_source_classes[rule_str]}")
@@ -1058,7 +1058,7 @@ def test_rules_from_json(
                 logger.info(f"    Rank {rank}: precision={rule_info['rule_precision']:.4f}, "
                           f"coverage={rule_info['rule_coverage']:.4f}, "
                           f"score={rule_info['combined_score']:.4f}")
-                logger.info(f"      Rule: {rule_info['rule'][:80]}...")
+                logger.info(f"      Rule: {rule_info['rule']}")
     
     # Store ranked rules in results
     results["ranked_rules_per_class"] = ranked_rules_per_class
@@ -1137,7 +1137,7 @@ def test_rules_from_json(
     if rules_satisfying_both_classes:
         logger.info(f"Rules that satisfy multiple classes:")
         for rule_info in rules_satisfying_both_classes:
-            logger.info(f"  Rule {rule_info['rule_index'] + 1}: {rule_info['rule'][:80]}...")
+            logger.info(f"  Rule {rule_info['rule_index'] + 1}: {rule_info['rule']}")
             logger.info(f"    Classes satisfied: {rule_info['classes_satisfied']}")
             for class_val in rule_info['classes_satisfied']:
                 class_key = f"class_{class_val}"
@@ -1217,9 +1217,7 @@ def test_rules_from_json(
         if n_selected > 0:
             logger.info(f"  Selected rule indices: {selected_indices}")
             for idx, rule_str in enumerate(selected_rules, 1):
-                # Truncate long rules for readability
-                rule_display = rule_str[:100] + "..." if len(rule_str) > 100 else rule_str
-                logger.info(f"    Rule {idx} (index {selected_indices[idx-1]}): {rule_display}")
+                logger.info(f"    Rule {idx} (index {selected_indices[idx-1]}): {rule_str}")
         else:
             logger.info(f"  No rules selected (no rules met precision threshold {settings.get('precision_threshold', 0.9):.2f})")
         logger.info("")
