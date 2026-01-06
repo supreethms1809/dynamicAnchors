@@ -896,10 +896,13 @@ def plot_feature_importance_subplot(ax, summary: Optional[Dict], title: str, top
     
     for class_key, class_data in per_class.items():
         target_class = class_data.get("class", -1)
-        # Collect both instance-based and class-based rules
+        # Collect rules: instance-based plus union-level class-based rules (preferred),
+        # falling back to per-agent class-based rules for backward compatibility.
         unique_rules = class_data.get("unique_rules", [])
+        union_rules = class_data.get("class_union_unique_rules", [])
         class_based_unique_rules = class_data.get("class_based_unique_rules", [])
-        all_unique_rules = unique_rules + class_based_unique_rules
+        rules_for_class_based = union_rules if union_rules else class_based_unique_rules
+        all_unique_rules = unique_rules + rules_for_class_based
         
         for rule_str in all_unique_rules:
             intervals = extract_feature_intervals_from_rule(rule_str)

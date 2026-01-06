@@ -1031,6 +1031,7 @@ def extract_rules_from_policies(
     device: str = "cpu",
     exploration_mode: str = "sample",
     action_noise_scale: float = 0.05,
+    filter_by_prediction: bool = True,
 ) -> Dict[str, Any]:
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
@@ -1880,7 +1881,7 @@ def extract_rules_from_policies(
         
         # CRITICAL FIX: Sample instances from the correct dataset based on eval_on_test_data and coverage_on_all_data
         # This ensures consistency: if env evaluates on combined dataset, sample from combined dataset
-        # Also add prediction-match filtering to ensure original_pred == target_class
+        # Optionally add prediction-match filtering to ensure original_pred == target_class
         if coverage_on_all_data:
             # When coverage_on_all_data=True, env evaluates on combined dataset, so sample from combined dataset
             if env_data.get("X_test_unit") is not None:
@@ -1920,9 +1921,10 @@ def extract_rules_from_policies(
             y_data_for_filtering = env_data["y"]
             data_source_name = "training"
         
-        # CRITICAL FIX: Filter instances by classifier prediction to ensure original_pred == target_class
-        # This matches training behavior and prevents precision proxy depression
-        if len(class_instances) > 0:
+        # Optional prediction-match filtering: ensure original_pred == target_class
+        # NOTE: This matches training behavior when enabled, but for fair baseline comparison
+        # we often disable it (filter_by_prediction=False) via CLI / pipeline.
+        if filter_by_prediction and len(class_instances) > 0:
             # Get classifier predictions for all class instances
             X_class_std = X_data_std[class_instances]
             classifier_device = torch.device(device)
@@ -1940,11 +1942,17 @@ def extract_rules_from_policies(
             n_total = len(class_instances)
             
             if n_matching == 0:
-                logger.warning(f"  No instances found for class {target_class} with prediction matching target_class in {data_source_name} data, skipping...")
+                logger.warning(
+                    f"  No instances found for class {target_class} with prediction matching target_class "
+                    f"in {data_source_name} data, skipping..."
+                )
                 continue
             
             if n_matching < n_total:
-                logger.info(f"  Filtered instances for class {target_class}: {n_matching}/{n_total} have prediction matching target_class (using filtered set)")
+                logger.info(
+                    f"  Filtered instances for class {target_class}: {n_matching}/{n_total} have prediction "
+                    f"matching target_class (using filtered set)"
+                )
             
             # Use filtered instances
             class_instances = matching_indices
@@ -3552,6 +3560,22 @@ def main():
     )
     
     parser.add_argument(
+        "--filter_by_prediction",
+        action="store_true",
+        default=True,
+        help="If True (default), filter instances where classifier prediction matches target_class. "
+             "Set to False for fair comparison with baselines that do not apply prediction filtering."
+    )
+    
+    parser.add_argument(
+        "--no_filter_by_prediction",
+        action="store_false",
+        dest="filter_by_prediction",
+        help="Disable prediction filtering (equivalent to --filter_by_prediction=False). "
+             "Use this for fair comparison with baseline methods."
+    )
+    
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -3626,6 +3650,7 @@ def main():
         device=args.device,
         exploration_mode=args.exploration_mode,
         action_noise_scale=args.action_noise_scale,
+        filter_by_prediction=args.filter_by_prediction,
     )
     
     # Save results

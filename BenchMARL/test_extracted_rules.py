@@ -736,6 +736,7 @@ def test_rules_from_json(
     rules_file: str,
     dataset_name: str,
     use_test_data: bool = True,
+    use_full_dataset: bool = False,
     seed: int = 42,
     precision_threshold: float = 0.9,
     max_rules_per_class: int = -1,
@@ -758,7 +759,10 @@ def test_rules_from_json(
     logger.info("="*80)
     logger.info(f"Rules file: {rules_file}")
     logger.info(f"Dataset: {dataset_name}")
-    logger.info(f"Data split: {'test' if use_test_data else 'training'}")
+    if use_full_dataset:
+        logger.info("Data split: full (train + test combined)")
+    else:
+        logger.info(f"Data split: {'test' if use_test_data else 'training'}")
     logger.info("="*80)
     
     # Load rules from JSON
@@ -817,7 +821,11 @@ def test_rules_from_json(
     
     # Get data (in standardized feature space, matching the denormalized rules)
     # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)
-    if use_test_data:
+    if use_full_dataset:
+        X_data = np.vstack([dataset_loader.X_train_scaled, dataset_loader.X_test_scaled])
+        y_data = np.concatenate([dataset_loader.y_train, dataset_loader.y_test])
+        data_type = "full (train+test)"
+    elif use_test_data:
         X_data = dataset_loader.X_test_scaled  # Standardized feature space (matches rule space)
         y_data = dataset_loader.y_test
         data_type = "test"
@@ -1406,6 +1414,12 @@ Examples:
         help="Test on training data instead of test data (default: test data)"
     )
     
+    parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        help="Test on full dataset (train + test combined). Overrides --use_train_data / default test split."
+    )
+    
     
     parser.add_argument(
         "--seed",
@@ -1474,6 +1488,7 @@ Examples:
         rules_file=args.rules_file,
         dataset_name=args.dataset,
         use_test_data=not args.use_train_data,
+        use_full_dataset=args.use_full_dataset,
         seed=args.seed,
         precision_threshold=args.precision_threshold,
         max_rules_per_class=args.max_rules_per_class,

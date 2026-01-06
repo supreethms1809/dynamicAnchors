@@ -312,7 +312,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 90_000,
+    total_timesteps: int = 180_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -2260,6 +2260,7 @@ Examples:
     parser.add_argument(
         "--coverage_on_all_data",
         action="store_true",
+        default=True,
         help="If True, use full dataset (train+test) during rollouts. "
              "NOTE: Final metrics are ALWAYS computed on full dataset following original Anchors paper methodology, "
              "regardless of this flag. This flag only affects the dataset used during rollout environment evaluation. "
@@ -2493,12 +2494,14 @@ Examples:
         # Summarize and plot
         if single_agent_rules_file:
             sa_output_dir = output_path / "single_agent"
+            # Let the summarizer run tests so test metrics are included in summary/plots.
             run_summarize_and_plot(
                 rules_file=single_agent_rules_file,
                 dataset=args.dataset,
                 output_dir=str(sa_output_dir),
-                run_tests=False,  # Tests already run
-                seed=args.seed
+                run_tests=not args.skip_testing,
+                seed=args.seed,
+                use_full_dataset=True,
             )
             # Find summary file
             summary_file = sa_output_dir / "summary.json"
@@ -2560,6 +2563,8 @@ Examples:
         
         # Inference
         if not args.skip_inference and multi_agent_experiment_dir:
+            # CRITICAL: For fair comparison with baseline and single-agent, always use full dataset
+            # during multi-agent rollouts/metrics and disable prediction filtering here.
             multi_agent_rules_file = run_multi_agent_inference(
                 experiment_dir=multi_agent_experiment_dir,
                 dataset=args.dataset,
@@ -2567,7 +2572,8 @@ Examples:
                 steps_per_episode=args.steps_per_episode,
                 n_instances_per_class=args.n_instances_per_class,
                 device=args.device,
-                coverage_on_all_data=args.coverage_on_all_data
+                coverage_on_all_data=True,
+                filter_by_prediction=False,
             )
         elif args.skip_inference:
             logger.info("Inference skipped (--skip_inference). Looking for existing rules file...")
@@ -2599,12 +2605,14 @@ Examples:
         # Summarize and plot
         if multi_agent_rules_file:
             ma_output_dir = output_path / "multi_agent"
+            # Run tests inside the summarizer so test-based plots/JSON stay in sync.
             run_summarize_and_plot(
                 rules_file=multi_agent_rules_file,
                 dataset=args.dataset,
                 output_dir=str(ma_output_dir),
-                run_tests=False,  # Tests already run
-                seed=args.seed
+                run_tests=not args.skip_testing,
+                seed=args.seed,
+                use_full_dataset=True,
             )
             # Find summary file
             summary_file = ma_output_dir / "summary.json"

@@ -272,7 +272,7 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         unique_rules = class_data.get("unique_rules", [])
         all_rules = class_data.get("rules", [])
         
-        # Extract class-based rules
+        # Extract class-based rules (per-agent, pre-union)
         class_based_results = class_data.get("class_based_results", {})
         class_based_unique_rules = []
         class_based_all_rules = []
@@ -312,6 +312,9 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
             features = extract_features_from_rule(rule_str)
             feature_frequency.update(features)
         
+        # Also propagate union-level rule lists if present (already filtered in inference).
+        class_union_unique_rules = class_data.get("class_union_unique_rules", [])
+        
         class_summary = {
             "class": int(target_class),
             "agent": class_data.get("group", "unknown"),
@@ -341,6 +344,8 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
             "class_based_n_total_rules": len(class_based_all_rules),
             "class_based_n_unique_rules": len(class_based_unique_rules),
             "class_based_unique_rules": class_based_unique_rules,
+            # Union-level rules actually used for class-union metrics
+            "class_union_unique_rules": class_union_unique_rules,
         }
         
         # Add stds if available
@@ -542,7 +547,8 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax1.set_ylabel('Precision', fontsize=12, fontweight='bold')
     ax1.set_title(f'{title_prefix}: Instance-Level Precision vs Coverage', fontsize=14, fontweight='bold')
     ax1.set_xlim([-0.05, 1.05])
-    ax1.set_ylim([0.7, 1.05])
+    # Allow full precision range so regressions are visible
+    ax1.set_ylim([0.0, 1.05])
     ax1.grid(True, alpha=0.3, linestyle='--', zorder=0)
     ax1.legend(fontsize=10, loc='best', framealpha=0.9)
     # Add diagonal reference line (ideal: high precision, high coverage)
@@ -572,7 +578,7 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
     ax2.set_ylabel('Precision', fontsize=12, fontweight='bold')
     ax2.set_title(f'{title_prefix}: Class Union Precision vs Coverage', fontsize=14, fontweight='bold')
     ax2.set_xlim([-0.05, 1.05])
-    ax2.set_ylim([0.7, 1.05])
+    ax2.set_ylim([0.0, 1.05])
     ax2.grid(True, alpha=0.3, linestyle='--', zorder=0)
     ax2.legend(fontsize=10, loc='best', framealpha=0.9)
     # Add diagonal reference line (ideal: high precision, high coverage)
@@ -604,7 +610,7 @@ def plot_precision_coverage_tradeoff(summary: Dict, output_dir: str, dataset_nam
         ax3.set_ylabel('Precision', fontsize=12, fontweight='bold')
         ax3.set_title(f'{title_prefix}: Class-Level Precision vs Coverage', fontsize=14, fontweight='bold')
         ax3.set_xlim([-0.05, 1.05])
-        ax3.set_ylim([0.7, 1.05])
+        ax3.set_ylim([0.0, 1.05])
         ax3.grid(True, alpha=0.3, linestyle='--', zorder=0)
         ax3.legend(fontsize=10, loc='best', framealpha=0.9)
         # Add diagonal reference line (ideal: high precision, high coverage)
@@ -1768,6 +1774,13 @@ Examples:
     )
     
     parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        help="Use full dataset (train + test combined) for testing (if --run_tests is used). "
+             "Overrides --use_train_data / default test split."
+    )
+    
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -1844,7 +1857,8 @@ Examples:
             rules_file=str(rules_file),
             dataset_name=args.dataset,
             use_test_data=not args.use_train_data,
-            seed=args.seed
+            use_full_dataset=args.use_full_dataset,
+            seed=args.seed,
         )
         # Save test results
         test_results_file = output_dir / "test_results.json"
