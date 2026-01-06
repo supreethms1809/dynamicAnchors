@@ -36,6 +36,54 @@ from test_extracted_rules_single import test_rules_from_json, parse_rule
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+    
+    Args:
+        obj: Object that may contain numpy types
+        
+    Returns:
+        Object with numpy types converted to native Python types
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, dict):
+        # CRITICAL: Convert both keys and values to handle numpy types in dictionary keys
+        converted_dict = {}
+        for k, v in obj.items():
+            # Convert key if it's a numpy type
+            if isinstance(k, np.integer):
+                converted_key = int(k)
+            elif isinstance(k, np.floating):
+                # JSON doesn't accept float keys, convert to string
+                converted_key = str(float(k))
+            elif isinstance(k, np.bool_):
+                converted_key = bool(k)
+            else:
+                converted_key = k
+            converted_dict[converted_key] = convert_numpy_types(v)
+        return converted_dict
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, (bool, type(None), int, float, str)):
+        return obj
+    else:
+        # Try to convert if it's a NumPy scalar (fallback)
+        try:
+            if hasattr(obj, 'item'):
+                return obj.item()
+        except (ValueError, AttributeError, TypeError):
+            pass
+        return obj
+
 try:
     import matplotlib
     matplotlib.use('Agg')  # Use non-interactive backend
@@ -1578,9 +1626,9 @@ def save_consolidated_metrics(summary: Dict, dataset_name: str, output_file: str
     
     consolidated["timing"] = timing
     
-    # Save to file
+    # Save to file (convert numpy types to native Python types first)
     with open(output_file, 'w') as f:
-        json.dump(consolidated, f, indent=2)
+        json.dump(convert_numpy_types(consolidated), f, indent=2)
     
     logger.info(f"Saved consolidated metrics to {output_file}")
 
@@ -1726,10 +1774,10 @@ Examples:
             use_full_dataset=args.use_full_dataset,
             seed=args.seed
         )
-        # Save test results
+        # Save test results (convert numpy types to native Python types first)
         test_results_file = output_dir / "test_results.json"
         with open(test_results_file, 'w') as f:
-            json.dump(test_results, f, indent=2)
+            json.dump(convert_numpy_types(test_results), f, indent=2)
         logger.info(f"Saved test results to {test_results_file}")
     elif args.test_results_file:
         logger.info(f"Loading test results from {args.test_results_file}...")
@@ -1754,13 +1802,13 @@ Examples:
     report_file = output_dir / "summary_report.txt"
     generate_summary_report(summary, test_results, str(report_file))
     
-    # Save summary JSON
+    # Save summary JSON (convert numpy types to native Python types first)
     summary_file = output_dir / "summary.json"
     with open(summary_file, 'w') as f:
-        json.dump({
+        json.dump(convert_numpy_types({
             "summary": summary,
             "test_results": test_results
-        }, f, indent=2)
+        }), f, indent=2)
     logger.info(f"Saved summary JSON to {summary_file}")
     
     # Save consolidated metrics JSON (easy to copy)

@@ -2618,10 +2618,9 @@ class AnchorTrainer:
             "inter_class_overlap_weight": 0.1,
             "shared_reward_weight": 0.2,
             "use_class_centroids": True,
-            "max_termination_count_excellent_precision": 30,
+            "max_termination_count_excellent_precision": 100,
             "max_termination_count_both_targets": -1,
             "max_termination_count_high_precision": 200,
-            "max_termination_count_both_close": 50,
+            "max_termination_count_both_close": 100,
             "logging_verbosity": "normal",  # Default logging verbosity
         }
-
