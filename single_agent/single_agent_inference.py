@@ -46,6 +46,201 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
+def canonicalize_rule_key(
+    lower_bounds_normalized: np.ndarray,
+    upper_bounds_normalized: np.ndarray,
+    min_width: float = 0.05,
+    epsilon: Optional[float] = None
+) -> str:
+    """
+    Create a canonical rule key from normalized bounds for deduplication.
+    
+    Steps:
+    1. Quantize bounds to epsilon grid
+    2. Drop near-full-range features (lower <= eps & upper >= 1 - eps)
+    3. Sort by feature index
+    4. Return string key
+    
+    Args:
+        lower_bounds_normalized: Lower bounds in [0, 1] normalized space
+        upper_bounds_normalized: Upper bounds in [0, 1] normalized space
+        min_width: Minimum width (used to compute epsilon if not provided)
+        epsilon: Quantization step size (default: max(1e-3, min_width/4))
+    
+    Returns:
+        Canonical rule key as string
+    """
+    lower = np.array(lower_bounds_normalized, dtype=np.float32).flatten()
+    upper = np.array(upper_bounds_normalized, dtype=np.float32).flatten()
+    
+    # Compute epsilon for quantization
+    if epsilon is None:
+        epsilon = max(1e-3, min_width / 4.0)
+    
+    # Quantize bounds to epsilon grid
+    lower_quantized = np.round(lower / epsilon) * epsilon
+    upper_quantized = np.round(upper / epsilon) * epsilon
+    
+    # Clip to valid range [0, 1]
+    lower_quantized = np.clip(lower_quantized, 0.0, 1.0)
+    upper_quantized = np.clip(upper_quantized, 0.0, 1.0)
+    
+    # Drop near-full-range features (features that haven't been tightened)
+    # A feature is near-full-range if: lower <= eps AND upper >= 1 - eps
+    tightened_mask = ~((lower_quantized <= epsilon) & (upper_quantized >= 1.0 - epsilon))
+    tightened_indices = np.where(tightened_mask)[0]
+    
+    if len(tightened_indices) == 0:
+        # No tightened features - return special key
+        return "any_values"
+    
+    # Extract only tightened features and sort by feature index
+    tightened_lower = lower_quantized[tightened_indices]
+    tightened_upper = upper_quantized[tightened_indices]
+    
+    # Sort by feature index for canonical ordering
+    sort_order = np.argsort(tightened_indices)
+    tightened_indices_sorted = tightened_indices[sort_order]
+    tightened_lower_sorted = tightened_lower[sort_order]
+    tightened_upper_sorted = tightened_upper[sort_order]
+    
+    # Create canonical key: "f1:l1:u1;f2:l2:u2;..."
+    key_parts = [f"{idx}:{lo:.6f}:{hi:.6f}" 
+                 for idx, lo, hi in zip(tightened_indices_sorted, tightened_lower_sorted, tightened_upper_sorted)]
+    
+    return ";".join(key_parts)
+
+
+def compute_box_iou(
+    lower1: np.ndarray,
+    upper1: np.ndarray,
+    lower2: np.ndarray,
+    upper2: np.ndarray
+) -> float:
+    """
+    Compute Intersection over Union (IoU) between two bounding boxes in normalized [0,1] space.
+    
+    Args:
+        lower1: Lower bounds of first box (n_features,)
+        upper1: Upper bounds of first box (n_features,)
+        lower2: Lower bounds of second box (n_features,)
+        upper2: Upper bounds of second box (n_features,)
+    
+    Returns:
+        IoU value in [0, 1]
+    """
+    lower1 = np.array(lower1, dtype=np.float32).flatten()
+    upper1 = np.array(upper1, dtype=np.float32).flatten()
+    lower2 = np.array(lower2, dtype=np.float32).flatten()
+    upper2 = np.array(upper2, dtype=np.float32).flatten()
+    
+    if len(lower1) != len(upper1) or len(lower2) != len(upper2) or len(lower1) != len(lower2):
+        return 0.0
+    
+    # Compute intersection: max of lower bounds, min of upper bounds
+    intersect_lower = np.maximum(lower1, lower2)
+    intersect_upper = np.minimum(upper1, upper2)
+    
+    # Intersection volume (only where intersect_lower < intersect_upper)
+    intersect_widths = np.maximum(0.0, intersect_upper - intersect_lower)
+    intersection_volume = np.prod(intersect_widths)
+    
+    # Compute union volumes
+    volume1 = np.prod(np.maximum(0.0, upper1 - lower1))
+    volume2 = np.prod(np.maximum(0.0, upper2 - lower2))
+    union_volume = volume1 + volume2 - intersection_volume
+    
+    if union_volume <= 0.0:
+        return 0.0
+    
+    iou = intersection_volume / union_volume
+    return float(iou)
+
+
+def nms_deduplicate_anchors(
+    anchors_list: List[Dict[str, Any]],
+    iou_threshold: float = 0.9,
+    key_precision: str = "precision_recomputed",
+    key_coverage: str = "coverage_recomputed",
+    fallback_precision: str = "precision",
+    fallback_coverage: str = "coverage"
+) -> List[Dict[str, Any]]:
+    """
+    Non-Maximum Suppression (NMS) for anchor deduplication using IoU.
+    
+    Ranks anchors by precision (tie-break by coverage), then keeps a rule only if
+    its box IoU with all kept rules is below the threshold.
+    
+    Args:
+        anchors_list: List of anchor dictionaries with bounds and metrics
+        iou_threshold: IoU threshold for considering anchors as duplicates (default: 0.9)
+        key_precision: Key for precision metric (prefer recomputed)
+        key_coverage: Key for coverage metric (prefer recomputed)
+        fallback_precision: Fallback key for precision if primary not found
+        fallback_coverage: Fallback key for coverage if primary not found
+    
+    Returns:
+        Filtered list of anchors after NMS
+    """
+    if len(anchors_list) == 0:
+        return []
+    
+    # Extract bounds and metrics for each anchor
+    anchor_data = []
+    for i, anchor in enumerate(anchors_list):
+        lower = anchor.get("lower_bounds_normalized")
+        upper = anchor.get("upper_bounds_normalized")
+        
+        if lower is None or upper is None:
+            # Skip anchors without bounds
+            continue
+        
+        lower = np.array(lower, dtype=np.float32)
+        upper = np.array(upper, dtype=np.float32)
+        
+        # Get precision and coverage (prefer recomputed, fallback to primary)
+        precision = anchor.get(key_precision, anchor.get(fallback_precision, 0.0))
+        coverage = anchor.get(key_coverage, anchor.get(fallback_coverage, 0.0))
+        
+        anchor_data.append({
+            "index": i,
+            "anchor": anchor,
+            "lower": lower,
+            "upper": upper,
+            "precision": float(precision),
+            "coverage": float(coverage),
+            "score": float(precision)  # Primary sort by precision
+        })
+    
+    if len(anchor_data) == 0:
+        return []
+    
+    # Sort by precision (descending), tie-break by coverage (descending)
+    anchor_data.sort(key=lambda x: (x["precision"], x["coverage"]), reverse=True)
+    
+    # Greedy NMS: keep anchors with IoU < threshold with all previously kept anchors
+    kept = []
+    for current in anchor_data:
+        is_duplicate = False
+        
+        # Check IoU with all previously kept anchors
+        for kept_anchor in kept:
+            iou = compute_box_iou(
+                current["lower"], current["upper"],
+                kept_anchor["lower"], kept_anchor["upper"]
+            )
+            
+            if iou >= iou_threshold:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            kept.append(current)
+    
+    # Return original anchor dictionaries in order
+    return [anchor_data[i]["anchor"] for i in sorted(a["index"] for a in kept)]
+
+
 def compute_anchor_metrics_on_full_dataset(
     lower_bounds_normalized: np.ndarray,
     upper_bounds_normalized: np.ndarray,
@@ -54,9 +249,11 @@ def compute_anchor_metrics_on_full_dataset(
     original_instance_unit: np.ndarray,
     original_instance_std: np.ndarray,
     original_prediction: int,
-    classifier,
-    device: str,
-    target_class: int
+    full_predictions: np.ndarray,
+    classifier=None,
+    device: str = "cpu",
+    target_class: int = None,
+    validate_with_classifier: bool = False
 ) -> Tuple[float, float]:
     """
     Compute precision and coverage for a single anchor on the full dataset.
@@ -76,12 +273,17 @@ def compute_anchor_metrics_on_full_dataset(
         original_instance_unit: The instance that this anchor explains (in normalized [0,1] space)
         original_instance_std: The instance that this anchor explains (in standardized space)
         original_prediction: The model's prediction for the original instance
-        classifier: Trained classifier model (expects standardized data)
-        device: Device to run classifier on
-        target_class: Target class for this anchor
+        full_predictions: Pre-computed predictions for all instances in X_full_std (numpy array of shape (n_samples,))
+        classifier: Trained classifier model (optional, only used for validation if validate_with_classifier=True)
+        device: Device to run classifier on (only used for validation)
+        target_class: Target class for this anchor (optional, only used for validation/logging)
+        validate_with_classifier: If True, validate predictions using classifier (expensive, for debugging only)
     
     Returns:
-        Tuple of (precision, coverage) on the full dataset
+        Tuple of (precision, coverage, n_in_box) on the full dataset
+        - precision: P(f(x) = f(x_original) | x satisfies anchor) for instance-based
+        - coverage: P(x satisfies anchor)
+        - n_in_box: Number of instances that satisfy the anchor (support count for weighting)
     """
     # Determine which instances satisfy the anchor
     # An instance satisfies the anchor if it's within all feature bounds
@@ -109,15 +311,9 @@ def compute_anchor_metrics_on_full_dataset(
         # No instances satisfy the anchor
         precision = 0.0
     else:
-        # Get predictions for all instances that satisfy the anchor
-        # CRITICAL: Use X_full_std (standardized) for classifier, not X_full_unit (unit space)
-        # Classifier expects standardized data (mean=0, std=1), not unit space [0,1]
-        X_in_anchor_std = X_full_std[anchor_mask]
-        classifier.eval()
-        with torch.no_grad():
-            X_tensor = torch.from_numpy(X_in_anchor_std.astype(np.float32)).to(device)
-            logits = classifier(X_tensor)
-            predictions = logits.argmax(dim=1).cpu().numpy()
+        # Use pre-computed predictions (much faster than running classifier per anchor)
+        # Extract predictions for samples that satisfy the anchor
+        predictions_in_anchor = full_predictions[anchor_mask]
         
         # VALIDATION: Check if original instance is in the anchor box
         # The original instance should always be in the box (environment ensures this)
@@ -128,10 +324,11 @@ def compute_anchor_metrics_on_full_dataset(
                 f"Original instance bounds check: lower={lower[:3]} (first 3), upper={upper[:3]} (first 3), "
                 f"original_instance_unit={original_instance_unit[:3]} (first 3)"
             )
-        else:
+        elif validate_with_classifier and classifier is not None:
+            # Optional validation: verify predictions using classifier (expensive, for debugging only)
             # Verify original instance's prediction matches stored original_prediction
-            # Use standardized instance for prediction (classifier expects standardized data)
             original_tensor = torch.from_numpy(original_instance_std.astype(np.float32)).unsqueeze(0).to(device)
+            classifier.eval()
             with torch.no_grad():
                 original_logits = classifier(original_tensor)
                 original_pred_computed = int(original_logits.argmax(dim=1).cpu().numpy()[0])
@@ -141,14 +338,21 @@ def compute_anchor_metrics_on_full_dataset(
                     f"  WARNING: Original instance's computed prediction ({original_pred_computed}) "
                     f"!= stored original_prediction ({original_prediction}). This may cause precision calculation issues."
                 )
+            
+            # Use target_class for diagnostics: verify original prediction matches target class (if expected)
+            if target_class is not None and original_pred_computed != target_class:
+                logger.debug(
+                    f"  Note: Original instance prediction ({original_pred_computed}) != target_class ({target_class}). "
+                    f"This is expected when using prediction routing or when instance belongs to different class."
+                )
         
         # Count how many have the same prediction as the original instance
-        n_matching_pred = (predictions == original_prediction).sum()
+        n_matching_pred = (predictions_in_anchor == original_prediction).sum()
         precision = float(n_matching_pred / n_in_anchor)
         
         # DEBUG: Log precision calculation details when precision is exactly 1.0 with multiple instances
         if precision == 1.0 and n_in_anchor > 1:
-            unique_preds, counts = np.unique(predictions, return_counts=True)
+            unique_preds, counts = np.unique(predictions_in_anchor, return_counts=True)
             logger.debug(
                 f"  DEBUG: Precision=1.0 with n_in_anchor={n_in_anchor}, n_matching_pred={n_matching_pred}, "
                 f"coverage={coverage:.4f}. Unique predictions in box: {dict(zip(unique_preds, counts))}, "
@@ -168,7 +372,7 @@ def compute_anchor_metrics_on_full_dataset(
     assert 0.0 <= precision <= 1.0, f"Precision {precision} out of range [0, 1]"
     assert 0.0 <= coverage <= 1.0, f"Coverage {coverage} out of range [0, 1]"
     
-    return precision, coverage
+    return precision, coverage, int(n_in_anchor)
 
 
 def run_single_agent_rollout(
@@ -318,20 +522,14 @@ def _process_instances_for_class(
     for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
         # Get the actual instance from the dataset
         x_instance = X_data_unit[data_instance_idx]
+        x_instance_std = X_data_std[data_instance_idx]
         
-        # Get original prediction for this instance
-        # Map instance index to full dataset index
-        if use_full_for_sampling:
-            # Instance is already from full dataset
-            full_instance_idx = data_instance_idx
-        elif eval_on_test_data and env_data.get("X_test_unit") is not None:
-            # Instance is from test data, need to offset
-            full_instance_idx = len(env_data["X_unit"]) + data_instance_idx
-        else:
-            # Instance is from train data
-            full_instance_idx = data_instance_idx
-        
-        original_prediction = full_predictions[full_instance_idx]
+        # Compute original prediction directly from the instance vector (avoid fragile index mapping)
+        classifier.eval()
+        with torch.no_grad():
+            instance_tensor = torch.from_numpy(x_instance_std.astype(np.float32)).unsqueeze(0).to(device)
+            logits = classifier(instance_tensor)
+            original_prediction = int(logits.argmax(dim=1).cpu().numpy()[0])
         
         logger.info(f"\n  Instance {instance_idx_in_range + 1}/{n_samples} (data index {data_instance_idx}): Running {n_rollouts_per_instance} rollouts")
         
@@ -399,6 +597,14 @@ def _process_instances_for_class(
                 "y_test": env_data.get("y_test")
             })
         
+        # Track anchors seen so far for this instance (for early stopping)
+        seen_canonical_keys = set()
+        seen_anchors_for_instance = []  # Store anchors with bounds for IoU checking
+        
+        # Track anchors seen so far for this instance (for early stopping duplicates)
+        seen_canonical_keys = set()
+        seen_anchors_for_instance = []  # Store anchors with bounds for IoU checking
+        
         # Run multiple rollouts for this instance
         for rollout_idx in range(n_rollouts_per_instance):
             rollout_seed = seed + (instance_idx_in_range * n_rollouts_per_instance) + rollout_idx if seed is not None else None
@@ -408,7 +614,7 @@ def _process_instances_for_class(
                 X_std=env_X_std,
                 y=env_y,
                 feature_names=feature_names,
-                classifier=dataset_loader.get_classifier(),
+                classifier=classifier,
                 device=device,
                 target_class=target_class,
                 env_config=inference_env_config
@@ -433,10 +639,6 @@ def _process_instances_for_class(
             logger.info(f"    Rollout {rollout_idx + 1}/{n_rollouts_per_instance} for instance {data_instance_idx}: "
                       f"Precision={precision:.4f}, Coverage={coverage:.4f}, "
                       f"Class-Conditional Coverage={coverage_class_conditional:.4f}")
-            
-            precisions.append(float(precision))
-            coverages.append(float(coverage))
-            rollout_times.append(float(rollout_time))
         
             # Extract rule from final bounds
             rule = "any values (no tightened features)"
@@ -465,7 +667,7 @@ def _process_instances_for_class(
                     X_std=env_X_std,
                     y=env_y,
                     feature_names=feature_names,
-                    classifier=dataset_loader.get_classifier(),
+                    classifier=classifier,
                     device="cpu",
                     target_class=target_class,
                     env_config=env_config
@@ -478,25 +680,30 @@ def _process_instances_for_class(
                 initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
                 initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
                 
-                rule = temp_env.extract_rule(
+                rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
                     initial_lower=initial_lower_normalized,
                     initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
+            else:
+                # No bounds - use default canonical key
+                canonical_key = "any_values"
             
             anchor_data = {
                 "instance_idx": instance_idx_in_range,
                 "rollout_idx": rollout_idx,
                 "data_instance_idx": int(data_instance_idx),
                 "rollout_type": "instance_based",
-                "precision": float(precision),
-                "coverage": float(coverage),
-                "coverage_class_conditional": float(coverage_class_conditional),
+                # Rollout-estimated metrics (computed during rollout using perturbation samples)
+                "precision_rollout_estimated": float(precision),
+                "coverage_rollout_estimated": float(coverage),
+                "coverage_class_conditional_rollout_estimated": float(coverage_class_conditional),
                 "total_reward": float(episode_data.get("total_reward", 0.0)),
                 "n_steps": int(episode_data.get("n_steps", 0)),
                 "rollout_time_seconds": float(rollout_time),
                 "rule": rule,
+                "canonical_key": canonical_key,  # Canonical key for deduplication
                 "original_prediction": int(original_prediction),
             }
             
@@ -510,7 +717,53 @@ def _process_instances_for_class(
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
                 })
             
-            instance_rollouts.append(anchor_data)
+            # Check for early stopping: if anchor is too similar to existing ones, skip adding it
+            # (This reduces duplicates at source)
+            early_stop_iou_threshold = env_config.get("early_stop_iou_threshold", 0.95)  # Default: 0.95 (very similar)
+            is_duplicate = False
+            
+            if lower_normalized is not None and upper_normalized is not None:
+                # Check canonical key first (fast check)
+                if canonical_key in seen_canonical_keys:
+                    is_duplicate = True
+                    logger.debug(f"    Rollout {rollout_idx + 1}: Skipping duplicate (canonical key match)")
+                else:
+                    # Check IoU with existing anchors (more expensive but catches near-duplicates)
+                    for seen_anchor in seen_anchors_for_instance:
+                        seen_lower = seen_anchor["lower"]
+                        seen_upper = seen_anchor["upper"]
+                        iou = compute_box_iou(lower_normalized, upper_normalized, seen_lower, seen_upper)
+                        if iou >= early_stop_iou_threshold:
+                            is_duplicate = True
+                            logger.debug(f"    Rollout {rollout_idx + 1}: Skipping near-duplicate (IoU={iou:.4f} >= {early_stop_iou_threshold})")
+                            break
+            
+            if not is_duplicate:
+                instance_rollouts.append(anchor_data)
+                if canonical_key not in seen_canonical_keys:
+                    seen_canonical_keys.add(canonical_key)
+                if lower_normalized is not None and upper_normalized is not None:
+                    seen_anchors_for_instance.append({
+                        "lower": lower_normalized.copy(),
+                        "upper": upper_normalized.copy()
+                    })
+        
+        # After all rollouts for this instance are done:
+        # 0. (Optional) Reduce duplicates at source: keep top-K anchors per instance by precision/coverage score
+        #    This reduces the number of anchors to recompute and deduplicate later
+        top_k_per_instance = env_config.get("top_k_anchors_per_instance", None)
+        if top_k_per_instance is not None and top_k_per_instance > 0 and len(instance_rollouts) > top_k_per_instance:
+            # Score anchors by precision * coverage (simple product score)
+            scores = []
+            for rollout_data in instance_rollouts:
+                prec = rollout_data.get("precision_rollout_estimated", 0.0)
+                cov = rollout_data.get("coverage_rollout_estimated", 0.0)
+                scores.append(prec * cov)
+            
+            # Sort by score (descending) and keep top-K
+            sorted_indices = np.argsort(scores)[::-1]
+            instance_rollouts = [instance_rollouts[i] for i in sorted_indices[:top_k_per_instance]]
+            logger.debug(f"  Kept top {top_k_per_instance} anchors per instance (from {len(sorted_indices)} rollouts)")
         
         # After all rollouts for this instance are done:
         # 1. Recompute precision and coverage on full dataset for each anchor
@@ -518,110 +771,201 @@ def _process_instances_for_class(
         # 3. Average filtered anchors for this instance
         logger.info(f"\n  Processing {len(instance_rollouts)} rollouts for instance {data_instance_idx}...")
         
-        # Recompute metrics on full dataset for each rollout
-        x_instance_std = X_full_std[full_instance_idx]
+        # x_instance_std was already computed directly from X_data_std[data_instance_idx] above
+        # This avoids fragile index mapping - we use the instance vector directly rather than looking it up
+        # The instance is the same regardless of whether it came from train/test/full dataset
         
-        filtered_instance_rollouts = []
+        # Step 1: Recompute metrics on appropriate dataset based on flags
+        valid_rollouts = []
+        # Select dataset for recomputation based on eval_on_test_data and coverage_on_all_data flags
+        # This ensures metrics match training logs and user expectations
+        if coverage_on_all_data:
+            # Use full dataset (train + test) if explicitly requested
+            if env_data.get("X_test_unit") is not None:
+                X_recompute_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                X_recompute_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                y_recompute = np.concatenate([env_data["y"], env_data["y_test"]])
+                recompute_data_source = "full (train + test)"
+            else:
+                X_recompute_unit = env_data["X_unit"]
+                X_recompute_std = env_data["X_std"]
+                y_recompute = env_data["y"]
+                recompute_data_source = "training"
+        elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+            # Use test data only (matches training evaluation and original Anchor paper)
+            X_recompute_unit = env_data["X_test_unit"]
+            X_recompute_std = env_data["X_test_std"]
+            y_recompute = env_data["y_test"]
+            recompute_data_source = "test"
+        else:
+            # Fallback: Use training data if test data not available
+            X_recompute_unit = env_data["X_unit"]
+            X_recompute_std = env_data["X_std"]
+            y_recompute = env_data["y"]
+            recompute_data_source = "training"
+        
+        logger.debug(f"  Recomputing metrics on {recompute_data_source} data (eval_on_test_data={eval_on_test_data}, coverage_on_all_data={coverage_on_all_data})")
+        
+        # Compute predictions for recompute dataset once (much faster than per-anchor)
+        # This is a critical performance optimization - avoids running classifier per anchor
+        # Check if passed-in full_predictions aligns with recompute dataset (can reuse if it matches)
+        use_passed_predictions = False
+        if full_predictions is not None and len(full_predictions) == len(X_recompute_std):
+            # Check if X_full_std matches X_recompute_std (they should be the same arrays or same content)
+            if (X_full_std is X_recompute_std) or (np.array_equal(X_full_std, X_recompute_std)):
+                full_predictions_recompute = full_predictions
+                use_passed_predictions = True
+                logger.debug(f"  Reusing passed-in full_predictions for recompute dataset ({len(full_predictions)} samples)")
+        
+        if not use_passed_predictions:
+            # Compute predictions for recompute dataset
+            classifier.eval()
+            with torch.no_grad():
+                X_recompute_tensor = torch.from_numpy(X_recompute_std.astype(np.float32)).to(device)
+                full_logits_recompute = classifier(X_recompute_tensor)
+                full_predictions_recompute = full_logits_recompute.argmax(dim=1).cpu().numpy()
+        
         for rollout_data in instance_rollouts:
             if rollout_data.get("lower_bounds_normalized") is not None and rollout_data.get("upper_bounds_normalized") is not None:
                 lower_norm = np.array(rollout_data["lower_bounds_normalized"], dtype=np.float32)
                 upper_norm = np.array(rollout_data["upper_bounds_normalized"], dtype=np.float32)
                 
-                # Recompute precision and coverage on full dataset
-                prec_full, cov_full = compute_anchor_metrics_on_full_dataset(
+                # Recompute precision and coverage on selected dataset (respects eval_on_test_data and coverage_on_all_data)
+                # Use pre-computed predictions for performance (avoids running classifier per anchor)
+                prec_full, cov_full, n_in_box = compute_anchor_metrics_on_full_dataset(
                     lower_bounds_normalized=lower_norm,
                     upper_bounds_normalized=upper_norm,
-                    X_full_unit=X_full_unit,
-                    X_full_std=X_full_std,
+                    X_full_unit=X_recompute_unit,
+                    X_full_std=X_recompute_std,
                     original_instance_unit=x_instance,
                     original_instance_std=x_instance_std,
                     original_prediction=rollout_data["original_prediction"],
+                    full_predictions=full_predictions_recompute,
                     classifier=classifier,
                     device=device,
-                    target_class=target_class
+                    target_class=target_class,
+                    validate_with_classifier=False
                 )
                 
+                # Recompute class-conditional coverage on selected dataset (for consistency)
+                # P(x in box | y = target_class) on selected dataset
+                in_box_mask = np.all((X_recompute_unit >= lower_norm) & (X_recompute_unit <= upper_norm), axis=1)
+                class_mask = (y_recompute == target_class)
+                n_class_samples = class_mask.sum()
+                if n_class_samples > 0:
+                    n_class_in_box = (in_box_mask & class_mask).sum()
+                    cov_class_conditional_full = float(n_class_in_box / n_class_samples)
+                else:
+                    cov_class_conditional_full = 0.0
+                
                 # DEBUG: Log precision change when significant
-                prec_original = rollout_data["precision"]
-                if abs(prec_full - prec_original) > 0.05:  # Log if difference > 5%
+                prec_rollout = rollout_data.get("precision_rollout_estimated", 0.0)
+                if abs(prec_full - prec_rollout) > 0.05:  # Log if difference > 5%
                     logger.info(
-                        f"    Rollout {rollout_data['rollout_idx']}: Precision changed from {prec_original:.4f} "
-                        f"(during rollout, using perturbation samples) to {prec_full:.4f} "
+                        f"    Rollout {rollout_data['rollout_idx']}: Precision changed from {prec_rollout:.4f} "
+                        f"(rollout-estimated, using perturbation samples) to {prec_full:.4f} "
                         f"(recomputed on full dataset with actual instances)"
                     )
                 
-                # Update with full dataset metrics
-                rollout_data["precision_full_dataset"] = float(prec_full)
-                rollout_data["coverage_full_dataset"] = float(cov_full)
-                rollout_data["precision_original"] = rollout_data["precision"]
-                rollout_data["coverage_original"] = rollout_data["coverage"]
+                # Store recomputed metrics (computed on full dataset)
+                rollout_data["precision_recomputed"] = float(prec_full)
+                rollout_data["coverage_recomputed"] = float(cov_full)
+                rollout_data["coverage_class_conditional_recomputed"] = float(cov_class_conditional_full)
+                rollout_data["n_in_box"] = int(n_in_box)  # Support count for weighting
+                rollout_data["n_class_in_box"] = int(n_class_in_box) if n_class_samples > 0 else 0  # Class-conditional support count
+                
+                # Set primary metrics to recomputed values (these are the metrics we use for evaluation)
                 rollout_data["precision"] = float(prec_full)
                 rollout_data["coverage"] = float(cov_full)
+                rollout_data["coverage_class_conditional"] = float(cov_class_conditional_full)
+                
+                # Append to valid_rollouts (has recomputed metrics)
+                valid_rollouts.append(rollout_data)
             else:
                 logger.warning(f"    Rollout {rollout_data['rollout_idx']} has no normalized bounds, skipping")
                 continue
         
-        # Filter bad anchors for this instance
+        # Step 2: Filter bad anchors for this instance (from valid_rollouts)
+        kept_rollouts = []
         if filter_low_quality_rollouts:
             if min_precision_threshold is None:
                 precision_target = env_config.get("precision_target", 0.95)
                 min_precision_threshold = precision_target * 0.8
             
-            for rollout_data in instance_rollouts:
-                if "precision_full_dataset" not in rollout_data:
-                    continue
-                
-                anchor_precision = rollout_data["precision_full_dataset"]
-                anchor_coverage = rollout_data["coverage_full_dataset"]
+            for rollout_data in valid_rollouts:
+                anchor_precision = rollout_data["precision_recomputed"]
+                anchor_coverage = rollout_data["coverage_recomputed"]
                 
                 if anchor_precision >= min_precision_threshold and anchor_coverage >= min_coverage_threshold:
-                    filtered_instance_rollouts.append(rollout_data)
+                    kept_rollouts.append(rollout_data)
                     logger.debug(f"    ✓ Kept rollout {rollout_data['rollout_idx']}: precision={anchor_precision:.4f}, coverage={anchor_coverage:.4f}")
                 else:
                     logger.debug(f"    ✗ Discarded rollout {rollout_data['rollout_idx']}: precision={anchor_precision:.4f} (< {min_precision_threshold:.3f}) or "
                                f"coverage={anchor_coverage:.4f} (< {min_coverage_threshold:.3f})")
             
-            if len(filtered_instance_rollouts) == 0:
-                logger.warning(f"  WARNING: All {len(instance_rollouts)} rollouts for instance {data_instance_idx} were filtered out! Using all rollouts with valid metrics as fallback.")
-                filtered_instance_rollouts = [r for r in instance_rollouts if "precision_full_dataset" in r]
-                if len(filtered_instance_rollouts) == 0:
-                    logger.warning(f"  WARNING: No rollouts with valid metrics found! Using all rollouts (may have missing metrics).")
-                    filtered_instance_rollouts = instance_rollouts
+            if len(kept_rollouts) == 0:
+                logger.warning(f"  WARNING: All {len(valid_rollouts)} valid rollouts for instance {data_instance_idx} were filtered out! Using all valid rollouts as fallback.")
+                kept_rollouts = valid_rollouts
+                if len(kept_rollouts) == 0:
+                    logger.warning(f"  WARNING: No valid rollouts found! Using all rollouts (may have missing metrics).")
+                    kept_rollouts = instance_rollouts
         else:
-            filtered_instance_rollouts = instance_rollouts
+            kept_rollouts = valid_rollouts
         
-        # Average filtered anchors for this instance
-        instance_precisions = [r["precision_full_dataset"] for r in filtered_instance_rollouts if "precision_full_dataset" in r and r.get("precision_full_dataset") is not None]
-        instance_coverages = [r["coverage_full_dataset"] for r in filtered_instance_rollouts if "coverage_full_dataset" in r and r.get("coverage_full_dataset") is not None]
+        # Average kept anchors for this instance (use recomputed metrics)
+        instance_precisions = [r["precision_recomputed"] for r in kept_rollouts if "precision_recomputed" in r and r.get("precision_recomputed") is not None]
+        instance_coverages = [r["coverage_recomputed"] for r in kept_rollouts if "coverage_recomputed" in r and r.get("coverage_recomputed") is not None]
         
-        if len(instance_precisions) != len(filtered_instance_rollouts) or len(instance_coverages) != len(filtered_instance_rollouts):
-            logger.warning(f"  WARNING: Instance {instance_idx_in_range + 1}: Only {len(instance_precisions)}/{len(filtered_instance_rollouts)} rollouts have valid precision metrics, "
-                         f"{len(instance_coverages)}/{len(filtered_instance_rollouts)} have valid coverage metrics")
+        if len(instance_precisions) != len(kept_rollouts) or len(instance_coverages) != len(kept_rollouts):
+            logger.warning(f"  WARNING: Instance {instance_idx_in_range + 1}: Only {len(instance_precisions)}/{len(kept_rollouts)} rollouts have valid precision metrics, "
+                         f"{len(instance_coverages)}/{len(kept_rollouts)} have valid coverage metrics")
         
         if instance_precisions and instance_coverages:
             avg_instance_precision = float(np.mean(instance_precisions))
             avg_instance_coverage = float(np.mean(instance_coverages))
-            logger.info(f"  Instance {instance_idx_in_range + 1} average (from {len(filtered_instance_rollouts)} filtered rollouts): "
-                      f"Precision={avg_instance_precision:.4f}, Coverage={avg_instance_coverage:.4f}")
+            # Calculate median and IQR for robustness (helps avoid being dominated by outliers)
+            instance_precision_median = float(np.median(instance_precisions))
+            instance_precision_q25 = float(np.percentile(instance_precisions, 25))
+            instance_precision_q75 = float(np.percentile(instance_precisions, 75))
+            instance_precision_iqr = instance_precision_q75 - instance_precision_q25
+            
+            instance_coverage_median = float(np.median(instance_coverages))
+            instance_coverage_q25 = float(np.percentile(instance_coverages, 25))
+            instance_coverage_q75 = float(np.percentile(instance_coverages, 75))
+            instance_coverage_iqr = instance_coverage_q75 - instance_coverage_q25
+            
+            logger.info(f"  Instance {instance_idx_in_range + 1} average (from {len(kept_rollouts)} kept rollouts): "
+                      f"Precision={avg_instance_precision:.4f} (median={instance_precision_median:.4f}, IQR=[{instance_precision_q25:.4f}, {instance_precision_q75:.4f}]), "
+                      f"Coverage={avg_instance_coverage:.4f} (median={instance_coverage_median:.4f}, IQR=[{instance_coverage_q25:.4f}, {instance_coverage_q75:.4f}])")
             
             per_instance_results.append({
                 "instance_idx": instance_idx_in_range,
                 "data_instance_idx": int(data_instance_idx),
                 "n_rollouts_total": len(instance_rollouts),
-                "n_rollouts_filtered": len(filtered_instance_rollouts),
+                "n_rollouts_valid": len(valid_rollouts),
+                "n_rollouts_kept": len(kept_rollouts),
                 "avg_precision": avg_instance_precision,
                 "avg_coverage": avg_instance_coverage,
+                "precision_median": instance_precision_median,
+                "precision_q25": instance_precision_q25,
+                "precision_q75": instance_precision_q75,
+                "precision_iqr": instance_precision_iqr,
+                "coverage_median": instance_coverage_median,
+                "coverage_q25": instance_coverage_q25,
+                "coverage_q75": instance_coverage_q75,
+                "coverage_iqr": instance_coverage_iqr,
             })
         else:
             logger.warning(f"  No valid metrics for instance {instance_idx_in_range + 1}, skipping")
         
-        # Add filtered rollouts to main lists
-        for rollout_data in filtered_instance_rollouts:
+        # Add kept rollouts to main lists (use recomputed metrics)
+        # Note: We'll deduplicate using canonical keys and NMS after all instances are processed
+        for rollout_data in kept_rollouts:
             anchors_list.append(rollout_data)
             rules_list.append(rollout_data["rule"])
-            if "precision_full_dataset" in rollout_data:
-                precisions.append(rollout_data["precision_full_dataset"])
-                coverages.append(rollout_data["coverage_full_dataset"])
+            if "precision_recomputed" in rollout_data:
+                precisions.append(rollout_data["precision_recomputed"])
+                coverages.append(rollout_data["coverage_recomputed"])
             rollout_times.append(rollout_data.get("rollout_time_seconds", 0.0))
     
     # Compute instance-level metrics from per-instance results
@@ -629,15 +973,52 @@ def _process_instances_for_class(
         instance_level_precisions = [r["avg_precision"] for r in per_instance_results]
         instance_level_coverages = [r["avg_coverage"] for r in per_instance_results]
         
-        if use_weighted_average and instance_level_coverages:
-            weights = np.array(instance_level_coverages, dtype=np.float64)
-            weights = np.maximum(weights, 0.0)
-            weights_sum = weights.sum()
-            if weights_sum > 0:
-                weights = weights / weights_sum
-                instance_precision = float(np.average(instance_level_precisions, weights=weights))
-                instance_coverage = float(np.average(instance_level_coverages, weights=weights))
+        # Support-weighted means: weight by n_in_box (support count) instead of coverage values
+        # This follows the metrics strategy: weight by actual number of samples covered
+        # CRITICAL FIX: Build weights from anchors_list (all anchors across all instances), not just kept_rollouts from last instance
+        if use_weighted_average:
+            # Extract n_in_box from anchors_list (support count for each anchor across ALL instances)
+            # For instance-based: weight by n_in_box (number of samples covered by each anchor)
+            # We need to aggregate n_in_box per instance to match instance_level_precisions/coverages
+            # Since instance_level_precisions/coverages are per-instance averages, we should weight by
+            # the total n_in_box for each instance (sum of n_in_box for all anchors from that instance)
+            n_in_box_per_instance = []
+            instance_idx_to_n_in_box = {}
+            
+            # Aggregate n_in_box by instance_idx
+            for anchor in anchors_list:
+                instance_idx = anchor.get("instance_idx", None)
+                n_in_box = anchor.get("n_in_box", None)
+                if instance_idx is not None and n_in_box is not None:
+                    if instance_idx not in instance_idx_to_n_in_box:
+                        instance_idx_to_n_in_box[instance_idx] = 0
+                    instance_idx_to_n_in_box[instance_idx] += int(n_in_box)
+            
+            # Build weights list matching per_instance_results order
+            for result in per_instance_results:
+                instance_idx = result.get("instance_idx", None)
+                if instance_idx is not None and instance_idx in instance_idx_to_n_in_box:
+                    n_in_box_per_instance.append(instance_idx_to_n_in_box[instance_idx])
+                else:
+                    # Fallback: estimate from coverage if n_in_box not available
+                    cov = result.get("avg_coverage", 0.0)
+                    n_in_box_per_instance.append(max(1, int(cov * 1000)))  # Rough estimate
+            
+            if n_in_box_per_instance and len(n_in_box_per_instance) == len(instance_level_precisions):
+                weights = np.array(n_in_box_per_instance, dtype=np.float64)
+                weights = np.maximum(weights, 0.0)
+                weights_sum = weights.sum()
+                if weights_sum > 0:
+                    weights = weights / weights_sum
+                    instance_precision = float(np.average(instance_level_precisions, weights=weights))
+                    instance_coverage = float(np.average(instance_level_coverages, weights=weights))
+                else:
+                    instance_precision = float(np.mean(instance_level_precisions)) if instance_level_precisions else 0.0
+                    instance_coverage = float(np.mean(instance_level_coverages)) if instance_level_coverages else 0.0
             else:
+                # Fallback to simple mean if n_in_box not available or lengths don't match
+                logger.warning(f"  Support-weighted average: n_in_box list length ({len(n_in_box_per_instance) if n_in_box_per_instance else 0}) "
+                             f"!= instance metrics length ({len(instance_level_precisions)}). Using unweighted mean.")
                 instance_precision = float(np.mean(instance_level_precisions)) if instance_level_precisions else 0.0
                 instance_coverage = float(np.mean(instance_level_coverages)) if instance_level_coverages else 0.0
         else:
@@ -645,29 +1026,71 @@ def _process_instances_for_class(
             instance_coverage = float(np.mean(instance_level_coverages)) if instance_level_coverages else 0.0
     else:
         # Fallback: Compute from all rollouts
-        if use_weighted_average and precisions and coverages:
-            weights = np.array(coverages, dtype=np.float64)
-            weights = np.maximum(weights, 0.0)
-            weights_sum = weights.sum()
-            if weights_sum > 0:
-                weights = weights / weights_sum
-                instance_precision = float(np.average(precisions, weights=weights))
-                instance_coverage = float(np.average(coverages, weights=weights))
+        # Extract metrics directly from anchors_list (same source as precisions/coverages lists)
+        # Prefer recomputed metrics, fallback to primary metrics (which should be recomputed)
+        fallback_precisions = [a.get("precision_recomputed", a.get("precision", 0.0)) for a in anchors_list if "precision_recomputed" in a or "precision" in a]
+        fallback_coverages = [a.get("coverage_recomputed", a.get("coverage", 0.0)) for a in anchors_list if "coverage_recomputed" in a or "coverage" in a]
+        
+        # Support-weighted means: weight by n_in_box (support count) instead of coverage values
+        if use_weighted_average and fallback_precisions and fallback_coverages:
+            # Extract n_in_box from anchors_list (support count for weighting)
+            n_in_box_list = []
+            for anchor in anchors_list:
+                n_in_box = anchor.get("n_in_box", None)
+                if n_in_box is not None:
+                    n_in_box_list.append(int(n_in_box))
+                else:
+                    # Fallback: use coverage as estimate if n_in_box not available
+                    cov = anchor.get("coverage_recomputed", anchor.get("coverage", 0.0))
+                    n_in_box_list.append(max(1, int(cov * 1000)))  # Rough estimate
+            
+            if n_in_box_list and len(n_in_box_list) == len(fallback_precisions):
+                weights = np.array(n_in_box_list, dtype=np.float64)
+                weights = np.maximum(weights, 0.0)
+                weights_sum = weights.sum()
+                if weights_sum > 0:
+                    weights = weights / weights_sum
+                    instance_precision = float(np.average(fallback_precisions, weights=weights))
+                    instance_coverage = float(np.average(fallback_coverages, weights=weights))
+                else:
+                    instance_precision = float(np.mean(fallback_precisions)) if fallback_precisions else 0.0
+                    instance_coverage = float(np.mean(fallback_coverages)) if fallback_coverages else 0.0
             else:
-                instance_precision = float(np.mean(precisions)) if precisions else 0.0
-                instance_coverage = float(np.mean(coverages)) if coverages else 0.0
+                instance_precision = float(np.mean(fallback_precisions)) if fallback_precisions else 0.0
+                instance_coverage = float(np.mean(fallback_coverages)) if fallback_coverages else 0.0
         else:
-            instance_precision = float(np.mean(precisions)) if precisions else 0.0
-            instance_coverage = float(np.mean(coverages)) if coverages else 0.0
+            instance_precision = float(np.mean(fallback_precisions)) if fallback_precisions else 0.0
+            instance_coverage = float(np.mean(fallback_coverages)) if fallback_coverages else 0.0
     
     # Compute average class-conditional coverage
+    # For class-conditional coverage: weight by class-conditional covered count (n_class_in_box)
     coverages_class_conditional = []
+    n_class_in_box_list = []  # Class-conditional support counts for weighting
     for anchor_data in anchors_list:
         if "coverage_class_conditional" in anchor_data:
             coverages_class_conditional.append(anchor_data["coverage_class_conditional"])
+            # For class-conditional coverage, weight by class-conditional covered count
+            n_class_in_box = anchor_data.get("n_class_in_box", None)
+            if n_class_in_box is not None:
+                n_class_in_box_list.append(int(n_class_in_box))
+            else:
+                # Fallback: estimate from n_in_box and coverage_class_conditional ratio
+                n_in_box = anchor_data.get("n_in_box", None)
+                if n_in_box is not None:
+                    cov_class_cond = anchor_data.get("coverage_class_conditional", 0.0)
+                    cov_overall = anchor_data.get("coverage_recomputed", anchor_data.get("coverage", 1e-6))
+                    if cov_overall > 0:
+                        n_class_in_box_est = max(1, int(n_in_box * (cov_class_cond / cov_overall)))
+                    else:
+                        n_class_in_box_est = max(1, n_in_box)
+                    n_class_in_box_list.append(n_class_in_box_est)
+                else:
+                    # Final fallback: use coverage_class_conditional as estimate
+                    cov_class_cond = anchor_data.get("coverage_class_conditional", 0.0)
+                    n_class_in_box_list.append(max(1, int(cov_class_cond * 1000)))  # Rough estimate
     
-    if use_weighted_average and coverages_class_conditional and coverages:
-        weights = np.array(coverages, dtype=np.float64)
+    if use_weighted_average and coverages_class_conditional and n_class_in_box_list and len(n_class_in_box_list) == len(coverages_class_conditional):
+        weights = np.array(n_class_in_box_list, dtype=np.float64)
         weights = np.maximum(weights, 0.0)
         weights_sum = weights.sum()
         if weights_sum > 0:
@@ -677,6 +1100,25 @@ def _process_instances_for_class(
             instance_coverage_class_conditional = float(np.mean(coverages_class_conditional)) if coverages_class_conditional else 0.0
     else:
         instance_coverage_class_conditional = float(np.mean(coverages_class_conditional)) if coverages_class_conditional else 0.0
+    
+    # Calculate overall median and IQR if we have per-instance results
+    instance_precision_median = None
+    instance_precision_iqr = None
+    instance_coverage_median = None
+    instance_coverage_iqr = None
+    if per_instance_results:
+        instance_level_precisions = [r.get("avg_precision", 0.0) for r in per_instance_results]
+        instance_level_coverages = [r.get("avg_coverage", 0.0) for r in per_instance_results]
+        if instance_level_precisions:
+            instance_precision_median = float(np.median(instance_level_precisions))
+            instance_precision_q25 = float(np.percentile(instance_level_precisions, 25))
+            instance_precision_q75 = float(np.percentile(instance_level_precisions, 75))
+            instance_precision_iqr = instance_precision_q75 - instance_precision_q25
+        if instance_level_coverages:
+            instance_coverage_median = float(np.median(instance_level_coverages))
+            instance_coverage_q25 = float(np.percentile(instance_level_coverages, 25))
+            instance_coverage_q75 = float(np.percentile(instance_level_coverages, 75))
+            instance_coverage_iqr = instance_coverage_q75 - instance_coverage_q25
     
     return {
         "anchors_list": anchors_list,
@@ -688,6 +1130,10 @@ def _process_instances_for_class(
         "instance_precision": instance_precision,
         "instance_coverage": instance_coverage,
         "instance_coverage_class_conditional": instance_coverage_class_conditional,
+        "instance_precision_median": instance_precision_median,
+        "instance_precision_iqr": instance_precision_iqr,
+        "instance_coverage_median": instance_coverage_median,
+        "instance_coverage_iqr": instance_coverage_iqr,
     }
 
 
@@ -899,6 +1345,9 @@ def extract_rules_single_agent(
             f"\nPlease ensure the classifier was trained and saved during the training phase."
         )
     
+    # Use the classifier instance loaded above everywhere (env + recompute)
+    # This ensures we use the same classifier instance throughout
+    
     # Get environment data
     env_data = dataset_loader.get_anchor_env_data()
     target_classes = sorted(np.unique(dataset_loader.y_train).tolist())
@@ -1014,6 +1463,9 @@ def extract_rules_single_agent(
         logger.warning(f"  Falling back to mean centroid per class")
         env_config["cluster_centroids_per_class"] = None
     
+    # Classifier is already loaded earlier (line ~892), use the same instance everywhere
+    # This ensures consistency between environment and recompute operations
+    
     # Load models for each class (one model per class)
     logger.info(f"\nLoading models for {len(target_classes)} classes...")
     models = {}  # class -> model
@@ -1037,12 +1489,13 @@ def extract_rules_single_agent(
             continue
         
         # Create environment for this class (needed for model loading)
+        # Use the same classifier instance loaded earlier
         env = SingleAgentAnchorEnv(
             X_unit=env_data["X_unit"],
             X_std=env_data["X_std"],
             y=env_data["y"],
             feature_names=feature_names,
-            classifier=dataset_loader.get_classifier(),
+            classifier=classifier,
             device=device,
             target_class=target_class,
             env_config=env_config
@@ -1068,6 +1521,8 @@ def extract_rules_single_agent(
     # Start overall timing
     overall_start_time = time.perf_counter()
     
+    # Classifier is already loaded earlier (before model loading), use the same instance everywhere
+    
     results = {
         "per_class_results": {},
         "metadata": {
@@ -1077,6 +1532,10 @@ def extract_rules_single_agent(
             "target_classes": target_classes,
             "max_features_in_rule": max_features_in_rule,
             "eval_on_test_data": eval_on_test_data,
+            "coverage_on_all_data": coverage_on_all_data,
+            "sample_from_full_dataset": sample_from_full_dataset,
+            "filter_by_prediction": filter_by_prediction,
+            "use_prediction_routing": use_prediction_routing,
             "n_instances_per_class": n_instances_per_class,
             "n_rollouts_per_instance": n_rollouts_per_instance,
             "steps_per_episode": steps_per_episode,
@@ -1084,15 +1543,26 @@ def extract_rules_single_agent(
         },
     }
     
-    # Get classifier for prediction routing
-    classifier = dataset_loader.get_classifier()
-    
-    # Prepare full dataset (used in both modes)
-    if env_data.get("X_test_unit") is not None:
-        X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-        X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
-        y_full = np.concatenate([env_data["y"], env_data["y_test"]])
+    # Prepare dataset for recomputation (respects eval_on_test_data and coverage_on_all_data)
+    # This will be used when calling _process_instances_for_class, which will select the appropriate
+    # dataset for recomputation based on the flags passed to it
+    if coverage_on_all_data:
+        # Use full dataset (train + test) if explicitly requested
+        if env_data.get("X_test_unit") is not None:
+            X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+            y_full = np.concatenate([env_data["y"], env_data["y_test"]])
+        else:
+            X_full_unit = env_data["X_unit"]
+            X_full_std = env_data["X_std"]
+            y_full = env_data["y"]
+    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+        # Use test data only (matches training evaluation)
+        X_full_unit = env_data["X_test_unit"]
+        X_full_std = env_data["X_test_std"]
+        y_full = env_data["y_test"]
     else:
+        # Fallback: Use training data
         X_full_unit = env_data["X_unit"]
         X_full_std = env_data["X_std"]
         y_full = env_data["y"]
@@ -1109,8 +1579,11 @@ def extract_rules_single_agent(
         
         # PREDICTION ROUTING MODE: Sample from all classes and route by predictions
         # Determine dataset to sample from
+        # Respect eval_on_test_data and coverage_on_all_data flags to avoid mixing instance source and evaluation set
         use_full_for_sampling = sample_from_full_dataset
-        if n_rollouts_per_instance > 1 and env_data.get("X_test_unit") is not None:
+        # Only force full dataset if explicitly requested (coverage_on_all_data) or user-set (sample_from_full_dataset)
+        # Don't force it based on n_rollouts_per_instance to avoid mixing train+test sampling with test-only evaluation
+        if coverage_on_all_data and env_data.get("X_test_unit") is not None:
             use_full_for_sampling = True
         
         if use_full_for_sampling and env_data.get("X_test_unit") is not None:
@@ -1208,13 +1681,6 @@ def extract_rules_single_agent(
             logger.info(f"    - Average filtered anchors per instance -> per-instance metrics")
             logger.info(f"    - Average across instances -> final instance-level metrics")
             
-            # Get predictions for all instances in full dataset (needed for precision calculation)
-            classifier.eval()
-            with torch.no_grad():
-                X_full_tensor = torch.from_numpy(X_full_std.astype(np.float32)).to(device)
-                full_logits = classifier(X_full_tensor)
-                full_predictions = full_logits.argmax(dim=1).cpu().numpy()
-            
             # Store per-instance results
             per_instance_results = []
             
@@ -1225,21 +1691,29 @@ def extract_rules_single_agent(
             # The key difference is in index mapping: in prediction routing, sampled_indices are already 
             # indices into X_data_unit, and we need to map them to full dataset indices correctly
             
-            # Prepare full dataset for recomputing metrics (train + test combined)
-            if env_data.get("X_test_unit") is not None:
-                X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-                X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+            # Prepare dataset for recomputing metrics (respects eval_on_test_data and coverage_on_all_data)
+            # Note: _process_instances_for_class will compute predictions for the recompute dataset internally
+            # We don't need to compute full_predictions here - it will be computed once inside _process_instances_for_class
+            if coverage_on_all_data:
+                # Use full dataset (train + test) if explicitly requested
+                if env_data.get("X_test_unit") is not None:
+                    X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                    X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                else:
+                    X_full_unit = env_data["X_unit"]
+                    X_full_std = env_data["X_std"]
+            elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+                # Use test data only (matches training evaluation)
+                X_full_unit = env_data["X_test_unit"]
+                X_full_std = env_data["X_test_std"]
             else:
+                # Fallback: Use training data
                 X_full_unit = env_data["X_unit"]
                 X_full_std = env_data["X_std"]
             
-            # Get predictions for all instances in full dataset (needed for precision calculation)
-            classifier = dataset_loader.get_classifier()
-            classifier.eval()
-            with torch.no_grad():
-                X_full_tensor = torch.from_numpy(X_full_std.astype(np.float32)).to(device)
-                full_logits = classifier(X_full_tensor)
-                full_predictions = full_logits.argmax(dim=1).cpu().numpy()
+            # Note: full_predictions will be computed inside _process_instances_for_class for X_recompute_std
+            # We pass None here to indicate it should be computed (it already does this internally)
+            # This avoids duplicate computation - predictions are computed once per instance inside _process_instances_for_class
             
             # Process instances using helper function (same as traditional mode)
             process_results = _process_instances_for_class(
@@ -1250,7 +1724,7 @@ def extract_rules_single_agent(
                 X_data_std=X_data_std,
                 X_full_unit=X_full_unit,
                 X_full_std=X_full_std,
-                full_predictions=full_predictions,
+                full_predictions=None,  # Will be computed inside _process_instances_for_class for recompute dataset
                 env_data=env_data,
                 env_config=env_config,
                 feature_names=feature_names,
@@ -1286,7 +1760,80 @@ def extract_rules_single_agent(
                       f"Coverage={instance_coverage_per_class:.4f}")
             
             # Compute unique rules for this class
-            unique_rules_per_class = list(set([r for r in rules_list_per_class if r and r != "any values (no tightened features)"]))
+            # Deduplicate using canonical keys (more robust than rule strings)
+            # Step 1: Deduplicate by canonical key
+            canonical_keys_seen = set()
+            unique_anchors_by_key = {}
+            for anchor in anchors_list_per_class:
+                canonical_key = anchor.get("canonical_key")
+                if canonical_key is None:
+                    # Fallback: use rule string if canonical key not available
+                    rule_str = anchor.get("rule", "")
+                    if rule_str and rule_str != "any values (no tightened features)":
+                        # Use rule string as fallback key
+                        canonical_key = f"rule:{rule_str}"
+                    else:
+                        canonical_key = "any_values"
+                
+                # Keep the anchor with best precision (tie-break by coverage) for each canonical key
+                if canonical_key not in canonical_keys_seen:
+                    canonical_keys_seen.add(canonical_key)
+                    unique_anchors_by_key[canonical_key] = anchor
+                else:
+                    # Compare with existing anchor - keep the one with better precision
+                    existing = unique_anchors_by_key[canonical_key]
+                    existing_prec = existing.get("precision_recomputed", existing.get("precision", 0.0))
+                    new_prec = anchor.get("precision_recomputed", anchor.get("precision", 0.0))
+                    if new_prec > existing_prec:
+                        unique_anchors_by_key[canonical_key] = anchor
+                    elif new_prec == existing_prec:
+                        # Tie-break by coverage
+                        existing_cov = existing.get("coverage_recomputed", existing.get("coverage", 0.0))
+                        new_cov = anchor.get("coverage_recomputed", anchor.get("coverage", 0.0))
+                        if new_cov > existing_cov:
+                            unique_anchors_by_key[canonical_key] = anchor
+            
+            # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
+            nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)  # Default: 0.9
+            anchors_after_nms = nms_deduplicate_anchors(
+                list(unique_anchors_by_key.values()),
+                iou_threshold=nms_iou_threshold
+            )
+            
+            # Update anchors_list_per_class with deduplicated anchors
+            anchors_list_per_class = anchors_after_nms
+            
+            # Extract unique rules from deduplicated anchors (for backward compatibility)
+            unique_rules_per_class = list(set([
+                anchor.get("rule", "") 
+                for anchor in anchors_list_per_class 
+                if anchor.get("rule") and anchor.get("rule") != "any values (no tightened features)"
+            ]))
+            
+            # Calculate duplicate ratio: (total_rules - unique_rules) / total_rules
+            total_rules_per_class = len(rules_list_per_class) if rules_list_per_class else 0
+            unique_rules_count_per_class = len(unique_rules_per_class)
+            duplicate_ratio_per_class = (total_rules_per_class - unique_rules_count_per_class) / total_rules_per_class if total_rules_per_class > 0 else 0.0
+            
+            # Compute top-K rules by score: precision * (1 + coverage)
+            # This provides a clear ranking of best rules
+            top_k_rules_count = env_config.get("top_k_rules_by_score", 10)  # Default: top 10
+            rule_scores = []
+            for anchor in anchors_list_per_class:
+                precision = anchor.get("precision_recomputed", anchor.get("precision", 0.0))
+                coverage = anchor.get("coverage_recomputed", anchor.get("coverage", 0.0))
+                score = precision * (1 + coverage)  # Score formula: precision * (1 + coverage)
+                rule_scores.append({
+                    "rule": anchor.get("rule", ""),
+                    "precision": float(precision),
+                    "coverage": float(coverage),
+                    "score": float(score),
+                    "canonical_key": anchor.get("canonical_key", "")
+                })
+            
+            # Sort by score (descending) and take top-K
+            rule_scores.sort(key=lambda x: x["score"], reverse=True)
+            top_k_rules_per_class = rule_scores[:top_k_rules_count]
             
             # Compute timing metrics for this class
             avg_rollout_time_per_class = float(np.mean(rollout_times_per_class)) if rollout_times_per_class else 0.0
@@ -1314,7 +1861,11 @@ def extract_rules_single_agent(
                 "n_episodes": len(anchors_list_per_class),
                 "rules": rules_list_per_class,
                 "unique_rules": unique_rules_per_class,
-                "unique_rules_count": len(unique_rules_per_class),
+                "unique_rules_count": unique_rules_count_per_class,
+                "total_rules_count": total_rules_per_class,
+                "duplicate_ratio": float(duplicate_ratio_per_class),
+                "top_k_rules_by_score": top_k_rules_per_class,
+                "top_k_rules_count": len(top_k_rules_per_class),
                 "anchors": anchors_list_per_class,
                 # Timing metrics
                 "avg_rollout_time_seconds": avg_rollout_time_per_class,
@@ -1368,21 +1919,16 @@ def extract_rules_single_agent(
             logger.info(f"  Starting instance-based rollouts...")
             
             # Determine which dataset to sample from
-            # For instance-based rollouts: Always use full dataset (train + test) for sampling instances
-            # because:
-            # 1. Precision/coverage are computed on full dataset anyway
-            # 2. We need enough instances to sample from (especially with multiple rollouts per instance)
-            # 3. This ensures we're not limited by test dataset size
-            # Note: This is different from baseline comparison where we might want test-only sampling
+            # Respect eval_on_test_data and coverage_on_all_data flags to avoid mixing instance source and evaluation set
+            # When eval_on_test_data=True, sample from test data to match evaluation set (avoids depressing coverage)
+            # When coverage_on_all_data=True, sample from full dataset to match evaluation set
             use_full_for_sampling = sample_from_full_dataset
-            
-            # For instance-based rollouts with multiple rollouts per instance, always use full dataset
-            # to ensure we have enough instances to sample from
-            if n_rollouts_per_instance > 1 and env_data.get("X_test_unit") is not None:
+            # Only force full dataset if explicitly requested (coverage_on_all_data) or user-set (sample_from_full_dataset)
+            # Don't force it based on n_rollouts_per_instance to avoid mixing train+test sampling with test-only evaluation
+            if coverage_on_all_data and env_data.get("X_test_unit") is not None:
                 use_full_for_sampling = True
                 if not sample_from_full_dataset:
-                    logger.info(f"  Using full dataset (train + test) for instance sampling to ensure enough instances "
-                              f"for {n_rollouts_per_instance} rollouts per instance")
+                    logger.info(f"  Using full dataset (train + test) for instance sampling (coverage_on_all_data=True)")
             
             # Check if we need more instances than available in test data
             if eval_on_test_data and env_data.get("X_test_unit") is not None and not use_full_for_sampling:
@@ -1438,7 +1984,7 @@ def extract_rules_single_agent(
                 # When filter_by_prediction=True, this ensures original_prediction == target_class, preventing precision calculation issues
                 # This matches the filtering done during training (anchor_trainer_sb3.py lines 483-500)
                 if filter_by_prediction:
-                    classifier = dataset_loader.get_classifier()
+                    # Use the classifier instance already loaded at the top of extract_rules_single_agent
                     if classifier is not None and len(class_instances) > 0:
                         # Get predictions for all class instances
                         X_class_std = X_data_std[class_instances]
@@ -1477,7 +2023,14 @@ def extract_rules_single_agent(
                     logger.info(f"  Sampling {n_samples} instances from {data_source_name} data for instance-based rollouts")
                     logger.info(f"  Methodology (following original Anchors paper):")
                     logger.info(f"    - For each instance: run {n_rollouts_per_instance} rollouts")
-                    logger.info(f"    - Recompute precision/coverage on FULL dataset (train + test) for each anchor")
+                    # Log which dataset will be used for recomputation
+                    if coverage_on_all_data:
+                        recompute_dataset_name = "FULL dataset (train + test)"
+                    elif eval_on_test_data:
+                        recompute_dataset_name = "TEST dataset"
+                    else:
+                        recompute_dataset_name = "TRAINING dataset"
+                    logger.info(f"    - Recompute precision/coverage on {recompute_dataset_name} for each anchor (eval_on_test_data={eval_on_test_data}, coverage_on_all_data={coverage_on_all_data})")
                     logger.info(f"    - Filter out bad anchors for each instance (precision/coverage thresholds)")
                     logger.info(f"    - Average filtered anchors per instance -> per-instance metrics")
                     logger.info(f"    - Average across instances -> final instance-level metrics")
@@ -1487,17 +2040,25 @@ def extract_rules_single_agent(
                     else:
                         logger.info(f"    Using {n_samples} instances as requested (found {len(class_instances)} instances available)")
                     
-                    # Prepare full dataset for recomputing metrics (train + test combined)
-                    # Following original Anchors paper methodology: compute metrics on full dataset
-                    if env_data.get("X_test_unit") is not None:
-                        X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-                        X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                    # Prepare dataset for recomputing metrics (respects eval_on_test_data and coverage_on_all_data)
+                    if coverage_on_all_data:
+                        # Use full dataset (train + test) if explicitly requested
+                        if env_data.get("X_test_unit") is not None:
+                            X_full_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                            X_full_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                        else:
+                            X_full_unit = env_data["X_unit"]
+                            X_full_std = env_data["X_std"]
+                    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+                        # Use test data only (matches training evaluation)
+                        X_full_unit = env_data["X_test_unit"]
+                        X_full_std = env_data["X_test_std"]
                     else:
+                        # Fallback: Use training data
                         X_full_unit = env_data["X_unit"]
                         X_full_std = env_data["X_std"]
                     
-                    # Get predictions for all instances in full dataset (needed for precision calculation)
-                    classifier = dataset_loader.get_classifier()
+                    # Use the classifier instance already loaded at the top of extract_rules_single_agent
                     classifier.eval()
                     with torch.no_grad():
                         X_full_tensor = torch.from_numpy(X_full_std.astype(np.float32)).to(device)
@@ -1549,7 +2110,52 @@ def extract_rules_single_agent(
                     logger.info(f"    Precision: {instance_precision:.4f}")
                     logger.info(f"    Coverage:  {instance_coverage:.4f}")
                     
-                    unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
+                    # Deduplicate using canonical keys (more robust than rule strings)
+                    # Step 1: Deduplicate by canonical key
+                    canonical_keys_seen = set()
+                    unique_anchors_by_key = {}
+                    for anchor in anchors_list:
+                        canonical_key = anchor.get("canonical_key")
+                        if canonical_key is None:
+                            # Fallback: use rule string if canonical key not available
+                            rule_str = anchor.get("rule", "")
+                            if rule_str and rule_str != "any values (no tightened features)":
+                                canonical_key = f"rule:{rule_str}"
+                            else:
+                                canonical_key = "any_values"
+                        
+                        # Keep the anchor with best precision (tie-break by coverage) for each canonical key
+                        if canonical_key not in canonical_keys_seen:
+                            canonical_keys_seen.add(canonical_key)
+                            unique_anchors_by_key[canonical_key] = anchor
+                        else:
+                            existing = unique_anchors_by_key[canonical_key]
+                            existing_prec = existing.get("precision_recomputed", existing.get("precision", 0.0))
+                            new_prec = anchor.get("precision_recomputed", anchor.get("precision", 0.0))
+                            if new_prec > existing_prec:
+                                unique_anchors_by_key[canonical_key] = anchor
+                            elif new_prec == existing_prec:
+                                existing_cov = existing.get("coverage_recomputed", existing.get("coverage", 0.0))
+                                new_cov = anchor.get("coverage_recomputed", anchor.get("coverage", 0.0))
+                                if new_cov > existing_cov:
+                                    unique_anchors_by_key[canonical_key] = anchor
+                    
+                    # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
+                    nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)
+                    anchors_after_nms = nms_deduplicate_anchors(
+                        list(unique_anchors_by_key.values()),
+                        iou_threshold=nms_iou_threshold
+                    )
+                    
+                    # Update anchors_list with deduplicated anchors
+                    anchors_list = anchors_after_nms
+                    
+                    # Extract unique rules from deduplicated anchors (for backward compatibility)
+                    unique_rules = list(set([
+                        anchor.get("rule", "") 
+                        for anchor in anchors_list 
+                        if anchor.get("rule") and anchor.get("rule") != "any values (no tightened features)"
+                    ]))
                     
                     # End timing for this class
                     class_end_time = time.perf_counter()
@@ -1705,6 +2311,23 @@ def extract_rules_single_agent(
                 "rules": rules_list,
                 "unique_rules": unique_rules,
                 "unique_rules_count": len(unique_rules),
+                "total_rules_count": len(rules_list) if rules_list else 0,
+                "duplicate_ratio": (len(rules_list) - len(unique_rules)) / len(rules_list) if rules_list and len(rules_list) > 0 else 0.0,
+                # Top-K rules by score: precision * (1 + coverage)
+                "top_k_rules_by_score": [
+                    {
+                        "rule": anchor.get("rule", ""),
+                        "precision": float(anchor.get("precision_recomputed", anchor.get("precision", 0.0))),
+                        "coverage": float(anchor.get("coverage_recomputed", anchor.get("coverage", 0.0))),
+                        "score": float((anchor.get("precision_recomputed", anchor.get("precision", 0.0)) * (1 + anchor.get("coverage_recomputed", anchor.get("coverage", 0.0)))))
+                    }
+                    for anchor in sorted(
+                        anchors_list,
+                        key=lambda a: (a.get("precision_recomputed", a.get("precision", 0.0)) * (1 + a.get("coverage_recomputed", a.get("coverage", 0.0)))),
+                        reverse=True
+                    )[:env_config.get("top_k_rules_by_score", 10)]
+                ],
+                "top_k_rules_count": min(env_config.get("top_k_rules_by_score", 10), len(anchors_list)),
                 "anchors": anchors_list,
                 # Timing metrics
                 "avg_rollout_time_seconds": avg_rollout_time,
@@ -1796,8 +2419,6 @@ def extract_rules_single_agent(
         # Initialize lists for class-based rollouts
         class_based_anchors_list = []
         class_based_rules_list = []
-        class_based_precisions = []
-        class_based_coverages = []
         class_based_rollout_times = []
         
         class_based_start_time = time.perf_counter()
@@ -1806,27 +2427,36 @@ def extract_rules_single_agent(
         for rollout_idx in range(n_class_based_rollouts_per_class):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # CRITICAL: Use FULL dataset (train + test) for class-based rollouts
-            # Class-based rules should express a particular class of the full dataset
-            # This ensures rules are evaluated on the complete class distribution
-            if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                # Combine train and test data for class-based rollouts (full dataset)
+            # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data flags for class-based rollouts
+            # This ensures consistent evaluation sets between instance-based and class-based metrics
+            # Previously, class-based always used full dataset when test data existed, mixing evaluation sets
+            if coverage_on_all_data and env_data.get("X_test_unit") is not None:
+                # Use full dataset (train + test) if explicitly requested via coverage_on_all_data
                 env_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
                 env_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
                 env_y = np.concatenate([env_data["y"], env_data["y_test"]])
                 use_full_dataset = True
                 if rollout_idx == 0:  # Log once per class
-                    logger.info(f"  Using FULL dataset (train + test) for class-based rollouts")
+                    logger.info(f"  Using FULL dataset (train + test) for class-based rollouts (coverage_on_all_data=True)")
                     logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(env_y)}")
-                    logger.info(f"    Note: Class-based rules should express the class across the full dataset")
+            elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+                # Use test data only (matches instance-based evaluation when eval_on_test_data=True)
+                env_X_unit = env_data["X_test_unit"]
+                env_X_std = env_data["X_test_std"]
+                env_y = env_data["y_test"]
+                use_full_dataset = False
+                if rollout_idx == 0:  # Log once per class
+                    logger.info(f"  Using TEST dataset for class-based rollouts (eval_on_test_data=True, matches instance-based evaluation)")
+                    logger.info(f"    Test samples: {len(env_y)}")
             else:
-                # Fallback to training data only if test data not available
+                # Fallback to training data only if test data not available or eval_on_test_data=False
                 env_X_unit = env_data["X_unit"]
                 env_X_std = env_data["X_std"]
                 env_y = env_data["y"]
                 use_full_dataset = False
                 if rollout_idx == 0:  # Log once per class
-                    logger.info(f"  Using TRAINING data only for class-based rollouts (test data not available)")
+                    logger.info(f"  Using TRAINING dataset for class-based rollouts (test data not available or eval_on_test_data=False)")
+                    logger.info(f"    Training samples: {len(env_y)}")
             
             # Set mode to "inference" for rule extraction
             # CRITICAL: Ensure use_class_centroids is True for class-based rollouts
@@ -1843,7 +2473,7 @@ def extract_rules_single_agent(
                 X_std=env_X_std,
                 y=env_y,
                 feature_names=feature_names,
-                classifier=dataset_loader.get_classifier(),
+                classifier=classifier,
                 device=device,
                 target_class=target_class,
                 env_config=inference_env_config
@@ -1893,8 +2523,7 @@ def extract_rules_single_agent(
                 logger.debug(f"    Final bounds: lower={env.lower[:3] if hasattr(env, 'lower') else 'N/A'}, upper={env.upper[:3] if hasattr(env, 'upper') else 'N/A'} (first 3 dims)")
                 logger.debug(f"    Box volume: {np.prod(env.upper - env.lower) if hasattr(env, 'lower') and hasattr(env, 'upper') else 'N/A'}")
             
-            class_based_precisions.append(float(precision))
-            class_based_coverages.append(float(coverage))
+            # Append rollout_time only (doesn't change after recompute)
             class_based_rollout_times.append(float(rollout_time))
             
             # Extract rule from final bounds
@@ -1924,7 +2553,7 @@ def extract_rules_single_agent(
                     X_std=env_X_std,
                     y=env_y,
                     feature_names=feature_names,
-                    classifier=dataset_loader.get_classifier(),
+                    classifier=classifier,
                     device="cpu",
                     target_class=target_class,
                     env_config=env_config
@@ -1938,22 +2567,27 @@ def extract_rules_single_agent(
                 initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
                 initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
                 
-                rule = temp_env.extract_rule(
+                rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
                     initial_lower=initial_lower_normalized,
                     initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
+            else:
+                # No bounds - use default canonical key
+                canonical_key = "any_values"
             
             # Store anchor data
             anchor_data = {
                 "rollout_type": "class_based",  # Flag to distinguish from instance-based
                 "rollout_idx": rollout_idx,
-                "precision": float(precision),
-                "coverage": float(coverage),
+                # Rollout-estimated metrics (computed during rollout using perturbation samples)
+                "precision_rollout_estimated": float(precision),
+                "coverage_rollout_estimated": float(coverage),
                 "total_reward": float(episode_data.get("total_reward", 0.0)),
                 "n_steps": int(episode_data.get("n_steps", 0)),
                 "rule": rule,
+                "canonical_key": canonical_key,  # Canonical key for deduplication
             }
             
             if lower is not None and upper is not None:
@@ -1969,8 +2603,54 @@ def extract_rules_single_agent(
             class_based_anchors_list.append(anchor_data)
             class_based_rules_list.append(rule)
         
-        # Compute aggregated metrics for class-based rollouts
-        class_based_unique_rules = list(set([r for r in class_based_rules_list if r and r != "any values (no tightened features)"]))
+        # Deduplicate class-based anchors using canonical keys + NMS
+        # Step 1: Deduplicate by canonical key
+        canonical_keys_seen = set()
+        unique_class_based_anchors_by_key = {}
+        for anchor in class_based_anchors_list:
+            canonical_key = anchor.get("canonical_key")
+            if canonical_key is None:
+                # Fallback: use rule string if canonical key not available
+                rule_str = anchor.get("rule", "")
+                if rule_str and rule_str != "any values (no tightened features)":
+                    canonical_key = f"rule:{rule_str}"
+                else:
+                    canonical_key = "any_values"
+            
+            # Keep the anchor with best precision (tie-break by coverage) for each canonical key
+            if canonical_key not in canonical_keys_seen:
+                canonical_keys_seen.add(canonical_key)
+                unique_class_based_anchors_by_key[canonical_key] = anchor
+            else:
+                existing = unique_class_based_anchors_by_key[canonical_key]
+                existing_prec = existing.get("precision_rollout_estimated", existing.get("precision", 0.0))
+                new_prec = anchor.get("precision_rollout_estimated", anchor.get("precision", 0.0))
+                if new_prec > existing_prec:
+                    unique_class_based_anchors_by_key[canonical_key] = anchor
+                elif new_prec == existing_prec:
+                    existing_cov = existing.get("coverage_rollout_estimated", existing.get("coverage", 0.0))
+                    new_cov = anchor.get("coverage_rollout_estimated", anchor.get("coverage", 0.0))
+                    if new_cov > existing_cov:
+                        unique_class_based_anchors_by_key[canonical_key] = anchor
+        
+        # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
+        nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)
+        class_based_anchors_after_nms = nms_deduplicate_anchors(
+            list(unique_class_based_anchors_by_key.values()),
+            iou_threshold=nms_iou_threshold,
+            key_precision="precision_rollout_estimated",
+            key_coverage="coverage_rollout_estimated"
+        )
+        
+        # Update class_based_anchors_list with deduplicated anchors
+        class_based_anchors_list = class_based_anchors_after_nms
+        
+        # Extract unique rules from deduplicated anchors (for backward compatibility)
+        class_based_unique_rules = list(set([
+            anchor.get("rule", "") 
+            for anchor in class_based_anchors_list 
+            if anchor.get("rule") and anchor.get("rule") != "any values (no tightened features)"
+        ]))
         class_based_end_time = time.perf_counter()
         class_based_total_time = class_based_end_time - class_based_start_time
         
@@ -1988,16 +2668,27 @@ def extract_rules_single_agent(
         precision_target = env_config.get("precision_target", 0.95)
         precision_threshold = precision_target * 0.8
         
-        # Get FULL dataset for recomputing metrics (following original Anchors paper methodology)
-        if env_data.get("X_test_unit") is not None:
+        # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data flags for class-based recomputation
+        # This ensures consistent evaluation sets between instance-based and class-based metrics
+        # Previously, class-based always used full dataset, mixing evaluation sets
+        if coverage_on_all_data and env_data.get("X_test_unit") is not None:
+            # Use full dataset (train + test) if explicitly requested via coverage_on_all_data
             X_data_filter = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
             y_data_filter = np.concatenate([env_data["y"], env_data["y_test"]])
+            recompute_data_source = "FULL dataset (train + test)"
+        elif eval_on_test_data and env_data.get("X_test_unit") is not None:
+            # Use test data only (matches instance-based evaluation when eval_on_test_data=True)
+            X_data_filter = env_data["X_test_unit"]
+            y_data_filter = env_data["y_test"]
+            recompute_data_source = "TEST dataset"
         else:
+            # Fallback to training data only if test data not available or eval_on_test_data=False
             X_data_filter = env_data["X_unit"]
             y_data_filter = env_data["y"]
+            recompute_data_source = "TRAINING dataset"
         
-        logger.info(f"  Recomputing precision and coverage on FULL dataset (train + test) for {len(class_based_anchors_list)} class-based anchors")
-        logger.info(f"    Total samples in full dataset: {len(X_data_filter)}")
+        logger.info(f"  Recomputing precision and coverage on {recompute_data_source} for {len(class_based_anchors_list)} class-based anchors")
+        logger.info(f"    Total samples: {len(X_data_filter)} (eval_on_test_data={eval_on_test_data}, coverage_on_all_data={coverage_on_all_data})")
         
         # Filter anchors by recomputing precision on actual dataset
         filtered_class_based_precisions = []
@@ -2026,11 +2717,13 @@ def extract_rules_single_agent(
                         n_class_in_box = (in_box & class_mask).sum()
                         actual_coverage = float(n_class_in_box / n_class_samples) if n_class_samples > 0 else 0.0
                         
-                        # Store recomputed metrics (for reference)
-                        anchor_data["precision_full_dataset"] = actual_precision
-                        anchor_data["coverage_full_dataset"] = actual_coverage
-                        anchor_data["precision_original"] = anchor_data.get("precision", 0.0)  # Original from rollout
-                        anchor_data["coverage_original"] = anchor_data.get("coverage", 0.0)  # Original from rollout
+                        # Store recomputed metrics (computed on full dataset)
+                        anchor_data["precision_recomputed"] = actual_precision
+                        anchor_data["coverage_recomputed"] = actual_coverage
+                        
+                        # Set primary metrics to recomputed values (these are the metrics we use for evaluation)
+                        anchor_data["precision"] = actual_precision
+                        anchor_data["coverage"] = actual_coverage
                         
                         # Only include high-precision anchors in average
                         if actual_precision >= precision_threshold:
@@ -2056,13 +2749,13 @@ def extract_rules_single_agent(
             all_precisions_full = []
             all_coverages_full = []
             for anchor_data in class_based_anchors_list:
-                if "precision_full_dataset" in anchor_data:
-                    all_precisions_full.append(anchor_data["precision_full_dataset"])
-                    all_coverages_full.append(anchor_data["coverage_full_dataset"])
+                if "precision_recomputed" in anchor_data:
+                    all_precisions_full.append(anchor_data["precision_recomputed"])
+                    all_coverages_full.append(anchor_data["coverage_recomputed"])
                 else:
-                    # Fallback to original if not recomputed
-                    all_precisions_full.append(anchor_data.get("precision", 0.0))
-                    all_coverages_full.append(anchor_data.get("coverage", 0.0))
+                    # Fallback to primary metrics (should be recomputed) or rollout-estimated if not recomputed yet
+                    all_precisions_full.append(anchor_data.get("precision", anchor_data.get("precision_rollout_estimated", 0.0)))
+                    all_coverages_full.append(anchor_data.get("coverage", anchor_data.get("coverage_rollout_estimated", 0.0)))
             
             if all_precisions_full:
                 class_based_precision = float(np.mean(all_precisions_full))
@@ -2070,11 +2763,18 @@ def extract_rules_single_agent(
                 logger.warning(f"    Using average of all {len(all_precisions_full)} anchors (on full dataset): "
                              f"precision={class_based_precision:.4f}, coverage={class_based_coverage:.4f}")
             else:
-                # Last resort: use original rollout metrics
-                class_based_precision = float(np.mean(class_based_precisions)) if class_based_precisions else 0.0
-                class_based_coverage = float(np.mean(class_based_coverages)) if class_based_coverages else 0.0
-                logger.warning(f"    Using original rollout metrics (fallback): "
-                             f"precision={class_based_precision:.4f}, coverage={class_based_coverage:.4f}")
+                # Last resort: use recomputed metrics from anchor_data
+                all_precisions_recomputed = [a.get("precision_recomputed", a.get("precision", 0.0)) for a in class_based_anchors_list if "precision_recomputed" in a or "precision" in a]
+                all_coverages_recomputed = [a.get("coverage_recomputed", a.get("coverage", 0.0)) for a in class_based_anchors_list if "coverage_recomputed" in a or "coverage" in a]
+                if all_precisions_recomputed:
+                    class_based_precision = float(np.mean(all_precisions_recomputed))
+                    class_based_coverage = float(np.mean(all_coverages_recomputed))
+                    logger.warning(f"    Using recomputed metrics from all anchors (fallback): "
+                                 f"precision={class_based_precision:.4f}, coverage={class_based_coverage:.4f}")
+                else:
+                    class_based_precision = 0.0
+                    class_based_coverage = 0.0
+                    logger.warning(f"    No valid metrics found for any anchor")
         
         class_based_avg_rollout_time = float(np.mean(class_based_rollout_times)) if class_based_rollout_times else 0.0
         class_based_total_rollout_time = float(np.sum(class_based_rollout_times)) if class_based_rollout_times else 0.0
@@ -2097,7 +2797,7 @@ def extract_rules_single_agent(
         # NOTE: class_precision and class_coverage (union metrics) will be set later in the union computation section
         # Store count of filtered vs total anchors for transparency
         results["per_class_results"][class_key]["class_based_n_filtered"] = len(filtered_class_based_precisions)
-        results["per_class_results"][class_key]["class_based_n_total"] = len(class_based_precisions)
+        results["per_class_results"][class_key]["class_based_n_total"] = len(class_based_anchors_list)
         
         # Also store class-based results in a separate key for easy access (kept for backward compatibility)
         class_based_key = f"class_{target_class}_class_based"
@@ -2107,8 +2807,8 @@ def extract_rules_single_agent(
             "n_episodes": len(class_based_anchors_list),
             "precision": class_based_precision,
             "coverage": class_based_coverage,
-            "precision_std": float(np.std(class_based_precisions)) if len(class_based_precisions) > 1 else 0.0,
-            "coverage_std": float(np.std(class_based_coverages)) if len(class_based_coverages) > 1 else 0.0,
+            "precision_std": float(np.std(filtered_class_based_precisions)) if len(filtered_class_based_precisions) > 1 else 0.0,
+            "coverage_std": float(np.std(filtered_class_based_coverages)) if len(filtered_class_based_coverages) > 1 else 0.0,
             "unique_rules": class_based_unique_rules,
             "unique_rules_count": len(class_based_unique_rules),
             "rules": class_based_rules_list,
@@ -2183,15 +2883,15 @@ def extract_rules_single_agent(
         filtered_rules_for_union = []
         
         # CRITICAL: Filter anchors using precision computed on full dataset
-        # Use already-computed precision_full_dataset if available (from class-based rollouts),
+        # Use already-computed precision_recomputed if available (from class-based rollouts),
         # otherwise recompute precision on full dataset for filtering
         # Following original Anchors paper methodology: all metrics computed on full dataset
         if X_data_union is not None and y_data_union is not None:
             for anchor_data in all_anchors_for_union:
                 if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                    # Prefer using already-computed precision_full_dataset if available
-                    if "precision_full_dataset" in anchor_data:
-                        actual_precision = anchor_data["precision_full_dataset"]
+                    # Prefer using already-computed precision_recomputed if available
+                    if "precision_recomputed" in anchor_data:
+                        actual_precision = anchor_data["precision_recomputed"]
                     else:
                         # Recompute precision on full dataset if not already computed
                         lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)

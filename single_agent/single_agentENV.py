@@ -182,7 +182,7 @@ class SingleAgentAnchorEnv(Env):
             "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", 200),
             "both_reasonably_close": env_config.get("max_termination_count_both_close", 50)
         }
-        self._reset_termination_counters()
+        self._reset_termination_counters()  # This will check self.mode and disable lenient conditions in inference mode
         
         # Multi-agent config options (kept for API compatibility, but not used in single-agent)
         # Single-agent environments are independent (one per class), so these don't apply
@@ -238,7 +238,13 @@ class SingleAgentAnchorEnv(Env):
 
     # SS: It is used to mask the data in the box for the perturbation sampling.
     def _mask_in_box(self) -> np.ndarray:
-        if self.eval_on_test_data:
+        # CRITICAL: During training (mode="training"), always use training data to prevent test set leakage
+        # Only use test data during evaluation (mode="evaluation") or inference (mode="inference")
+        if self.mode == "training":
+            # Training environments MUST use training data only
+            X_eval_unit = self.X_unit
+        elif self.eval_on_test_data:
+            # Evaluation/inference environments can use test data if flag is set
             X_eval_unit = self.X_test_unit
         else:
             X_eval_unit = self.X_unit
@@ -308,8 +314,16 @@ class SingleAgentAnchorEnv(Env):
                     
                     # CRITICAL FIX: For scattered data, centroids might be mean centroids (not actual data points)
                     # Check if centroid is close to any actual data point. If not, use the nearest data point instead.
-                    X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
-                    y_data = self.y_test if self.eval_on_test_data else self.y
+                    # CRITICAL: During training, always use training data to prevent test set leakage
+                    if self.mode == "training":
+                        X_data = self.X_unit
+                        y_data = self.y
+                    elif self.eval_on_test_data:
+                        X_data = self.X_test_unit
+                        y_data = self.y_test
+                    else:
+                        X_data = self.X_unit
+                        y_data = self.y
                     class_mask = (y_data == self.target_class)
                     
                     if class_mask.sum() > 0:
@@ -431,7 +445,15 @@ class SingleAgentAnchorEnv(Env):
         covered = np.where(mask)[0]
         
         # Determine which dataset to use (test or training)
-        if self.eval_on_test_data:
+        # CRITICAL: During training (mode="training"), always use training data to prevent test set leakage
+        # Only use test data during evaluation (mode="evaluation") or inference (mode="inference")
+        if self.mode == "training":
+            # Training environments MUST use training data only
+            X_data_std = self.X_std
+            y_data = self.y
+            data_source = "training"
+        elif self.eval_on_test_data:
+            # Evaluation/inference environments can use test data if flag is set
             X_data_std = self.X_test_std
             y_data = self.y_test
             data_source = "test"
@@ -665,7 +687,14 @@ class SingleAgentAnchorEnv(Env):
                 # Precision = fraction of samples in box that are actually target class
                 hard_precision = float((y_eval == self.target_class).mean())
 
-        avg_prob = float(probs[:, self.target_class].mean())
+        # For avg_prob blending, use original_prediction for instance-based, target_class for class-based
+        if is_instance_based and self.original_prediction is not None:
+            # Instance-based: blend with probability of original_prediction class
+            avg_prob = float(probs[:, self.original_prediction].mean())
+        else:
+            # Class-based: blend with probability of target_class
+            avg_prob = float(probs[:, self.target_class].mean())
+        
         precision_proxy = (
             self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
         )
@@ -681,7 +710,7 @@ class SingleAgentAnchorEnv(Env):
         }
 
     def _reset_termination_counters(self):
-        """Reset termination reason counters and enable all reasons."""
+        """Reset termination reason counters and enable all reasons (except lenient ones in inference mode)."""
         self.termination_reason_counts = {
             "both_targets_met": 0,
             "excellent_precision": 0,
@@ -694,6 +723,11 @@ class SingleAgentAnchorEnv(Env):
             "high_precision_reasonable_coverage": True,
             "both_reasonably_close": True
         }
+        # In inference mode, disable lenient termination conditions to force optimization for both metrics
+        # Only allow "both_targets_met" and "both_reasonably_close" to avoid early termination
+        if self.mode == "inference":
+            self.termination_reason_enabled["excellent_precision"] = False
+            self.termination_reason_enabled["high_precision_reasonable_coverage"] = False
     
     def reset(
         self, 
@@ -1428,7 +1462,13 @@ class SingleAgentAnchorEnv(Env):
         initial_lower: Optional[np.ndarray] = None,
         initial_upper: Optional[np.ndarray] = None,
         denormalize: bool = False
-    ) -> str:
+    ) -> Tuple[str, str]:
+        """
+        Extract a human-readable rule string and canonical rule key.
+        
+        Returns:
+            Tuple of (rule_string, canonical_key)
+        """
         lower = self.lower.copy()
         upper = self.upper.copy()
         
@@ -1501,8 +1541,13 @@ class SingleAgentAnchorEnv(Env):
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref)[0]
         
+        # Compute canonical key from normalized bounds (before denormalization)
+        # This ensures canonicalization works consistently regardless of denormalization
+        canonical_key = self._canonicalize_rule_key()
+        
         if tightened.size == 0:
-            return "any values (no tightened features)"
+            rule_str = "any values (no tightened features)"
+            return rule_str, canonical_key
         
         tightened_sorted = np.argsort(current_width[tightened])
         if max_features_in_rule is None or max_features_in_rule == -1 or max_features_in_rule == 0:
@@ -1511,13 +1556,60 @@ class SingleAgentAnchorEnv(Env):
             to_show_idx = tightened[tightened_sorted[:max_features_in_rule]]
         
         if to_show_idx.size == 0:
-            return "any values (no tightened features)"
+            rule_str = "any values (no tightened features)"
+            return rule_str, canonical_key
         
         cond_parts = []
         for i in to_show_idx:
             cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.4f}, {upper[i]:.4f}]")
         
-        return " and ".join(cond_parts)
+        rule_str = " and ".join(cond_parts)
+        return rule_str, canonical_key
+    
+    def _canonicalize_rule_key(self) -> str:
+        """
+        Create a canonical rule key from current normalized bounds for deduplication.
+        Quantizes bounds to epsilon grid, drops near-full-range features, and sorts.
+        
+        Returns:
+            Canonical rule key as string
+        """
+        lower = self.lower.copy()
+        upper = self.upper.copy()
+        min_width = getattr(self, 'min_width', 0.05)
+        epsilon = max(1e-3, min_width / 4.0)
+        
+        # Quantize bounds to epsilon grid
+        lower_quantized = np.round(lower / epsilon) * epsilon
+        upper_quantized = np.round(upper / epsilon) * epsilon
+        
+        # Clip to valid range [0, 1]
+        lower_quantized = np.clip(lower_quantized, 0.0, 1.0)
+        upper_quantized = np.clip(upper_quantized, 0.0, 1.0)
+        
+        # Drop near-full-range features (features that haven't been tightened)
+        # A feature is near-full-range if: lower <= eps AND upper >= 1 - eps
+        tightened_mask = ~((lower_quantized <= epsilon) & (upper_quantized >= 1.0 - epsilon))
+        tightened_indices = np.where(tightened_mask)[0]
+        
+        if len(tightened_indices) == 0:
+            return "any_values"
+        
+        # Extract only tightened features and sort by feature index
+        tightened_lower = lower_quantized[tightened_indices]
+        tightened_upper = upper_quantized[tightened_indices]
+        
+        # Sort by feature index for canonical ordering
+        sort_order = np.argsort(tightened_indices)
+        tightened_indices_sorted = tightened_indices[sort_order]
+        tightened_lower_sorted = tightened_lower[sort_order]
+        tightened_upper_sorted = tightened_upper[sort_order]
+        
+        # Create canonical key: "f1:l1:u1;f2:l2:u2;..."
+        key_parts = [f"{idx}:{lo:.6f}:{hi:.6f}" 
+                     for idx, lo, hi in zip(tightened_indices_sorted, tightened_lower_sorted, tightened_upper_sorted)]
+        
+        return ";".join(key_parts)
     
     def render(self):
         raise NotImplementedError("Render not implemented for AnchorEnv")

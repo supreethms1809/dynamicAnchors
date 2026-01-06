@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.4
+  coverage_target: 0.3
   
   # Data perturbation settings
   use_perturbation: True
@@ -54,7 +54,7 @@ env_config:
   use_random_sampling: false
   # Training initialization: ratio of instance-based vs centroid-based episodes
   # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% centroid-based
-  training_instance_ratio: 0.4  # 10% instance-based (prediction matching), 90% class-based (class correctness)
+  training_instance_ratio: 1.0  # 10% instance-based (prediction matching), 90% class-based (class correctness)
   # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
   use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
   

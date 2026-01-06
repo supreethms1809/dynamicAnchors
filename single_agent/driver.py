@@ -276,7 +276,7 @@ def main():
     # - This helps catch good models early and track if training rewards improve but eval rewards degrade
     experiment_config = {
         "total_timesteps": args.total_timesteps,
-        "eval_freq": 3000,  # Increased frequency: every 3000 steps (was 6000) for better model selection
+        "eval_freq": 5000,  # Increased frequency: every 3000 steps (was 6000) for better model selection
         "n_eval_episodes": 20,  # More episodes for better statistics (was 10)
         "checkpoint_freq": 12_000,
         "log_interval": 10,

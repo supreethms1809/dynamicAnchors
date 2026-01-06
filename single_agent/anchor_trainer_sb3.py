@@ -645,7 +645,8 @@ class AnchorTrainerSB3:
             logger.info(f"  Setting up class {target_class}...")
             
             # Create training environment for this class
-            train_env_config = {**env_config_with_data, "mode": "training"}
+            # CRITICAL: Training environments MUST use training data only (no test set leakage)
+            train_env_config = {**env_config_with_data, "mode": "training", "eval_on_test_data": False}
             train_env = self._create_env_for_class(
                 env_data=env_data,
                 env_config=train_env_config,
@@ -656,7 +657,9 @@ class AnchorTrainerSB3:
             self.envs[target_class] = train_env
             
             # Create evaluation environment for this class (with evaluation mode)
+            # Evaluation environments can use test data if eval_on_test_data is enabled
             eval_env_config = {**env_config_with_data, "mode": "evaluation"}
+            # Note: eval_env_config already has eval_on_test_data from env_config_with_data
             eval_env = self._create_env_for_class(
                 env_data=env_data,
                 env_config=eval_env_config,

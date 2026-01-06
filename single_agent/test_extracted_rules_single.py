@@ -747,9 +747,15 @@ def test_rules_from_json(
         logger.warning(f"⚠ Model type: {model_type} (expected 'single_agent_sb3')")
     
     # Determine the data source for metrics labels
-    # Check if inference was run on test data
+    # Check if inference was run on test data and coverage_on_all_data flag
     inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
-    metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+    inference_coverage_on_all_data = metadata.get("coverage_on_all_data", False)
+    if inference_coverage_on_all_data:
+        metrics_data_source = "full dataset (train + test)"
+    elif inference_eval_on_test_data:
+        metrics_data_source = "test data"
+    else:
+        metrics_data_source = "training data"
     
     # Load dataset
     logger.info(f"Loading dataset: {dataset_name}")
@@ -791,6 +797,7 @@ def test_rules_from_json(
     class_based_rules = set()
     rule_to_source_classes = defaultdict(list)  # Track which classes each rule came from
     rule_to_rollout_type = {}  # Track whether rule is instance-based or class-based
+    rule_to_original_predictions = defaultdict(list)  # Track original predictions for instance-based rules
     
     for class_key, class_data in per_class_results.items():
         # Skip separate class-based keys (we'll process them separately)
@@ -803,10 +810,23 @@ def test_rules_from_json(
         
         # Collect instance-based rules
         unique_rules = class_data.get("unique_rules", [])
+        anchors_list = class_data.get("anchors", [])  # Get anchors to extract original predictions
+        rule_to_orig_pred_for_class = defaultdict(set)  # Track original predictions per rule for this class
+        
+        # Extract original predictions from anchors for this class
+        for anchor in anchors_list:
+            if anchor.get("rollout_type") == "instance_based" and "rule" in anchor and "original_prediction" in anchor:
+                rule_str = anchor["rule"]
+                orig_pred = anchor["original_prediction"]
+                rule_to_orig_pred_for_class[rule_str].add(orig_pred)
+                rule_to_original_predictions[rule_str].append(orig_pred)
+        
         for rule_str in unique_rules:
             all_unique_rules.add(rule_str)
             instance_based_rules.add(rule_str)
             rule_to_source_classes[rule_str].append(target_class)
+            # CRITICAL FIX: Always set instance_based, never overwrite it with class_based later
+            # This ensures prediction-match precision is used for instance-based rules even if they also appear in class-based sets
             rule_to_rollout_type[rule_str] = "instance_based"
         
         # Collect class-based rules from nested dict (legacy format)
@@ -820,7 +840,10 @@ def test_rules_from_json(
                     all_unique_rules.add(rule_str)
                     class_based_rules.add(rule_str)
                     rule_to_source_classes[rule_str].append(target_class)
-                    rule_to_rollout_type[rule_str] = "class_based"
+                    # CRITICAL FIX: Only set class_based if rule doesn't already exist as instance_based
+                    # This preserves instance-based classification for overlapping rules
+                    if rule_str not in rule_to_rollout_type:
+                        rule_to_rollout_type[rule_str] = "class_based"
             else:
                 # Dict of agent results (for multi-agent compatibility)
                 for agent_name, agent_results in class_based_results.items():
@@ -829,7 +852,9 @@ def test_rules_from_json(
                         all_unique_rules.add(rule_str)
                         class_based_rules.add(rule_str)
                         rule_to_source_classes[rule_str].append(target_class)
-                        rule_to_rollout_type[rule_str] = "class_based"
+                        # CRITICAL FIX: Only set class_based if rule doesn't already exist as instance_based
+                        if rule_str not in rule_to_rollout_type:
+                            rule_to_rollout_type[rule_str] = "class_based"
     
     # CRITICAL: Also collect class-based rules from separate keys (current format)
     # Inference saves class-based rules in separate class_{class}_class_based keys
@@ -850,16 +875,28 @@ def test_rules_from_json(
                 all_unique_rules.add(rule_str)
                 class_based_rules.add(rule_str)
                 rule_to_source_classes[rule_str].append(target_class)
-                rule_to_rollout_type[rule_str] = "class_based"
+                # CRITICAL FIX: Only set class_based if rule doesn't already exist as instance_based
+                # This preserves instance-based classification for overlapping rules
+                # Instance-based rules should use prediction-match precision, which is more accurate for fidelity
+                if rule_str not in rule_to_rollout_type:
+                    rule_to_rollout_type[rule_str] = "class_based"
     
     all_unique_rules = sorted(list(all_unique_rules))  # Sort for consistent ordering
     instance_based_rules = sorted(list(instance_based_rules))
     class_based_rules = sorted(list(class_based_rules))
     
+    # Count overlapping rules (rules that appear in both instance-based and class-based sets)
+    # Convert to sets for intersection operation, then back to sorted list
+    overlapping_rules = sorted(list(set(instance_based_rules) & set(class_based_rules)))
+    
     logger.info(f"{'='*80}")
     logger.info(f"Found {len(all_unique_rules)} total unique rules")
     logger.info(f"  Instance-based rules: {len(instance_based_rules)}")
     logger.info(f"  Class-based rules: {len(class_based_rules)}")
+    if overlapping_rules:
+        logger.info(f"  Overlapping rules (in both sets): {len(overlapping_rules)}")
+        logger.info(f"    Note: Overlapping rules will use instance-based classification (prediction-match precision)")
+        logger.debug(f"    Overlapping rules: {overlapping_rules[:5]}{'...' if len(overlapping_rules) > 5 else ''}")
     logger.info(f"  Overlapping rules (in both): {len(set(instance_based_rules) & set(class_based_rules))}")
     logger.info(f"{'='*80}")
     logger.info(f"Testing all {len(all_unique_rules)} unique rules against all classes")
@@ -869,6 +906,59 @@ def test_rules_from_json(
     unique_classes = sorted(list(np.unique(y_data)))
     logger.info(f"Classes in dataset: {unique_classes}")
     logger.info(f"Class distribution: {dict(zip(*np.unique(y_data, return_counts=True)))}")
+    
+    # For instance-based rules, track original predictions per rule
+    # CRITICAL FIX: Store all original predictions per rule, not just most common
+    # This allows computing precision per source class when a rule has multiple original predictions
+    from collections import Counter
+    rule_to_most_common_orig_pred = {}  # For backward compatibility / fallback
+    rule_to_all_orig_preds = {}  # Store all original predictions per rule
+    rule_to_orig_pred_by_source_class = {}  # Store original predictions per rule per source class
+    
+    for rule_str, orig_preds in rule_to_original_predictions.items():
+        if orig_preds:
+            # Store all original predictions for this rule
+            rule_to_all_orig_preds[rule_str] = list(orig_preds)
+            # Use most common as fallback (for backward compatibility)
+            counter = Counter(orig_preds)
+            rule_to_most_common_orig_pred[rule_str] = counter.most_common(1)[0][0]
+    
+    # Build mapping from rule to original predictions by source class
+    # This allows computing precision per source class when rules span multiple classes
+    for class_key, class_data in per_class_results.items():
+        if class_key.endswith("_class_based") or class_data.get("rollout_type") == "class_based":
+            continue
+        target_class = class_data.get("class")
+        if target_class is None:
+            continue
+        anchors_list = class_data.get("anchors", [])
+        for anchor in anchors_list:
+            if anchor.get("rollout_type") == "instance_based" and "rule" in anchor and "original_prediction" in anchor:
+                rule_str = anchor["rule"]
+                orig_pred = anchor["original_prediction"]
+                if rule_str not in rule_to_orig_pred_by_source_class:
+                    rule_to_orig_pred_by_source_class[rule_str] = {}
+                if target_class not in rule_to_orig_pred_by_source_class[rule_str]:
+                    rule_to_orig_pred_by_source_class[rule_str][target_class] = []
+                rule_to_orig_pred_by_source_class[rule_str][target_class].append(orig_pred)
+    
+    # Load classifier for prediction-match precision calculation (instance-based rules only)
+    classifier = None
+    device = "cpu"
+    try:
+        import torch
+        # Try to get classifier from metadata or dataset_loader
+        # For now, we'll compute predictions on-the-fly if classifier is available
+        # If not available, we'll fall back to class-label precision with a warning
+        if hasattr(dataset_loader, 'classifier') and dataset_loader.classifier is not None:
+            classifier = dataset_loader.classifier
+            logger.info("✓ Using classifier from dataset_loader for prediction-match precision (instance-based rules)")
+        elif hasattr(dataset_loader, 'get_classifier'):
+            classifier = dataset_loader.get_classifier()
+            logger.info("✓ Loaded classifier for prediction-match precision (instance-based rules)")
+    except Exception as e:
+        logger.warning(f"Could not load classifier for prediction-match precision: {e}")
+        logger.warning("Will use class-label precision for all rules (including instance-based)")
     
     # Process each rule and test against all classes
     results = {
@@ -930,11 +1020,45 @@ def test_rules_from_json(
             n_class_samples = np.sum(y_data == target_class)
             n_satisfying_class = np.sum(satisfying_mask & (y_data == target_class))
             
-            # Calculate precision and coverage for this class
-            if n_satisfying > 0:
-                precision = n_satisfying_class / n_satisfying
+            # Calculate precision based on rollout type to match rollout/recomputation metrics
+            # - Instance-based: Use prediction-match precision (P(pred(x) = original_pred | x satisfies rule))
+            #   This matches the recomputation metric used in inference
+            # - Class-based: Use class-label precision (P(y = target_class | x satisfies rule))
+            #   This matches the class-based precision used in inference
+            if rollout_type == "instance_based" and classifier is not None and all_predictions is not None:
+                # Instance-based rule: Compute prediction-match precision
+                # CRITICAL FIX: Use original prediction for this specific source class if available,
+                # otherwise fall back to most common across all source classes
+                # This handles rules extracted from multiple classes with different original predictions
+                original_prediction = None
+                if rule_str in rule_to_orig_pred_by_source_class and target_class in rule_to_orig_pred_by_source_class[rule_str]:
+                    # Use most common original prediction for this specific source class
+                    source_class_preds = rule_to_orig_pred_by_source_class[rule_str][target_class]
+                    if source_class_preds:
+                        counter = Counter(source_class_preds)
+                        original_prediction = counter.most_common(1)[0][0]
+                        logger.debug(f"  Using original prediction {original_prediction} for source class {target_class} (from {len(source_class_preds)} instances)")
+                
+                if original_prediction is None and rule_str in rule_to_most_common_orig_pred:
+                    # Fallback: use most common original prediction across all source classes
+                    original_prediction = rule_to_most_common_orig_pred[rule_str]
+                    logger.debug(f"  Using most common original prediction {original_prediction} across all source classes (fallback)")
+                
+                if original_prediction is not None and n_satisfying > 0:
+                    # Use pre-computed predictions (performance optimization)
+                    predictions_satisfying = all_predictions[satisfying_mask]
+                    # Precision = fraction of satisfying samples with prediction matching original
+                    n_matching_pred = (predictions_satisfying == original_prediction).sum()
+                    precision = float(n_matching_pred / n_satisfying)
+                else:
+                    precision = 0.0
             else:
-                precision = 0.0
+                # Class-based rule (or instance-based without classifier): Use class-label precision
+                # This is P(y = target_class | x satisfies rule)
+                if n_satisfying > 0:
+                    precision = n_satisfying_class / n_satisfying
+                else:
+                    precision = 0.0
             
             if n_class_samples > 0:
                 coverage = n_satisfying_class / n_class_samples
@@ -970,7 +1094,10 @@ def test_rules_from_json(
             
             logger.info(f"  Class {target_class}:")
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
-            logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
+            if rollout_type == "instance_based" and rule_str in rule_to_most_common_orig_pred and classifier is not None:
+                logger.info(f"    Rule-level precision: {precision:.4f} (prediction-match, matches rollout/recomputation metrics)")
+            else:
+                logger.info(f"    Rule-level precision: {precision:.4f} (class-label, calculated from testing)")
             
             # Only display instance-level and class-level metrics if:
             # 1. The rule matches samples from this class (n_satisfying_class > 0), OR
@@ -1013,48 +1140,82 @@ def test_rules_from_json(
     logger.info(f"{'='*80}")
     
     # For each class, collect all rules with their precision and coverage, then rank them
+    # CRITICAL FIX: Separate rankings for instance-based and class-based rules to avoid mixing precision semantics
+    # Instance-based uses prediction-match precision, class-based uses class-label precision
     ranked_rules_per_class = {}
     for target_class in unique_classes:
-        class_rules_with_metrics = []
+        instance_based_rules_with_metrics = []
+        class_based_rules_with_metrics = []
         
         for rule_result in results["rule_results"]:
             class_key = f"class_{target_class}"
             if class_key in rule_result["per_class_results"]:
                 class_res = rule_result["per_class_results"][class_key]
                 rule_str = rule_result["rule"]
+                rollout_type = rule_result.get("rollout_type", "unknown")
                 
                 # Get rule-level precision and coverage (from testing)
                 rule_precision = class_res.get("rule_precision", 0.0)
                 rule_coverage = class_res.get("rule_coverage", 0.0)
                 
                 # Calculate a combined score for ranking (weighted: precision more important)
-                # Using F1-like score: 2 * (precision * coverage) / (precision + coverage)
-                # But we'll prioritize precision, so use: precision * (1 + coverage)
+                # Using: precision * (1 + coverage)
                 if rule_precision > 0:
                     combined_score = rule_precision * (1.0 + rule_coverage)
                 else:
                     combined_score = 0.0
                 
-                class_rules_with_metrics.append({
+                rule_info = {
                     "rule": rule_str,
                     "rule_precision": rule_precision,
                     "rule_coverage": rule_coverage,
                     "combined_score": combined_score,
-                    "rule_index": rule_result.get("rule_index", -1)
-                })
+                    "rule_index": rule_result.get("rule_index", -1),
+                    "precision_type": "prediction-match" if rollout_type == "instance_based" else "class-label"
+                }
+                
+                # Separate by rollout type to avoid mixing precision semantics
+                if rollout_type == "instance_based":
+                    instance_based_rules_with_metrics.append(rule_info)
+                elif rollout_type == "class_based":
+                    class_based_rules_with_metrics.append(rule_info)
+                else:
+                    # Unknown type - add to both for backward compatibility
+                    instance_based_rules_with_metrics.append(rule_info)
+                    class_based_rules_with_metrics.append(rule_info)
         
-        # Sort by combined score (descending), then by precision, then by coverage
-        class_rules_with_metrics.sort(
+        # Sort each group separately by combined score (descending), then by precision, then by coverage
+        instance_based_rules_with_metrics.sort(
+            key=lambda x: (x["combined_score"], x["rule_precision"], x["rule_coverage"]),
+            reverse=True
+        )
+        class_based_rules_with_metrics.sort(
             key=lambda x: (x["combined_score"], x["rule_precision"], x["rule_coverage"]),
             reverse=True
         )
         
-        ranked_rules_per_class[target_class] = class_rules_with_metrics
+        # Store both rankings separately
+        ranked_rules_per_class[target_class] = {
+            "instance_based": instance_based_rules_with_metrics,
+            "class_based": class_based_rules_with_metrics,
+            "all": instance_based_rules_with_metrics + class_based_rules_with_metrics  # Combined for backward compatibility
+        }
         
-        logger.info(f"Class {target_class}: Ranked {len(class_rules_with_metrics)} rules")
-        if class_rules_with_metrics:
-            logger.info(f"  Top 5 rules:")
-            for rank, rule_info in enumerate(class_rules_with_metrics[:5], 1):
+        total_rules = len(instance_based_rules_with_metrics) + len(class_based_rules_with_metrics)
+        logger.info(f"Class {target_class}: Ranked {total_rules} rules ({len(instance_based_rules_with_metrics)} instance-based, {len(class_based_rules_with_metrics)} class-based)")
+        
+        # Log top rules separately by type to avoid mixing precision semantics
+        if instance_based_rules_with_metrics:
+            logger.info(f"  Top 3 instance-based rules (prediction-match precision):")
+            for rank, rule_info in enumerate(instance_based_rules_with_metrics[:3], 1):
+                logger.info(f"    Rank {rank}: precision={rule_info['rule_precision']:.4f}, "
+                          f"coverage={rule_info['rule_coverage']:.4f}, "
+                          f"score={rule_info['combined_score']:.4f}")
+                logger.info(f"      Rule: {rule_info['rule']}")
+        
+        if class_based_rules_with_metrics:
+            logger.info(f"  Top 3 class-based rules (class-label precision):")
+            for rank, rule_info in enumerate(class_based_rules_with_metrics[:3], 1):
                 logger.info(f"    Rank {rank}: precision={rule_info['rule_precision']:.4f}, "
                           f"coverage={rule_info['rule_coverage']:.4f}, "
                           f"score={rule_info['combined_score']:.4f}")
@@ -1068,10 +1229,17 @@ def test_rules_from_json(
         target_class = class_data.get("class", -1)
         if target_class in ranked_rules_per_class:
             ranked_rules = ranked_rules_per_class[target_class]
-            # Store ranked rules with their metrics
+            # Store ranked rules with their metrics (now a dict with instance_based, class_based, all)
             class_data["ranked_rules"] = ranked_rules
             # Also update unique_rules to be in ranked order (top rules first)
-            class_data["ranked_unique_rules"] = [r["rule"] for r in ranked_rules]
+            # Use "all" for backward compatibility (combined list)
+            if isinstance(ranked_rules, dict) and "all" in ranked_rules:
+                class_data["ranked_unique_rules"] = [r["rule"] for r in ranked_rules["all"]]
+            elif isinstance(ranked_rules, list):
+                # Backward compatibility: if it's still a list, use it directly
+                class_data["ranked_unique_rules"] = [r["rule"] for r in ranked_rules]
+            else:
+                class_data["ranked_unique_rules"] = []
     
     # Compute statistics by rollout type
     instance_based_stats = {
@@ -1350,9 +1518,16 @@ Examples:
             rules_data = json.load(f)
         
         # Get metadata to determine data source for metrics labels
+        # CRITICAL FIX: Account for coverage_on_all_data flag to match test_rules_from_json logic
         metadata = rules_data.get("metadata", {})
         inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
-        metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+        inference_coverage_on_all_data = metadata.get("coverage_on_all_data", False)
+        if inference_coverage_on_all_data:
+            metrics_data_source = "full dataset (train + test)"
+        elif inference_eval_on_test_data:
+            metrics_data_source = "test data"
+        else:
+            metrics_data_source = "training data"
         
         # Test rules
         results = test_rules_from_json(

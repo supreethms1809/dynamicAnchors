@@ -561,8 +561,11 @@ def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[
     # Pattern to match: "feature_name ∈ [lower, upper]" or "feature_name <= value" or "feature_name >= value"
     # Also handle "feature_name > value" and "feature_name < value"
     # Also handle formats like "feature_name <= value <= feature_name" (range)
+    # Also handle formats like "lower < feature_name <= upper" (anchor-exp range format)
     pattern_range = r'(.+?)\s*∈\s*\[([-\d.]+),\s*([-\d.]+)\]'
     pattern_range_alt = r'(.+?)\s*<=\s*([-\d.]+)\s*<=\s*(.+)'  # "feature <= val <= feature" (same feature)
+    # Pattern for "lower < feature <= upper" or "lower <= feature <= upper" or "lower < feature < upper"
+    pattern_range_lower_first = r'([-\d.]+)\s*[<]=?\s*(.+?)\s*[<]=?\s*([-\d.]+)'
     pattern_le = r'(.+?)\s*<=\s*([-\d.]+)'
     pattern_ge = r'(.+?)\s*>=\s*([-\d.]+)'
     pattern_lt = r'(.+?)\s*<\s*([-\d.]+)'
@@ -584,6 +587,48 @@ def parse_anchor_rule(anchor_rule: Any, feature_names: List[str]) -> List[Tuple[
             upper = float(match.group(3))
             conditions.append((feature_name, lower, upper))
             continue
+        
+        # Try range pattern with lower bound first: "lower < feature <= upper" or "lower <= feature <= upper"
+        # This handles anchor-exp format like "-0.80 < feature_0 <= 0.79"
+        match = re.search(pattern_range_lower_first, condition_str)
+        if match:
+            try:
+                lower_str = match.group(1).strip()
+                feature_name = match.group(2).strip()
+                upper_str = match.group(3).strip()
+                # Verify that middle group is a feature name (not a number)
+                # and both outer groups are numbers
+                lower_val = float(lower_str)
+                upper_val = float(upper_str)
+                # Check if middle is a feature name (contains letters/underscores, not just digits)
+                if any(c.isalpha() or c == '_' for c in feature_name):
+                    # Determine if bounds are inclusive or exclusive based on operators
+                    # Pattern: "lower < feature <=" means lower exclusive, upper inclusive
+                    # Pattern: "lower <= feature <=" means both inclusive
+                    # Pattern: "lower < feature <" means both exclusive
+                    # Pattern: "lower <= feature <" means lower inclusive, upper exclusive
+                    
+                    # Check if lower bound is exclusive (<) or inclusive (<=)
+                    # Look for pattern like "-0.80 < feature" (no = after <)
+                    lower_exclusive = bool(re.search(rf'^{re.escape(lower_str)}\s*<\s*{re.escape(feature_name)}\b', condition_str))
+                    # Check if upper bound is exclusive (<) or inclusive (<=)
+                    # Look for pattern like "feature < 0.79" (no = after <) and not "feature <="
+                    upper_exclusive = bool(re.search(rf'{re.escape(feature_name)}\s*<\s*{re.escape(upper_str)}$', condition_str)) and \
+                                     not bool(re.search(rf'{re.escape(feature_name)}\s*<=', condition_str))
+                    
+                    # Adjust bounds for exclusivity (add/subtract small epsilon)
+                    # For exclusive lower: use lower + epsilon so that >= comparison works
+                    # For exclusive upper: use upper - epsilon so that <= comparison works
+                    # Use a small but meaningful epsilon relative to the data scale
+                    # Since data is typically scaled, 1e-6 should be sufficient
+                    epsilon = 1e-6  # Small epsilon for floating point comparisons
+                    lower = lower_val + (epsilon if lower_exclusive else 0.0)
+                    upper = upper_val - (epsilon if upper_exclusive else 0.0)
+                    
+                    conditions.append((feature_name, lower, upper))
+                    continue
+            except (ValueError, IndexError):
+                pass
         
         # Try alternative range pattern (feature <= val <= feature)
         match = re.search(pattern_range_alt, condition_str)

@@ -311,7 +311,7 @@ def explain_new_instance_single_agent(
             initial_lower_normalized = np.clip(instance_unit - initial_window, 0.0, 1.0)
             initial_upper_normalized = np.clip(instance_unit + initial_window, 0.0, 1.0)
             
-            rule = temp_env.extract_rule(
+            rule, canonical_key = temp_env.extract_rule(
                 max_features_in_rule=max_features_in_rule,
                 initial_lower=initial_lower_normalized,
                 initial_upper=initial_upper_normalized,
