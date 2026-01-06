@@ -757,7 +757,17 @@ class AnchorEnv(ParallelEnv):
                 hard_precision = float((y_eval == target_class).mean())
                 using_synthetic_samples = False
 
-        avg_prob = float(probs[:, target_class].mean())
+        # CRITICAL FIX: For instance-based mode, use original prediction probability instead of target_class
+        # This ensures reward signal matches single-agent behavior and original Anchor paper
+        if is_instance_based and agent in self.original_predictions:
+            original_pred = self.original_predictions[agent]
+            # Use probability of original prediction class, not target_class
+            avg_prob = float(probs[:, original_pred].mean())
+            logger.debug(f"Agent {agent}: Instance-based precision proxy using original prediction class {original_pred} probability")
+        else:
+            # Class-based mode: use target_class probability
+            avg_prob = float(probs[:, target_class].mean())
+        
         precision_proxy = (
             self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
         )
@@ -880,6 +890,9 @@ class AnchorEnv(ParallelEnv):
                         del self.original_predictions[agent]
             
             if self.x_star_unit.get(agent) is not None:
+                # Get target_class for this agent (needed for validation and logging)
+                target_class = self._get_class_for_agent(agent)
+                
                 w = self.initial_window
                 centroid = self.x_star_unit[agent]
                 self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
@@ -903,9 +916,9 @@ class AnchorEnv(ParallelEnv):
                         probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
                         original_pred = int(np.argmax(probs))
                         self.original_predictions[agent] = original_pred
-                        # CRITICAL VALIDATION: Verify original_prediction matches target_class
+                        # CRITICAL VALIDATION: Verify original_prediction matches target_class (if target_class is available)
                         # This should be true after filtering instances by prediction, but check as safety
-                        if original_pred != target_class:
+                        if target_class is not None and original_pred != target_class:
                             logger.warning(
                                 f"Agent {agent}: original_prediction ({original_pred}) != target_class ({target_class})! "
                                 f"This may cause precision calculation issues. "
@@ -1110,24 +1123,22 @@ class AnchorEnv(ParallelEnv):
             if agent not in actions:
                 # Agent did not act in this step; keep its box unchanged
                 precision, coverage, details = self._current_metrics(agent)
+                # Skip action application for agents without actions
+                continue
             else:
-                precision, coverage, details = self._current_metrics(agent)
-                metrics_cache[agent] = (precision, coverage, details)
-                
-                state = np.concatenate(
-                    [self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)]
-                )
-                observations[agent] = np.array(state, dtype=np.float32)
-                
+                # Agent has an action; read it and apply it
+                # CRITICAL FIX: Do not compute metrics here - observation will be created with post-action metrics
+                # This avoids wasted compute and prevents stochastic variance from duplicate calls
                 # No local reward contribution; shared reward will be added later
                 reward_without_shared[agent] = 0.0
                 terminations[agent] = False
                 truncations[agent] = False
                 
                 # SS: This is part of the metrics callback of BenchMARL. (currently not working BUG: Need to fix this)
+                # Initialize infos with placeholder values - will be updated after action with actual metrics
                 infos[agent] = {
-                    "anchor_precision": float(precision),
-                    "anchor_coverage": float(coverage),
+                    "anchor_precision": 0.0,
+                    "anchor_coverage": 0.0,
                     "drift": 0.0,
                     "anchor_drift": 0.0,
                     "js_penalty": 0.0,
@@ -1155,13 +1166,15 @@ class AnchorEnv(ParallelEnv):
                     "total_reward": 0.0,
                 }
                 self._stable_counts[agent] = 0
-                continue
             
+            # Read and apply action (only reached for agents with actions in the else branch)
             action = actions[agent]
             if isinstance(action, torch.Tensor):
                 action = action.cpu().numpy()
             action = np.array(action, dtype=np.float32)
             
+            # CRITICAL FIX: Single call to _current_metrics for prev metrics (before action)
+            # This ensures consistent prev_precision/prev_coverage without stochastic variance
             prev_precision, prev_coverage, _ = self._current_metrics(agent)
             prev_lower = self.lower[agent].copy()
             prev_upper = self.upper[agent].copy()

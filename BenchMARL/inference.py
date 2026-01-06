@@ -26,6 +26,8 @@ import sys
 from datetime import datetime
 from logging import INFO, WARNING, ERROR, CRITICAL
 from pathlib import Path
+from collections import defaultdict
+from typing import List, Tuple
 
 # Configure logging to write to both console and file
 def setup_logging(log_file=None):
@@ -61,6 +63,201 @@ def setup_logging(log_file=None):
 # Initialize with default
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def canonicalize_rule_key(
+    lower_bounds_normalized: np.ndarray,
+    upper_bounds_normalized: np.ndarray,
+    min_width: float = 0.05,
+    epsilon: Optional[float] = None
+) -> str:
+    """
+    Create a canonical rule key from normalized bounds for deduplication.
+    
+    Steps:
+    1. Quantize bounds to epsilon grid
+    2. Drop near-full-range features (lower <= eps & upper >= 1 - eps)
+    3. Sort by feature index
+    4. Return string key
+    
+    Args:
+        lower_bounds_normalized: Lower bounds in [0, 1] normalized space
+        upper_bounds_normalized: Upper bounds in [0, 1] normalized space
+        min_width: Minimum width (used to compute epsilon if not provided)
+        epsilon: Quantization step size (default: max(1e-3, min_width/4))
+    
+    Returns:
+        Canonical rule key as string
+    """
+    lower = np.array(lower_bounds_normalized, dtype=np.float32).flatten()
+    upper = np.array(upper_bounds_normalized, dtype=np.float32).flatten()
+    
+    # Compute epsilon for quantization
+    if epsilon is None:
+        epsilon = max(1e-3, min_width / 4.0)
+    
+    # Quantize bounds to epsilon grid
+    lower_quantized = np.round(lower / epsilon) * epsilon
+    upper_quantized = np.round(upper / epsilon) * epsilon
+    
+    # Clip to valid range [0, 1]
+    lower_quantized = np.clip(lower_quantized, 0.0, 1.0)
+    upper_quantized = np.clip(upper_quantized, 0.0, 1.0)
+    
+    # Drop near-full-range features (features that haven't been tightened)
+    # A feature is near-full-range if: lower <= eps AND upper >= 1 - eps
+    tightened_mask = ~((lower_quantized <= epsilon) & (upper_quantized >= 1.0 - epsilon))
+    tightened_indices = np.where(tightened_mask)[0]
+    
+    if len(tightened_indices) == 0:
+        # No tightened features - return special key
+        return "any_values"
+    
+    # Extract only tightened features and sort by feature index
+    tightened_lower = lower_quantized[tightened_indices]
+    tightened_upper = upper_quantized[tightened_indices]
+    
+    # Sort by feature index for canonical ordering
+    sort_order = np.argsort(tightened_indices)
+    tightened_indices_sorted = tightened_indices[sort_order]
+    tightened_lower_sorted = tightened_lower[sort_order]
+    tightened_upper_sorted = tightened_upper[sort_order]
+    
+    # Create canonical key: "f1:l1:u1;f2:l2:u2;..."
+    key_parts = [f"{idx}:{lo:.6f}:{hi:.6f}" 
+                 for idx, lo, hi in zip(tightened_indices_sorted, tightened_lower_sorted, tightened_upper_sorted)]
+    
+    return ";".join(key_parts)
+
+
+def compute_box_iou(
+    lower1: np.ndarray,
+    upper1: np.ndarray,
+    lower2: np.ndarray,
+    upper2: np.ndarray
+) -> float:
+    """
+    Compute Intersection over Union (IoU) between two bounding boxes in normalized [0,1] space.
+    
+    Args:
+        lower1: Lower bounds of first box (n_features,)
+        upper1: Upper bounds of first box (n_features,)
+        lower2: Lower bounds of second box (n_features,)
+        upper2: Upper bounds of second box (n_features,)
+    
+    Returns:
+        IoU value in [0, 1]
+    """
+    lower1 = np.array(lower1, dtype=np.float32).flatten()
+    upper1 = np.array(upper1, dtype=np.float32).flatten()
+    lower2 = np.array(lower2, dtype=np.float32).flatten()
+    upper2 = np.array(upper2, dtype=np.float32).flatten()
+    
+    if len(lower1) != len(upper1) or len(lower2) != len(upper2) or len(lower1) != len(lower2):
+        return 0.0
+    
+    # Compute intersection: max of lower bounds, min of upper bounds
+    intersect_lower = np.maximum(lower1, lower2)
+    intersect_upper = np.minimum(upper1, upper2)
+    
+    # Intersection volume (only where intersect_lower < intersect_upper)
+    intersect_widths = np.maximum(0.0, intersect_upper - intersect_lower)
+    intersection_volume = np.prod(intersect_widths)
+    
+    # Compute union volumes
+    volume1 = np.prod(np.maximum(0.0, upper1 - lower1))
+    volume2 = np.prod(np.maximum(0.0, upper2 - lower2))
+    union_volume = volume1 + volume2 - intersection_volume
+    
+    if union_volume <= 0.0:
+        return 0.0
+    
+    iou = intersection_volume / union_volume
+    return float(iou)
+
+
+def nms_deduplicate_anchors(
+    anchors_list: List[Dict[str, Any]],
+    iou_threshold: float = 0.9,
+    key_precision: str = "instance_precision",
+    key_coverage: str = "instance_coverage",
+    fallback_precision: str = "anchor_precision",
+    fallback_coverage: str = "anchor_coverage"
+) -> List[Dict[str, Any]]:
+    """
+    Non-Maximum Suppression (NMS) for anchor deduplication using IoU.
+    
+    Ranks anchors by precision (tie-break by coverage), then keeps a rule only if
+    its box IoU with all kept rules is below the threshold.
+    
+    Args:
+        anchors_list: List of anchor dictionaries with bounds and metrics
+        iou_threshold: IoU threshold for considering anchors as duplicates (default: 0.9)
+        key_precision: Key for precision metric (prefer instance_precision)
+        key_coverage: Key for coverage metric (prefer instance_coverage)
+        fallback_precision: Fallback key for precision if primary not found
+        fallback_coverage: Fallback key for coverage if primary not found
+    
+    Returns:
+        Filtered list of anchors after NMS
+    """
+    if len(anchors_list) == 0:
+        return []
+    
+    # Extract bounds and metrics for each anchor
+    anchor_data = []
+    for i, anchor in enumerate(anchors_list):
+        lower = anchor.get("lower_bounds_normalized")
+        upper = anchor.get("upper_bounds_normalized")
+        
+        if lower is None or upper is None:
+            # Skip anchors without bounds
+            continue
+        
+        lower = np.array(lower, dtype=np.float32)
+        upper = np.array(upper, dtype=np.float32)
+        
+        # Get precision and coverage (prefer primary, fallback to fallback)
+        precision = anchor.get(key_precision, anchor.get(fallback_precision, 0.0))
+        coverage = anchor.get(key_coverage, anchor.get(fallback_coverage, 0.0))
+        
+        anchor_data.append({
+            "index": i,
+            "anchor": anchor,
+            "lower": lower,
+            "upper": upper,
+            "precision": float(precision),
+            "coverage": float(coverage),
+            "score": float(precision)  # Primary sort by precision
+        })
+    
+    if len(anchor_data) == 0:
+        return []
+    
+    # Sort by precision (descending), tie-break by coverage (descending)
+    anchor_data.sort(key=lambda x: (x["precision"], x["coverage"]), reverse=True)
+    
+    # Greedy NMS: keep anchors with IoU < threshold with all previously kept anchors
+    kept = []
+    for current in anchor_data:
+        is_duplicate = False
+        
+        # Check IoU with all previously kept anchors
+        for kept_anchor in kept:
+            iou = compute_box_iou(
+                current["lower"], current["upper"],
+                kept_anchor["lower"], kept_anchor["upper"]
+            )
+            
+            if iou >= iou_threshold:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            kept.append(current)
+    
+    # Return original anchor dictionaries in order
+    return [anchor_data[i]["anchor"] for i in sorted(a["index"] for a in kept)]
 
 
 def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -1671,29 +1868,86 @@ def extract_rules_from_policies(
         # Timing metrics
         rollout_times = []
         
+        # CRITICAL: Track seen anchors for near-duplicate suppression during rollouts
+        # This prevents adding very similar anchors during rollouts (early stopping)
+        seen_canonical_keys = set()
+        seen_anchors_for_instance = []  # Track anchors per instance for IoU-based early stopping
+        min_width = env_config.get("min_width", 0.05)
+        early_stop_iou_threshold = env_config.get("early_stop_iou_threshold", 0.95)  # Default: 0.95 (very similar)
+        
         # Track time for this class
         class_start_time = time.perf_counter()
         
-        # CRITICAL FIX: Sample instances from the target class data (instance-based rollouts)
-        # This matches training's extract_rules behavior where x_star_unit is set per instance
-        # Determine which dataset to sample from (test or training)
-        if eval_on_test_data:
-            class_mask = (anchor_config["y"] == target_class)
-            class_instances = np.where(class_mask)[0]
-            X_data_unit = anchor_config["X_unit"]
-            data_source_name = "test"
-        else:
-            # If not using test data, use training data (should not happen in normal inference)
-            if env_data.get("X_unit") is not None:
+        # CRITICAL FIX: Sample instances from the correct dataset based on eval_on_test_data and coverage_on_all_data
+        # This ensures consistency: if env evaluates on combined dataset, sample from combined dataset
+        # Also add prediction-match filtering to ensure original_pred == target_class
+        if coverage_on_all_data:
+            # When coverage_on_all_data=True, env evaluates on combined dataset, so sample from combined dataset
+            if env_data.get("X_test_unit") is not None:
+                combined_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                combined_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                combined_y = np.concatenate([env_data["y"], env_data["y_test"]])
+                class_mask = (combined_y == target_class)
+                class_instances = np.where(class_mask)[0]
+                X_data_unit = combined_X_unit
+                X_data_std = combined_X_std
+                y_data_for_filtering = combined_y
+                data_source_name = "combined (train+test)"
+            else:
                 class_mask = (env_data["y"] == target_class)
                 class_instances = np.where(class_mask)[0]
                 X_data_unit = env_data["X_unit"]
-            else:
-                # Fallback: use anchor_config data
-                class_mask = (anchor_config["y"] == target_class)
+                X_data_std = env_data["X_std"]
+                y_data_for_filtering = env_data["y"]
+                data_source_name = "training (test not available)"
+        elif eval_on_test_data:
+            # When eval_on_test_data=True, use test data
+            if env_data.get("X_test_unit") is not None:
+                class_mask = (env_data["y_test"] == target_class)
                 class_instances = np.where(class_mask)[0]
-                X_data_unit = anchor_config["X_unit"]
+                X_data_unit = env_data["X_test_unit"]
+                X_data_std = env_data["X_test_std"]
+                y_data_for_filtering = env_data["y_test"]
+                data_source_name = "test"
+            else:
+                raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
+        else:
+            # When eval_on_test_data=False and coverage_on_all_data=False, use training data
+            class_mask = (env_data["y"] == target_class)
+            class_instances = np.where(class_mask)[0]
+            X_data_unit = env_data["X_unit"]
+            X_data_std = env_data["X_std"]
+            y_data_for_filtering = env_data["y"]
             data_source_name = "training"
+        
+        # CRITICAL FIX: Filter instances by classifier prediction to ensure original_pred == target_class
+        # This matches training behavior and prevents precision proxy depression
+        if len(class_instances) > 0:
+            # Get classifier predictions for all class instances
+            X_class_std = X_data_std[class_instances]
+            classifier_device = torch.device(device)
+            with torch.no_grad():
+                classifier.eval()
+                X_tensor = torch.from_numpy(X_class_std.astype(np.float32)).to(classifier_device)
+                logits = classifier(X_tensor)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                predictions = np.argmax(probs, axis=1)
+            
+            # Filter: keep only instances where prediction matches target_class
+            prediction_match_mask = (predictions == target_class)
+            matching_indices = class_instances[prediction_match_mask]
+            n_matching = len(matching_indices)
+            n_total = len(class_instances)
+            
+            if n_matching == 0:
+                logger.warning(f"  No instances found for class {target_class} with prediction matching target_class in {data_source_name} data, skipping...")
+                continue
+            
+            if n_matching < n_total:
+                logger.info(f"  Filtered instances for class {target_class}: {n_matching}/{n_total} have prediction matching target_class (using filtered set)")
+            
+            # Use filtered instances
+            class_instances = matching_indices
         
         if len(class_instances) == 0:
             logger.warning(f"  No instances found for class {target_class} in {data_source_name} data, skipping...")
@@ -1872,10 +2126,6 @@ def extract_rules_from_policies(
             coverage = 0.0
             
             if episode_data:
-                # Get rollout time from episode_data
-                rollout_time = episode_data.get("rollout_time_seconds", 0.0)
-                rollout_times.append(float(rollout_time))
-                
                 # Instance-level metrics
                 instance_precision = episode_data.get("anchor_precision", episode_data.get("instance_precision", 0.0))
                 instance_coverage = episode_data.get("anchor_coverage", episode_data.get("instance_coverage", 0.0))
@@ -1903,28 +2153,18 @@ def extract_rules_from_policies(
                         f"This is expected if the dataset has many samples from other classes."
                     )
                 
-                instance_precisions.append(float(instance_precision))
-                instance_coverages.append(float(instance_coverage))
-                class_precisions.append(float(class_precision))
-                class_coverages.append(float(class_coverage))
-                
-                # Legacy fields (for backward compatibility)
-                precisions.append(float(instance_precision))
-                coverages.append(float(instance_coverage))
-                
-                precision = float(instance_precision)
-                coverage = float(instance_coverage)
+                # Extract metrics for anchor_data
+                anchor_instance_precision = float(instance_precision)
+                anchor_instance_coverage = float(instance_coverage)
+                anchor_instance_coverage_class_conditional = float(instance_coverage_class_conditional)
+                anchor_class_precision = float(class_precision)
+                anchor_class_coverage = float(class_coverage)
             else:
                 # Log warning if episode_data is empty
                 if instance_idx_in_range == 0:
                     logger.warning(f"  ⚠ Warning: Empty episode_data for class {target_class}, episode {instance_idx_in_range}")
-                rollout_times.append(0.0)
-                instance_precisions.append(0.0)
-                instance_coverages.append(0.0)
-                class_precisions.append(0.0)
-                class_coverages.append(0.0)
-                precisions.append(0.0)
-                coverages.append(0.0)
+                # Skip empty episodes - don't add to anchors_list
+                continue
             
             # Extract rule from final observation (if available)
             rule = "any values (no tightened features)"
@@ -1999,13 +2239,7 @@ def extract_rules_from_policies(
                         denormalize=True  # Denormalize to standardized feature space (mean=0, std=1)
                     )
             
-            # Extract metrics for anchor_data (variables are already defined above)
-            anchor_instance_precision = float(instance_precision)
-            anchor_instance_coverage = float(instance_coverage)
-            anchor_instance_coverage_class_conditional = float(instance_coverage_class_conditional) if 'instance_coverage_class_conditional' in locals() else 0.0
-            anchor_class_precision = float(class_precision)
-            anchor_class_coverage = float(class_coverage)
-            
+            # Create anchor_data with metrics
             anchor_data = {
                 "instance_idx": instance_idx_in_range,
                 "data_instance_idx": int(data_instance_idx),
@@ -2033,11 +2267,140 @@ def extract_rules_from_policies(
                     "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
                 })
-            
-            anchors_list.append(anchor_data)
-            rules_list.append(rule)
+                
+                # CRITICAL: Check for near-duplicates using quantization and IoU (early stopping)
+                # This prevents adding very similar anchors during rollouts
+                canonical_key = canonicalize_rule_key(lower_normalized, upper_normalized, min_width=min_width)
+                anchor_data["canonical_key"] = canonical_key
+                
+                is_duplicate = False
+                if canonical_key in seen_canonical_keys:
+                    is_duplicate = True
+                    if verbose_logging:
+                        logger.debug(f"    Rollout {instance_idx_in_range + 1}: Skipping duplicate (canonical key match)")
+                else:
+                    # Check IoU with existing anchors for this instance (more expensive but catches near-duplicates)
+                    for seen_anchor in seen_anchors_for_instance:
+                        seen_lower = seen_anchor["lower"]
+                        seen_upper = seen_anchor["upper"]
+                        iou = compute_box_iou(lower_normalized, upper_normalized, seen_lower, seen_upper)
+                        if iou >= early_stop_iou_threshold:
+                            is_duplicate = True
+                            if verbose_logging:
+                                logger.debug(f"    Rollout {instance_idx_in_range + 1}: Skipping near-duplicate (IoU={iou:.4f} >= {early_stop_iou_threshold})")
+                            break
+                
+                if not is_duplicate:
+                    anchors_list.append(anchor_data)
+                    rules_list.append(rule)
+                    # CRITICAL: Only append metrics when anchor is actually added (not duplicate)
+                    instance_precisions.append(float(instance_precision))
+                    instance_coverages.append(float(instance_coverage))
+                    class_precisions.append(float(class_precision))
+                    class_coverages.append(float(class_coverage))
+                    precisions.append(float(instance_precision))
+                    coverages.append(float(instance_coverage))
+                    rollout_times.append(float(episode_data.get("rollout_time_seconds", 0.0)) if episode_data else 0.0)
+                    
+                    if canonical_key not in seen_canonical_keys:
+                        seen_canonical_keys.add(canonical_key)
+                    seen_anchors_for_instance.append({
+                        "lower": lower_normalized.copy(),
+                        "upper": upper_normalized.copy()
+                    })
+                else:
+                    # Skip duplicate anchor - don't add to lists or metrics
+                    if verbose_logging:
+                        logger.debug(f"    Skipped duplicate anchor (metrics not counted)")
+            else:
+                # No bounds available - still add anchor but without deduplication
+                anchors_list.append(anchor_data)
+                rules_list.append(rule)
+                # Append metrics even without bounds (for backward compatibility)
+                instance_precisions.append(float(instance_precision))
+                instance_coverages.append(float(instance_coverage))
+                class_precisions.append(float(class_precision))
+                class_coverages.append(float(class_coverage))
+                precisions.append(float(instance_precision))
+                coverages.append(float(instance_coverage))
+                rollout_times.append(float(episode_data.get("rollout_time_seconds", 0.0)) if episode_data else 0.0)
         
-        unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
+        # CRITICAL: Apply quantization-based deduplication, NMS, and top-K selection
+        # Step 1: Quantization-based deduplication (group by canonical key)
+        unique_anchors_by_key = {}
+        for anchor in anchors_list:
+            canonical_key = anchor.get("canonical_key")
+            if canonical_key is None and anchor.get("lower_bounds_normalized") is not None:
+                # Compute canonical key if missing
+                canonical_key = canonicalize_rule_key(
+                    np.array(anchor["lower_bounds_normalized"]),
+                    np.array(anchor["upper_bounds_normalized"]),
+                    min_width=min_width
+                )
+                anchor["canonical_key"] = canonical_key
+            
+            if canonical_key:
+                if canonical_key not in unique_anchors_by_key:
+                    unique_anchors_by_key[canonical_key] = anchor
+                else:
+                    # Keep anchor with higher precision (tie-break by coverage)
+                    existing = unique_anchors_by_key[canonical_key]
+                    existing_prec = existing.get("instance_precision", existing.get("anchor_precision", 0.0))
+                    new_prec = anchor.get("instance_precision", anchor.get("anchor_precision", 0.0))
+                    if new_prec > existing_prec:
+                        unique_anchors_by_key[canonical_key] = anchor
+                    elif new_prec == existing_prec:
+                        # Tie-break by coverage
+                        existing_cov = existing.get("instance_coverage", existing.get("anchor_coverage", 0.0))
+                        new_cov = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
+                        if new_cov > existing_cov:
+                            unique_anchors_by_key[canonical_key] = anchor
+        
+        # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
+        nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)  # Default: 0.9
+        anchors_after_nms = nms_deduplicate_anchors(
+            list(unique_anchors_by_key.values()),
+            iou_threshold=nms_iou_threshold,
+            key_precision="instance_precision",
+            key_coverage="instance_coverage",
+            fallback_precision="anchor_precision",
+            fallback_coverage="anchor_coverage"
+        )
+        
+        # Step 3: Apply top-K selection by score (precision * (1 + coverage))
+        top_k_rules_count = env_config.get("top_k_rules_by_score", None)  # None = no limit
+        if top_k_rules_count is not None and top_k_rules_count > 0 and len(anchors_after_nms) > top_k_rules_count:
+            rule_scores = []
+            for anchor in anchors_after_nms:
+                precision = anchor.get("instance_precision", anchor.get("anchor_precision", 0.0))
+                coverage = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
+                score = precision * (1 + coverage)  # Score formula: precision * (1 + coverage)
+                rule_scores.append({
+                    "anchor": anchor,
+                    "score": float(score)
+                })
+            
+            # Sort by score (descending) and take top-K
+            rule_scores.sort(key=lambda x: x["score"], reverse=True)
+            anchors_after_nms = [item["anchor"] for item in rule_scores[:top_k_rules_count]]
+            logger.info(f"  Selected top {top_k_rules_count} anchors by score (from {len(rule_scores)} after NMS)")
+        
+        # Update anchors_list with deduplicated and filtered anchors
+        anchors_list = anchors_after_nms
+        
+        # Extract unique rules from deduplicated anchors
+        unique_rules = list(set([
+            anchor.get("rule", "") 
+            for anchor in anchors_list 
+            if anchor.get("rule") and anchor.get("rule") != "any values (no tightened features)"
+        ]))
+        
+        # Calculate duplicate ratio for logging
+        total_rules = len(rules_list) if rules_list else 0
+        unique_rules_count = len(unique_rules)
+        duplicate_ratio = (total_rules - unique_rules_count) / total_rules if total_rules > 0 else 0.0
+        if duplicate_ratio > 0:
+            logger.info(f"  Deduplication: {unique_rules_count} unique rules from {total_rules} total ({duplicate_ratio:.1%} duplicates removed)")
         
         # End timing for this class
         class_end_time = time.perf_counter()
@@ -2324,33 +2687,58 @@ def extract_rules_from_policies(
         class_based_class_coverages = []
         class_based_rollout_times = []
         
+        # CRITICAL: Track seen anchors for near-duplicate suppression during class-based rollouts
+        seen_canonical_keys = set()  # Reset per agent/class
+        seen_anchors_for_class = []  # Track anchors for IoU-based early stopping
+        min_width = env_config.get("min_width", 0.05)
+        early_stop_iou_threshold = env_config.get("early_stop_iou_threshold", 0.95)  # Default: 0.95 (very similar)
+        
         class_based_start_time = time.perf_counter()
         
         # Run class-based rollouts (NOT setting x_star_unit, so environment uses cluster centroids)
         for rollout_idx in range(n_class_based_rollouts_per_agent):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # CRITICAL: Use FULL dataset (train + test) for class-based rollouts
-            # Class-based rules should express a particular class of the full dataset
-            # This ensures rules are evaluated on the complete class distribution
-            if env_data.get("X_test_unit") is not None:
-                # Combine train and test data for class-based rollouts (full dataset)
-                full_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-                full_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
-                full_y = np.concatenate([env_data["y"], env_data["y_test"]])
-                use_full_dataset = True
-                if rollout_idx == 0:  # Log once per class
-                    logger.info(f"  Using FULL dataset (train + test) for class-based rollouts")
-                    logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(full_y)}")
-                    logger.info(f"    Note: Class-based rules should express the class across the full dataset")
+            # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data for consistent comparisons
+            # Previously always used full dataset, causing inconsistent metrics between instance-based and class-based
+            if coverage_on_all_data:
+                # When coverage_on_all_data=True, use combined dataset (matches instance-based behavior)
+                if env_data.get("X_test_unit") is not None:
+                    full_X_unit = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                    full_X_std = np.vstack([env_data["X_std"], env_data["X_test_std"]])
+                    full_y = np.concatenate([env_data["y"], env_data["y_test"]])
+                    use_full_dataset = True
+                    if rollout_idx == 0:  # Log once per class
+                        logger.info(f"  Using FULL dataset (train + test) for class-based rollouts (coverage_on_all_data=True)")
+                        logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(full_y)}")
+                else:
+                    full_X_unit = env_data["X_unit"]
+                    full_X_std = env_data["X_std"]
+                    full_y = env_data["y"]
+                    use_full_dataset = False
+                    if rollout_idx == 0:
+                        logger.info(f"  Using TRAINING data only for class-based rollouts (test data not available, coverage_on_all_data=True)")
+            elif eval_on_test_data:
+                # When eval_on_test_data=True, use test data only (matches instance-based behavior)
+                if env_data.get("X_test_unit") is not None:
+                    full_X_unit = env_data["X_test_unit"]
+                    full_X_std = env_data["X_test_std"]
+                    full_y = env_data["y_test"]
+                    use_full_dataset = False
+                    if rollout_idx == 0:
+                        logger.info(f"  Using TEST data only for class-based rollouts (eval_on_test_data=True)")
+                        logger.info(f"    Test samples: {len(full_y)}")
+                else:
+                    raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
             else:
-                # Fallback to training data only if test data not available
+                # When eval_on_test_data=False and coverage_on_all_data=False, use training data only
                 full_X_unit = env_data["X_unit"]
                 full_X_std = env_data["X_std"]
                 full_y = env_data["y"]
                 use_full_dataset = False
-                if rollout_idx == 0:  # Log once per class
-                    logger.info(f"  Using TRAINING data only for class-based rollouts (test data not available)")
+                if rollout_idx == 0:
+                    logger.info(f"  Using TRAINING data only for class-based rollouts (eval_on_test_data=False, coverage_on_all_data=False)")
+                    logger.info(f"    Training samples: {len(full_y)}")
             
             # Create environment config for this class with full dataset
             class_based_config = anchor_config.copy()
@@ -2368,6 +2756,13 @@ def extract_rules_from_policies(
             class_based_config["env_config"]["normalize_data"] = False
             # When using full dataset, set eval_on_test_data=False so metrics are computed on full dataset
             class_based_config["env_config"]["eval_on_test_data"] = False if use_full_dataset else eval_on_test_data
+            
+            # CRITICAL FIX: Enforce use_class_centroids=True for class-based rollouts
+            # Class-based rollouts should always use centroids, not full-space initialization
+            # This matches single-agent behavior and ensures proper class-based initialization
+            class_based_config["env_config"]["use_class_centroids"] = True
+            if rollout_idx == 0:  # Log once per class
+                logger.info(f"  Enforced use_class_centroids=True for class-based rollouts (required for class-based mode)")
             
             # Ensure cluster centroids are available
             if "cluster_centroids_per_class" not in class_based_config["env_config"]:
@@ -2514,11 +2909,126 @@ def extract_rules_from_policies(
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
                 })
             
-            class_based_anchors_list.append(anchor_data)
-            class_based_rules_list.append(rule)
+            # CRITICAL: Check for near-duplicates using quantization and IoU (early stopping)
+            # This prevents adding very similar anchors during rollouts
+            if lower is not None and upper is not None:
+                canonical_key = canonicalize_rule_key(lower_normalized, upper_normalized, min_width=min_width)
+                anchor_data["canonical_key"] = canonical_key
+                
+                # Check for duplicates (use class-based specific tracking)
+                is_duplicate = False
+                if canonical_key in seen_canonical_keys:
+                    is_duplicate = True
+                    if verbose_logging:
+                        logger.debug(f"    Class-based rollout {rollout_idx + 1}: Skipping duplicate (canonical key match)")
+                else:
+                    # Check IoU with existing class-based anchors
+                    for seen_anchor in seen_anchors_for_class:
+                        seen_lower = seen_anchor["lower"]
+                        seen_upper = seen_anchor["upper"]
+                        iou = compute_box_iou(lower_normalized, upper_normalized, seen_lower, seen_upper)
+                        if iou >= early_stop_iou_threshold:
+                            is_duplicate = True
+                            if verbose_logging:
+                                logger.debug(f"    Class-based rollout {rollout_idx + 1}: Skipping near-duplicate (IoU={iou:.4f} >= {early_stop_iou_threshold})")
+                            break
+                
+                if not is_duplicate:
+                    class_based_anchors_list.append(anchor_data)
+                    class_based_rules_list.append(rule)
+                    if canonical_key not in seen_canonical_keys:
+                        seen_canonical_keys.add(canonical_key)
+                    seen_anchors_for_class.append({
+                        "lower": lower_normalized.copy(),
+                        "upper": upper_normalized.copy()
+                    })
+                else:
+                    # Skip duplicate anchor
+                    if verbose_logging:
+                        logger.debug(f"    Skipped duplicate class-based anchor (metrics not counted)")
+            else:
+                # No bounds available - still add anchor but without deduplication
+                class_based_anchors_list.append(anchor_data)
+                class_based_rules_list.append(rule)
+        
+        # CRITICAL: Apply quantization-based deduplication, NMS, and top-K selection for class-based anchors
+        # Step 1: Quantization-based deduplication (group by canonical key)
+        unique_class_based_anchors_by_key = {}
+        for anchor in class_based_anchors_list:
+            canonical_key = anchor.get("canonical_key")
+            if canonical_key is None and anchor.get("lower_bounds_normalized") is not None:
+                # Compute canonical key if missing
+                canonical_key = canonicalize_rule_key(
+                    np.array(anchor["lower_bounds_normalized"]),
+                    np.array(anchor["upper_bounds_normalized"]),
+                    min_width=min_width
+                )
+                anchor["canonical_key"] = canonical_key
+            
+            if canonical_key:
+                if canonical_key not in unique_class_based_anchors_by_key:
+                    unique_class_based_anchors_by_key[canonical_key] = anchor
+                else:
+                    # Keep anchor with higher precision (tie-break by coverage)
+                    existing = unique_class_based_anchors_by_key[canonical_key]
+                    existing_prec = existing.get("class_precision", existing.get("instance_precision", 0.0))
+                    new_prec = anchor.get("class_precision", anchor.get("instance_precision", 0.0))
+                    if new_prec > existing_prec:
+                        unique_class_based_anchors_by_key[canonical_key] = anchor
+                    elif new_prec == existing_prec:
+                        # Tie-break by coverage
+                        existing_cov = existing.get("class_coverage", existing.get("instance_coverage", 0.0))
+                        new_cov = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
+                        if new_cov > existing_cov:
+                            unique_class_based_anchors_by_key[canonical_key] = anchor
+        
+        # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
+        nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)  # Default: 0.9
+        class_based_anchors_after_nms = nms_deduplicate_anchors(
+            list(unique_class_based_anchors_by_key.values()),
+            iou_threshold=nms_iou_threshold,
+            key_precision="class_precision",
+            key_coverage="class_coverage",
+            fallback_precision="instance_precision",
+            fallback_coverage="instance_coverage"
+        )
+        
+        # Step 3: Apply top-K selection by score (precision * (1 + coverage))
+        top_k_rules_count = env_config.get("top_k_rules_by_score", None)  # None = no limit
+        if top_k_rules_count is not None and top_k_rules_count > 0 and len(class_based_anchors_after_nms) > top_k_rules_count:
+            rule_scores = []
+            for anchor in class_based_anchors_after_nms:
+                precision = anchor.get("class_precision", anchor.get("instance_precision", 0.0))
+                coverage = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
+                score = precision * (1 + coverage)  # Score formula: precision * (1 + coverage)
+                rule_scores.append({
+                    "anchor": anchor,
+                    "score": float(score)
+                })
+            
+            # Sort by score (descending) and take top-K
+            rule_scores.sort(key=lambda x: x["score"], reverse=True)
+            class_based_anchors_after_nms = [item["anchor"] for item in rule_scores[:top_k_rules_count]]
+            logger.info(f"  Selected top {top_k_rules_count} class-based anchors by score (from {len(rule_scores)} after NMS)")
+        
+        # Update class_based_anchors_list with deduplicated and filtered anchors
+        class_based_anchors_list = class_based_anchors_after_nms
+        
+        # Extract unique rules from deduplicated anchors
+        class_based_unique_rules = list(set([
+            anchor.get("rule", "") 
+            for anchor in class_based_anchors_list 
+            if anchor.get("rule") and anchor.get("rule") != "any values (no tightened features)"
+        ]))
+        
+        # Calculate duplicate ratio for logging
+        total_class_based_rules = len(class_based_rules_list) if class_based_rules_list else 0
+        unique_class_based_rules_count = len(class_based_unique_rules)
+        duplicate_ratio_class_based = (total_class_based_rules - unique_class_based_rules_count) / total_class_based_rules if total_class_based_rules > 0 else 0.0
+        if duplicate_ratio_class_based > 0:
+            logger.info(f"  Class-based deduplication: {unique_class_based_rules_count} unique rules from {total_class_based_rules} total ({duplicate_ratio_class_based:.1%} duplicates removed)")
         
         # Compute aggregated metrics for class-based rollouts
-        class_based_unique_rules = list(set([r for r in class_based_rules_list if r and r != "any values (no tightened features)"]))
         class_based_end_time = time.perf_counter()
         class_based_total_time = class_based_end_time - class_based_start_time
         
@@ -2528,10 +3038,21 @@ def extract_rules_from_policies(
         precision_target = env_config.get("precision_target", 0.95)
         precision_threshold = precision_target * 0.8
         
-        # Get dataset for recomputing precision (same as used for union)
-        if env_data.get("X_test_unit") is not None:
-            X_data_filter = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-            y_data_filter = np.concatenate([env_data["y"], env_data["y_test"]])
+        # CRITICAL FIX: Use same dataset as class-based rollouts for consistency
+        # Respect eval_on_test_data and coverage_on_all_data to match rollout behavior
+        if coverage_on_all_data:
+            if env_data.get("X_test_unit") is not None:
+                X_data_filter = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                y_data_filter = np.concatenate([env_data["y"], env_data["y_test"]])
+            else:
+                X_data_filter = env_data["X_unit"]
+                y_data_filter = env_data["y"]
+        elif eval_on_test_data:
+            if env_data.get("X_test_unit") is not None:
+                X_data_filter = env_data["X_test_unit"]
+                y_data_filter = env_data["y_test"]
+            else:
+                raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
         else:
             X_data_filter = env_data["X_unit"]
             y_data_filter = env_data["y"]
@@ -2633,20 +3154,31 @@ def extract_rules_from_policies(
     logger.info("Recomputing Class Union Metrics (Class-based anchors only)")
     logger.info(f"{'='*80}")
     
-    # CRITICAL: Use FULL dataset (train + test) for class union metrics
-    # Class union metrics represent rules that express a particular class of the full dataset
-    # This ensures consistency with class-based rollouts which also use full dataset
-    if env_data.get("X_test_unit") is not None:
-        # Use full dataset (train + test) for class union metrics
-        X_data_union = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
-        y_data_union = np.concatenate([env_data["y"], env_data["y_test"]])
-        logger.info(f"  Using FULL dataset (train + test) for class union metrics")
-        logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(y_data_union)}")
+    # CRITICAL FIX: Use same dataset as class-based rollouts for consistency
+    # Respect eval_on_test_data and coverage_on_all_data to match rollout behavior
+    if coverage_on_all_data:
+        if env_data.get("X_test_unit") is not None:
+            X_data_union = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            y_data_union = np.concatenate([env_data["y"], env_data["y_test"]])
+            logger.info(f"  Using FULL dataset (train + test) for class union metrics (coverage_on_all_data=True)")
+            logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(y_data_union)}")
+        else:
+            X_data_union = env_data["X_unit"]
+            y_data_union = env_data["y"]
+            logger.info(f"  Using TRAINING data only for class union metrics (test data not available, coverage_on_all_data=True)")
+    elif eval_on_test_data:
+        if env_data.get("X_test_unit") is not None:
+            X_data_union = env_data["X_test_unit"]
+            y_data_union = env_data["y_test"]
+            logger.info(f"  Using TEST data only for class union metrics (eval_on_test_data=True)")
+            logger.info(f"    Test samples: {len(y_data_union)}")
+        else:
+            raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
     else:
-        # Fallback to training data only if test data not available
         X_data_union = env_data["X_unit"]
         y_data_union = env_data["y"]
-        logger.info(f"  Using TRAINING data only for class union metrics (test data not available)")
+        logger.info(f"  Using TRAINING data only for class union metrics (eval_on_test_data=False, coverage_on_all_data=False)")
+        logger.info(f"    Training samples: {len(y_data_union)}")
     
     # Recompute union metrics for each class
     for class_key, class_data in results["per_class_results"].items():

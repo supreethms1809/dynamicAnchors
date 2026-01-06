@@ -786,7 +786,15 @@ def test_rules_from_json(
     # Check metadata to determine data source for metrics labels
     metadata = rules_data.get("metadata", {})
     inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
-    metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+    inference_coverage_on_all_data = metadata.get("coverage_on_all_data", False)
+    
+    # CRITICAL FIX: Respect coverage_on_all_data for accurate metrics labels
+    if inference_coverage_on_all_data:
+        metrics_data_source = "full dataset (train+test)"
+    elif inference_eval_on_test_data:
+        metrics_data_source = "test data"
+    else:
+        metrics_data_source = "training data"
     
     # Load dataset
     logger.info(f"Loading dataset: {dataset_name}")
@@ -797,6 +805,15 @@ def test_rules_from_json(
     )
     dataset_loader.load_dataset()
     dataset_loader.preprocess_data()
+    
+    # CRITICAL FIX: Load classifier for prediction-match precision calculation
+    # Instance-based rules should use prediction-match precision, not class-label precision
+    classifier = dataset_loader.get_classifier()
+    if classifier is None:
+        logger.warning("Classifier not available - instance-based rules will use class-label precision instead of prediction-match precision")
+        classifier = None
+    else:
+        logger.info("✓ Classifier loaded for prediction-match precision calculation")
     
     # Get data (in standardized feature space, matching the denormalized rules)
     # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)
@@ -821,7 +838,7 @@ def test_rules_from_json(
     instance_based_rules = set()
     class_based_rules = set()
     rule_to_source_classes = defaultdict(list)  # Track which classes each rule came from
-    rule_to_rollout_type = {}  # Track whether rule is instance-based or class-based
+    rule_to_rollout_type = defaultdict(set)  # Track rollout types (can be both for overlapping rules)
     
     for class_key, class_data in per_class_results.items():
         target_class = class_data.get("class")
@@ -832,7 +849,7 @@ def test_rules_from_json(
             all_unique_rules.add(rule_str)
             instance_based_rules.add(rule_str)
             rule_to_source_classes[rule_str].append(target_class)
-            rule_to_rollout_type[rule_str] = "instance_based"
+            rule_to_rollout_type[rule_str].add("instance_based")
         
         # Collect class-based rules
         class_based_results = class_data.get("class_based_results", {})
@@ -842,7 +859,24 @@ def test_rules_from_json(
                 all_unique_rules.add(rule_str)
                 class_based_rules.add(rule_str)
                 rule_to_source_classes[rule_str].append(target_class)
-                rule_to_rollout_type[rule_str] = "class_based"
+                rule_to_rollout_type[rule_str].add("class_based")
+        
+        # CRITICAL FIX: Also collect class_union_unique_rules and class_level_unique_rules if available
+        # These represent union-level rules that should be tested
+        class_union_unique_rules = class_data.get("class_union_unique_rules", [])
+        class_level_unique_rules = class_data.get("class_level_unique_rules", [])
+        
+        for rule_str in class_union_unique_rules:
+            all_unique_rules.add(rule_str)
+            class_based_rules.add(rule_str)  # Union rules are class-based
+            rule_to_source_classes[rule_str].append(target_class)
+            rule_to_rollout_type[rule_str].add("class_based")
+        
+        for rule_str in class_level_unique_rules:
+            all_unique_rules.add(rule_str)
+            class_based_rules.add(rule_str)  # Class-level rules are class-based
+            rule_to_source_classes[rule_str].append(target_class)
+            rule_to_rollout_type[rule_str].add("class_based")
     
     all_unique_rules = sorted(list(all_unique_rules))  # Sort for consistent ordering
     instance_based_rules = sorted(list(instance_based_rules))
@@ -879,11 +913,19 @@ def test_rules_from_json(
     rules_satisfying_both_classes = []
     
     for rule_idx, rule_str in enumerate(all_unique_rules):
-        rollout_type = rule_to_rollout_type.get(rule_str, "unknown")
+        # CRITICAL FIX: Handle rollout_type as set (can be both instance_based and class_based)
+        rollout_types = rule_to_rollout_type.get(rule_str, set())
+        if isinstance(rollout_types, str):
+            # Backward compatibility: convert string to set
+            rollout_types = {rollout_types}
+        rollout_type_str = ", ".join(sorted(rollout_types)) if rollout_types else "unknown"
+        is_instance_based = "instance_based" in rollout_types
+        is_class_based = "class_based" in rollout_types
+        
         logger.info(f"{'='*80}")
         logger.info(f"Rule {rule_idx + 1}/{len(all_unique_rules)}: {rule_str[:100]}...")
         logger.info(f"{'='*80}")
-        logger.info(f"  Rollout type: {rollout_type}")
+        logger.info(f"  Rollout type: {rollout_type_str}")
         logger.info(f"  Source classes: {rule_to_source_classes[rule_str]}")
         
         # Parse rule
@@ -899,11 +941,41 @@ def test_rules_from_json(
         n_satisfying = np.sum(satisfying_mask)
         logger.info(f"  Total samples satisfying rule: {n_satisfying}/{X_data.shape[0]} ({100*n_satisfying/X_data.shape[0]:.2f}%)")
         
+        # CRITICAL FIX: Compute classifier predictions for instance-based precision calculation
+        # Instance-based rules should use prediction-match precision, not class-label precision
+        predictions = None
+        if is_instance_based and classifier is not None and n_satisfying > 0:
+            try:
+                import torch
+                satisfying_indices = np.where(satisfying_mask)[0]
+                X_satisfying = X_data[satisfying_indices]
+                
+                # Detect device from classifier if possible
+                device = "cpu"
+                if hasattr(classifier, 'parameters'):
+                    try:
+                        device = next(classifier.parameters()).device
+                    except:
+                        pass
+                
+                classifier.eval()
+                with torch.no_grad():
+                    X_tensor = torch.from_numpy(X_satisfying.astype(np.float32)).to(device)
+                    logits = classifier(X_tensor)
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                    predictions = np.argmax(probs, axis=1)
+                
+                logger.debug(f"  Computed predictions for {len(predictions)} satisfying samples (device: {device})")
+            except Exception as e:
+                logger.warning(f"  Failed to compute predictions for instance-based precision: {e}")
+                predictions = None
+        
         # Test against each class
         rule_result = {
             "rule": rule_str,
             "rule_index": rule_idx,
-            "rollout_type": rule_to_rollout_type.get(rule_str, "unknown"),  # Track instance vs class-based
+            "rollout_type": rollout_type_str,  # Track instance vs class-based (can be both)
+            "rollout_types": sorted(list(rollout_types)) if rollout_types else ["unknown"],
             "source_classes": rule_to_source_classes[rule_str],
             "n_conditions": len(rule_conditions),
             "conditions": [
@@ -920,11 +992,26 @@ def test_rules_from_json(
             n_class_samples = np.sum(y_data == target_class)
             n_satisfying_class = np.sum(satisfying_mask & (y_data == target_class))
             
-            # Calculate precision and coverage for this class
-            if n_satisfying > 0:
-                precision = n_satisfying_class / n_satisfying
+            # CRITICAL FIX: Calculate precision differently for instance-based vs class-based rules
+            # Instance-based: P(prediction == target_class | rule) - prediction-match precision
+            # Class-based: P(y == target_class | rule) - class-label precision
+            if is_instance_based and predictions is not None:
+                # Instance-based: use prediction-match precision
+                # Get predictions for satisfying samples
+                satisfying_indices = np.where(satisfying_mask)[0]
+                if len(satisfying_indices) > 0:
+                    # Filter to samples where prediction matches target_class
+                    n_matching_predictions = np.sum(predictions == target_class)
+                    precision = n_matching_predictions / n_satisfying if n_satisfying > 0 else 0.0
+                    logger.debug(f"  Instance-based precision (prediction-match): {precision:.4f} ({n_matching_predictions}/{n_satisfying} predictions match target_class {target_class})")
+                else:
+                    precision = 0.0
             else:
-                precision = 0.0
+                # Class-based: use class-label precision (or fallback for instance-based if no classifier)
+                if n_satisfying > 0:
+                    precision = n_satisfying_class / n_satisfying
+                else:
+                    precision = 0.0
             
             if n_class_samples > 0:
                 coverage = n_satisfying_class / n_class_samples
@@ -938,9 +1025,10 @@ def test_rules_from_json(
                 "class": int(target_class),
                 "n_class_samples": int(n_class_samples),
                 "n_satisfying_class_samples": int(n_satisfying_class),
-                "rule_precision": float(precision),  # Rule-level precision
+                "rule_precision": float(precision),  # Rule-level precision (prediction-match for instance-based, class-label for class-based)
                 "rule_coverage": float(coverage),    # Rule-level coverage
-                "satisfying_sample_indices": satisfying_class_indices
+                "satisfying_sample_indices": satisfying_class_indices,
+                "precision_type": "prediction_match" if (is_instance_based and predictions is not None) else "class_label"
             }
             
             # Try to get instance-level and class-level metrics from the rules file if available
@@ -1371,7 +1459,15 @@ Examples:
     # Get metadata to determine data source for metrics labels
     metadata = rules_data.get("metadata", {})
     inference_eval_on_test_data = metadata.get("eval_on_test_data", False)
-    metrics_data_source = "test data" if inference_eval_on_test_data else "training data"
+    inference_coverage_on_all_data = metadata.get("coverage_on_all_data", False)
+    
+    # CRITICAL FIX: Respect coverage_on_all_data for accurate metrics labels
+    if inference_coverage_on_all_data:
+        metrics_data_source = "full dataset (train+test)"
+    elif inference_eval_on_test_data:
+        metrics_data_source = "test data"
+    else:
+        metrics_data_source = "training data"
 
     # Test rules
     results = test_rules_from_json(

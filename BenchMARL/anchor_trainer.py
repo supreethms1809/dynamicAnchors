@@ -83,7 +83,7 @@ class AnchorTrainer:
         target_classes: Optional[List[int]] = None,
         max_cycles: Optional[int] = None,
         device: str = "cpu",
-        eval_on_test_data: bool = True
+        eval_on_test_data: Optional[bool] = None
     ) -> Experiment:
         if self.dataset_loader.classifier is None:
             raise ValueError(
@@ -204,7 +204,48 @@ class AnchorTrainer:
         
         logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} for training (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
         
-        if eval_on_test_data:
+        # CRITICAL: Prevent test data leak into training - multi-agent uses same env for training/eval
+        # Unlike single-agent which has separate train/eval envs, multi-agent must force training data during training
+        # The eval_on_test_data parameter should only affect evaluation, not training
+        # CRITICAL FIX: Always use training data for training environment (mode="training")
+        # Store eval_on_test_data for later use in evaluation, but force False for training env
+        env_mode = env_config.get("mode", "training")
+        is_training_mode = (env_mode == "training")
+        
+        # Respect YAML config for eval_on_test_data if parameter not explicitly provided
+        if eval_on_test_data is None:
+            eval_on_test_data = env_config.get("eval_on_test_data", False)
+            logger.info(f"  Using eval_on_test_data={eval_on_test_data} from YAML config (anchor.yaml)")
+        else:
+            # Parameter was explicitly provided, use it (but log a warning if it overrides YAML)
+            yaml_value = env_config.get("eval_on_test_data", False)
+            if eval_on_test_data != yaml_value:
+                logger.warning(
+                    f"  WARNING: eval_on_test_data={eval_on_test_data} (explicit parameter) "
+                    f"overrides YAML config value ({yaml_value}). "
+                    f"Note: This will only affect evaluation, not training (training always uses training data)."
+                )
+        
+        # CRITICAL: Force eval_on_test_data=False for training to prevent test data leakage
+        # Store the original value for evaluation use, but training environment must use training data
+        if is_training_mode:
+            if eval_on_test_data:
+                logger.warning(
+                    f"  CRITICAL: eval_on_test_data=True was requested, but forcing False for TRAINING environment "
+                    f"to prevent test data leakage. Training will use training data only. "
+                    f"Evaluation can use test data separately."
+                )
+            eval_on_test_data_for_env = False
+            logger.info(f"  Training environment configured to use TRAINING data (test data leak prevented)")
+        else:
+            # For evaluation/inference modes, use the requested eval_on_test_data value
+            eval_on_test_data_for_env = eval_on_test_data
+            logger.info(f"  {'Evaluation' if env_mode == 'evaluation' else 'Inference'} environment configured to use {'TEST' if eval_on_test_data_for_env else 'TRAINING'} data")
+        
+        # Store original eval_on_test_data for potential use in evaluation
+        self._eval_on_test_data_for_evaluation = eval_on_test_data
+        
+        if eval_on_test_data_for_env:
             if env_data.get("X_test_unit") is None or env_data.get("X_test_std") is None or env_data.get("y_test") is None:
                 raise ValueError(
                     "eval_on_test_data=True requires test data. "
@@ -216,10 +257,8 @@ class AnchorTrainer:
                 "X_test_std": env_data["X_test_std"],
                 "y_test": env_data["y_test"],
             })
-            logger.info(f"  Evaluation configured to use TEST data")
         else:
             env_config_with_data["eval_on_test_data"] = False
-            logger.info(f"  Evaluation configured to use TRAINING data")
         
         # Compute k-means centroids for multiple agents per class
         # Compute k-means centroids for diversity across episodes
@@ -1743,6 +1782,19 @@ class AnchorTrainer:
                 env_config=temp_env_config
             )
             
+            # Get the agent name for this class (use first agent from temp environment)
+            # The environment creates agents based on target_classes and agents_per_class
+            if temp_anchor_env.agents and len(temp_anchor_env.agents) > 0:
+                agent = temp_anchor_env.agents[0]
+            elif hasattr(temp_anchor_env, 'possible_agents') and temp_anchor_env.possible_agents:
+                agent = temp_anchor_env.possible_agents[0]
+            else:
+                # Fallback: construct agent name based on agents_per_class
+                if agents_per_class == 1:
+                    agent = f"agent_{target_class}"
+                else:
+                    agent = f"agent_{target_class}_0"
+            
             for episode_idx, episode in enumerate(agent_episodes):
                 # Instance-level metrics
                 instance_precision = episode.get("anchor_precision", episode.get("instance_precision", 0.0))
@@ -1779,15 +1831,18 @@ class AnchorTrainer:
                         upper = obs[n_features:2*n_features].copy()
                         
                         # Set anchor bounds in temp environment for rule extraction
+                        # Bounds are in unit space [0,1] from observation
                         temp_anchor_env.lower[agent] = lower
                         temp_anchor_env.upper[agent] = upper
                         
                         # Extract rule using the environment's method
+                        # Use denormalize=True to convert rules to standardized space (matches test_extracted_rules.py expectations)
                         rule = temp_anchor_env.extract_rule(
                             agent,
                             max_features_in_rule=max_features_in_rule,
                             initial_lower=initial_lower,
-                            initial_upper=initial_upper
+                            initial_upper=initial_upper,
+                            denormalize=True  # Convert from unit space [0,1] to standardized space (mean=0, std=1)
                         )
                 
                 anchor_data = {

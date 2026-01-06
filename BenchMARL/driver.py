@@ -161,10 +161,16 @@ def main():
         help="Device to use"
     )
     
+    # Use nargs='?' with const=True to allow None (not provided) or True (--eval_on_test_data)
+    # This allows YAML config to apply when not explicitly provided
     parser.add_argument(
         "--eval_on_test_data",
-        action="store_true",
-        help="Evaluate on test data instead of training data (for final evaluation)"
+        nargs='?',
+        const=True,
+        default=None,  # Use None as sentinel to allow YAML config to apply
+        help="Evaluate on test data instead of training data (for final evaluation). "
+             "If not provided, uses value from conf/anchor.yaml. "
+             "Note: Training always uses training data to prevent leakage."
     )
     
     parser.add_argument(
