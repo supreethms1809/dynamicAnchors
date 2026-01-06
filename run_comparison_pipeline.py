@@ -312,7 +312,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 180_000,
+    total_timesteps: int = 30_000,
     **kwargs
 ) -> Optional[str]:
     """
@@ -2261,10 +2261,10 @@ Examples:
         "--coverage_on_all_data",
         action="store_true",
         default=True,
-        help="If True, use full dataset (train+test) during rollouts. "
+        help="If True (default), use full dataset (train+test) during rollouts for fair comparison. "
              "NOTE: Final metrics are ALWAYS computed on full dataset following original Anchors paper methodology, "
              "regardless of this flag. This flag only affects the dataset used during rollout environment evaluation. "
-             "Default behavior in pipeline: True (passed explicitly for consistency with baseline)."
+             "Default: True for fair comparison with baseline and single-agent."
     )
     
     parser.add_argument(
@@ -2595,7 +2595,8 @@ Examples:
             run_multi_agent_test(
                 rules_file=multi_agent_rules_file,
                 dataset=args.dataset,
-                seed=args.seed
+                seed=args.seed,
+                use_full_dataset=True  # Use full dataset (train + test) for testing rules
             )
         elif args.skip_testing:
             logger.info("Testing skipped (--skip_testing)")

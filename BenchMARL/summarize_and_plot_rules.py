@@ -307,13 +307,17 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
             features = extract_features_from_rule(rule_str)
             feature_frequency.update(features)
         
-        # Count features in class-based rules
-        for rule_str in class_based_unique_rules:
-            features = extract_features_from_rule(rule_str)
-            feature_frequency.update(features)
-        
+        # CRITICAL: Prefer union-level rules (used for class-union metrics) over per-agent rules
         # Also propagate union-level rule lists if present (already filtered in inference).
         class_union_unique_rules = class_data.get("class_union_unique_rules", [])
+        # If union rules exist, use them instead of per-agent class-based rules for feature counting
+        # This ensures visuals match the union metrics
+        rules_for_feature_counting = class_union_unique_rules if class_union_unique_rules else class_based_unique_rules
+        
+        # Count features in class-based rules (prefer union rules if available)
+        for rule_str in rules_for_feature_counting:
+            features = extract_features_from_rule(rule_str)
+            feature_frequency.update(features)
         
         class_summary = {
             "class": int(target_class),
@@ -374,11 +378,13 @@ def summarize_rules_from_json(rules_data: Dict) -> Dict:
         all_unique_rule_counts.append(len(unique_rules))
         
         # Also collect class-level stats (centroid-based rollouts)
+        # CRITICAL: Use union rules count if available (matches union metrics), otherwise use per-agent rules
+        union_rule_count = len(class_union_unique_rules) if class_union_unique_rules else len(class_based_unique_rules)
         if class_based_precision > 0 or class_based_coverage > 0:
             all_precisions.append(class_based_precision)
             all_coverages.append(class_based_coverage)
             all_rule_counts.append(len(class_based_all_rules))
-            all_unique_rule_counts.append(len(class_based_unique_rules))
+            all_unique_rule_counts.append(union_rule_count)
     
     # Store summary stats (no global averages - removed per user request)
     # Only keep rule counts and feature frequency for overall stats
@@ -753,7 +759,26 @@ def plot_feature_importance(summary: Dict, output_dir: str, dataset_name: str = 
         target_class = class_data.get("class", -1)
         unique_rules = class_data.get("unique_rules", [])
         
+        # CRITICAL: Prefer union rules (used for class-union metrics) over per-agent rules
+        # This ensures feature importance matches the union metrics
+        union_rules = class_data.get("class_union_unique_rules", [])
+        class_based_rules = class_data.get("class_level_unique_rules", class_data.get("class_based_unique_rules", []))
+        rules_for_importance = union_rules if union_rules else class_based_rules
+        
+        # Process instance-based rules
         for rule_str in unique_rules:
+            intervals = extract_feature_intervals_from_rule(rule_str)
+            for feature_name, lower, upper in intervals:
+                # Global collection
+                feature_intervals_global[feature_name].append((lower, upper))
+                feature_frequency_global[feature_name] += 1
+                
+                # Per-class collection
+                feature_intervals_per_class[target_class][feature_name].append((lower, upper))
+                feature_frequency_per_class[target_class][feature_name] += 1
+        
+        # Process class-based rules (prefer union rules if available)
+        for rule_str in rules_for_importance:
             intervals = extract_feature_intervals_from_rule(rule_str)
             for feature_name, lower, upper in intervals:
                 # Global collection

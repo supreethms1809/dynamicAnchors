@@ -1025,13 +1025,13 @@ def extract_rules_from_policies(
     steps_per_episode: Optional[int] = None,
     n_instances_per_class: int = 20,
     eval_on_test_data: bool = True,
-    coverage_on_all_data: bool = False,  # If True, compute coverage on all data (train+test combined, matches baseline)
+    coverage_on_all_data: bool = True,  # Default True for fair comparison with single-agent and baseline
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu",
     exploration_mode: str = "sample",
     action_noise_scale: float = 0.05,
-    filter_by_prediction: bool = True,
+    filter_by_prediction: bool = False,  # Default False for fair comparison (can be enabled if needed)
 ) -> Dict[str, Any]:
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
@@ -1487,7 +1487,15 @@ def extract_rules_from_policies(
     # Set min_coverage_floor to ensure box always covers at least the anchor instance
     # Use 1/n_samples from the dataset (to ensure at least one point is covered), 
     # or fall back to config default (0.005) if dataset size unavailable
-    if eval_on_test_data and env_data.get("X_test_unit") is not None:
+    # CRITICAL: When coverage_on_all_data=True, use full dataset size (train+test combined)
+    if coverage_on_all_data:
+        # Use full dataset size (train + test combined)
+        n_train = env_data.get("X_unit", np.array([])).shape[0] if env_data.get("X_unit") is not None else 0
+        n_test = env_data.get("X_test_unit", np.array([])).shape[0] if env_data.get("X_test_unit") is not None else 0
+        n_samples = n_train + n_test
+        if n_samples == 0:
+            n_samples = None
+    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
         n_samples = env_data["X_test_unit"].shape[0]
     elif env_data.get("X_unit") is not None:
         n_samples = env_data["X_unit"].shape[0]

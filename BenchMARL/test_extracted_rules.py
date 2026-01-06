@@ -812,12 +812,31 @@ def test_rules_from_json(
     
     # CRITICAL FIX: Load classifier for prediction-match precision calculation
     # Instance-based rules should use prediction-match precision, not class-label precision
-    classifier = dataset_loader.get_classifier()
-    if classifier is None:
-        logger.warning("Classifier not available - instance-based rules will use class-label precision instead of prediction-match precision")
-        classifier = None
-    else:
+    classifier = None
+    try:
+        classifier = dataset_loader.get_classifier()
         logger.info("✓ Classifier loaded for prediction-match precision calculation")
+    except ValueError:
+        # Classifier not created yet, try to load from standard location or create it
+        import os
+        classifier_path = os.path.join("models", f"classifier_{dataset_name}_seed{seed}.pth")
+        if os.path.exists(classifier_path):
+            logger.info(f"Loading classifier from {classifier_path}...")
+            try:
+                classifier = dataset_loader.load_classifier(
+                    filepath=classifier_path,
+                    classifier_type="dnn",
+                    device="cpu"
+                )
+                dataset_loader.classifier = classifier
+                logger.info("✓ Classifier loaded from file for prediction-match precision calculation")
+            except Exception as e:
+                logger.warning(f"Failed to load classifier from {classifier_path}: {e}")
+                classifier = None
+        else:
+            logger.warning(f"Classifier not found at {classifier_path} and not created yet.")
+            logger.warning("Instance-based rules will use class-label precision instead of prediction-match precision")
+            classifier = None
     
     # Get data (in standardized feature space, matching the denormalized rules)
     # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)

@@ -1650,6 +1650,13 @@ Examples:
     )
     
     parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        help="Use full dataset (train + test combined) for testing (if --run_tests is used). "
+             "Overrides --use_train_data / default test split."
+    )
+    
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -1716,6 +1723,7 @@ Examples:
             rules_file=str(rules_file),
             dataset_name=args.dataset,
             use_test_data=not args.use_train_data,
+            use_full_dataset=args.use_full_dataset,
             seed=args.seed
         )
         # Save test results
