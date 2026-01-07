@@ -130,9 +130,9 @@ class AnchorEnv(ParallelEnv):
         # SS - Termination reason counters: track usage and disable overused reasons per agent
         self.termination_reason_max_counts = {
             "both_targets_met": env_config.get("max_termination_count_both_targets", -1),
-            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 30),
+            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 100),
             "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", 200),
-            "both_reasonably_close": env_config.get("max_termination_count_both_close", 50)
+            "both_reasonably_close": env_config.get("max_termination_count_both_close", 100)
         }
         self._reset_termination_counters()
 

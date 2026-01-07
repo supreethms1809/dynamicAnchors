@@ -25,7 +25,6 @@ DATASETS = [
 # These are passed directly to run_comparison_pipeline.py.
 ALGORITHMS = [
     "maddpg",
-    "masac",
     # Add/remove algorithms here as needed
 ]
 
