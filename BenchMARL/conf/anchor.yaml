@@ -18,7 +18,7 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 # Environment configuration dictionary
 env_config:
   precision_target: 0.95
-  coverage_target: 0.2
+  coverage_target: 0.15
   use_perturbation: True
   perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 4096
@@ -98,7 +98,7 @@ env_config:
   # Set to false to use training data for evaluation (matches baseline behavior)
   # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
   eval_on_test_data: false
-  
+
   # Termination reason counters: disable overused reasons
   # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
   max_termination_count_both_targets: -1

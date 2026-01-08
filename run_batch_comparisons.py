@@ -15,9 +15,13 @@ from pathlib import Path
 # Make sure each dataset is supported by run_comparison_pipeline.py.
 DATASETS = [
     "iris",
-    "wine",
     "breast_cancer",
+    "wine",
     "housing",
+    "covtype",
+    "circles",
+    "uci_credit",
+    "folktables_income_CA_2018",
     # Add/remove datasets here as needed
 ]
 
@@ -47,15 +51,11 @@ def main() -> None:
                 algo,
                 "--force_retrain",
             ]
-
             print("\n" + "=" * 80)
             print(f"Running comparison pipeline for dataset='{dataset}', algorithm='{algo}'")
             print("Command:", " ".join(cmd))
             print("=" * 80)
-
-            # Run in the project root so relative paths in the pipeline work as intended
             subprocess.run(cmd, check=True, cwd=str(project_root))
-
 
 if __name__ == "__main__":
     main()

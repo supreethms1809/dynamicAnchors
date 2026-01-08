@@ -5,7 +5,7 @@
 env_config:
   # Target metrics
   precision_target: 0.95
-  coverage_target: 0.3
+  coverage_target: 0.15
   
   # Data perturbation settings
   use_perturbation: True
@@ -62,7 +62,7 @@ env_config:
   # RECOMMENDED: Set to true to evaluate on test data during training for better model selection
   # This helps catch models that generalize well and avoids overfitting to training data
   # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
-  eval_on_test_data: true  # Changed to true for better model selection based on generalization
+  eval_on_test_data: false  # Changed to true for better model selection based on generalization
   
   # Episode length (kept here so it is passed directly into SingleAgentAnchorEnv.__init__)
   max_cycles: 500  # Increased from 100 to allow boxes more time to expand for better coverage

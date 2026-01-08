@@ -331,6 +331,22 @@ def run_single_agent_training(
     Returns:
         Path to experiment directory if successful, None otherwise
     """
+    if dataset == "iris":
+        total_timesteps = 60_000
+    elif dataset == "breast_cancer":
+        total_timesteps = 60_000
+    elif dataset == "wine":
+        total_timesteps = 120_000
+    elif dataset == "covtype":
+        total_timesteps = 480_000
+    elif dataset == "circles":
+        total_timesteps = 60_000
+    elif dataset == "uci_credit":
+        total_timesteps = 480_000
+    elif dataset == "folktables_income_CA_2018":
+        total_timesteps = 480_000
+    else:
+        total_timesteps = 60_000
     if output_dir is None:
         # The driver appends "training/" to the output_dir, so we need to ensure it has a trailing slash
         # This creates: single_agent_sb3_{dataset}_{algorithm}/training/ instead of concatenating
@@ -2225,8 +2241,8 @@ Examples:
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=100,
-        help="Steps per episode (default: 100)"
+        default=500,
+        help="Steps per episode (default: 500)"
     )
     
     parser.add_argument(
@@ -2317,7 +2333,7 @@ Examples:
     if args.output_dir is None:
         # Add datetime stamp to prevent overwriting previous results
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = str(PROJECT_ROOT / "comparison_results" / f"{args.dataset}_{args.algorithm}_{datetime_str}")
+        args.output_dir = str(PROJECT_ROOT / "comparison_results" / f"all_datasets_0_15_{datetime_str}" / f"{args.dataset}_{args.algorithm}_{datetime_str}")
     else:
         # Resolve relative paths relative to project root
         args.output_dir = str(Path(args.output_dir).resolve())
