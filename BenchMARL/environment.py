@@ -541,6 +541,15 @@ class AnchorEnv(ParallelEnv):
         # - Class-based (x_star_unit not set): Class-conditional coverage P(x in box | y = target_class)
         is_instance_based = self.x_star_unit.get(agent) is not None
         
+        # CRITICAL: Log if instance-based mode is not detected when it should be
+        # This helps catch bugs where x_star_unit is not preserved during reset
+        if self.mode == "inference" and not is_instance_based:
+            logger.debug(
+                f"Agent {agent}: Instance-based mode not detected during inference (x_star_unit is None). "
+                f"This may indicate x_star_unit was not set before reset() or was cleared during reset(). "
+                f"Will use class-conditional coverage instead of overall coverage."
+            )
+        
         # If instance-based and original prediction not stored, compute it now
         if is_instance_based and agent not in self.original_predictions:
             x_star = self.x_star_unit[agent]
@@ -837,6 +846,15 @@ class AnchorEnv(ParallelEnv):
         observations = {}
         infos = {}
         
+        # CRITICAL: Preserve x_star_unit during inference/evaluation mode
+        # During inference, x_star_unit is set externally (e.g., by inference code) to indicate instance-based mode
+        # We must preserve it to ensure correct coverage calculation (overall vs class-conditional)
+        x_star_unit_preserved = {}
+        if self.mode in ["inference", "evaluation"]:
+            for agent in self.possible_agents:
+                if agent in self.x_star_unit and self.x_star_unit[agent] is not None:
+                    x_star_unit_preserved[agent] = self.x_star_unit[agent].copy() if isinstance(self.x_star_unit[agent], np.ndarray) else self.x_star_unit[agent]
+        
         # Mixed initialization during training: randomly choose between instance-based and centroid-based
         # For each agent, decide whether to use instance-based or centroid-based
         for agent in self.agents:
@@ -888,6 +906,12 @@ class AnchorEnv(ParallelEnv):
                     # Also clear original prediction when switching to class-based
                     if agent in self.original_predictions:
                         del self.original_predictions[agent]
+            
+            # CRITICAL: Restore x_star_unit during inference/evaluation mode if it was set externally
+            # This ensures instance-based mode is preserved and correct coverage (overall) is used for termination
+            if self.mode in ["inference", "evaluation"] and agent in x_star_unit_preserved:
+                self.x_star_unit[agent] = x_star_unit_preserved[agent].copy() if isinstance(x_star_unit_preserved[agent], np.ndarray) else x_star_unit_preserved[agent]
+                logger.debug(f"Agent {agent}: Preserved x_star_unit for instance-based mode during {self.mode}")
             
             if self.x_star_unit.get(agent) is not None:
                 # Get target_class for this agent (needed for validation and logging)

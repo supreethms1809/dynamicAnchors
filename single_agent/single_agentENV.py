@@ -478,6 +478,15 @@ class SingleAgentAnchorEnv(Env):
         # - Class-based (x_star_unit not set): Class-conditional coverage P(x in box | y = target_class)
         is_instance_based = self.x_star_unit is not None
         
+        # CRITICAL: Log if instance-based mode is not detected when it should be
+        # This helps catch bugs where x_star_unit is not preserved during reset
+        if self.mode == "inference" and not is_instance_based:
+            logger.debug(
+                f"SingleAgent: Instance-based mode not detected during inference (x_star_unit is None). "
+                f"This may indicate x_star_unit was not set before reset() or was cleared during reset(). "
+                f"Will use class-conditional coverage instead of overall coverage."
+            )
+        
         # If instance-based and original prediction not stored, compute it now
         if is_instance_based and self.original_prediction is None:
             if isinstance(self.x_star_unit, np.ndarray):
@@ -754,6 +763,13 @@ class SingleAgentAnchorEnv(Env):
         
         self.timestep = 0
         
+        # CRITICAL: Preserve x_star_unit during inference/evaluation mode
+        # During inference, x_star_unit is set externally (e.g., by inference code) to indicate instance-based mode
+        # We must preserve it to ensure correct coverage calculation (overall vs class-conditional)
+        x_star_unit_preserved = None
+        if self.mode in ["inference", "evaluation"] and self.x_star_unit is not None:
+            x_star_unit_preserved = self.x_star_unit.copy() if isinstance(self.x_star_unit, np.ndarray) else self.x_star_unit
+        
         # Mixed initialization during training: randomly choose between instance-based and centroid-based
         use_instance_based = False
         if self.mode == "training" and self.training_instances_per_class is not None:
@@ -786,6 +802,12 @@ class SingleAgentAnchorEnv(Env):
                 self.x_star_unit = None
                 # Also clear original prediction when switching to class-based
                 self.original_prediction = None
+        
+        # CRITICAL: Restore x_star_unit during inference/evaluation mode if it was set externally
+        # This ensures instance-based mode is preserved and correct coverage (overall) is used for termination
+        if self.mode in ["inference", "evaluation"] and x_star_unit_preserved is not None:
+            self.x_star_unit = x_star_unit_preserved.copy() if isinstance(x_star_unit_preserved, np.ndarray) else x_star_unit_preserved
+            logger.debug(f"SingleAgent: Preserved x_star_unit for instance-based mode during {self.mode}")
         
         # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
         if self.x_star_unit is not None:
