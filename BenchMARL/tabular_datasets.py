@@ -152,6 +152,7 @@ class TabularDatasetLoader:
                 "tic-tac-toe": 101,
                 "vote": 56,
                 "zoo": 111,
+                "default-credit-card-clients": 350,
             }
             
             # Try to get ID from map or parse as integer

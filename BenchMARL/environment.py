@@ -2241,7 +2241,7 @@ class AnchorEnv(ParallelEnv):
         
         cond_parts = []
         for i in to_show_idx:
-            cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.4f}, {upper[i]:.4f}]")
+            cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.6f}, {upper[i]:.6f}]")
         
         return " and ".join(cond_parts)
     

@@ -13,7 +13,7 @@ We use the BenchMARL library to train the multi-agent dynamic anchors model.
 Training pipeline supports the following datasets and algorithms:
 Dataset: 
   - sklearn: breast_cancer, wine, iris, synthetic, moons, circles, covtype, housing
-  - UCIML: uci_adult, uci_car, uci_credit, uci_nursery, uci_mushroom, uci_tic-tac-toe, uci_vote, uci_zoo
+  - UCIML: uci_adult, uci_car, uci_credit, uci_nursery, uci_mushroom, uci_tic-tac-toe, uci_vote, uci_zoo, uci_default-credit-card-clients
   - Folktables: folktables_<task>_<state>_<year> (e.g., folktables_income_CA_2018)
 Algorithm: maddpg, masac
 Classifier: dnn, random_forest, gradient_boosting
@@ -56,7 +56,7 @@ def main():
         from ucimlrepo import fetch_ucirepo
         dataset_choices.extend([
             "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
-            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo", "uci_default-credit-card-clients"
         ])
     except ImportError:
         pass

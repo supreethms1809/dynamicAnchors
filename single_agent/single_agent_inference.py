@@ -3223,7 +3223,7 @@ def main():
         from ucimlrepo import fetch_ucirepo
         dataset_choices.extend([
             "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
-            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo", "uci_default-credit-card-clients"
         ])
     except ImportError:
         pass
