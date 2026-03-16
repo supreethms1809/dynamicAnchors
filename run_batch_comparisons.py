@@ -14,15 +14,19 @@ from pathlib import Path
 # Editable list of datasets to run.
 # Make sure each dataset is supported by run_comparison_pipeline.py.
 DATASETS = [
+    # Small sklearn datasets
     "iris",
     "breast_cancer",
     "wine",
-    "housing",
-    "covtype",
     "circles",
-    "uci_credit",
-    "folktables_income_CA_2018",
-    # Add/remove datasets here as needed
+    # Medium datasets
+    "housing",        # ~20K samples (California housing, 4-class)
+    "uci_adult",      # ~32K samples
+    "uci_credit",     # ~30K samples (German credit)
+    "uci_default-credit-card-clients",  # ~30K samples
+    # Large datasets
+    "covtype",        # ~581K samples
+    "folktables_income_CA_2018",  # ~40K samples
 ]
 
 # Editable list of multi-agent algorithms to run.

@@ -1,4 +1,69 @@
-Dynamic Anchors: BenchMARL (Multi‑Agent) and Single‑Agent Pipelines
+# Dynamic Anchors: BenchMARL (Multi‑Agent) and Single‑Agent Pipelines
+
+## Quick start — run everything
+
+To train fresh models and collect results for all datasets:
+
+```bash
+python run_all_experiments.py --force_retrain --device cpu --seed 42
+```
+
+To run on a GPU:
+
+```bash
+python run_all_experiments.py --force_retrain --device cuda --seed 42
+```
+
+To run a subset first (recommended smoke test):
+
+```bash
+python run_all_experiments.py --force_retrain --device cpu --seed 42 \
+    --datasets iris breast_cancer wine circles
+```
+
+`run_all_experiments.py` launches `run_comparison_pipeline.py` for every dataset with
+per-dataset training budgets (see table below), running both single-agent (DDPG) and
+multi-agent (MADDPG) pipelines plus the static-anchor baseline.
+
+### Per-dataset training budget
+
+| Dataset | Single-agent steps | Multi-agent frames | max\_cycles | Instances/class |
+|---|---|---|---|---|
+| iris | 90K | 360K | 500 | 20 |
+| breast\_cancer | 90K | 360K | 500 | 20 |
+| wine | 120K | 360K | 500 | 20 |
+| circles | 90K | 360K | 500 | 20 |
+| housing | 240K | 480K | 500 | 25 |
+| uci\_adult | 360K | 720K | 500 | 25 |
+| uci\_credit | 360K | 720K | 500 | 25 |
+| uci\_default-credit-card-clients | 360K | 720K | 500 | 25 |
+| covtype | 1 440K | 1 440K | 500 | 20 |
+| folktables\_income\_CA\_2018 | 720K | 1 080K | 500 | 25 |
+
+### Result directories
+
+| What | Location |
+|------|----------|
+| Comparison results (JSON, plots, logs) | `comparison_results/all_datasets_0_35_uci_credit/{dataset}_{algorithm}_{timestamp}/` |
+| Multi-agent model checkpoints | `BenchMARL/output/{dataset}_{algorithm}/` |
+| Single-agent model checkpoints | `single_agent/output/single_agent_sb3_{dataset}_{algorithm}/` |
+
+Comparison result folders are always timestamped — re-running never overwrites previous
+results. Model checkpoints are reused across runs unless `--force_retrain` is passed.
+
+### `run_all_experiments.py` flags
+
+| Flag | Effect |
+|------|--------|
+| `--datasets D1 D2 ...` | Run only a subset of datasets |
+| `--algorithm maddpg\|masac` | Multi-agent algorithm (default: maddpg) |
+| `--seed N` | Random seed (default: 42) |
+| `--device cpu\|cuda\|mps` | Device (default: cpu) |
+| `--force_retrain` | Retrain even if checkpoints exist |
+| `--skip_training` | Skip training, run inference on existing models |
+| `--skip_baseline` | Skip static-anchor baseline computation |
+
+---
 
 ### Conda environment (Python 3.12) and dependencies
 

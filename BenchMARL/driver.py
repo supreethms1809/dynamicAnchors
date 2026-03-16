@@ -30,6 +30,9 @@ os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
 from tabular_datasets import TabularDatasetLoader
 from anchor_trainer import AnchorTrainer
 import argparse
+import random
+import numpy as np
+import torch
 
 # Set up logging
 import logging
@@ -179,6 +182,13 @@ def main():
         default=None,
         help="Maximum cycles per episode. If omitted, uses env_config.max_cycles from conf/anchor.yaml"
     )
+
+    parser.add_argument(
+        "--max_n_frames",
+        type=int,
+        default=None,
+        help="Total training frames. Overrides max_n_frames in conf/base_experiment.yaml when provided."
+    )
     
     parser.add_argument(
         "--target_classes",
@@ -197,7 +207,14 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # Set global seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     if args.output_dir is None:
         args.output_dir = f"./output/{args.dataset}_{args.algorithm}/"
     
@@ -340,6 +357,7 @@ def main():
             env_config=None,
             target_classes=args.target_classes,
             max_cycles=args.max_cycles,
+            max_n_frames=args.max_n_frames,
             device=args.device,
             eval_on_test_data=args.eval_on_test_data
         )

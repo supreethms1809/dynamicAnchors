@@ -252,6 +252,9 @@ class TabularDatasetLoader:
             else:
                 y = y.astype(int)
                 unique_classes = np.unique(y)
+                # Remap to 0-indexed labels so CrossEntropyLoss targets are always in [0, n_classes-1]
+                label_map = {old: new for new, old in enumerate(unique_classes)}
+                y = np.array([label_map[v] for v in y], dtype=int)
                 class_names = [f"class_{i}" for i in unique_classes]
             
             logger.info(f"  Loaded UCIML dataset: {dataset.metadata.name if hasattr(dataset, 'metadata') else 'Unknown'}")

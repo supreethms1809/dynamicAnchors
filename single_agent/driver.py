@@ -30,6 +30,9 @@ from BenchMARL.tabular_datasets import TabularDatasetLoader
 from anchor_trainer_sb3 import AnchorTrainerSB3
 import argparse
 import logging
+import random
+import numpy as np
+import torch
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -182,7 +185,14 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # Set global seeds for reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     if args.output_dir is None:
         args.output_dir = f"./output/single_agent_sb3_{args.dataset}_{args.algorithm}/"
     

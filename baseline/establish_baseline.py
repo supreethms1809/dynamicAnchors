@@ -66,7 +66,7 @@ def build_dataset_choices() -> list:
         from ucimlrepo import fetch_ucirepo
         dataset_choices.extend([
             "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
-            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo", "uci_default-credit-card-clients"
         ])
     except ImportError:
         pass
@@ -201,6 +201,7 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
             "tic-tac-toe": 101,
             "vote": 56,
             "zoo": 111,
+            "default-credit-card-clients": 350,
         }
         
         # Try to get ID from map or parse as integer
@@ -1331,9 +1332,10 @@ def run_static_anchors(
         if idx_cls_full.size == 0:
             continue
         
-        # Sample instances from full dataset
-        # Use same random number generator API as single-agent for consistency
-        rng = np.random.default_rng(seed)
+        # Sample instances from full dataset.
+        # Use a per-class seed so different classes draw independently,
+        # matching the per-agent seeding used in single-agent and multi-agent scripts.
+        rng = np.random.default_rng(seed + int(cls))
         sel_full = rng.choice(idx_cls_full, size=min(n_instances_per_class, idx_cls_full.size), replace=False)
         
         class_results = []

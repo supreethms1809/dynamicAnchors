@@ -83,7 +83,8 @@ class AnchorTrainer:
         target_classes: Optional[List[int]] = None,
         max_cycles: Optional[int] = None,
         device: str = "cpu",
-        eval_on_test_data: Optional[bool] = None
+        eval_on_test_data: Optional[bool] = None,
+        max_n_frames: Optional[int] = None
     ) -> Experiment:
         if self.dataset_loader.classifier is None:
             raise ValueError(
@@ -107,7 +108,12 @@ class AnchorTrainer:
         self.algorithm_config = self.algorithm_config_class.get_from_yaml(self.algorithm_config_path)
         self.model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
         self.critic_model_config = MlpConfig.get_from_yaml(self.mlp_config_path)
-        
+
+        # Apply per-dataset training budget override before Experiment() is created.
+        if max_n_frames is not None:
+            logger.info(f"  Overriding max_n_frames: {self.experiment_config.max_n_frames} → {max_n_frames}")
+            self.experiment_config.max_n_frames = max_n_frames
+
         # Adjust network sizes based on dataset size for larger datasets
         n_train_samples = len(self.dataset_loader.y_train) if hasattr(self.dataset_loader, 'y_train') and self.dataset_loader.y_train is not None else 0
         if n_train_samples > 10000:

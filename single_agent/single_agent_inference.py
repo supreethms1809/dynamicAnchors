@@ -597,10 +597,6 @@ def _process_instances_for_class(
                 "y_test": env_data.get("y_test")
             })
         
-        # Track anchors seen so far for this instance (for early stopping)
-        seen_canonical_keys = set()
-        seen_anchors_for_instance = []  # Store anchors with bounds for IoU checking
-        
         # Track anchors seen so far for this instance (for early stopping duplicates)
         seen_canonical_keys = set()
         seen_anchors_for_instance = []  # Store anchors with bounds for IoU checking
@@ -636,9 +632,9 @@ def _process_instances_for_class(
             coverage_class_conditional = episode_data.get("coverage_class_conditional", 0.0)
             rollout_time = episode_data.get("rollout_time_seconds", 0.0)
             
-            logger.info(f"    Rollout {rollout_idx + 1}/{n_rollouts_per_instance} for instance {data_instance_idx}: "
-                      f"Precision={precision:.4f}, Coverage={coverage:.4f}, "
-                      f"Class-Conditional Coverage={coverage_class_conditional:.4f}")
+            logger.debug(f"    Rollout {rollout_idx + 1}/{n_rollouts_per_instance} for instance {data_instance_idx}: "
+                       f"Precision={precision:.4f}, Coverage={coverage:.4f}, "
+                       f"Class-Conditional Coverage={coverage_class_conditional:.4f}")
         
             # Extract rule from final bounds
             rule = "any values (no tightened features)"
@@ -858,10 +854,9 @@ def _process_instances_for_class(
                 else:
                     cov_class_conditional_full = 0.0
                 
-                # DEBUG: Log precision change when significant
                 prec_rollout = rollout_data.get("precision_rollout_estimated", 0.0)
-                if abs(prec_full - prec_rollout) > 0.05:  # Log if difference > 5%
-                    logger.info(
+                if abs(prec_full - prec_rollout) > 0.05:
+                    logger.debug(
                         f"    Rollout {rollout_data['rollout_idx']}: Precision changed from {prec_rollout:.4f} "
                         f"(rollout-estimated, using perturbation samples) to {prec_full:.4f} "
                         f"(recomputed on full dataset with actual instances)"

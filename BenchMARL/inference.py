@@ -176,6 +176,53 @@ def compute_box_iou(
     return float(iou)
 
 
+def compute_anchor_metrics_on_full_dataset(
+    lower_bounds_normalized: np.ndarray,
+    upper_bounds_normalized: np.ndarray,
+    X_full_unit: np.ndarray,
+    X_full_std: np.ndarray,
+    original_instance_unit: np.ndarray,
+    original_instance_std: np.ndarray,
+    original_prediction: int,
+    full_predictions: np.ndarray,
+    classifier=None,
+    device: str = "cpu",
+    target_class: int = None,
+    validate_with_classifier: bool = False,
+) -> Tuple[float, float, int]:
+    """
+    Recompute precision and coverage for an anchor on the full evaluation dataset.
+
+    Matches the single-agent inference recomputation logic so that multi-agent and
+    single-agent metrics are on the same basis and directly comparable.
+
+    Returns:
+        (precision, coverage, n_in_box)
+    """
+    lower = np.array(lower_bounds_normalized, dtype=np.float32)
+    upper = np.array(upper_bounds_normalized, dtype=np.float32)
+
+    if lower.shape[0] != X_full_unit.shape[1] or upper.shape[0] != X_full_unit.shape[1]:
+        logger.warning(
+            f"  Bounds shape mismatch in recomputation: lower={lower.shape}, "
+            f"X_full_unit cols={X_full_unit.shape[1]}"
+        )
+        return 0.0, 0.0, 0
+
+    anchor_mask = np.all((X_full_unit >= lower) & (X_full_unit <= upper), axis=1)
+    n_total = len(X_full_unit)
+    n_in_box = int(anchor_mask.sum())
+    coverage = float(n_in_box / n_total) if n_total > 0 else 0.0
+
+    if n_in_box == 0:
+        return 0.0, coverage, 0
+
+    predictions_in_anchor = full_predictions[anchor_mask]
+    n_matching = int((predictions_in_anchor == original_prediction).sum())
+    precision = float(n_matching / n_in_box)
+    return precision, coverage, n_in_box
+
+
 def nms_deduplicate_anchors(
     anchors_list: List[Dict[str, Any]],
     iou_threshold: float = 0.9,
@@ -2001,10 +2048,21 @@ def extract_rules_from_policies(
             sampled_indices = rng_for_sampling.choice(class_instances, size=n_samples, replace=False)
             logger.info(f"  Agent {agent_name} (idx={agent_idx}): Sampling {n_samples} instances from {data_source_name} data for class {target_class} (shared pool - not enough instances for separate subsets)")
         
+        # Pre-compute classifier predictions on the evaluation dataset once per class.
+        # Reused for every anchor's full-dataset precision/coverage recomputation,
+        # matching the single-agent inference approach so metrics are directly comparable.
+        classifier_for_recompute = dataset_loader.get_classifier()
+        classifier_for_recompute.eval()
+        with torch.no_grad():
+            _X_recompute_tensor = torch.from_numpy(X_data_std.astype(np.float32)).to(torch.device(device))
+            _full_logits = classifier_for_recompute(_X_recompute_tensor)
+            full_predictions_recompute = _full_logits.argmax(dim=1).cpu().numpy()
+
         for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
             # Get the actual instance from the dataset
             x_instance = X_data_unit[data_instance_idx]
-            
+            x_instance_std = X_data_std[data_instance_idx]
+
             # Create environment for this specific class and agent
             # IMPORTANT: When agents_per_class > 1, we create an environment with all agents for the class
             # but only run rollouts for the specific agent (agent_name)
@@ -2283,7 +2341,48 @@ def extract_rules_from_policies(
                     "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
                 })
-                
+
+                # Recompute precision/coverage on the full evaluation dataset.
+                # Rollout-estimated metrics use perturbation samples (~4096); recomputed metrics
+                # use the actual dataset, matching the single-agent and baseline approaches so
+                # all three methods are directly comparable.
+                prec_full, cov_full, n_in_box = compute_anchor_metrics_on_full_dataset(
+                    lower_bounds_normalized=lower_normalized,
+                    upper_bounds_normalized=upper_normalized,
+                    X_full_unit=X_data_unit,
+                    X_full_std=X_data_std,
+                    original_instance_unit=x_instance,
+                    original_instance_std=x_instance_std,
+                    original_prediction=target_class,
+                    full_predictions=full_predictions_recompute,
+                    classifier=classifier_for_recompute,
+                    device=device,
+                    target_class=target_class,
+                    validate_with_classifier=False,
+                )
+                in_box_mask = np.all(
+                    (X_data_unit >= lower_normalized) & (X_data_unit <= upper_normalized), axis=1
+                )
+                class_mask_rc = (y_data_for_filtering == target_class)
+                n_class_rc = int(class_mask_rc.sum())
+                cov_class_cond = (
+                    float((in_box_mask & class_mask_rc).sum() / n_class_rc) if n_class_rc > 0 else 0.0
+                )
+                # Preserve rollout-estimated values for diagnostics
+                anchor_data["precision_rollout_estimated"] = anchor_data["instance_precision"]
+                anchor_data["coverage_rollout_estimated"] = anchor_data["instance_coverage"]
+                anchor_data["precision_recomputed"] = float(prec_full)
+                anchor_data["coverage_recomputed"] = float(cov_full)
+                anchor_data["coverage_class_conditional_recomputed"] = float(cov_class_cond)
+                anchor_data["n_in_box"] = n_in_box
+                # Replace primary metrics with recomputed values
+                anchor_data["instance_precision"] = float(prec_full)
+                anchor_data["instance_coverage"] = float(cov_full)
+                anchor_data["instance_coverage_class_conditional"] = float(cov_class_cond)
+                anchor_data["anchor_precision"] = float(prec_full)
+                anchor_data["anchor_coverage"] = float(cov_full)
+                anchor_data["anchor_coverage_class_conditional"] = float(cov_class_cond)
+
                 # CRITICAL: Check for near-duplicates using quantization and IoU (early stopping)
                 # This prevents adding very similar anchors during rollouts
                 canonical_key = canonicalize_rule_key(lower_normalized, upper_normalized, min_width=min_width)

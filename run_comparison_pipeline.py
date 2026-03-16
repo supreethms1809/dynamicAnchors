@@ -109,6 +109,30 @@ logger.setLevel(logging.INFO)
 SCRIPT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = SCRIPT_DIR
 
+# Timesteps per dataset for single-agent training.
+# Large/complex datasets need more timesteps; simple ones can converge faster.
+DATASET_TIMESTEPS = {
+    # Small datasets
+    "iris": 90_000,
+    "breast_cancer": 90_000,
+    "wine": 120_000,
+    "circles": 90_000,
+    # Medium datasets
+    "housing": 240_000,
+    "uci_adult": 360_000,
+    "uci_credit": 360_000,
+    "uci_default-credit-card-clients": 360_000,
+    # Large datasets
+    "covtype": 1_440_000,
+    "folktables_income_CA_2018": 720_000,
+}
+_DEFAULT_TIMESTEPS = 90_000
+
+# Label for the current experiment batch (used as the results group folder name).
+# Update this when changing key hyperparameters (e.g. coverage_target) to keep
+# results from different configurations separate.
+RESULTS_GROUP_NAME = "all_datasets_0_35_uci_credit"
+
 
 def build_dataset_choices() -> list:
     """
@@ -124,7 +148,7 @@ def build_dataset_choices() -> list:
         from ucimlrepo import fetch_ucirepo
         dataset_choices.extend([
             "uci_adult", "uci_car", "uci_credit", "uci_nursery", 
-            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo"
+            "uci_mushroom", "uci_tic-tac-toe", "uci_vote", "uci_zoo", "uci_default-credit-card-clients"
         ])
     except ImportError:
         pass
@@ -312,7 +336,7 @@ def run_single_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
-    total_timesteps: int = 30_000,
+    total_timesteps: Optional[int] = None,
     **kwargs
 ) -> Optional[str]:
     """
@@ -331,22 +355,9 @@ def run_single_agent_training(
     Returns:
         Path to experiment directory if successful, None otherwise
     """
-    if dataset == "iris":
-        total_timesteps = 60_000
-    elif dataset == "breast_cancer":
-        total_timesteps = 60_000
-    elif dataset == "wine":
-        total_timesteps = 120_000
-    elif dataset == "covtype":
-        total_timesteps = 480_000
-    elif dataset == "circles":
-        total_timesteps = 60_000
-    elif dataset == "uci_credit":
-        total_timesteps = 480_000
-    elif dataset == "folktables_income_CA_2018":
-        total_timesteps = 480_000
-    else:
-        total_timesteps = 60_000
+    # Explicit override takes priority; fall back to per-dataset table, then global default.
+    if total_timesteps is None:
+        total_timesteps = DATASET_TIMESTEPS.get(dataset, _DEFAULT_TIMESTEPS)
     if output_dir is None:
         # The driver appends "training/" to the output_dir, so we need to ensure it has a trailing slash
         # This creates: single_agent_sb3_{dataset}_{algorithm}/training/ instead of concatenating
@@ -605,6 +616,7 @@ def run_multi_agent_training(
     device: str = "cpu",
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
+    max_n_frames: Optional[int] = None,
     **kwargs
 ) -> Optional[str]:
     """
@@ -662,7 +674,10 @@ def run_multi_agent_training(
         "--algorithm", algorithm,
         "--seed", str(seed)
     ]
-    
+
+    if max_n_frames is not None:
+        cmd.extend(["--max_n_frames", str(max_n_frames)])
+
     # Add additional arguments
     for key, value in kwargs.items():
         if value is not None:
@@ -671,7 +686,7 @@ def run_multi_agent_training(
                     cmd.append(f"--{key}")
             else:
                 cmd.extend([f"--{key}", str(value)])
-    
+
     # Run from BenchMARL directory so relative config paths work
     benchmarl_dir = str(PROJECT_ROOT / "BenchMARL")
     success, output = run_command(cmd, f"Multi-Agent Training: {dataset} with {algorithm.upper()}", cwd=benchmarl_dir, capture_output=True)
@@ -711,67 +726,16 @@ def run_multi_agent_training(
                     if (item / "checkpoints").exists() or (item / "individual_models").exists() or (item / "config.pkl").exists():
                         # Check if it matches the algorithm pattern (e.g., "maddpg" in name)
                         if algorithm.lower() in item.name.lower():
-                            # Check if it was created recently (within last hour for newly trained models)
-                            import time
-                            mtime = item.stat().st_mtime
-                            if time.time() - mtime < 3600:  # Within last hour
-                                experiment_dirs.append(item)
-            
+                            experiment_dirs.append(item)
+
             if experiment_dirs:
-                # Get most recent
+                # Pick the most recently modified matching experiment directory
                 experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
-                logger.info(f"✓ Found experiment directory (fallback search, recent): {experiment_dir}")
+                logger.info(f"✓ Found experiment directory (most recent match): {experiment_dir}")
                 return str(experiment_dir)
-        
+
         logger.warning("⚠ Training completed but could not find experiment directory")
         return None
-        # with names like: maddpg_anchor_mlp__e30d851d_25_11_29-19_41_35
-        benchmarl_dir = PROJECT_ROOT / "BenchMARL"
-        
-        # Look for experiment directories directly in BenchMARL directory
-        # These are created by BenchMARL and contain checkpoints/individual_models
-        # BenchMARL creates folders like: maddpg_anchor_mlp__e30d851d_25_11_29-19_41_35
-        experiment_dirs = []
-        excluded_dirs = {'output', 'conf', 'docs', '__pycache__', '.git'}
-        
-        for item in benchmarl_dir.iterdir():
-            if (item.is_dir() and 
-                not item.name.startswith('.') and 
-                item.name not in excluded_dirs):
-                # Check if it looks like an experiment directory (contains checkpoints or individual_models)
-                if (item / "checkpoints").exists() or (item / "individual_models").exists():
-                    experiment_dirs.append(item)
-        
-        if experiment_dirs:
-            # Sort by modification time, get most recent (should be the one we just created)
-            experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
-            logger.info(f"✓ Found experiment directory (most recent): {experiment_dir}")
-            return str(experiment_dir)
-        
-        # Fallback: Check in output directory structure
-        if Path(output_dir).is_absolute():
-            output_path = Path(output_dir)
-        else:
-            output_path = benchmarl_dir / output_dir
-        
-        training_dir = output_path / "training"
-        if training_dir.exists():
-            experiment_dirs = [d for d in training_dir.iterdir() if d.is_dir()]
-            if experiment_dirs:
-                experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
-                logger.info(f"✓ Found experiment directory in training folder: {experiment_dir}")
-                return str(experiment_dir)
-        
-        # Also check if experiment directory is directly in output_dir
-        experiment_dirs = [d for d in output_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
-        if experiment_dirs:
-            for exp_dir in experiment_dirs:
-                if (exp_dir / "checkpoints").exists() or (exp_dir / "individual_models").exists():
-                    logger.info(f"✓ Found experiment directory: {exp_dir}")
-                    return str(exp_dir)
-        
-        logger.warning(f"⚠ Could not find experiment directory, using output directory: {output_path}")
-        return str(output_path)
     
     return None
 
@@ -2300,7 +2264,21 @@ Examples:
         help="Disable prediction routing (equivalent to --use_prediction_routing=False). "
              "Use traditional evaluation mode with ground truth labels for routing."
     )
-    
+
+    parser.add_argument(
+        "--max_n_frames",
+        type=int,
+        default=None,
+        help="Override total training frames for multi-agent (default: per-dataset table or base_experiment.yaml)"
+    )
+
+    parser.add_argument(
+        "--total_timesteps",
+        type=int,
+        default=None,
+        help="Override total training timesteps for single-agent (default: per-dataset DATASET_TIMESTEPS table)"
+    )
+
     args = parser.parse_args()
     
     # Determine single-agent algorithm from multi-agent algorithm
@@ -2333,7 +2311,7 @@ Examples:
     if args.output_dir is None:
         # Add datetime stamp to prevent overwriting previous results
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = str(PROJECT_ROOT / "comparison_results" / f"all_datasets_0_15_{datetime_str}" / f"{args.dataset}_{args.algorithm}_{datetime_str}")
+        args.output_dir = str(PROJECT_ROOT / "comparison_results" / RESULTS_GROUP_NAME / f"{args.dataset}_{args.algorithm}_{datetime_str}")
     else:
         # Resolve relative paths relative to project root
         args.output_dir = str(Path(args.output_dir).resolve())
@@ -2442,7 +2420,8 @@ Examples:
                 seed=args.seed,
                 device=args.device,
                 output_dir=args.single_agent_output_dir,
-                force_retrain=args.force_retrain
+                force_retrain=args.force_retrain,
+                total_timesteps=args.total_timesteps
             )
         else:
             # Try to find existing experiment directory
@@ -2537,7 +2516,8 @@ Examples:
                 algorithm=multi_agent_algorithm,
                 seed=args.seed,
                 output_dir=args.multi_agent_output_dir,
-                force_retrain=args.force_retrain
+                force_retrain=args.force_retrain,
+                max_n_frames=args.max_n_frames
             )
         else:
             logger.info("Training skipped (--skip_training). Looking for existing experiment directory...")
@@ -2590,6 +2570,7 @@ Examples:
                 device=args.device,
                 coverage_on_all_data=True,
                 filter_by_prediction=False,
+                use_prediction_routing=args.use_prediction_routing,
             )
         elif args.skip_inference:
             logger.info("Inference skipped (--skip_inference). Looking for existing rules file...")
