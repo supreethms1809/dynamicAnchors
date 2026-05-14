@@ -160,16 +160,17 @@ class WyoDOTDatasetLoader(TabularDatasetLoader):
         hidden_sizes: Optional[List[int]] = None
     ):
         if classifier_type.lower() == "random_forest":
+            rf_params = {**self.RF_PARAMS, "random_state": self.random_state}
             logger.info(f"\nCreating Random Forest classifier with WyoDOT paper parameters")
             logger.info("=" * 80)
-            logger.info(f"  Parameters: {self.RF_PARAMS}")
+            logger.info(f"  Parameters: {rf_params}")
 
             classifier = UnifiedClassifier(
                 classifier_type="random_forest",
                 input_dim=self.n_features,
                 num_classes=self.n_classes,
                 device=device,
-                **self.RF_PARAMS,
+                **rf_params,
             )
 
             self.classifier = classifier
