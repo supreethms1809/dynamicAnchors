@@ -1871,6 +1871,15 @@ def extract_rules_from_policies(
             "dataset": dataset_name,
             "experiment_dir": experiment_dir,
             "target_classes": target_classes,
+            "class_names": {
+                f"class_{int(cls)}": (
+                    dataset_loader.class_names[int(cls)]
+                    if getattr(dataset_loader, "class_names", None)
+                    and int(cls) < len(dataset_loader.class_names)
+                    else f"class_{int(cls)}"
+                )
+                for cls in target_classes
+            },
             "max_features_in_rule": max_features_in_rule,
             "eval_on_test_data": eval_on_test_data,
             "coverage_on_all_data": coverage_on_all_data,

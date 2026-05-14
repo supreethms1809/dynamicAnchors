@@ -984,6 +984,15 @@ def test_rules_from_json(
         "n_samples": X_data.shape[0],
         "n_features": X_data.shape[1],
         "classes": unique_classes,
+        "class_names": {
+            f"class_{int(cls)}": (
+                dataset_loader.class_names[int(cls)]
+                if getattr(dataset_loader, "class_names", None)
+                and int(cls) < len(dataset_loader.class_names)
+                else f"class_{int(cls)}"
+            )
+            for cls in unique_classes
+        },
         "rules_tested": len(all_unique_rules),
         "rule_results": [],
         # Include original per_class_results from rules file for consistency with missed_samples_analysis
