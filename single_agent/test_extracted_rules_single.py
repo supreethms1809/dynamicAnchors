@@ -767,20 +767,19 @@ def test_rules_from_json(
     dataset_loader.load_dataset()
     dataset_loader.preprocess_data()
     
-    # Get data (in standardized feature space, matching the denormalized rules)
-    # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)
+    # Get data in original (raw) feature space, matching the denormalized rule bounds.
+    # Rules are denormalized all the way back to raw feature units (inverse StandardScaler).
     if use_full_dataset:
-        # Combine train and test data for full dataset evaluation
-        X_data = np.vstack([dataset_loader.X_train_scaled, dataset_loader.X_test_scaled])
+        X_data = np.vstack([dataset_loader.X_train, dataset_loader.X_test]).astype(np.float32)
         y_data = np.concatenate([dataset_loader.y_train, dataset_loader.y_test])
         data_type = "full (train + test)"
         logger.info(f"✓ Loaded full dataset: {len(dataset_loader.y_train)} training + {len(dataset_loader.y_test)} test = {X_data.shape[0]} total samples")
     elif use_test_data:
-        X_data = dataset_loader.X_test_scaled  # Standardized feature space (matches rule space)
+        X_data = dataset_loader.X_test.astype(np.float32)  # Raw feature space (matches rule space)
         y_data = dataset_loader.y_test
         data_type = "test"
     else:
-        X_data = dataset_loader.X_train_scaled  # Standardized feature space (matches rule space)
+        X_data = dataset_loader.X_train.astype(np.float32)  # Raw feature space (matches rule space)
         y_data = dataset_loader.y_train
         data_type = "training"
     
@@ -947,15 +946,31 @@ def test_rules_from_json(
     device = "cpu"
     try:
         import torch
-        # Try to get classifier from metadata or dataset_loader
-        # For now, we'll compute predictions on-the-fly if classifier is available
-        # If not available, we'll fall back to class-label precision with a warning
         if hasattr(dataset_loader, 'classifier') and dataset_loader.classifier is not None:
             classifier = dataset_loader.classifier
             logger.info("✓ Using classifier from dataset_loader for prediction-match precision (instance-based rules)")
-        elif hasattr(dataset_loader, 'get_classifier'):
-            classifier = dataset_loader.get_classifier()
-            logger.info("✓ Loaded classifier for prediction-match precision (instance-based rules)")
+        else:
+            # Search likely on-disk locations relative to the rules file.
+            # Single-agent layout typically: <exp_dir>/inference/extracted_rules_*.json
+            # with classifier at <exp_dir>/classifier.pth or <exp_dir>/training/classifier.pth.
+            rules_parent = os.path.dirname(os.path.abspath(rules_file))
+            exp_dir = os.path.dirname(rules_parent)
+            candidates = [
+                os.path.join(exp_dir, "classifier.pth"),
+                os.path.join(exp_dir, "training", "classifier.pth"),
+                os.path.join(rules_parent, "classifier.pth"),
+                os.path.join(os.path.dirname(exp_dir), "training", "classifier.pth"),
+                os.path.join("models", f"classifier_{dataset_name}_seed{seed}.pth"),
+            ]
+            classifier_path = next((p for p in candidates if os.path.exists(p)), None)
+            if classifier_path is not None:
+                logger.info(f"Loading classifier from {classifier_path}...")
+                classifier = dataset_loader.load_classifier(filepath=classifier_path, device=device)
+                dataset_loader.classifier = classifier
+                logger.info("✓ Classifier loaded from file for prediction-match precision (instance-based rules)")
+            else:
+                logger.warning(f"Classifier not found in any of: {candidates}")
+                logger.warning("Will use class-label precision for all rules (including instance-based)")
     except Exception as e:
         logger.warning(f"Could not load classifier for prediction-match precision: {e}")
         logger.warning("Will use class-label precision for all rules (including instance-based)")

@@ -647,12 +647,17 @@ def _process_instances_for_class(
                 lower_normalized = np.array(episode_data["final_lower"], dtype=np.float32)
                 upper_normalized = np.array(episode_data["final_upper"], dtype=np.float32)
                 
-                # Denormalize bounds
+                # Denormalize bounds: unit -> standardized -> raw
                 X_min = env_config.get("X_min")
                 X_range = env_config.get("X_range")
+                scaler_mean = env_config.get("scaler_mean")
+                scaler_scale = env_config.get("scaler_scale")
                 if X_min is not None and X_range is not None:
                     lower = (lower_normalized * X_range) + X_min
                     upper = (upper_normalized * X_range) + X_min
+                    if scaler_mean is not None and scaler_scale is not None:
+                        lower = lower * scaler_scale + scaler_mean
+                        upper = upper * scaler_scale + scaler_mean
                 else:
                     lower = lower_normalized
                     upper = upper_normalized
@@ -671,10 +676,16 @@ def _process_instances_for_class(
                 temp_env.lower = lower_normalized
                 temp_env.upper = upper_normalized
                 
-                # Compute initial bounds from x_instance and initial_window for correct reference
-                initial_window = env_config.get("initial_window", 0.1)
-                initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
-                initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+                # Use the true initial box recorded during the rollout. It accounts for the
+                # min_width guard and class-based initialization; fall back to reconstructing
+                # from x_instance only if the rollout didn't report it.
+                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                else:
+                    initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
+                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
                 
                 rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
@@ -1328,8 +1339,7 @@ def extract_rules_single_agent(
         logger.info(f"Loading classifier from: {classifier_path}")
         classifier = dataset_loader.load_classifier(
             filepath=classifier_path,
-            classifier_type="dnn",
-            device=device
+            device=device,
         )
         dataset_loader.classifier = classifier
     else:
@@ -1360,6 +1370,8 @@ def extract_rules_single_agent(
     env_config.update({
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
+        "scaler_mean": env_data.get("scaler_mean"),
+        "scaler_scale": env_data.get("scaler_scale"),
     })
     
     # Check logging verbosity from config and apply to loggers
@@ -1985,9 +1997,9 @@ def extract_rules_single_agent(
                         X_class_std = X_data_std[class_instances]
                         # torch is already imported at module level, no need to import again
                         with torch.no_grad():
+                            from utils.networks import predict_proba_torch
                             X_tensor = torch.from_numpy(X_class_std.astype(np.float32)).to(device)
-                            logits = classifier(X_tensor)
-                            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                            probs = predict_proba_torch(classifier, X_tensor).cpu().numpy()
                             predictions = np.argmax(probs, axis=1)
                         
                         # Filter: keep only instances where prediction matches target_class
@@ -2532,12 +2544,17 @@ def extract_rules_single_agent(
                 lower_normalized = np.array(episode_data["final_lower"], dtype=np.float32)
                 upper_normalized = np.array(episode_data["final_upper"], dtype=np.float32)
                 
-                # Denormalize bounds
+                # Denormalize bounds: unit -> standardized -> raw
                 X_min = env_config.get("X_min")
                 X_range = env_config.get("X_range")
+                scaler_mean = env_config.get("scaler_mean")
+                scaler_scale = env_config.get("scaler_scale")
                 if X_min is not None and X_range is not None:
                     lower = (lower_normalized * X_range) + X_min
                     upper = (upper_normalized * X_range) + X_min
+                    if scaler_mean is not None and scaler_scale is not None:
+                        lower = lower * scaler_scale + scaler_mean
+                        upper = upper * scaler_scale + scaler_mean
                 else:
                     lower = lower_normalized
                     upper = upper_normalized
@@ -2556,12 +2573,19 @@ def extract_rules_single_agent(
                 temp_env.lower = lower_normalized
                 temp_env.upper = upper_normalized
                 
-                # For class-based, use the center of the final box as reference for initial bounds
-                initial_window = env_config.get("initial_window", 0.1)
-                box_center = (lower_normalized + upper_normalized) / 2.0
-                initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
-                initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
-                
+                # Use the true initial box recorded during the rollout. For class-based
+                # rollouts the real initial box is a nearest-neighbor box from
+                # _compute_box_from_centroid, not reconstructible from the final box center —
+                # so only fall back to the center approximation if it wasn't reported.
+                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                else:
+                    initial_window = env_config.get("initial_window", 0.1)
+                    box_center = (lower_normalized + upper_normalized) / 2.0
+                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+
                 rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
                     initial_lower=initial_lower_normalized,

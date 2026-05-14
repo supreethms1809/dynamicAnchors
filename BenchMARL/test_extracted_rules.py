@@ -817,39 +817,45 @@ def test_rules_from_json(
         classifier = dataset_loader.get_classifier()
         logger.info("✓ Classifier loaded for prediction-match precision calculation")
     except ValueError:
-        # Classifier not created yet, try to load from standard location or create it
+        # Classifier not created yet — search likely locations.
+        # The rules file usually lives at <exp_dir>/inference/extracted_rules.json,
+        # so the trained classifier is at <exp_dir>/training/classifier.pth (or <exp_dir>/classifier.pth).
         import os
-        classifier_path = os.path.join("models", f"classifier_{dataset_name}_seed{seed}.pth")
-        if os.path.exists(classifier_path):
+        rules_parent = os.path.dirname(os.path.abspath(rules_file))
+        exp_dir = os.path.dirname(rules_parent)
+        candidates = [
+            os.path.join(exp_dir, "training", "classifier.pth"),
+            os.path.join(exp_dir, "classifier.pth"),
+            os.path.join(rules_parent, "classifier.pth"),
+            os.path.join("models", f"classifier_{dataset_name}_seed{seed}.pth"),
+        ]
+        classifier_path = next((p for p in candidates if os.path.exists(p)), None)
+        if classifier_path is not None:
             logger.info(f"Loading classifier from {classifier_path}...")
             try:
-                classifier = dataset_loader.load_classifier(
-                    filepath=classifier_path,
-                    classifier_type="dnn",
-                    device="cpu"
-                )
+                classifier = dataset_loader.load_classifier(filepath=classifier_path, device="cpu")
                 dataset_loader.classifier = classifier
                 logger.info("✓ Classifier loaded from file for prediction-match precision calculation")
             except Exception as e:
                 logger.warning(f"Failed to load classifier from {classifier_path}: {e}")
                 classifier = None
         else:
-            logger.warning(f"Classifier not found at {classifier_path} and not created yet.")
+            logger.warning(f"Classifier not found in any of: {candidates}")
             logger.warning("Instance-based rules will use class-label precision instead of prediction-match precision")
             classifier = None
     
-    # Get data (in standardized feature space, matching the denormalized rules)
-    # Rules are denormalized from [0, 1] to standardized space (mean=0, std=1)
+    # Get data in original (raw) feature space, matching the denormalized rule bounds.
+    # Rules are denormalized all the way back to raw feature units (inverse StandardScaler).
     if use_full_dataset:
-        X_data = np.vstack([dataset_loader.X_train_scaled, dataset_loader.X_test_scaled])
+        X_data = np.vstack([dataset_loader.X_train, dataset_loader.X_test]).astype(np.float32)
         y_data = np.concatenate([dataset_loader.y_train, dataset_loader.y_test])
         data_type = "full (train+test)"
     elif use_test_data:
-        X_data = dataset_loader.X_test_scaled  # Standardized feature space (matches rule space)
+        X_data = dataset_loader.X_test.astype(np.float32)  # Raw feature space (matches rule space)
         y_data = dataset_loader.y_test
         data_type = "test"
     else:
-        X_data = dataset_loader.X_train_scaled  # Standardized feature space (matches rule space)
+        X_data = dataset_loader.X_train.astype(np.float32)  # Raw feature space (matches rule space)
         y_data = dataset_loader.y_train
         data_type = "training"
     
@@ -985,11 +991,15 @@ def test_rules_from_json(
                     except:
                         pass
                 
+                # X_data is in raw feature space; classifier was trained on standardized features,
+                # so apply the dataset's scaler before passing through the classifier.
+                X_satisfying_scaled = dataset_loader.scaler.transform(X_satisfying).astype(np.float32)
+
                 classifier.eval()
                 with torch.no_grad():
-                    X_tensor = torch.from_numpy(X_satisfying.astype(np.float32)).to(device)
-                    logits = classifier(X_tensor)
-                    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                    from utils.networks import predict_proba_torch
+                    X_tensor = torch.from_numpy(X_satisfying_scaled).to(device)
+                    probs = predict_proba_torch(classifier, X_tensor).cpu().numpy()
                     predictions = np.argmax(probs, axis=1)
                 
                 logger.debug(f"  Computed predictions for {len(predictions)} satisfying samples (device: {device})")

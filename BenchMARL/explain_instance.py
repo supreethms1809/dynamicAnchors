@@ -60,10 +60,10 @@ def predict_class(
     """
     classifier.eval()
     with torch.no_grad():
+        from utils.networks import predict_proba_torch
         # Reshape to (1, n_features) for batch dimension
         instance_tensor = torch.from_numpy(instance.astype(np.float32)).unsqueeze(0).to(device)
-        logits = classifier(instance_tensor)
-        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+        probs = predict_proba_torch(classifier, instance_tensor).cpu().numpy()[0]
         predicted_class = int(np.argmax(probs))
     
     return predicted_class, probs

@@ -656,6 +656,8 @@ class TabularDatasetLoader:
             "y_test": self.y_test,
             "X_min": self.X_min,
             "X_range": self.X_range,
+            "scaler_mean": np.asarray(self.scaler.mean_, dtype=np.float32),
+            "scaler_scale": np.asarray(self.scaler.scale_, dtype=np.float32),
             "feature_names": self.feature_names
         }
     
@@ -674,18 +676,26 @@ class TabularDatasetLoader:
     def load_classifier(
         self,
         filepath: str,
-        classifier_type: str = "dnn",
+        classifier_type: Optional[str] = None,
         device: str = "cpu"
     ) -> torch.nn.Module:
-        classifier = self.create_classifier(classifier_type=classifier_type, device=device)
-        
-        if isinstance(classifier, UnifiedClassifier) and classifier.classifier_type != "dnn":
+        # Auto-detect file format by reading the first 2 bytes.
+        # Pickle files start with 0x80 (PROTO opcode); torch.save files are zip archives starting with "PK".
+        with open(filepath, 'rb') as f:
+            magic = f.read(2)
+        is_pickle = len(magic) >= 1 and magic[0] == 0x80
+
+        if is_pickle:
             import pickle
             with open(filepath, 'rb') as f:
                 classifier = pickle.load(f)
+            if isinstance(classifier, UnifiedClassifier):
+                classifier.device = device
         else:
+            ct = classifier_type if classifier_type is not None else "dnn"
+            classifier = self.create_classifier(classifier_type=ct, device=device)
             classifier.load_state_dict(torch.load(filepath, map_location=device))
-        
+
         classifier.eval()
         logger.info(f"Classifier loaded from {filepath}")
         return classifier

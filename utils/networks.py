@@ -119,6 +119,20 @@ class SimpleClassifier(nn.Module):
         return self.net(x)
 
 
+def predict_proba_torch(classifier, x: torch.Tensor) -> torch.Tensor:
+    """Return class probabilities as a torch.Tensor on the same device as ``x``.
+
+    Works with both raw nn.Module DNN classifiers (e.g. SimpleClassifier) and
+    UnifiedClassifier wrappers around tree-based models. For tree models this
+    skips the log/clip/softmax round-trip done by UnifiedClassifier.forward.
+    """
+    if isinstance(classifier, UnifiedClassifier):
+        return classifier.predict_proba_torch(x)
+    # Raw nn.Module — assume DNN producing logits.
+    logits = classifier(x)
+    return torch.softmax(logits, dim=-1)
+
+
 class UnifiedClassifier(nn.Module):
     """
     Unified classifier wrapper that supports PyTorch DNN, sklearn Random Forest, and Gradient Boosting.
@@ -208,40 +222,56 @@ class UnifiedClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass that works for DNN, Random Forest, and Gradient Boosting.
-        
-        Args:
-            x: Input tensor of shape (batch_size, input_dim)
-        
-        Returns:
-            Output logits of shape (batch_size, num_classes)
+
+        For DNN this returns true logits. For tree-based models there are no
+        logits — we return log(probs) so that ``softmax(forward(x)) ≈ probs``,
+        which keeps existing call sites that wrap this in ``torch.softmax``
+        approximately correct. Prefer ``predict_proba_torch`` when you only
+        need probabilities — it skips the redundant log/softmax round-trip
+        and avoids the small precision loss from clipping.
+
+        Returns a tensor on the same device as ``x``.
         """
         if self.classifier_type == "dnn":
             return self.model(x)
-        else:  # Tree-based models (Random Forest or Gradient Boosting)
-            # Convert torch tensor to numpy
-            if isinstance(x, torch.Tensor):
-                x_np = x.detach().cpu().numpy()
-            else:
-                x_np = x
-            
-            # Get probabilities from tree-based model
-            if self.classifier_type == "random_forest":
-                probs = self.rf_model.predict_proba(x_np)
-            elif self.classifier_type == "gradient_boosting":
-                probs = self.gb_model.predict_proba(x_np)
-            else:
-                raise ValueError(f"Unknown classifier_type: {self.classifier_type}")
-            
-            # Convert probabilities to logits
-            # For multi-class: logits = log(probs) - log(sum(probs))
-            # Since probs are already normalized (sum to 1), we can use log(probs)
-            # Add small epsilon to avoid log(0)
-            eps = 1e-8
-            probs = np.clip(probs, eps, 1 - eps)
-            logits = np.log(probs)
-            
-            # Convert back to torch tensor
-            return torch.from_numpy(logits).float().to(self.device)
+
+        out_device = x.device if isinstance(x, torch.Tensor) else torch.device(self.device)
+        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+
+        if self.classifier_type == "random_forest":
+            probs = self.rf_model.predict_proba(x_np)
+        elif self.classifier_type == "gradient_boosting":
+            probs = self.gb_model.predict_proba(x_np)
+        else:
+            raise ValueError(f"Unknown classifier_type: {self.classifier_type}")
+
+        eps = 1e-8
+        probs = np.clip(probs, eps, 1 - eps)
+        logits = np.log(probs)
+        return torch.from_numpy(logits).float().to(out_device)
+
+    def predict_proba_torch(self, x: torch.Tensor) -> torch.Tensor:
+        """Return class probabilities as a torch.Tensor on the same device as ``x``.
+
+        Use this instead of ``torch.softmax(classifier(x), dim=-1)`` — it gives
+        exact probabilities for tree-based models (no log/clip/softmax round-trip)
+        and matches the DNN behavior.
+        """
+        if self.classifier_type == "dnn":
+            logits = self.model(x)
+            return torch.softmax(logits, dim=-1)
+
+        out_device = x.device if isinstance(x, torch.Tensor) else torch.device(self.device)
+        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
+
+        if self.classifier_type == "random_forest":
+            probs = self.rf_model.predict_proba(x_np)
+        elif self.classifier_type == "gradient_boosting":
+            probs = self.gb_model.predict_proba(x_np)
+        else:
+            raise ValueError(f"Unknown classifier_type: {self.classifier_type}")
+
+        return torch.from_numpy(probs).float().to(out_device)
     
     def train(self, mode: bool = True):
         """Set training/eval mode (only relevant for DNN)."""

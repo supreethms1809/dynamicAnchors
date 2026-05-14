@@ -13,6 +13,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.device_utils import get_device
+from utils.networks import predict_proba_torch
 import logging
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,12 @@ class AnchorEnv(ParallelEnv):
             # logger.info(f"  Adaptive mode threshold: will use uniform sampling if covered points < {min_points_threshold}")
         self.X_min = env_config.get("X_min", None)
         self.X_range = env_config.get("X_range", None)
+        self.scaler_mean = env_config.get("scaler_mean", None)
+        self.scaler_scale = env_config.get("scaler_scale", None)
+        if self.scaler_mean is not None:
+            self.scaler_mean = np.asarray(self.scaler_mean, dtype=np.float32)
+        if self.scaler_scale is not None:
+            self.scaler_scale = np.asarray(self.scaler_scale, dtype=np.float32)
         self.rng = env_config.get("rng", None)
         if self.rng is None:
             self.rng = np.random.default_rng(42)
@@ -310,6 +317,14 @@ class AnchorEnv(ParallelEnv):
         if self.X_min is None or self.X_range is None:
             raise ValueError("X_min/X_range must be set for uniform perturbation sampling.")
         return (X_unit_samples * self.X_range) + self.X_min
+
+    def _std_to_orig(self, X_std_samples: np.ndarray) -> np.ndarray:
+        if self.scaler_mean is None or self.scaler_scale is None:
+            return X_std_samples
+        return X_std_samples * self.scaler_scale + self.scaler_mean
+
+    def _unit_to_orig(self, X_unit_samples: np.ndarray) -> np.ndarray:
+        return self._std_to_orig(self._unit_to_std(X_unit_samples))
     
     def _get_class_for_agent(self, agent: str) -> Optional[int]:
         if agent in self.agent_to_class:
@@ -562,8 +577,7 @@ class AnchorEnv(ParallelEnv):
             
             with torch.no_grad():
                 instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
-                logits = self.classifier(instance_tensor)
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                probs = predict_proba_torch(self.classifier, instance_tensor).cpu().numpy()[0]
                 self.original_predictions[agent] = int(np.argmax(probs))
                 logger.debug(f"Agent {agent}: Computed original prediction {self.original_predictions[agent]} for instance-based anchor")
         
@@ -726,8 +740,7 @@ class AnchorEnv(ParallelEnv):
         
         with torch.no_grad():
             inputs = torch.from_numpy(X_eval).float().to(self.device)
-            logits = self.classifier(inputs)
-            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            probs = predict_proba_torch(self.classifier, inputs).cpu().numpy()
 
         preds = probs.argmax(axis=1)
         positive_idx = (preds == target_class)
@@ -917,7 +930,10 @@ class AnchorEnv(ParallelEnv):
                 # Get target_class for this agent (needed for validation and logging)
                 target_class = self._get_class_for_agent(agent)
                 
-                w = self.initial_window
+                # Guard: never start narrower than min_width (e.g. if a YAML sets
+                # initial_window < min_width). For a centroid at the [0,1] boundary
+                # the box half-width collapses to w, so w itself must be >= min_width.
+                w = max(self.initial_window, self.min_width)
                 centroid = self.x_star_unit[agent]
                 self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
                 self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
@@ -936,8 +952,7 @@ class AnchorEnv(ParallelEnv):
                     
                     with torch.no_grad():
                         instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
-                        logits = self.classifier(instance_tensor)
-                        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                        probs = predict_proba_torch(self.classifier, instance_tensor).cpu().numpy()[0]
                         original_pred = int(np.argmax(probs))
                         self.original_predictions[agent] = original_pred
                         # CRITICAL VALIDATION: Verify original_prediction matches target_class (if target_class is available)
@@ -2158,37 +2173,42 @@ class AnchorEnv(ParallelEnv):
     ) -> str:
         lower = self.lower[agent].copy()
         upper = self.upper[agent].copy()
-        
-        # Denormalize bounds if requested
+
+        # Denormalize bounds if requested: unit [0,1] -> standardized -> original raw units
         if denormalize:
             if self.X_min is None or self.X_range is None:
                 logger.warning("Cannot denormalize: X_min or X_range not available. Using normalized bounds.")
                 denormalize = False
             else:
-                lower = self._unit_to_std(lower)
-                upper = self._unit_to_std(upper)
-        
+                lower = self._unit_to_orig(lower)
+                upper = self._unit_to_orig(upper)
+
+        # Full-range reference in the same space as `lower`/`upper`. In raw-units, a unit-space
+        # width of 1.0 corresponds to X_range * scaler_scale.
+        scaler_scale = self.scaler_scale if self.scaler_scale is not None else 1.0
+        full_range_scale = self.X_range * scaler_scale if (denormalize and self.X_range is not None) else 1.0
+
         if initial_lower is None or initial_upper is None:
             initial_width_normalized = np.ones(self.n_features, dtype=np.float32)
             if denormalize and self.X_min is not None and self.X_range is not None:
-                initial_width = initial_width_normalized * self.X_range
+                initial_width = initial_width_normalized * full_range_scale
             else:
                 initial_width = initial_width_normalized
         else:
             initial_width = initial_upper - initial_lower
             if denormalize and self.X_min is not None and self.X_range is not None:
                 if np.all(initial_lower >= 0) and np.all(initial_lower <= 1) and np.all(initial_upper >= 0) and np.all(initial_upper <= 1):
-                    initial_lower_denorm = self._unit_to_std(initial_lower)
-                    initial_upper_denorm = self._unit_to_std(initial_upper)
+                    initial_lower_denorm = self._unit_to_orig(initial_lower)
+                    initial_upper_denorm = self._unit_to_orig(initial_upper)
                     initial_width = initial_upper_denorm - initial_lower_denorm
-        
+
         current_width = upper - lower
-        
+
         if np.any(initial_width <= 0) or np.any(np.isnan(initial_width)) or np.any(np.isinf(initial_width)):
             initial_width_ref = np.ones_like(initial_width)
         else:
             initial_width_ref = initial_width.copy()
-        
+
         if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
             tightened = np.array([], dtype=int)
         else:
@@ -2199,30 +2219,30 @@ class AnchorEnv(ParallelEnv):
                 tightened = np.where(current_width < initial_width_ref * 0.98)[0]
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref * 0.99)[0]
-            
+
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_90 = 0.90 * self.X_range
+                    threshold_90 = 0.90 * full_range_scale
                     tightened = np.where(current_width < threshold_90)[0]
                 else:
                     tightened = np.where(current_width < 0.90)[0]
-            
+
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_85 = 0.85 * self.X_range
+                    threshold_85 = 0.85 * full_range_scale
                     tightened = np.where(current_width < threshold_85)[0]
                 else:
                     tightened = np.where(current_width < 0.85)[0]
-            
+
             if tightened.size == 0:
                 if denormalize and self.X_range is not None:
-                    threshold_80 = 0.8 * self.X_range
+                    threshold_80 = 0.8 * full_range_scale
                     if np.all(initial_width_ref >= threshold_80):
                         tightened = np.where(current_width < threshold_80)[0]
                 else:
                     if np.all(initial_width_ref >= 0.8):
                         tightened = np.where(current_width < 0.8)[0]
-            
+
             # Final fallback: any feature that tightened
             if tightened.size == 0:
                 tightened = np.where(current_width < initial_width_ref)[0]

@@ -1004,11 +1004,22 @@ def run_rollout_with_policy(
         # Get final box bounds
         lower = env.lower[agent_id]
         upper = env.upper[agent_id]
-        
+
+        # Capture the true initial box (set in reset(), recorded as box_history[...][0]).
+        # This is the correct reference for extract_rule — it accounts for the min_width
+        # guard and for class-based nearest-neighbor initialization, neither of which can
+        # be reconstructed from initial_window alone.
+        initial_lower = initial_upper = None
+        if agent_id in env.box_history and len(env.box_history[agent_id]) > 0:
+            initial_lower = env.box_history[agent_id][0][0].tolist()
+            initial_upper = env.box_history[agent_id][0][1].tolist()
+
         # Construct final observation (using instance-level metrics)
         final_obs = np.concatenate([lower, upper, np.array([instance_precision, instance_coverage], dtype=np.float32)])
-        
+
         episode_data = {
+            "initial_lower": initial_lower,
+            "initial_upper": initial_upper,
             # Instance-level metrics (for this specific agent/instance)
             "instance_precision": float(instance_precision),
             "instance_coverage": float(instance_coverage),  # Overall coverage P(x in box)
@@ -1216,8 +1227,7 @@ def extract_rules_from_policies(
         logger.info(f"\nLoading classifier from: {classifier_path}")
         classifier = dataset_loader.load_classifier(
             filepath=classifier_path,
-            classifier_type="dnn",
-            device=device
+            device=device,
         )
         dataset_loader.classifier = classifier
         logger.info("Classifier loaded successfully")
@@ -1235,10 +1245,11 @@ def extract_rules_from_policies(
     
     # Create trainer early to get env_config and check verbosity
     from anchor_trainer import AnchorTrainer
+    output_dir = output_dir or os.path.join(experiment_dir, "inference")
     trainer = AnchorTrainer(
         dataset_loader=dataset_loader,
         algorithm="maddpg",
-        output_dir=output_dir or os.path.join(experiment_dir, "inference"),
+        output_dir=output_dir,
         seed=seed
     )
     # Prefer YAML-based env config so inference matches training settings.
@@ -1572,6 +1583,8 @@ def extract_rules_from_policies(
     env_config.update({
         "X_min": env_data["X_min"],
         "X_range": env_data["X_range"],
+        "scaler_mean": env_data.get("scaler_mean"),
+        "scaler_scale": env_data.get("scaler_scale"),
     })
     
     # Apply logging verbosity early (before any logging happens)
@@ -1984,10 +1997,10 @@ def extract_rules_from_policies(
             X_class_std = X_data_std[class_instances]
             classifier_device = torch.device(device)
             with torch.no_grad():
+                from utils.networks import predict_proba_torch
                 classifier.eval()
                 X_tensor = torch.from_numpy(X_class_std.astype(np.float32)).to(classifier_device)
-                logits = classifier(X_tensor)
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                probs = predict_proba_torch(classifier, X_tensor).cpu().numpy()
                 predictions = np.argmax(probs, axis=1)
             
             # Filter: keep only instances where prediction matches target_class
@@ -2253,12 +2266,18 @@ def extract_rules_from_policies(
                     lower_normalized = obs[:n_features].copy()
                     upper_normalized = obs[n_features:2*n_features].copy()
                     
-                    # Denormalize bounds to original feature space
+                    # Denormalize bounds to original feature space:
+                    # unit [0,1] -> standardized (X_min/X_range) -> raw (scaler_mean/scale)
                     X_min = env_config.get("X_min")
                     X_range = env_config.get("X_range")
+                    scaler_mean = env_config.get("scaler_mean")
+                    scaler_scale = env_config.get("scaler_scale")
                     if X_min is not None and X_range is not None:
                         lower = (lower_normalized * X_range) + X_min
                         upper = (upper_normalized * X_range) + X_min
+                        if scaler_mean is not None and scaler_scale is not None:
+                            lower = lower * scaler_scale + scaler_mean
+                            upper = upper * scaler_scale + scaler_mean
                     else:
                         # Fallback to normalized if denormalization params not available
                         lower = lower_normalized
@@ -2298,12 +2317,16 @@ def extract_rules_from_policies(
                     temp_env.lower[temp_agent_name] = lower_normalized
                     temp_env.upper[temp_agent_name] = upper_normalized
                     
-                    # Compute initial bounds from x_instance and initial_window to get correct reference
-                    # This matches how the environment initializes bounds in reset()
-                    initial_window = env_config.get("initial_window", 0.1)
-                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
-                    
+                    # Use the true initial box recorded during the rollout. Fall back to
+                    # reconstructing it from x_instance only if the rollout didn't report it.
+                    if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                        initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                        initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                    else:
+                        initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
+                        initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
+                        initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+
                     # Extract rule with denormalization enabled and correct initial bounds
                     rule = temp_env.extract_rule(
                         temp_agent_name,
@@ -2959,12 +2982,17 @@ def extract_rules_from_policies(
                     lower_normalized = obs[:n_features].copy()
                     upper_normalized = obs[n_features:2*n_features].copy()
                     
-                    # Denormalize bounds
+                    # Denormalize bounds: unit -> standardized -> raw
                     X_min = env_config.get("X_min")
                     X_range = env_config.get("X_range")
+                    scaler_mean = env_config.get("scaler_mean")
+                    scaler_scale = env_config.get("scaler_scale")
                     if X_min is not None and X_range is not None:
                         lower = (lower_normalized * X_range) + X_min
                         upper = (upper_normalized * X_range) + X_min
+                        if scaler_mean is not None and scaler_scale is not None:
+                            lower = lower * scaler_scale + scaler_mean
+                            upper = upper * scaler_scale + scaler_mean
                     else:
                         lower = lower_normalized
                         upper = upper_normalized
@@ -2984,13 +3012,20 @@ def extract_rules_from_policies(
                     temp_env.lower[temp_agent_name] = lower_normalized
                     temp_env.upper[temp_agent_name] = upper_normalized
                     
-                    # For class-based, use the center of the final box as reference for initial bounds
-                    # This approximates what the initial box might have been
-                    initial_window = env_config.get("initial_window", 0.1)
-                    box_center = (lower_normalized + upper_normalized) / 2.0
-                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
-                    
+                    # Use the true initial box recorded during the rollout. For class-based
+                    # rollouts the real initial box comes from _compute_box_from_centroid
+                    # (a nearest-neighbor box), which cannot be reconstructed from the final
+                    # box center — so only fall back to the center approximation if the
+                    # rollout didn't report the initial box.
+                    if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                        initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                        initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                    else:
+                        initial_window = env_config.get("initial_window", 0.1)
+                        box_center = (lower_normalized + upper_normalized) / 2.0
+                        initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
+                        initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+
                     rule = temp_env.extract_rule(
                         temp_agent_name,
                         max_features_in_rule=max_features_in_rule,

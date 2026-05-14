@@ -204,6 +204,8 @@ class AnchorTrainer:
             **env_config,
             "X_min": env_data["X_min"],
             "X_range": env_data["X_range"],
+            "scaler_mean": env_data.get("scaler_mean"),
+            "scaler_scale": env_data.get("scaler_scale"),
             "max_cycles": max_cycles,  # Ensure max_cycles is in env_config for the environment
             "min_coverage_floor": min_coverage_floor,  # Override with dynamic value
         }
@@ -409,9 +411,9 @@ class AnchorTrainer:
                     # Get predictions for all class instances
                     X_class_std = env_data["X_std"][class_indices]
                     with torch.no_grad():
+                        from utils.networks import predict_proba_torch
                         X_tensor = torch.from_numpy(X_class_std.astype(np.float32)).to(device_torch)
-                        logits = classifier(X_tensor)
-                        probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                        probs = predict_proba_torch(classifier, X_tensor).cpu().numpy()
                         predictions = np.argmax(probs, axis=1)
                     
                     # Filter: keep only instances where prediction matches target_class
@@ -1775,6 +1777,8 @@ class AnchorTrainer:
             temp_env_config.update({
                 "X_min": env_data["X_min"],
                 "X_range": env_data["X_range"],
+                "scaler_mean": env_data.get("scaler_mean"),
+                "scaler_scale": env_data.get("scaler_scale"),
             })
             
             temp_anchor_env = AnchorEnv(
@@ -2067,6 +2071,8 @@ class AnchorTrainer:
             env_config.update({
                 "X_min": env_data["X_min"],
                 "X_range": env_data["X_range"],
+                "scaler_mean": env_data.get("scaler_mean"),
+                "scaler_scale": env_data.get("scaler_scale"),
             })
             
             if eval_on_test_data:
