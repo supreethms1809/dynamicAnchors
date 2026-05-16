@@ -61,12 +61,15 @@ DATASET_TIMESTEPS = {
 WYODOT_N_CLASSES = 5
 
 # Defaults per machine. Hand-tuned for the two boxes we actually run on.
-#   mac: M4 Pro = 10P + 4E cores; 5x2 = 10 workers fits the P-core cluster.
+# NOTE: n_envs>1 is currently disabled when parallel_classes>1 due to a
+# SubprocVecEnv/spawn deadlock — see the guard in main(). When that's fixed,
+# bump n_envs back up here.
+#   mac: M4 Pro = 10P + 4E cores; 5 parallel class shards uses 5 P-cores.
 #   amd: Ryzen 7 5800X = 8C/16T (+ RTX A6000 idle in CPU-bound rollouts);
-#        5x2 = 10 workers leaves headroom for the orchestrator + classifier.
+#        5 parallel class shards leaves plenty of headroom.
 PLATFORM_PRESETS = {
-    "mac": {"parallel_classes": 5, "n_envs": 2},
-    "amd": {"parallel_classes": 5, "n_envs": 2},
+    "mac": {"parallel_classes": 5, "n_envs": 1},
+    "amd": {"parallel_classes": 5, "n_envs": 1},
 }
 # DATASET_TIMESTEPS = {
 #     "wyodot_kvdw_labeled": 30_000,   # 39,858 rows, 5 classes → 6k/class
@@ -744,6 +747,19 @@ Examples:
         args.parallel_classes = preset.get("parallel_classes", 1)
     if args.n_envs is None:
         args.n_envs = preset.get("n_envs", 1)
+
+    # Stacking SubprocVecEnv (n_envs>1) inside K parallel class shards deadlocks:
+    # the spawn-context machinery and Loky-backed sklearn pool don't cooperate
+    # across that many simultaneous spawn parents. Symptom is 4/5 shards' worker
+    # processes blocking forever on a pipe read() after the first few thousand
+    # steps. Until that's properly fixed, force n_envs=1 whenever class sharding
+    # is on — class parallelism alone is the safe configuration.
+    if args.parallel_classes > 1 and args.n_envs > 1:
+        logger.warning(
+            f"  parallel_classes={args.parallel_classes} + n_envs={args.n_envs} "
+            "is known to deadlock; forcing n_envs=1 for stability."
+        )
+        args.n_envs = 1
 
     # Map algorithms
     algo = args.algorithm.lower()
