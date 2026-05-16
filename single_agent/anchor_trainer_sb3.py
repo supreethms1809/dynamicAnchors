@@ -33,6 +33,7 @@ try:
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
     from stable_baselines3.common.evaluation import evaluate_policy
     from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
     SB3_AVAILABLE = True
     WANDB_AVAILABLE = True
 except ImportError:
@@ -42,6 +43,43 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from single_agentENV import SingleAgentAnchorEnv
+
+
+def _build_anchor_env_thunk(env_data, env_config, target_class, device, classifier, seed):
+    """
+    Build a picklable zero-arg factory that constructs a SingleAgentAnchorEnv.
+
+    Used by SubprocVecEnv. Must be top-level (not a closure over `self`) so it
+    pickles cleanly across process boundaries on the "spawn" start method.
+
+    Each subprocess pins itself to a single BLAS thread; otherwise n_envs
+    workers would each spin up multi-threaded MKL/OpenBLAS pools and fight
+    over CPU.
+    """
+    def _thunk():
+        try:
+            import torch as _torch
+            _torch.set_num_threads(1)
+        except Exception:
+            pass
+        env = SingleAgentAnchorEnv(
+            X_unit=env_data["X_unit"],
+            X_std=env_data["X_std"],
+            y=env_data["y"],
+            feature_names=env_data["feature_names"],
+            classifier=classifier,
+            device=device,
+            target_class=target_class,
+            env_config=env_config,
+        )
+        env = Monitor(env, filename=None, allow_early_resets=True)
+        if seed is not None:
+            try:
+                env.reset(seed=int(seed))
+            except TypeError:
+                env.reset()
+        return env
+    return _thunk
 
 
 def _get_algorithm_configs():
@@ -146,7 +184,9 @@ class AnchorTrainerSB3:
         experiment_config: Optional[Dict[str, Any]] = None,
         algorithm_config: Optional[Dict[str, Any]] = None,
         output_dir: str = "./output/single_agent_sb3/",
-        seed: int = 42
+        seed: int = 42,
+        n_envs: int = 1,
+        experiment_folder_override: Optional[str] = None,
     ):
         """
         Initialize the SB3 trainer.
@@ -176,7 +216,22 @@ class AnchorTrainerSB3:
         self.algorithm_config = algorithm_config or self._get_default_algorithm_config()
         self.output_dir = output_dir
         self.seed = seed
-        
+        self.n_envs = max(1, int(n_envs))
+        self.experiment_folder_override = experiment_folder_override
+
+        # If using vectorized rollouts, scale gradient_steps to preserve the
+        # 1-update-per-collected-transition ratio. SubprocVecEnv collects
+        # n_envs transitions per env.step(), so a single gradient step would
+        # leave (n_envs - 1) transitions unconsumed each iteration.
+        if self.n_envs > 1 and algorithm_config is not None:
+            current_grad_steps = algorithm_config.get("gradient_steps", 1)
+            if current_grad_steps in (1, None):
+                algorithm_config["gradient_steps"] = self.n_envs
+                logger.info(
+                    f"  n_envs={self.n_envs}: auto-scaling gradient_steps -> {self.n_envs} "
+                    f"(was {current_grad_steps}) to keep update/data ratio constant"
+                )
+
         # One model per class
         self.models: Dict[int, Any] = {}  # class -> model
         self.envs: Dict[int, Any] = {}  # class -> training env
@@ -534,10 +589,15 @@ class AnchorTrainerSB3:
             env_config_with_data["training_instances_per_class"] = None
             logger.info("   Training instance ratio is 0.0 - using centroid-based initialization only")
         
-        # Create experiment folder
-        timestamp = datetime.now().strftime("%y_%m_%d-%H_%M_%S")
-        experiment_id = f"{self.algorithm}_single_agent_sb3_{timestamp}"
-        self.experiment_folder = os.path.join(self.output_dir, experiment_id)
+        # Create experiment folder. If override is provided (e.g. by a
+        # parallel-classes launcher that wants every shard to share one
+        # folder), use it verbatim instead of generating a fresh timestamp.
+        if self.experiment_folder_override:
+            self.experiment_folder = self.experiment_folder_override
+        else:
+            timestamp = datetime.now().strftime("%y_%m_%d-%H_%M_%S")
+            experiment_id = f"{self.algorithm}_single_agent_sb3_{timestamp}"
+            self.experiment_folder = os.path.join(self.output_dir, experiment_id)
         os.makedirs(self.experiment_folder, exist_ok=True)
         
         # Set up environments
@@ -645,17 +705,39 @@ class AnchorTrainerSB3:
         
         for target_class in target_classes:
             logger.info(f"  Setting up class {target_class}...")
-            
+
             # Create training environment for this class
             # CRITICAL: Training environments MUST use training data only (no test set leakage)
             train_env_config = {**env_config_with_data, "mode": "training", "eval_on_test_data": False}
-            train_env = self._create_env_for_class(
-                env_data=env_data,
-                env_config=train_env_config,
-                target_class=target_class,
-                device=device
-            )
-            train_env = Monitor(train_env, filename=None, allow_early_resets=True)
+
+            if self.n_envs > 1:
+                # Build N independent envs in worker processes. Each worker pins
+                # itself to 1 BLAS thread (see _build_anchor_env_thunk).
+                # Seed each env distinctly so they don't run identical rollouts.
+                classifier = self.dataset_loader.get_classifier()
+                thunks = [
+                    _build_anchor_env_thunk(
+                        env_data=env_data,
+                        env_config=train_env_config,
+                        target_class=target_class,
+                        device=device,
+                        classifier=classifier,
+                        seed=(self.seed + 1000 * target_class + i),
+                    )
+                    for i in range(self.n_envs)
+                ]
+                train_env = SubprocVecEnv(thunks, start_method="spawn")
+                logger.info(
+                    f"    Built SubprocVecEnv with n_envs={self.n_envs} for class {target_class}"
+                )
+            else:
+                train_env = self._create_env_for_class(
+                    env_data=env_data,
+                    env_config=train_env_config,
+                    target_class=target_class,
+                    device=device
+                )
+                train_env = Monitor(train_env, filename=None, allow_early_resets=True)
             self.envs[target_class] = train_env
             
             # Create evaluation environment for this class (with evaluation mode)

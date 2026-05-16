@@ -494,7 +494,34 @@ def load_policy_model(
     # Load state dict
     mlp.load_state_dict(state_dict)
     mlp.eval()
-    
+
+    # For MASAC, the saved actor MLP head produces 2*action_dim logits
+    # (loc + scale params for a TanhNormal). The rollout loop already has a
+    # branch that consumes {"action_dist_inputs": ...} and wraps it in a
+    # TanhNormal — so wrap the MLP to emit that dict for MASAC only.
+    # MADDPG (and any other / missing algorithm) returns the bare MLP, i.e.
+    # bit-for-bit the previous behavior.
+    algorithm_name = str(metadata.get("algorithm", "")).lower()
+    if algorithm_name == "masac":
+        class _MasacActorWrapper(torch.nn.Module):
+            def __init__(self, inner_mlp):
+                super().__init__()
+                self.mlp = inner_mlp
+
+            def forward(self, obs):
+                return {"action_dist_inputs": self.mlp(obs)}
+
+            def load_state_dict(self, state_dict, strict=True):
+                return self.mlp.load_state_dict(state_dict, strict=strict)
+
+            def state_dict(self, *args, **kwargs):
+                return self.mlp.state_dict(*args, **kwargs)
+
+        wrapped = _MasacActorWrapper(mlp).to(device)
+        wrapped.eval()
+        logger.info("  Wrapped MASAC actor MLP with TanhNormal-logits adapter")
+        return wrapped
+
     return mlp
 
 
@@ -733,13 +760,14 @@ def run_rollout_with_policy(
                         action = action_dist.sample()
                         action_has_noise = True  # Sampling provides randomness
                     elif exploration_mode == "noisy_mean":
-                        # Add Gaussian noise to mean action
-                        mean_action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                        # Add Gaussian noise to mean action.
+                        # TorchRL TanhNormal.mean is a property (not a method).
+                        mean_action = action_dist.mean if hasattr(action_dist, "mean") else action_dist.sample()
                         noise = torch.randn_like(mean_action) * action_noise_scale
                         action = torch.clamp(mean_action + noise, -1.0, 1.0)
                         action_has_noise = True
                     else:
-                        action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                        action = action_dist.mean if hasattr(action_dist, "mean") else action_dist.sample()
                         action_has_noise = False
                 elif "action" in fwd_outputs:
                     action = fwd_outputs["action"]

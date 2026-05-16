@@ -76,6 +76,16 @@ def main():
         "--learning_rate", type=float, default=None,
         help="Learning rate (default: dataset-specific)"
     )
+    parser.add_argument(
+        "--n_envs", type=int, default=1,
+        help="Parallel envs per class via SubprocVecEnv (default: 1). "
+             "When >1, gradient_steps auto-scales to n_envs."
+    )
+    parser.add_argument(
+        "--experiment_folder_override", type=str, default=None,
+        help="If set, use this exact folder as the experiment folder instead of "
+             "auto-generating one (used by run_pipeline.py for parallel-classes sharding)."
+    )
 
     args = parser.parse_args()
 
@@ -208,7 +218,9 @@ def main():
         experiment_config=experiment_config,
         algorithm_config=algorithm_config,
         output_dir=f"{args.output_dir}training/",
-        seed=args.seed
+        seed=args.seed,
+        n_envs=args.n_envs,
+        experiment_folder_override=args.experiment_folder_override,
     )
 
     if args.load_checkpoint:

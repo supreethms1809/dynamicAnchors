@@ -54,7 +54,19 @@ logger.setLevel(logging.INFO)
 # Target ~60-90k steps per class (5 classes for both WyoDOT datasets)
 DATASET_TIMESTEPS = {
     "wyodot_kvdw_labeled": 480_000,   # 39,858 rows, 5 classes → 96k/class
-    "wyodot_testbed": 800_000,        # 691 rows, 5 classes → 30k/class
+    "wyodot_testbed": 250_000,        # 691 rows, 5 classes → 30k/class
+}
+
+# Both WyoDOT datasets have 5 classes after label remapping.
+WYODOT_N_CLASSES = 5
+
+# Defaults per machine. Hand-tuned for the two boxes we actually run on.
+#   mac: M4 Pro = 10P + 4E cores; 5x2 = 10 workers fits the P-core cluster.
+#   amd: Ryzen 7 5800X = 8C/16T (+ RTX A6000 idle in CPU-bound rollouts);
+#        5x2 = 10 workers leaves headroom for the orchestrator + classifier.
+PLATFORM_PRESETS = {
+    "mac": {"parallel_classes": 5, "n_envs": 2},
+    "amd": {"parallel_classes": 5, "n_envs": 2},
 }
 # DATASET_TIMESTEPS = {
 #     "wyodot_kvdw_labeled": 30_000,   # 39,858 rows, 5 classes → 6k/class
@@ -107,12 +119,83 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
 # Training
 # ---------------------------------------------------------------------------
 
+def _spawn_parallel_class_shards(
+    *,
+    driver_script: Path, dataset: str, algorithm: str, seed: int, device: str,
+    total_timesteps: int, output_dir: str, shared_folder: str,
+    target_classes: List[int], parallel_classes: int, n_envs: int,
+    extra_args: Dict[str, Any],
+) -> bool:
+    """Launch K parallel driver subprocesses, each handling a shard of classes.
+
+    All shards write into `shared_folder` (passed via --experiment_folder_override),
+    so the final layout matches a single training run. Each shard's stdout/stderr
+    is captured to its own log file inside shared_folder; otherwise the streams
+    would interleave illegibly.
+    """
+    K = max(1, parallel_classes)
+    # Round-robin shard: classes [0,1,2,3,4], K=3 -> [[0,3],[1,4],[2]]
+    shards = [target_classes[i::K] for i in range(K)]
+    shards = [s for s in shards if s]
+
+    logger.info(f"  Parallel-classes: launching {len(shards)} shards x n_envs={n_envs}")
+    logger.info(f"  Shared experiment folder: {shared_folder}")
+
+    procs = []
+    for shard_idx, shard in enumerate(shards):
+        cmd = [
+            sys.executable, str(driver_script),
+            "--dataset", dataset, "--algorithm", algorithm,
+            "--seed", str(seed),  # same seed = identical classifier across shards
+            "--device", device,
+            "--total_timesteps", str(total_timesteps),
+            "--output_dir", output_dir,
+            "--experiment_folder_override", shared_folder,
+            "--n_envs", str(n_envs),
+            "--target_classes", *[str(c) for c in shard],
+            "--skip_eda",
+        ]
+        for key, value in extra_args.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                if value:
+                    cmd.append(f"--{key}")
+            else:
+                cmd.extend([f"--{key}", str(value)])
+
+        log_name = f"shard_{shard_idx}_classes_{'_'.join(map(str, shard))}.log"
+        log_path = os.path.join(shared_folder, log_name)
+        log_f = open(log_path, "w")
+        logger.info(f"  shard {shard_idx}: classes={shard} log={log_path}")
+        logger.info(f"    cmd: {' '.join(cmd)}")
+        p = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, cwd=str(PROJECT_ROOT))
+        procs.append((p, log_f, shard))
+
+    all_ok = True
+    for p, log_f, shard in procs:
+        ret = p.wait()
+        log_f.close()
+        if ret == 0:
+            logger.info(f"  shard classes={shard}: OK")
+        else:
+            logger.error(f"  shard classes={shard}: FAILED (exit {ret}) — see log")
+            all_ok = False
+    return all_ok
+
+
 def run_single_agent_training(
     dataset: str, algorithm: str, seed: int = 42, device: str = "cpu",
     output_dir: Optional[str] = None, force_retrain: bool = False,
-    total_timesteps: Optional[int] = None, **kwargs
+    total_timesteps: Optional[int] = None,
+    parallel_classes: int = 1, n_envs: int = 1, n_classes: int = WYODOT_N_CLASSES,
+    **kwargs
 ) -> Optional[str]:
-    """Run single-agent training using wyodot driver."""
+    """Run single-agent training using wyodot driver.
+
+    When parallel_classes>1, classes are sharded across K subprocesses that all
+    write into one shared experiment folder.
+    """
     if total_timesteps is None:
         total_timesteps = DATASET_TIMESTEPS.get(dataset, _DEFAULT_TIMESTEPS)
 
@@ -134,6 +217,32 @@ def run_single_agent_training(
                 return str(exp)
 
     driver_script = SCRIPT_DIR / "driver_single_agent.py"
+
+    # ---- Parallel-classes branch ----
+    if parallel_classes > 1:
+        timestamp = datetime.now().strftime("%y_%m_%d-%H_%M_%S")
+        shared_folder = os.path.join(
+            output_dir.rstrip("/"), "training",
+            f"{algorithm}_single_agent_sb3_{timestamp}",
+        )
+        os.makedirs(shared_folder, exist_ok=True)
+
+        target_classes = list(range(n_classes))
+        ok = _spawn_parallel_class_shards(
+            driver_script=driver_script,
+            dataset=dataset, algorithm=algorithm, seed=seed, device=device,
+            total_timesteps=total_timesteps,
+            output_dir=output_dir, shared_folder=shared_folder,
+            target_classes=target_classes,
+            parallel_classes=parallel_classes, n_envs=n_envs,
+            extra_args=kwargs,
+        )
+        if ok:
+            return shared_folder
+        logger.error("Single-agent parallel training had at least one shard failure.")
+        return None
+
+    # ---- Sequential branch (original behavior, with optional n_envs) ----
     cmd = [
         sys.executable, str(driver_script),
         "--dataset", dataset, "--algorithm", algorithm,
@@ -141,6 +250,8 @@ def run_single_agent_training(
         "--total_timesteps", str(total_timesteps),
         "--output_dir", output_dir, "--skip_eda",
     ]
+    if n_envs > 1:
+        cmd.extend(["--n_envs", str(n_envs)])
 
     for key, value in kwargs.items():
         if value is not None:
@@ -603,7 +714,36 @@ Examples:
     parser.add_argument("--total_timesteps", type=int, default=None,
                         help="Override total timesteps for single-agent")
 
+    # Parallelism (single-agent only)
+    parser.add_argument(
+        "--platform", type=str, default=None, choices=sorted(PLATFORM_PRESETS.keys()),
+        help=f"Hardware preset for single-agent parallelism. Choices: "
+             f"{sorted(PLATFORM_PRESETS.keys())}. Sets --parallel_classes and --n_envs "
+             "to machine-appropriate defaults. Either flag below overrides the preset."
+    )
+    parser.add_argument(
+        "--parallel_classes", type=int, default=None,
+        help="Number of parallel class-shard subprocesses for single-agent training "
+             "(overrides --platform). Default: 1 (no platform), or platform preset."
+    )
+    parser.add_argument(
+        "--n_envs", type=int, default=None,
+        help="Parallel envs per class via SubprocVecEnv (overrides --platform). "
+             "Default: 1 (no platform), or platform preset."
+    )
+    parser.add_argument(
+        "--n_classes", type=int, default=WYODOT_N_CLASSES,
+        help=f"Number of classes in the dataset (default: {WYODOT_N_CLASSES} for WyoDOT)."
+    )
+
     args = parser.parse_args()
+
+    # Resolve parallelism: explicit flag > platform preset > 1.
+    preset = PLATFORM_PRESETS.get(args.platform, {})
+    if args.parallel_classes is None:
+        args.parallel_classes = preset.get("parallel_classes", 1)
+    if args.n_envs is None:
+        args.n_envs = preset.get("n_envs", 1)
 
     # Map algorithms
     algo = args.algorithm.lower()
@@ -652,6 +792,11 @@ Examples:
     logger.info(f"Single-Agent: {single_agent_algorithm.upper()}")
     logger.info(f"Multi-Agent:  {multi_agent_algorithm.upper()}")
     logger.info(f"Seed: {args.seed}  |  Device: {args.device}")
+    logger.info(
+        f"Parallelism: platform={args.platform}  "
+        f"parallel_classes={args.parallel_classes}  n_envs={args.n_envs}  "
+        f"(total single-agent workers ≈ {args.parallel_classes * args.n_envs})"
+    )
     logger.info(f"Results: {args.output_dir}")
     logger.info(f"Log: {log_file}")
     logger.info(f"{'='*80}\n")
@@ -674,6 +819,9 @@ Examples:
                 output_dir=args.single_agent_output_dir,
                 force_retrain=args.force_retrain,
                 total_timesteps=args.total_timesteps,
+                parallel_classes=args.parallel_classes,
+                n_envs=args.n_envs,
+                n_classes=args.n_classes,
             )
         else:
             # Find existing

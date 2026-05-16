@@ -183,7 +183,25 @@ def main():
         default=None,  # Will be set based on dataset if None
         help="Learning rate for the algorithm (default: dataset-specific)"
     )
-    
+
+    parser.add_argument(
+        "--n_envs",
+        type=int,
+        default=1,
+        help="Number of parallel envs per class via SubprocVecEnv (default: 1 = "
+             "current sequential behavior). When >1, gradient_steps is auto-scaled "
+             "to n_envs to keep update/data ratio constant."
+    )
+
+    parser.add_argument(
+        "--experiment_folder_override",
+        type=str,
+        default=None,
+        help="If set, use this exact folder as the experiment folder instead of "
+             "generating a timestamped one. Used by run_parallel_classes.py so that "
+             "parallel class shards share one output folder."
+    )
+
     args = parser.parse_args()
 
     # Set global seeds for reproducibility
@@ -356,7 +374,9 @@ def main():
         experiment_config=experiment_config,
         algorithm_config=algorithm_config,
         output_dir=f"{args.output_dir}training/",
-        seed=args.seed
+        seed=args.seed,
+        n_envs=args.n_envs,
+        experiment_folder_override=args.experiment_folder_override,
     )
     
     if args.load_checkpoint:
