@@ -237,8 +237,11 @@ def nms_deduplicate_anchors(
         if not is_duplicate:
             kept.append(current)
     
-    # Return original anchor dictionaries in order
-    return [anchor_data[i]["anchor"] for i in sorted(a["index"] for a in kept)]
+    # Return kept anchor dictionaries in their kept order (sorted by precision desc,
+    # tie-broken by coverage desc — matches the NMS sort at the top of this function).
+    # Earlier code indexed `anchor_data[i]` by original anchors_list index, which is
+    # off-by-N whenever any anchor was skipped above for missing bounds.
+    return [a["anchor"] for a in kept]
 
 
 def compute_anchor_metrics_on_full_dataset(

@@ -78,7 +78,7 @@ off_policy_collected_frames_per_batch: 8000
 # CPU-optimized: Significantly reduced parallel environments to prevent CPU overload and threading issues
 # If the environment is vectorized, this will be the number of batched environments.
 # Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 16
+off_policy_n_envs_per_worker: 4
 # This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
 # CPU-optimized: Reduced optimizer steps to prevent CPU overload
 off_policy_n_optimizer_steps: 1000

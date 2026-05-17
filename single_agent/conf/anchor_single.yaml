@@ -5,11 +5,11 @@
 env_config:
   # Target metrics
   precision_target: 0.90
-  coverage_target: 0.10
+  coverage_target: 0.05
   
   # Data perturbation settings
   use_perturbation: True
-  perturbation_mode: "adaptive"  # "bootstrap", "uniform", or "adaptive"
+  perturbation_mode: "uniform"  # "bootstrap", "uniform", or "adaptive"
   n_perturb: 2048
   
   # Action and step settings
