@@ -90,9 +90,23 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
     if cwd is None:
         cwd = str(PROJECT_ROOT)
 
+    # Belt-and-suspenders: cap BLAS/OMP/joblib threads in the child so neither
+    # sklearn (RF predict via loky) nor numpy/torch (MKL/OpenBLAS) can spawn
+    # cohort-wide worker pools. Combined with RF n_jobs=1 in
+    # wyodot_dataset_loader, this prevents the SIGSEGV-from-semaphore-exhaustion
+    # failure we hit during multi-agent training on macOS.
+    child_env = {
+        **os.environ,
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+        "JOBLIB_MULTIPROCESSING": os.environ.get("JOBLIB_MULTIPROCESSING", "0"),
+        "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "false"),
+    }
+
     try:
         process = subprocess.Popen(
-            cmd, cwd=cwd,
+            cmd, cwd=cwd, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, universal_newlines=True
         )
@@ -373,55 +387,156 @@ def run_multi_agent_training(
 # Inference (in-process with monkey-patched TabularDatasetLoader)
 # ---------------------------------------------------------------------------
 
+def _convert_for_json(obj):
+    """Recursively convert numpy/bool scalars to JSON-friendly Python types."""
+    if isinstance(obj, np.ndarray): return obj.tolist()
+    if isinstance(obj, (np.integer, np.int_)): return int(obj)
+    if isinstance(obj, np.floating): return float(obj)
+    if isinstance(obj, (np.bool_, bool)): return bool(obj)
+    if isinstance(obj, dict): return {_convert_for_json(k): _convert_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [_convert_for_json(i) for i in obj]
+    return obj
+
+
+def _score_class_result(class_data: Dict[str, Any]) -> Tuple[float, float]:
+    """Score for a single-class result: (precision_recomputed, coverage_recomputed).
+
+    Higher is better. Precision is primary; coverage is the tiebreaker. Uses the
+    same keys the inference pipeline writes (see single_agent_inference.py:1864).
+    Falls back to 0 when a metric is missing so a class with no usable rules loses
+    to any class that produced something.
+    """
+    prec = class_data.get("instance_precision", class_data.get("precision", 0.0)) or 0.0
+    cov = class_data.get("instance_coverage", class_data.get("coverage", 0.0)) or 0.0
+    return float(prec), float(cov)
+
+
+def _merge_inference_results_by_class(
+    best_results: Dict[str, Any],
+    final_results: Dict[str, Any],
+) -> Dict[str, Any]:
+    """For each class_key, keep whichever source scored higher (precision, then coverage).
+
+    Adds a 'source_model' field to each kept class so downstream tooling can see
+    which checkpoint provided the rule set. Top-level metadata is taken from best.
+    """
+    merged = dict(best_results)
+    merged["per_class_results"] = {}
+    merged["model_selection"] = {"strategy": "per_class_best_score", "by_class": {}}
+
+    best_pc = best_results.get("per_class_results", {}) or {}
+    final_pc = final_results.get("per_class_results", {}) or {}
+    all_keys = sorted(set(best_pc.keys()) | set(final_pc.keys()))
+
+    for key in all_keys:
+        b = best_pc.get(key)
+        f = final_pc.get(key)
+        if b is None and f is None:
+            continue
+        if b is None:
+            merged["per_class_results"][key] = {**f, "source_model": "final"}
+            merged["model_selection"]["by_class"][key] = "final"
+            continue
+        if f is None:
+            merged["per_class_results"][key] = {**b, "source_model": "best"}
+            merged["model_selection"]["by_class"][key] = "best"
+            continue
+        winner = "best" if _score_class_result(b) >= _score_class_result(f) else "final"
+        chosen = b if winner == "best" else f
+        merged["per_class_results"][key] = {**chosen, "source_model": winner}
+        merged["model_selection"]["by_class"][key] = winner
+
+    return merged
+
+
+def _run_single_agent_inference_once(
+    experiment_dir: str, dataset: str, prefer_model: str,
+    max_features_in_rule: int, steps_per_episode: int,
+    n_instances_per_class: int, n_rollouts_per_instance: int,
+    device: str, **kwargs,
+) -> Optional[Dict[str, Any]]:
+    """Run inference once for a single model-preference. Returns the results dict
+    (not a file path) so the caller can merge multiple runs in memory."""
+    from single_agent_inference import extract_rules_single_agent
+    return extract_rules_single_agent(
+        experiment_dir=experiment_dir,
+        dataset_name=dataset,
+        max_features_in_rule=max_features_in_rule,
+        steps_per_episode=steps_per_episode,
+        n_instances_per_class=n_instances_per_class,
+        n_rollouts_per_instance=n_rollouts_per_instance,
+        device=device,
+        eval_on_test_data=True,
+        coverage_on_all_data=True,
+        sample_from_full_dataset=True,
+        filter_by_prediction=False,
+        use_prediction_routing=kwargs.get("use_prediction_routing", True),
+        use_weighted_average=False,
+        filter_low_quality_rollouts=True,
+        min_precision_threshold=None,
+        min_coverage_threshold=0.01,
+        prefer_model=prefer_model,
+    )
+
+
 def run_single_agent_inference(
     experiment_dir: str, dataset: str,
     max_features_in_rule: int = -1, steps_per_episode: int = 100,
     n_instances_per_class: int = 5, n_rollouts_per_instance: int = 5,
-    device: str = "cpu", **kwargs
+    device: str = "cpu",
+    inference_model_source: str = "best",  # "best", "final", or "both"
+    **kwargs,
 ) -> Optional[str]:
-    """Run single-agent inference in-process (uses monkey-patched loader)."""
+    """Run single-agent inference in-process (uses monkey-patched loader).
+
+    inference_model_source:
+      - "best"  : load EvalCallback's best checkpoint per class (default before this flag)
+      - "final" : load the final-step checkpoint per class
+      - "both"  : run inference twice and pick the higher-scoring rule set per class
+    """
     logger.info(f"\n{'='*80}")
-    logger.info(f"Single-Agent Inference: {dataset}")
+    logger.info(f"Single-Agent Inference: {dataset}  (model source: {inference_model_source})")
     logger.info(f"{'='*80}")
 
+    output_dir = os.path.join(experiment_dir, "inference")
+    os.makedirs(output_dir, exist_ok=True)
+    rules_file = os.path.join(output_dir, "extracted_rules_single_agent.json")
+
     try:
-        from single_agent_inference import extract_rules_single_agent
+        if inference_model_source == "both":
+            # Run twice, save each intermediate run for inspection, then merge.
+            logger.info("  [1/2] Running inference with prefer_model=best")
+            best_results = _run_single_agent_inference_once(
+                experiment_dir, dataset, "best",
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, n_rollouts_per_instance, device, **kwargs,
+            )
+            logger.info("  [2/2] Running inference with prefer_model=final")
+            final_results = _run_single_agent_inference_once(
+                experiment_dir, dataset, "final",
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, n_rollouts_per_instance, device, **kwargs,
+            )
 
-        results = extract_rules_single_agent(
-            experiment_dir=experiment_dir,
-            dataset_name=dataset,
-            max_features_in_rule=max_features_in_rule,
-            steps_per_episode=steps_per_episode,
-            n_instances_per_class=n_instances_per_class,
-            n_rollouts_per_instance=n_rollouts_per_instance,
-            device=device,
-            eval_on_test_data=True,
-            coverage_on_all_data=True,
-            sample_from_full_dataset=True,
-            filter_by_prediction=False,
-            use_prediction_routing=kwargs.get("use_prediction_routing", True),
-            use_weighted_average=False,
-            filter_low_quality_rollouts=True,
-            min_precision_threshold=None,
-            min_coverage_threshold=0.01,
-        )
+            for label, data in (("best", best_results), ("final", final_results)):
+                sub_dir = os.path.join(output_dir, label)
+                os.makedirs(sub_dir, exist_ok=True)
+                with open(os.path.join(sub_dir, "extracted_rules_single_agent.json"), "w") as f:
+                    json.dump(_convert_for_json(data), f, indent=2)
+                logger.info(f"    Saved {label}-only rules to {sub_dir}")
 
-        # Save results
-        output_dir = os.path.join(experiment_dir, "inference")
-        os.makedirs(output_dir, exist_ok=True)
-        rules_file = os.path.join(output_dir, "extracted_rules_single_agent.json")
-
-        def _convert(obj):
-            if isinstance(obj, np.ndarray): return obj.tolist()
-            if isinstance(obj, (np.integer, np.int_)): return int(obj)
-            if isinstance(obj, np.floating): return float(obj)
-            if isinstance(obj, (np.bool_, bool)): return bool(obj)
-            if isinstance(obj, dict): return {_convert(k): _convert(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)): return [_convert(i) for i in obj]
-            return obj
+            results = _merge_inference_results_by_class(best_results, final_results)
+            sel = results.get("model_selection", {}).get("by_class", {})
+            logger.info(f"  Per-class model selection: {sel}")
+        else:
+            results = _run_single_agent_inference_once(
+                experiment_dir, dataset, inference_model_source,
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, n_rollouts_per_instance, device, **kwargs,
+            )
 
         with open(rules_file, 'w') as f:
-            json.dump(_convert(results), f, indent=2)
+            json.dump(_convert_for_json(results), f, indent=2)
 
         logger.info(f"OK: Single-agent rules saved to {rules_file}")
         return rules_file
@@ -487,43 +602,64 @@ def run_multi_agent_inference(
 # ---------------------------------------------------------------------------
 
 def run_single_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs) -> Optional[str]:
-    """Run single-agent rule testing in-process. Returns path to saved test results."""
+    """Run single-agent rule testing in-process. Returns path to saved test results.
+
+    Also writes a dedicated per-test log file and a human-readable Markdown
+    summary into <experiment_dir>/inference/, so the test report can be
+    reviewed without scrolling through the full pipeline_run.log.
+    """
     logger.info(f"\n{'='*80}")
     logger.info(f"Single-Agent Test Rules: {dataset}")
     logger.info(f"{'='*80}")
 
+    inference_dir = Path(rules_file).parent
+    inference_dir.mkdir(parents=True, exist_ok=True)
+    test_log_path = str(inference_dir / "test_report_single_agent.log")
+    test_md_path = str(inference_dir / "test_report_single_agent.md")
+    test_results_file = str(inference_dir / "test_results_single_agent.json")
+
+    file_handler = None
     try:
-        from test_extracted_rules_single import test_rules_from_json as test_sa
+        from test_extracted_rules_single import (
+            test_rules_from_json as test_sa,
+            add_file_log_handler,
+        )
+
+        # Attach a dedicated FileHandler so the per-rule log output lands in
+        # the experiment folder, not buried in pipeline_run.log.
+        file_handler = add_file_log_handler(test_log_path)
+        logger.info(f"Per-test log file: {test_log_path}")
 
         results = test_sa(
             rules_file=rules_file,
             dataset_name=dataset,
             seed=seed,
             use_full_dataset=kwargs.get("use_full_dataset", True),
+            report_md_path=test_md_path,
         )
 
-        # Save test results so summarize_and_plot can use them without re-running
-        def _convert(obj):
-            if isinstance(obj, np.ndarray): return obj.tolist()
-            if isinstance(obj, (np.integer, np.int_)): return int(obj)
-            if isinstance(obj, np.floating): return float(obj)
-            if isinstance(obj, (np.bool_, bool)): return bool(obj)
-            if isinstance(obj, dict): return {_convert(k): _convert(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)): return [_convert(i) for i in obj]
-            return obj
-
-        inference_dir = Path(rules_file).parent
-        test_results_file = str(inference_dir / "test_results_single_agent.json")
         with open(test_results_file, 'w') as f:
-            json.dump(_convert(results), f, indent=2)
+            json.dump(_convert_for_json(results), f, indent=2)
 
-        logger.info(f"OK: Single-agent test completed, results saved to {test_results_file}")
+        logger.info(f"OK: Single-agent test completed")
+        logger.info(f"  JSON:     {test_results_file}")
+        logger.info(f"  Markdown: {test_md_path}")
+        logger.info(f"  Log:      {test_log_path}")
         return test_results_file
     except Exception as e:
         logger.error(f"FAIL: Single-agent test: {e}")
         import traceback
         traceback.print_exc()
         return None
+    finally:
+        # Detach the per-test file handler so the pipeline's root logger
+        # doesn't accumulate handlers across runs.
+        if file_handler is not None:
+            try:
+                logging.getLogger().removeHandler(file_handler)
+                file_handler.close()
+            except Exception:
+                pass
 
 
 def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs) -> Optional[str]:
@@ -700,6 +836,12 @@ Examples:
     parser.add_argument("--skip_inference", action="store_true", help="Skip inference")
     parser.add_argument("--skip_testing", action="store_true", help="Skip testing")
     parser.add_argument("--force_retrain", action="store_true", help="Force retraining")
+    parser.add_argument(
+        "--force_reinference", action="store_true",
+        help="Force re-running inference even if extracted_rules_*.json already exists. "
+             "By default, inference is skipped when its output already exists in the "
+             "experiment folder (same auto-skip behavior as --force_retrain for training)."
+    )
     parser.add_argument("--skip_single_agent", action="store_true", help="Skip single-agent pipeline")
     parser.add_argument("--skip_multi_agent", action="store_true", help="Skip multi-agent pipeline")
     parser.add_argument("--max_features_in_rule", type=int, default=-1,
@@ -737,6 +879,15 @@ Examples:
     parser.add_argument(
         "--n_classes", type=int, default=WYODOT_N_CLASSES,
         help=f"Number of classes in the dataset (default: {WYODOT_N_CLASSES} for WyoDOT)."
+    )
+    parser.add_argument(
+        "--inference_model_source", type=str, default="both",
+        choices=["best", "final", "both"],
+        help="Which saved checkpoint to use for single-agent inference. "
+             "'best' = EvalCallback's best-eval-reward snapshot per class; "
+             "'final' = last-step checkpoint per class; "
+             "'both' = run inference on both and keep the higher-scoring rule set per class "
+             "(precision primary, coverage tiebreaker). Default: both."
     )
 
     args = parser.parse_args()
@@ -854,13 +1005,21 @@ Examples:
 
         # Inference
         if not args.skip_inference and sa_exp_dir:
-            sa_rules = run_single_agent_inference(
-                experiment_dir=sa_exp_dir, dataset=args.dataset,
-                max_features_in_rule=args.max_features_in_rule,
-                steps_per_episode=args.steps_per_episode,
-                n_instances_per_class=args.n_instances_per_class,
-                device=args.device,
-            )
+            existing_rules = Path(sa_exp_dir) / "inference" / "extracted_rules_single_agent.json"
+            if existing_rules.exists() and not args.force_reinference:
+                sa_rules = str(existing_rules)
+                logger.info(
+                    f"Found existing single-agent rules (use --force_reinference to regenerate): {sa_rules}"
+                )
+            else:
+                sa_rules = run_single_agent_inference(
+                    experiment_dir=sa_exp_dir, dataset=args.dataset,
+                    max_features_in_rule=args.max_features_in_rule,
+                    steps_per_episode=args.steps_per_episode,
+                    n_instances_per_class=args.n_instances_per_class,
+                    device=args.device,
+                    inference_model_source=args.inference_model_source,
+                )
         elif args.skip_inference and sa_exp_dir:
             rf = Path(sa_exp_dir) / "inference" / "extracted_rules_single_agent.json"
             if rf.exists():
@@ -926,13 +1085,20 @@ Examples:
 
         # Inference
         if not args.skip_inference and ma_exp_dir:
-            ma_rules = run_multi_agent_inference(
-                experiment_dir=ma_exp_dir, dataset=args.dataset,
-                max_features_in_rule=args.max_features_in_rule,
-                steps_per_episode=args.steps_per_episode,
-                n_instances_per_class=args.n_instances_per_class,
-                device=args.device,
-            )
+            existing_ma_rules = Path(ma_exp_dir) / "inference" / "extracted_rules.json"
+            if existing_ma_rules.exists() and not args.force_reinference:
+                ma_rules = str(existing_ma_rules)
+                logger.info(
+                    f"Found existing multi-agent rules (use --force_reinference to regenerate): {ma_rules}"
+                )
+            else:
+                ma_rules = run_multi_agent_inference(
+                    experiment_dir=ma_exp_dir, dataset=args.dataset,
+                    max_features_in_rule=args.max_features_in_rule,
+                    steps_per_episode=args.steps_per_episode,
+                    n_instances_per_class=args.n_instances_per_class,
+                    device=args.device,
+                )
         elif args.skip_inference and ma_exp_dir:
             rf = Path(ma_exp_dir) / "inference" / "extracted_rules.json"
             if rf.exists():

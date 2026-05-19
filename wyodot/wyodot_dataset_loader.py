@@ -57,7 +57,14 @@ class WyoDOTDatasetLoader(TabularDatasetLoader):
         "max_features": "sqrt",
         "class_weight": "balanced",
         "random_state": 42,
-        "n_jobs": -1,
+        # n_jobs=1 is intentional. n_jobs=-1 makes joblib/loky spawn one worker
+        # per CPU on EVERY classifier.predict() call. For multi-agent BenchMARL,
+        # many agents call .predict() per TorchRL collector tick, so loky tries
+        # to spawn N×agents subprocess pools concurrently → semaphore
+        # exhaustion → SIGSEGV during the first env reset. Single-threaded RF
+        # inference on 7 features × 300 trees is fast enough that the loss is
+        # negligible compared to the pool-spawn overhead we avoid.
+        "n_jobs": 1,
     }
 
     def load_dataset(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], List[str]]:

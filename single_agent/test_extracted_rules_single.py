@@ -27,8 +27,8 @@ import json
 import argparse
 import numpy as np
 import re
-from typing import Dict, List, Tuple, Set, Any
-from collections import defaultdict
+from typing import Dict, List, Tuple, Set, Any, Optional
+from collections import defaultdict, Counter
 import logging
 from datetime import datetime
 
@@ -44,26 +44,27 @@ logger = logging.getLogger(__name__)
 def setup_file_logging(log_file_path: str):
     """
     Setup logging to write to both console and a log file.
-    
-    Args:
-        log_file_path: Path to the log file
+    Destructive: replaces all existing handlers. Use for the CLI entry point
+    where this script owns the logger. For in-process callers that already
+    have a logger configured (e.g. the wyodot pipeline), prefer
+    `add_file_log_handler` which is additive.
     """
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
+
     # Get root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    
+
     # Remove existing handlers
     root_logger.handlers = []
-    
+
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
-    
+
     # File handler (create directory if needed)
     log_dir = os.path.dirname(log_file_path)
     if log_dir:  # Only create if there's a directory component
@@ -72,8 +73,25 @@ def setup_file_logging(log_file_path: str):
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
-    
+
     return log_file_path
+
+
+def add_file_log_handler(log_file_path: str) -> logging.FileHandler:
+    """Append a FileHandler to the root logger without disturbing existing
+    handlers. Returns the handler so the caller can remove it afterward
+    (use logging.getLogger().removeHandler(handler)). Use this from
+    in-process callers like wyodot/run_pipeline.py that have their own
+    pipeline-level logging already set up."""
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+    logging.getLogger().addHandler(fh)
+    return fh
 
 
 def get_experiment_dir_from_rules_file(rules_file: str) -> str:
@@ -544,22 +562,43 @@ def select_global_rules_per_class(
             continue
 
         # Build candidate list for this class using unique_rules from per_class_results
-        # (same source as missed_samples_analysis to ensure consistency)
-        # Compute metrics directly from rule strings, matching missed_samples_analysis approach
+        # (same source as missed_samples_analysis to ensure consistency).
+        # We build candidates_all (everything that touches at least one class sample)
+        # AND candidates (the subset meeting precision_threshold). If candidates is
+        # empty but candidates_all is not, we fall back to candidates_all ranked by
+        # precision so the global-explanation report can show *something* instead
+        # of a misleading 0/0 — and we flag the fallback so the caller knows.
         candidates: List[Dict[str, Any]] = []
+        candidates_all: List[Dict[str, Any]] = []
         if class_key not in per_class_results:
             # Fallback: if class_key not in per_class_results, try to get from rule_results
             # This shouldn't happen if per_class_results is properly populated
             logger.warning(f"  Class key {class_key} not found in per_class_results. Available keys: {list(per_class_results.keys())}")
         else:
             unique_rules = per_class_results[class_key].get("unique_rules", [])
+            # Fallback: if the instance-based slot is empty (e.g. the classifier
+            # never predicted this class for any sampled instance, so no
+            # instance-based rollouts ran), borrow the class-based rules from
+            # the sibling "class_<N>_class_based" entry. These rules came from
+            # centroid-seeded class-based rollouts and don't depend on
+            # prediction routing — so they're available even when instance
+            # routing produces zero hits for the class.
+            cb_key = f"{class_key}_class_based"
+            if not unique_rules and cb_key in per_class_results:
+                cb_rules = per_class_results[cb_key].get("unique_rules", [])
+                if cb_rules:
+                    unique_rules = cb_rules
+                    logger.info(
+                        f"  Class {cls}: instance-based rules empty; falling back to "
+                        f"{len(cb_rules)} class-based rules from {cb_key} for global explanation."
+                    )
             if not unique_rules:
-                logger.debug(f"  No unique_rules found for {class_key} in per_class_results")
-            
+                logger.debug(f"  No unique_rules found for {class_key} or {cb_key} in per_class_results")
+
             for rule_str in unique_rules:
                 if rule_str == "any values (no tightened features)":
                     continue
-                
+
                 # Parse rule and compute metrics directly (same as missed_samples_analysis)
                 rule_conditions = parse_rule(rule_str)
                 if len(rule_conditions) == 0:
@@ -567,36 +606,56 @@ def select_global_rules_per_class(
                     satisfying_mask = np.ones(n_samples, dtype=bool)
                 else:
                     satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
-                
+
                 # Get class-specific samples (same approach as missed_samples_analysis)
                 class_satisfying = satisfying_mask[class_mask]  # Index to get only class samples
                 n_satisfying_class = int(np.sum(class_satisfying))
                 if n_satisfying_class <= 0:
                     continue
-                
+
                 # Compute precision: fraction of satisfying samples that belong to this class
                 n_satisfying_total = int(np.sum(satisfying_mask))
                 if n_satisfying_total > 0:
                     rule_prec = float(n_satisfying_class / n_satisfying_total)
                 else:
                     rule_prec = 0.0
-                
-                if rule_prec < precision_threshold:
-                    continue
-                
+
                 # Get indices of satisfying class samples (in full dataset indices)
                 class_satisfying_mask = satisfying_mask & class_mask
                 satisfying_class_indices = set(np.where(class_satisfying_mask)[0].tolist())
-                
+
                 # Find rule index in rule_results for union precision calculation
                 rule_idx = rule_str_to_idx.get(rule_str, -1)
-                
-                candidates.append({
+
+                cand = {
                     "rule_idx": rule_idx,
                     "rule_str": rule_str,
                     "precision": rule_prec,
                     "class_indices": satisfying_class_indices,
-                })
+                }
+                candidates_all.append(cand)
+                if rule_prec >= precision_threshold:
+                    candidates.append(cand)
+
+        # Fallback: if no rule met precision_threshold but rules do exist that
+        # cover this class, surface the top-K-by-precision so the user can see
+        # what the policy actually produced. The report layer can flag these
+        # via "fallback_used" / "max_candidate_precision".
+        used_fallback = False
+        if not candidates and candidates_all:
+            used_fallback = True
+            # Sort by precision desc; tie-break by class coverage desc
+            candidates_all.sort(
+                key=lambda c: (c["precision"], len(c["class_indices"])),
+                reverse=True,
+            )
+            fallback_k = max_rules_per_class if (max_rules_per_class and max_rules_per_class > 0) else len(candidates_all)
+            candidates = candidates_all[:fallback_k]
+            logger.warning(
+                f"  Class {cls}: no rule met precision_threshold={precision_threshold:.2f}; "
+                f"falling back to top {len(candidates)} of {len(candidates_all)} rules by precision "
+                f"(max precision available: {candidates_all[0]['precision']:.4f})"
+            )
 
         selected: List[Dict[str, Any]] = []
         covered_class_indices: Set[int] = set()
@@ -664,6 +723,7 @@ def select_global_rules_per_class(
         else:
             class_union_precision = 0.0
 
+        max_candidate_precision = max((c["precision"] for c in candidates_all), default=0.0)
         global_explanations["per_class"][class_key] = {
             "class": int(cls),
             "n_class_samples": int(n_class_samples),
@@ -674,6 +734,10 @@ def select_global_rules_per_class(
             "class_union_precision": float(class_union_precision),
             "n_covered_class_samples": int(n_covered_class),
             "n_union_samples_total": int(n_union_total),
+            # Honesty fields: did we have to drop below the precision bar to show anything?
+            "fallback_used": bool(used_fallback),
+            "n_candidates_total": int(len(candidates_all)),
+            "max_candidate_precision": float(max_candidate_precision),
         }
 
     return global_explanations
@@ -688,6 +752,7 @@ def test_rules_from_json(
     precision_threshold: float = 0.9,
     max_rules_per_class: int = -1,
     overlap_penalty_weight: float = 0.0,
+    report_md_path: Optional[str] = None,
 ) -> Dict:
     """
     Test extracted rules against a dataset.
@@ -974,7 +1039,36 @@ def test_rules_from_json(
     except Exception as e:
         logger.warning(f"Could not load classifier for prediction-match precision: {e}")
         logger.warning("Will use class-label precision for all rules (including instance-based)")
-    
+
+    # Precompute classifier predictions on every row of X_data once. The per-rule
+    # loop below indexes into all_predictions via a boolean mask (see prediction-
+    # match precision branch around line 1073). Without this, that branch raises
+    # NameError: name 'all_predictions' is not defined. We standardize first
+    # because the classifier (RF or DNN) was trained on scaler-normalized features.
+    all_predictions = None
+    if classifier is not None:
+        try:
+            X_for_pred = X_data
+            if hasattr(dataset_loader, "scaler") and dataset_loader.scaler is not None:
+                X_for_pred = dataset_loader.scaler.transform(X_data).astype(np.float32)
+            if hasattr(classifier, "predict"):
+                # sklearn estimators (RandomForest, GradientBoosting, ...)
+                all_predictions = np.asarray(classifier.predict(X_for_pred))
+            else:
+                # torch nn.Module (DNN classifier)
+                import torch as _torch
+                if hasattr(classifier, "eval"):
+                    classifier.eval()
+                with _torch.no_grad():
+                    X_tensor = _torch.from_numpy(np.asarray(X_for_pred, dtype=np.float32))
+                    logits = classifier(X_tensor)
+                    all_predictions = logits.argmax(dim=1).cpu().numpy()
+            logger.info(f"✓ Precomputed classifier predictions on all {len(all_predictions)} samples for prediction-match precision")
+        except Exception as e:
+            logger.warning(f"Could not precompute classifier predictions: {e}")
+            logger.warning("Will fall back to class-label precision for instance-based rules")
+            all_predictions = None
+
     # Process each rule and test against all classes
     results = {
         "dataset": dataset_name,
@@ -1400,23 +1494,254 @@ def test_rules_from_json(
         selected_rules = class_data.get("selected_rules", [])
         selected_indices = class_data.get("selected_rule_indices", [])
         
+        fallback_used = class_data.get("fallback_used", False)
+        n_candidates_total = class_data.get("n_candidates_total", 0)
+        max_cand_prec = class_data.get("max_candidate_precision", 0.0)
+
         logger.info(f"Class {cls}:")
         logger.info(f"  Class samples: {n_class_samples}")
-        logger.info(f"  Selected rules: {n_selected}")
+        if fallback_used:
+            logger.info(
+                f"  Selected rules: {n_selected}  "
+                f"[FALLBACK — no rule met threshold {settings.get('precision_threshold', 0.9):.2f}; "
+                f"showing top-{n_selected} by precision (max precision = {max_cand_prec:.4f})]"
+            )
+        else:
+            logger.info(f"  Selected rules: {n_selected}")
         logger.info(f"  Class-union coverage: {union_cov:.4f} ({n_covered}/{n_class_samples} samples covered)")
         logger.info(f"  Class-union precision: {union_prec:.4f}")
-        
+
         if n_selected > 0:
             logger.info(f"  Selected rule indices: {selected_indices}")
             for idx, rule_str in enumerate(selected_rules, 1):
                 logger.info(f"    Rule {idx} (index {selected_indices[idx-1]}): {rule_str}")
+        elif n_candidates_total == 0:
+            logger.info(f"  No rules in unique_rules for this class (nothing to evaluate).")
         else:
-            logger.info(f"  No rules selected (no rules met precision threshold {settings.get('precision_threshold', 0.9):.2f})")
+            logger.info(
+                f"  No rules selected (no rules met precision threshold "
+                f"{settings.get('precision_threshold', 0.9):.2f}, max available precision = {max_cand_prec:.4f})"
+            )
         logger.info("")
-    
+
     logger.info("="*80)
-    
+
+    # ------------------------------------------------------------------
+    # Post-hoc analysis enrichments (added 2026-05-18): feature_importance
+    # and lift over base rate. Both are derived from rule_results and the
+    # already-computed class distribution; no extra dataset passes needed.
+    # ------------------------------------------------------------------
+
+    # Feature importance: how often does each feature constrain a rule?
+    # Counts both raw occurrences and the number of distinct rules that use
+    # each feature. Useful for "what is the model paying attention to?".
+    feature_total_occurrences = Counter()
+    feature_distinct_rules = Counter()
+    for rr in results.get("rule_results", []):
+        seen_in_rule = set()
+        for cond in rr.get("conditions", []):
+            f = cond.get("feature")
+            if not f:
+                continue
+            feature_total_occurrences[f] += 1
+            seen_in_rule.add(f)
+        for f in seen_in_rule:
+            feature_distinct_rules[f] += 1
+    n_total_rules = len(results.get("rule_results", []))
+    results["feature_importance"] = {
+        "n_rules": int(n_total_rules),
+        "by_feature": [
+            {
+                "feature": f,
+                "n_conditions": int(feature_total_occurrences[f]),
+                "n_rules_using_it": int(feature_distinct_rules[f]),
+                "fraction_of_rules": float(feature_distinct_rules[f] / n_total_rules) if n_total_rules else 0.0,
+            }
+            for f in sorted(feature_total_occurrences, key=lambda k: -feature_distinct_rules[k])
+        ],
+    }
+
+    # Lift = rule_precision / class_base_rate. Lift > 1 means the rule
+    # carries signal above the prior; lift ≈ 1 means it's just predicting
+    # the class's base rate; lift < 1 is actively anti-predictive.
+    total_samples = X_data.shape[0]
+    class_base_rates = {
+        int(c): (float(np.sum(y_data == c) / total_samples) if total_samples else 0.0)
+        for c in unique_classes
+    }
+    results["class_base_rates"] = class_base_rates
+
+    lifts_by_class: Dict[int, list] = {int(c): [] for c in unique_classes}
+    for rr in results.get("rule_results", []):
+        for class_key, class_res in rr.get("per_class_results", {}).items():
+            cls_int = int(class_res.get("class", -1))
+            base_rate = class_base_rates.get(cls_int, 0.0)
+            prec = float(class_res.get("rule_precision", 0.0))
+            lift = float(prec / base_rate) if base_rate > 0 else 0.0
+            class_res["base_rate"] = base_rate
+            class_res["lift"] = lift
+            if class_res.get("n_satisfying_class_samples", 0) > 0:
+                lifts_by_class.setdefault(cls_int, []).append(lift)
+
+    # Per-class average lift, surfaced into per_class_results for at-a-glance use
+    for cls_int, lifts in lifts_by_class.items():
+        key = f"class_{cls_int}"
+        if key in results.get("per_class_results", {}):
+            results["per_class_results"][key]["avg_lift_over_base_rate"] = (
+                float(np.mean(lifts)) if lifts else 0.0
+            )
+            results["per_class_results"][key]["n_rules_scored_for_lift"] = int(len(lifts))
+
+    # ------------------------------------------------------------------
+    # Optional markdown report — the TL;DR a human can actually read.
+    # ------------------------------------------------------------------
+    if report_md_path:
+        try:
+            _write_test_report_markdown(results, report_md_path)
+            logger.info(f"✓ Test report (markdown) written to: {report_md_path}")
+        except Exception as e:
+            logger.warning(f"Could not write markdown report to {report_md_path}: {e}")
+
     return results
+
+
+def _write_test_report_markdown(results: Dict, output_path: str) -> None:
+    """Render a compact human-readable markdown summary of a test_rules_from_json
+    result. Designed for skim-reading after a pipeline run; the .json next to it
+    is the authoritative artifact."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    lines = []
+    lines.append(f"# Test report — {results.get('dataset', 'unknown')}")
+    lines.append("")
+    lines.append(f"- **Algorithm**: {results.get('algorithm', 'unknown')}")
+    lines.append(f"- **Model type**: {results.get('model_type', 'unknown')}")
+    lines.append(f"- **Data split**: {results.get('data_type', 'unknown')}")
+    lines.append(f"- **Total samples**: {results.get('n_samples', '?')}")
+    lines.append(f"- **Total rules tested**: {len(results.get('rule_results', []))}")
+    lines.append("")
+
+    # Per-class summary table
+    lines.append("## Per-class summary")
+    lines.append("")
+    lines.append("| Class | n samples | base rate | rules | inst. prec | inst. cov | class-union prec | class-union cov | avg lift |")
+    lines.append("|-------|----------:|----------:|------:|-----------:|----------:|-----------------:|----------------:|---------:|")
+    base_rates = results.get("class_base_rates", {})
+    for class_key in sorted(results.get("per_class_results", {}).keys()):
+        cd = results["per_class_results"][class_key]
+        cls = cd.get("class", "?")
+        n = cd.get("n_class_samples", 0) or cd.get("class_total_samples", 0)
+        br = base_rates.get(int(cls), 0.0) if isinstance(cls, int) else 0.0
+        n_rules = cd.get("unique_rules_count", len(cd.get("unique_rules", [])) if cd.get("unique_rules") else 0)
+        ip = cd.get("instance_precision", cd.get("precision", 0.0))
+        ic = cd.get("instance_coverage", cd.get("coverage", 0.0))
+        cp = cd.get("class_precision", 0.0)
+        cc = cd.get("class_coverage", 0.0)
+        lift = cd.get("avg_lift_over_base_rate", 0.0)
+        lines.append(
+            f"| {cls} | {n} | {br:.3f} | {n_rules} | {ip:.4f} | {ic:.4f} | {cp:.4f} | {cc:.4f} | {lift:.2f}× |"
+        )
+    lines.append("")
+
+    # Global explanations summary (with fallback markers)
+    ge = results.get("global_explanations", {})
+    if ge:
+        lines.append("## Global explanations (per-class union of selected rules)")
+        lines.append("")
+        s = ge.get("settings", {})
+        lines.append(f"_settings: precision_threshold={s.get('precision_threshold', '?')}, max_rules_per_class={s.get('max_rules_per_class', '?')}_")
+        lines.append("")
+        for class_key in sorted(ge.get("per_class", {}).keys()):
+            d = ge["per_class"][class_key]
+            cls = d.get("class", "?")
+            n_sel = d.get("n_selected_rules", 0)
+            cov = d.get("class_union_coverage", 0.0)
+            prec = d.get("class_union_precision", 0.0)
+            fb = d.get("fallback_used", False)
+            max_cp = d.get("max_candidate_precision", 0.0)
+            n_cands = d.get("n_candidates_total", 0)
+
+            tag = " **[FALLBACK below threshold]**" if fb else ""
+            lines.append(f"### Class {cls}{tag}")
+            lines.append(f"- Selected rules: **{n_sel}** of {n_cands} candidates  (max candidate precision: {max_cp:.4f})")
+            lines.append(f"- Class-union precision: **{prec:.4f}**")
+            lines.append(f"- Class-union coverage: **{cov:.4f}**  ({d.get('n_covered_class_samples', 0)}/{d.get('n_class_samples', 0)} class samples)")
+            if d.get("selected_rules"):
+                lines.append("")
+                lines.append("Selected rules:")
+                for i, r in enumerate(d["selected_rules"], 1):
+                    lines.append(f"  {i}. `{r}`")
+            lines.append("")
+
+    # Feature importance
+    fi = results.get("feature_importance", {})
+    by_feature = fi.get("by_feature", [])
+    if by_feature:
+        lines.append("## Feature importance across rules")
+        lines.append("")
+        lines.append("| Feature | rules using it | % of rules | total conditions |")
+        lines.append("|---------|---------------:|-----------:|-----------------:|")
+        for row in by_feature:
+            lines.append(
+                f"| {row['feature']} | {row['n_rules_using_it']} | "
+                f"{100*row['fraction_of_rules']:.1f}% | {row['n_conditions']} |"
+            )
+        lines.append("")
+
+    # Top-K rules by lift per class (the most informative rules)
+    lines.append("## Top rules by lift (most informative per class)")
+    lines.append("")
+    rule_results = results.get("rule_results", [])
+    classes = sorted({int(c.get("class", -1))
+                      for rr in rule_results for c in rr.get("per_class_results", {}).values()})
+    TOPK = 5
+    for cls in classes:
+        items = []
+        for rr in rule_results:
+            cr = rr.get("per_class_results", {}).get(f"class_{cls}")
+            if not cr or cr.get("n_satisfying_class_samples", 0) <= 0:
+                continue
+            items.append({
+                "rule": rr.get("rule", ""),
+                "precision": cr.get("rule_precision", 0.0),
+                "coverage": cr.get("rule_coverage", 0.0),
+                "lift": cr.get("lift", 0.0),
+                "n_satisfying_class": cr.get("n_satisfying_class_samples", 0),
+            })
+        items.sort(key=lambda r: (r["lift"], r["precision"]), reverse=True)
+        if not items:
+            continue
+        lines.append(f"### Class {cls}")
+        lines.append("")
+        lines.append("| # | lift | prec | cov | n class samples in box | rule |")
+        lines.append("|---|-----:|-----:|----:|----------------------:|------|")
+        for i, it in enumerate(items[:TOPK], 1):
+            lines.append(
+                f"| {i} | {it['lift']:.2f}× | {it['precision']:.3f} | {it['coverage']:.3f} | "
+                f"{it['n_satisfying_class']} | `{it['rule']}` |"
+            )
+        lines.append("")
+
+    # Overlap summary
+    oa = results.get("overlap_analysis", {}).get("summary", {})
+    if oa:
+        lines.append("## Cross-class rule overlap")
+        lines.append("")
+        lines.append(f"- Total unique rules: {oa.get('total_unique_rules', '?')}")
+        lines.append(f"- Rules satisfying ≥2 classes: {oa.get('rules_with_overlaps', '?')}")
+        lines.append(f"- Total overlap pairs: {oa.get('total_overlap_pairs', '?')}")
+        lines.append("")
+
+    # Missed samples summary
+    ms = results.get("missed_samples_analysis", {}).get("summary", {})
+    if ms:
+        lines.append("## Missed-sample summary")
+        lines.append("")
+        cov = ms.get("overall_coverage_ratio", 0.0)
+        lines.append(f"- Overall coverage: **{cov:.4f}**  ({ms.get('total_covered_samples', 0)}/{ms.get('total_samples', 0)})")
+        lines.append("")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def main():

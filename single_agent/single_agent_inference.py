@@ -1164,7 +1164,8 @@ def extract_rules_single_agent(
     min_coverage_threshold: float = 0.01,  # Minimum coverage to keep (default: 0.01)
     output_dir: Optional[str] = None,
     seed: int = 42,
-    device: str = "cpu"
+    device: str = "cpu",
+    prefer_model: str = "best",  # "best" or "final" — which saved checkpoint to load per class
 ) -> Dict[str, Any]:
     """
     Extract anchor rules using a trained single-agent SB3 model.
@@ -1480,23 +1481,38 @@ def extract_rules_single_agent(
     logger.info(f"\nLoading models for {len(target_classes)} classes...")
     models = {}  # class -> model
     
+    # Candidate paths per class, in priority order. Ordering depends on prefer_model:
+    #   prefer_model="best"  -> best_model/* first, fall back to final_model
+    #   prefer_model="final" -> final_model first, fall back to best_model
+    # Anything else is treated as "best" (legacy default).
+    pm = str(prefer_model).lower()
+    if pm not in ("best", "final"):
+        logger.warning(f"Unknown prefer_model={prefer_model!r}; defaulting to 'best'")
+        pm = "best"
+    logger.info(f"Model selection preference: {pm}")
+
     for target_class in target_classes:
-        # Try best model first (prefer best model over final model)
-        # Best model is saved as best_model.zip in best_model/class_X/ directory
-        model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", "best_model.zip")
-        if not os.path.exists(model_path):
-            # Also try the old naming convention for backward compatibility
-            model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip")
-        if not os.path.exists(model_path):
-            # Fallback to final model if best model doesn't exist
-            model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip")
-        
-        if not os.path.exists(model_path):
-            logger.warning(f"Model for class {target_class} not found")
-            logger.warning(f"  Tried: best_model/class_{target_class}/best_model.zip")
-            logger.warning(f"  Tried: best_model/class_{target_class}/class_{target_class}.zip")
-            logger.warning(f"  Tried: final_model/class_{target_class}.zip")
+        best_candidates = [
+            os.path.join(experiment_dir, "best_model", f"class_{target_class}", "best_model.zip"),
+            os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}.zip"),
+        ]
+        final_candidates = [
+            os.path.join(experiment_dir, "final_model", f"class_{target_class}.zip"),
+        ]
+        if pm == "best":
+            search_order = best_candidates + final_candidates
+        else:
+            search_order = final_candidates + best_candidates
+
+        model_path = next((p for p in search_order if os.path.exists(p)), None)
+        if model_path is None:
+            logger.warning(f"Model for class {target_class} not found (prefer_model={pm})")
+            for p in search_order:
+                logger.warning(f"  Tried: {os.path.relpath(p, experiment_dir)}")
             continue
+        # Log which bucket we actually loaded from (useful when prefer fell back)
+        which_bucket = "best_model" if "best_model" in model_path else "final_model"
+        logger.info(f"  Class {target_class}: loading from {which_bucket} ({os.path.basename(model_path)})")
         
         # Create environment for this class (needed for model loading)
         # Use the same classifier instance loaded earlier
@@ -1618,32 +1634,64 @@ def extract_rules_single_agent(
             X_data_std = env_data["X_std"]
             data_source_name = "training"
         
-        # Sample instances from ALL classes (not filtered by class)
+        # Stratified sampling by classifier prediction.
+        # Previously we did a single uniform random.choice of
+        # n_instances_per_class * n_classes indices and then *routed* by
+        # whatever class the classifier predicted for them. With a small total
+        # sample (e.g. 25), it's a coin flip whether a rare-but-real predicted
+        # class shows up at all — seed=42 happened to draw 0 predicted-class-3
+        # instances despite the RF predicting class 3 for ~13% of the dataset,
+        # which left class 3's instance-based rules permanently empty.
+        # The stratified scheme below guarantees each predicted class with
+        # available candidates gets exactly n_instances_per_class instances
+        # (or all of them, if fewer exist).
         n_total_instances = len(X_data_unit)
-        total_samples_needed = n_instances_per_class * len(target_classes)
-        n_samples_to_take = min(total_samples_needed, n_total_instances)
-        
         rng_for_sampling = np.random.default_rng(seed if seed is not None else 42)
-        all_sampled_indices = rng_for_sampling.choice(n_total_instances, size=n_samples_to_take, replace=False)
-        
-        logger.info(f"  Sampled {n_samples_to_take} instances from {data_source_name} data (from all classes)")
-        
-        # Get classifier predictions for all sampled instances
-        X_sampled_std = X_data_std[all_sampled_indices]
+
+        # Classify all candidate rows once, then stratify-sample within each
+        # predicted-class bucket.
         classifier.eval()
         with torch.no_grad():
-            X_tensor = torch.from_numpy(X_sampled_std.astype(np.float32)).to(device)
-            logits = classifier(X_tensor)
-            predictions = logits.argmax(dim=1).cpu().numpy()
-        
-        # Group instances by predicted class
+            X_all_tensor = torch.from_numpy(X_data_std.astype(np.float32)).to(device)
+            all_logits = classifier(X_all_tensor)
+            all_predictions = all_logits.argmax(dim=1).cpu().numpy()
+
         predicted_classes_to_indices = {}
-        for idx, pred_class in zip(all_sampled_indices, predictions):
-            if pred_class not in predicted_classes_to_indices:
-                predicted_classes_to_indices[pred_class] = []
-            predicted_classes_to_indices[pred_class].append(idx)
-        
-        logger.info(f"  Instances routed to classes: {[f'{cls}: {len(indices)} instances' for cls, indices in predicted_classes_to_indices.items()]}")
+        for target_class in target_classes:
+            candidate_mask = (all_predictions == int(target_class))
+            candidate_indices = np.where(candidate_mask)[0]
+            if candidate_indices.size == 0:
+                logger.warning(
+                    f"  No instances in {data_source_name} were predicted as class {target_class} "
+                    f"by the classifier — instance-based rules for this class will be empty."
+                )
+                continue
+            n_to_pick = int(min(n_instances_per_class, candidate_indices.size))
+            picked = rng_for_sampling.choice(candidate_indices, size=n_to_pick, replace=False)
+            predicted_classes_to_indices[int(target_class)] = picked.tolist()
+
+        all_sampled_indices = np.array(
+            [idx for inds in predicted_classes_to_indices.values() for idx in inds],
+            dtype=np.int64,
+        )
+        n_samples_to_take = len(all_sampled_indices)
+        logger.info(
+            f"  Stratified sampling on {data_source_name} ({n_total_instances} rows): "
+            f"picked {n_samples_to_take} instances "
+            f"({n_instances_per_class} per predicted class, "
+            f"covering {len(predicted_classes_to_indices)}/{len(target_classes)} classes)"
+        )
+        logger.info(
+            f"  Instances routed to classes: "
+            f"{[f'{cls}: {len(indices)} instances' for cls, indices in predicted_classes_to_indices.items()]}"
+        )
+
+        # `predictions` is kept for downstream code that may still expect it
+        # — same shape/order as `all_sampled_indices`.
+        predictions = np.array(
+            [int(cls) for cls, inds in predicted_classes_to_indices.items() for _ in inds],
+            dtype=np.int64,
+        )
         
         # Initialize aggregation variables for prediction routing mode (aggregate across all predicted classes)
         anchors_list = []
