@@ -77,7 +77,11 @@ on_policy_n_minibatch_iters: 40
 on_policy_minibatch_size: 64
 
 # Number of frames collected each experiment iteration.
-off_policy_collected_frames_per_batch: 4000
+# MUST be an exact multiple of off_policy_n_envs_per_worker: TorchRL's collector
+# rounds frames_per_batch up to a multiple of the env count, so a non-multiple
+# (e.g. 4000 with 12 envs -> actual 4008) makes total_frames drift off the
+# evaluation_interval grid and periodic evaluation never fires. 4800 = 12 * 400.
+off_policy_collected_frames_per_batch: 4800
 # Number of environments used for collection.
 off_policy_n_envs_per_worker: 12
 # Number of gradient updates per iteration.
@@ -100,9 +104,12 @@ off_policy_prb_beta: 0.4
 evaluation: True
 # Whether to render the evaluation (if rendering is available)
 render: True
-# Frequency of evaluation in terms of collected frames (this should be a multiple of on/off_policy_collected_frames_per_batch)
-# CPU-optimized: Updated to match reduced batch sizes
-evaluation_interval: 16_000
+# Frequency of evaluation in terms of collected frames. MUST be a multiple of
+# the ACTUAL collected_frames_per_batch (4800) so total_frames lands on it
+# exactly and BenchMARL's `total_frames % evaluation_interval == 0` eval trigger
+# fires. 24_000 = 4800 * 5 -> evaluation every 5 iterations (~25 evals over a
+# 125-iteration run).
+evaluation_interval: 24_000
 # Number of episodes that evaluation is run on
 # Production setting: Increased for more reliable evaluation metrics
 evaluation_episodes: 10
