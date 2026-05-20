@@ -20,8 +20,11 @@ prefer_continuous_actions: True
 # If False collection is done using a collector (under no grad). If True, collection is done with gradients.
 collect_with_grad: False
 # In case of non-vectorized environments, whether to run collection of multiple processes
-# If this is used, there will be n_envs_per_worker processes, collecting frames_per_batch/n_envs_per_worker frames each
-parallel_collection: False
+# If this is used, there will be n_envs_per_worker processes, collecting frames_per_batch/n_envs_per_worker frames each.
+# Was False as a safety measure while we hunted the MA spawn-storm. Now safe to
+# turn back on because RF n_jobs=1 (wyodot_dataset_loader) and the run_command
+# thread fences in run_pipeline.py keep classifier.predict() single-process.
+parallel_collection: True
 
 # Discount factor
 gamma: 0.99
@@ -54,10 +57,9 @@ exploration_anneal_frames: null
 # The maximum number of experiment iterations before the experiment terminates, exclusive with max_n_frames
 max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
-# With max_cycles=100: 200 * 100 = 20,000 frames (200 episodes if all run to max)
-# In practice, episodes often terminate early when targets are met, so this yields ~300-400 episodes
-# This provides sufficient training while avoiding excessive compute time
-max_n_frames: 360_000
+# A frame is one shared-env transition; every agent in the group acts on each
+# frame, so max_n_frames is the per-agent timestep budget.
+max_n_frames: 600_000
 
 # Number of frames collected and each experiment iteration
 # CPU-optimized: Reduced batch size to prevent CPU overload and hangs
@@ -74,23 +76,16 @@ on_policy_n_minibatch_iters: 40
 # CPU-optimized: Reduced minibatch size to prevent CPU overload
 on_policy_minibatch_size: 64
 
-# Number of frames collected and each experiment iteration
-# CPU-optimized: Reduced batch size to prevent CPU overload and hangs
-off_policy_collected_frames_per_batch: 2000
-# Number of environments used for collection
-# CPU-optimized: Significantly reduced parallel environments to prevent CPU overload and threading issues
-# If the environment is vectorized, this will be the number of batched environments.
-# Otherwise batching will be simulated and each env will be run sequentially or parallelly depending on parallel_collection.
-off_policy_n_envs_per_worker: 1
-# This is the number of times off_policy_train_batch_size will be sampled from the buffer and trained over.
-# CPU-optimized: Reduced optimizer steps to prevent CPU overload
+# Number of frames collected each experiment iteration.
+off_policy_collected_frames_per_batch: 4000
+# Number of environments used for collection.
+off_policy_n_envs_per_worker: 12
+# Number of gradient updates per iteration.
 off_policy_n_optimizer_steps: 1000
-# Number of frames used for each off_policy_n_optimizer_steps when training off-policy algorithms
-# CPU-optimized: Reduced batch size to prevent CPU overload
-off_policy_train_batch_size: 64
-# Maximum number of frames to keep in replay buffer memory for off-policy algorithms
-# CPU-optimized: Reduced buffer size to prevent memory issues
-off_policy_memory_size: 500_000
+# Number of frames used per minibatch during training.
+off_policy_train_batch_size: 1024
+# Replay buffer size.
+off_policy_memory_size: 5_000_000
 # Number of random action frames to prefill the replay buffer with
 off_policy_init_random_frames: 0
 # whether to use priorities while sampling from the replay buffer

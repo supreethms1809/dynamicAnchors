@@ -80,8 +80,17 @@ _DEFAULT_TIMESTEPS = 320_000
 RESULTS_GROUP_NAME = "wyodot_results"
 
 
-def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_output: bool = False) -> Tuple[bool, Optional[str]]:
-    """Run a command and return (success, output)."""
+def run_command(cmd: list, description: str, cwd: Optional[str] = None,
+                capture_output: bool = False, n_threads: int = 1) -> Tuple[bool, Optional[str]]:
+    """Run a command and return (success, output).
+
+    n_threads caps OMP/MKL/OpenBLAS thread pools in the child. Use 1 for the
+    SA shards (K=5 in parallel — total threads must stay below physical cores
+    to avoid contention). Use a larger value for single-process subprocesses
+    like the MA driver (no sibling competition; bigger BLAS thread pools mean
+    actual CPU utilization for the SAC/MADDPG matrix ops).
+    JOBLIB_MULTIPROCESSING stays 0 regardless — that's about subprocess spawn
+    storms (RF predict via loky), not threading."""
     logger.info(f"\n{'='*80}")
     logger.info(f"{description}")
     logger.info(f"{'='*80}")
@@ -90,19 +99,19 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
     if cwd is None:
         cwd = str(PROJECT_ROOT)
 
-    # Belt-and-suspenders: cap BLAS/OMP/joblib threads in the child so neither
-    # sklearn (RF predict via loky) nor numpy/torch (MKL/OpenBLAS) can spawn
-    # cohort-wide worker pools. Combined with RF n_jobs=1 in
-    # wyodot_dataset_loader, this prevents the SIGSEGV-from-semaphore-exhaustion
-    # failure we hit during multi-agent training on macOS.
+    n_threads = max(1, int(n_threads))
     child_env = {
         **os.environ,
-        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
-        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", str(n_threads)),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", str(n_threads)),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", str(n_threads)),
+        "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS", str(n_threads)),
+        "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", str(n_threads)),
         "JOBLIB_MULTIPROCESSING": os.environ.get("JOBLIB_MULTIPROCESSING", "0"),
         "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "false"),
     }
+    if n_threads > 1:
+        logger.info(f"  (child OMP/MKL/OpenBLAS thread cap: {n_threads})")
 
     try:
         process = subprocess.Popen(
@@ -306,6 +315,7 @@ def run_multi_agent_training(
         output_dir = str(SCRIPT_DIR / "output" / f"{dataset}_{algorithm}")
 
     # Check existing experiment
+    force_retrain = True
     if not force_retrain:
         output_path = Path(output_dir)
         if output_path.exists():
@@ -337,9 +347,14 @@ def run_multi_agent_training(
             else:
                 cmd.extend([f"--{key}", str(value)])
 
+    # MA runs as a single subprocess (no class sharding), so it can safely
+    # use a generous BLAS thread pool. We aim for "physical cores minus a
+    # couple for the OS / wandb / pipeline" — capped so an unusually large
+    # box doesn't allocate hundreds of threads.
+    ma_n_threads = max(1, min((os.cpu_count() or 4) - 2, 12))
     success, output = run_command(
         cmd, f"Multi-Agent Training: {dataset} with {algorithm.upper()}",
-        capture_output=True
+        capture_output=True, n_threads=ma_n_threads,
     )
 
     if success:
@@ -548,15 +563,57 @@ def run_single_agent_inference(
         return None
 
 
+def _run_multi_agent_inference_once(
+    experiment_dir: str, dataset: str, prefer_model: str,
+    max_features_in_rule: int, steps_per_episode: int,
+    n_instances_per_class: int, device: str, output_dir: str,
+) -> Optional[Dict[str, Any]]:
+    """Run multi-agent inference once for a given model preference.
+    extract_rules_from_policies writes extracted_rules.json into output_dir;
+    this returns the parsed results dict (or None on failure)."""
+    from inference import extract_rules_from_policies
+    extract_rules_from_policies(
+        experiment_dir=experiment_dir,
+        dataset_name=dataset,
+        max_features_in_rule=max_features_in_rule,
+        steps_per_episode=steps_per_episode,
+        n_instances_per_class=n_instances_per_class,
+        device=device,
+        eval_on_test_data=True,
+        coverage_on_all_data=True,
+        filter_by_prediction=False,
+        prefer_model=prefer_model,
+        output_dir=output_dir,
+    )
+    rules_path = Path(output_dir) / "extracted_rules.json"
+    if not rules_path.exists():
+        logger.warning(f"  MA inference ({prefer_model}) produced no rules file at {rules_path}")
+        return None
+    with open(rules_path) as f:
+        return json.load(f)
+
+
 def run_multi_agent_inference(
     experiment_dir: str, dataset: str,
     max_features_in_rule: int = -1, steps_per_episode: int = 100,
-    n_instances_per_class: int = 5, device: str = "cpu", **kwargs
+    n_instances_per_class: int = 5, device: str = "cpu",
+    inference_model_source: str = "best",  # "best", "final", or "both"
+    **kwargs
 ) -> Optional[str]:
-    """Run multi-agent inference in-process (uses monkey-patched loader)."""
+    """Run multi-agent inference in-process (uses monkey-patched loader).
+
+    inference_model_source mirrors the single-agent flag:
+      - "best"  : use individual_models_best/ (from best_model/best_checkpoint.pt)
+      - "final" : use individual_models/ (final training state)
+      - "both"  : run both, keep the higher-scoring rule set per class
+    """
     logger.info(f"\n{'='*80}")
-    logger.info(f"Multi-Agent Inference: {dataset}")
+    logger.info(f"Multi-Agent Inference: {dataset}  (model source: {inference_model_source})")
     logger.info(f"{'='*80}")
+
+    inference_dir = Path(experiment_dir) / "inference"
+    inference_dir.mkdir(parents=True, exist_ok=True)
+    rules_file = inference_dir / "extracted_rules.json"
 
     # inference.py loads conf/mlp.yaml via a relative path, so we must
     # chdir to BenchMARL/ while it runs.
@@ -564,23 +621,43 @@ def run_multi_agent_inference(
     try:
         os.chdir(str(PROJECT_ROOT / "BenchMARL"))
 
-        from inference import extract_rules_from_policies
+        if inference_model_source == "both":
+            logger.info("  [1/2] MA inference with prefer_model=best")
+            best_results = _run_multi_agent_inference_once(
+                experiment_dir, dataset, "best",
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, device, str(inference_dir / "best"),
+            )
+            logger.info("  [2/2] MA inference with prefer_model=final")
+            final_results = _run_multi_agent_inference_once(
+                experiment_dir, dataset, "final",
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, device, str(inference_dir / "final"),
+            )
+            if best_results is None and final_results is None:
+                logger.error("  MA inference produced no rules for either model source")
+                return None
+            if best_results is None:
+                merged = final_results
+            elif final_results is None:
+                merged = best_results
+            else:
+                merged = _merge_inference_results_by_class(best_results, final_results)
+                sel = merged.get("model_selection", {}).get("by_class", {})
+                logger.info(f"  Per-class model selection: {sel}")
+            with open(rules_file, "w") as f:
+                json.dump(_convert_for_json(merged), f, indent=2)
+        else:
+            results = _run_multi_agent_inference_once(
+                experiment_dir, dataset, inference_model_source,
+                max_features_in_rule, steps_per_episode,
+                n_instances_per_class, device, str(inference_dir),
+            )
+            if results is None:
+                return None
+            # extract_rules_from_policies already wrote extracted_rules.json
+            # into inference_dir; nothing more to write.
 
-        results = extract_rules_from_policies(
-            experiment_dir=experiment_dir,
-            dataset_name=dataset,
-            max_features_in_rule=max_features_in_rule,
-            steps_per_episode=steps_per_episode,
-            n_instances_per_class=n_instances_per_class,
-            device=device,
-            eval_on_test_data=True,
-            coverage_on_all_data=True,
-            filter_by_prediction=False,
-        )
-
-        # Find rules file
-        inference_dir = Path(experiment_dir) / "inference"
-        rules_file = inference_dir / "extracted_rules.json"
         if rules_file.exists():
             logger.info(f"OK: Multi-agent rules saved to {rules_file}")
             return str(rules_file)
@@ -1098,6 +1175,7 @@ Examples:
                     steps_per_episode=args.steps_per_episode,
                     n_instances_per_class=args.n_instances_per_class,
                     device=args.device,
+                    inference_model_source=args.inference_model_source,
                 )
         elif args.skip_inference and ma_exp_dir:
             rf = Path(ma_exp_dir) / "inference" / "extracted_rules.json"

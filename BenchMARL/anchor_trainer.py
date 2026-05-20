@@ -114,6 +114,19 @@ class AnchorTrainer:
             logger.info(f"  Overriding max_n_frames: {self.experiment_config.max_n_frames} → {max_n_frames}")
             self.experiment_config.max_n_frames = max_n_frames
 
+        # Pin the BenchMARL experiment folder under our output_dir. Without this,
+        # save_folder stays null and BenchMARL writes the experiment to the
+        # current working directory (the project root). That left run_pipeline's
+        # skip-check — which rglobs for individual_models *inside* output_dir —
+        # unable to find finished experiments, so MA training always retrained.
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            self.experiment_config.save_folder = str(Path(self.output_dir).resolve())
+            logger.info(f"  Experiment save_folder pinned to: {self.experiment_config.save_folder}")
+        except Exception as e:
+            logger.warning(f"  Could not pin experiment save_folder ({e}); "
+                           f"BenchMARL will default to the current working directory.")
+
         # Adjust network sizes based on dataset size for larger datasets
         n_train_samples = len(self.dataset_loader.y_train) if hasattr(self.dataset_loader, 'y_train') and self.dataset_loader.y_train is not None else 0
         if n_train_samples > 10000:
@@ -476,12 +489,22 @@ class AnchorTrainer:
         # SS Bug: Check if the collec_anchor_data is actually working
         # Get NashConv threshold from config (default: 0.01)
         nashconv_threshold = env_config.get("nashconv_threshold", 0.01)
-        
+
+        # NashConv is disabled for MASAC: its critic API (twin Q-nets, stochastic
+        # TanhNormal actor) doesn't match the MADDPG-shaped exploitability proxy
+        # this callback implements, so it returns empty metrics anyway. Turning it
+        # off removes the per-eval warning spam and the wasted compute. The
+        # best-model selection below no longer depends on NashConv (see Part 1).
+        compute_nashconv = self.algorithm != "masac"
+        if not compute_nashconv:
+            logger.info("  NashConv disabled for MASAC (incompatible critic API; would return empty metrics).")
+
         self.callback = AnchorMetricsCallback(
-            log_training_metrics=True, 
+            log_training_metrics=True,
             log_evaluation_metrics=True,
             save_to_file=True,
             collect_anchor_data=True,
+            compute_nashconv=compute_nashconv,
             nashconv_threshold=nashconv_threshold
         )
         self.experiment = Experiment(
@@ -1228,23 +1251,78 @@ class AnchorTrainer:
         return experiment_folder
     
     # This is needed for easier inference. Inference with BenchMARL is complicated and couldn't get it to work
+    def extract_best_and_final_models(
+        self,
+        save_policies: bool = True,
+        save_critics: bool = False,
+    ) -> Dict[str, Dict[str, str]]:
+        """Extract per-agent individual models from BOTH the final training
+        state and the best checkpoint.
+
+        Produces, under the experiment folder:
+          individual_models/        <- final training state (always)
+          individual_models_best/   <- best checkpoint state (only if
+                                       best_model/best_checkpoint.pt exists)
+
+        Gives the multi-agent pipeline the same best/final choice the
+        single-agent pipeline has. Returns {"final": {...}, "best": {...}}.
+        """
+        results: Dict[str, Dict[str, str]] = {}
+
+        # 1. Final state — whatever the experiment currently holds.
+        results["final"] = self.extract_and_save_individual_models(
+            save_policies=save_policies, save_critics=save_critics,
+            models_subdir="individual_models",
+        )
+
+        # 2. Best checkpoint, if the callback saved one.
+        best_ckpt = os.path.join(str(self.experiment.folder_name), "best_model", "best_checkpoint.pt")
+        if os.path.exists(best_ckpt):
+            logger.info(f"Best checkpoint found — extracting individual_models_best from: {best_ckpt}")
+            # Snapshot the final state so we can restore it after extraction.
+            final_state = self.experiment.state_dict()
+            try:
+                best_state = torch.load(best_ckpt, map_location="cpu")
+                self.experiment.load_state_dict(best_state)
+                results["best"] = self.extract_and_save_individual_models(
+                    save_policies=save_policies, save_critics=save_critics,
+                    models_subdir="individual_models_best",
+                )
+            except Exception as e:
+                logger.warning(f"Could not extract from best checkpoint ({e}); "
+                               f"multi-agent inference will fall back to final models.")
+                results["best"] = {}
+            finally:
+                # Restore final state so any later use of the experiment is unaffected.
+                try:
+                    self.experiment.load_state_dict(final_state)
+                except Exception as e:
+                    logger.warning(f"Could not restore final experiment state after best extraction: {e}")
+        else:
+            logger.info("No best_model/best_checkpoint.pt found — only final individual_models extracted.")
+            results["best"] = {}
+
+        return results
+
     def extract_and_save_individual_models(
         self,
         output_dir: Optional[str] = None,
         save_policies: bool = True,
-        save_critics: bool = False
+        save_critics: bool = False,
+        models_subdir: str = "individual_models",
     ) -> Dict[str, str]:
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
             )
-        
+
         algorithm = self.experiment.algorithm
-        
-        # Always save in the experiment's run log directory (where BenchMARL saves logs/checkpoints)
-        # SS: Models are saved alongside the run logs, not in a separate location
-        output_dir = os.path.join(str(self.experiment.folder_name), "individual_models")
-        
+
+        # Save in the experiment's run log directory. models_subdir lets the
+        # caller target a separate folder (e.g. "individual_models_best" when
+        # extracting from the best checkpoint — see extract_best_and_final_models).
+        output_dir = os.path.join(str(self.experiment.folder_name), models_subdir)
+
         os.makedirs(output_dir, exist_ok=True)
         
         saved_models = {}
@@ -2301,27 +2379,19 @@ class AnchorTrainer:
                         # Extract action from outputs
                         if isinstance(fwd_outputs, TensorDict):
                             if "action_dist_inputs" in fwd_outputs.keys():
-                                # Create action distribution and get deterministic action
+                                # Create action distribution and get deterministic action.
+                                # TanhNormal.from_logits is absent in this TorchRL
+                                # version; split the raw params with
+                                # NormalParamExtractor and construct directly.
                                 action_dist_inputs = fwd_outputs["action_dist_inputs"]
-                                
-                                # Try to get action distribution class
-                                if hasattr(policy, "get_inference_action_dist_cls"):
-                                    action_dist_class = policy.get_inference_action_dist_cls()
-                                    action_dist = action_dist_class.from_logits(action_dist_inputs)
-                                else:
-                                    # Fallback: try TanhNormal for continuous actions
-                                    from torchrl.modules import TanhNormal
-                                    action_dist = TanhNormal.from_logits(action_dist_inputs)
-                                
-                                # Get deterministic action (mean for evaluation)
-                                if hasattr(action_dist, "mean"):
-                                    action = action_dist.mean()
-                                elif hasattr(action_dist, "deterministic_sample"):
-                                    action = action_dist.deterministic_sample()
-                                elif hasattr(action_dist, "mode"):
-                                    action = action_dist.mode()
-                                else:
-                                    action = action_dist.sample()
+                                from torchrl.modules import TanhNormal
+                                from tensordict.nn.distributions import NormalParamExtractor
+                                _loc, _scale = NormalParamExtractor()(action_dist_inputs)
+                                action_dist = TanhNormal(_loc, _scale)
+                                # Deterministic action = tanh(loc), exposed as the
+                                # `deterministic_sample` property. `.mean`/`.mode`
+                                # raise for TanhNormal (no closed form).
+                                action = action_dist.deterministic_sample
                             elif "action" in fwd_outputs.keys():
                                 action = fwd_outputs["action"]
                             else:
@@ -2330,8 +2400,10 @@ class AnchorTrainer:
                             if "action_dist_inputs" in fwd_outputs:
                                 action_dist_inputs = fwd_outputs["action_dist_inputs"]
                                 from torchrl.modules import TanhNormal
-                                action_dist = TanhNormal.from_logits(action_dist_inputs)
-                                action = action_dist.mean() if hasattr(action_dist, "mean") else action_dist.sample()
+                                from tensordict.nn.distributions import NormalParamExtractor
+                                _loc, _scale = NormalParamExtractor()(action_dist_inputs)
+                                action_dist = TanhNormal(_loc, _scale)
+                                action = action_dist.deterministic_sample
                             elif "action" in fwd_outputs:
                                 action = fwd_outputs["action"]
                             else:

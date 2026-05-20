@@ -476,27 +476,24 @@ def main():
     logger.info(f"\n{'='*80}")
     logger.info("EXTRACTING INDIVIDUAL MODELS FOR STANDALONE INFERENCE")
     logger.info("="*80)
-    # Check if best model exists and use it instead of final checkpoint
-    best_model_path = os.path.join(checkpoint_path, "best_model", "best_checkpoint.pt")
-    if os.path.exists(best_model_path):
-        logger.info(f"\n✓ Found best model checkpoint: {best_model_path}")
-        logger.info(f"  Reloading experiment from best model for individual model extraction...")
-        try:
-            trainer.reload_experiment(best_model_path)
-            logger.info(f"  ✓ Reloaded from best model checkpoint")
-        except Exception as e:
-            logger.warning(f"  ⚠ Could not reload from best model: {e}")
-            logger.info(f"  Falling back to final checkpoint")
-    
+    # Extract per-agent models from BOTH the final training state and the best
+    # checkpoint, producing individual_models/ and individual_models_best/.
+    # extract_best_and_final_models() loads best_model/best_checkpoint.pt
+    # internally and restores the final state, so trainer.experiment must still
+    # hold the final training state here — do NOT reload_experiment() first.
     try:
-        saved_models = trainer.extract_and_save_individual_models(
+        extracted = trainer.extract_best_and_final_models(
             save_policies=True,
             save_critics=False  # Set to True if you need critic models
         )
+        saved_models = extracted.get("final", {})
         # Models are saved in the experiment's run log directory
         models_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models")
         logger.info(f"\n✓ Individual models extracted successfully!")
-        logger.info(f"  Models saved to: {models_dir}")
+        logger.info(f"  Final models saved to: {models_dir}")
+        if extracted.get("best"):
+            best_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models_best")
+            logger.info(f"  Best models saved to: {best_dir}")
     except Exception as e:
         logger.warning(f"\n⚠ Warning: Could not extract individual models: {e}")
         logger.info("  You can still use the full BenchMARL checkpoint for inference")

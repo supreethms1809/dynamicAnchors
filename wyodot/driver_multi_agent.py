@@ -268,18 +268,23 @@ def main():
     logger.info("EXTRACTING INDIVIDUAL MODELS")
     logger.info("=" * 80)
 
-    best_model_path = os.path.join(checkpoint_path, "best_model", "best_checkpoint.pt")
-    if os.path.exists(best_model_path):
-        try:
-            trainer.reload_experiment(best_model_path)
-            logger.info("Reloaded from best model checkpoint")
-        except Exception as e:
-            logger.warning(f"Could not reload best model: {e}")
-
     try:
-        trainer.extract_and_save_individual_models(save_policies=True, save_critics=False)
+        # Extract per-agent models from BOTH the final state and the best
+        # checkpoint (-> individual_models/ and individual_models_best/),
+        # giving multi-agent inference the same best/final choice as single-agent.
+        #
+        # Do NOT reload_experiment(best_checkpoint) first: that would replace
+        # trainer.experiment with the best state, so the "final" extraction
+        # below would also see the best model and individual_models/ would be a
+        # duplicate of individual_models_best/. extract_best_and_final_models()
+        # loads best_checkpoint.pt internally and restores the final state, so
+        # trainer.experiment must still hold the final training state here.
+        extracted = trainer.extract_best_and_final_models(save_policies=True, save_critics=False)
         models_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models")
-        logger.info(f"Individual models saved to: {models_dir}")
+        logger.info(f"Final individual models saved to: {models_dir}")
+        if extracted.get("best"):
+            best_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models_best")
+            logger.info(f"Best individual models saved to: {best_dir}")
     except Exception as e:
         logger.warning(f"Could not extract individual models: {e}")
 

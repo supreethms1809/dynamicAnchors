@@ -1177,6 +1177,58 @@ class AnchorMetricsCallback(Callback):
                 
                 self.training_metrics = []
     
+    def _extract_eval_score(self, aggregated: Dict[str, float]) -> Optional[float]:
+        """Pull a single scalar 'how good is this eval' score from the aggregated
+        metrics, robustly across algorithms.
+
+        Priority:
+          1. anchor_precision_mean + anchor_coverage_mean  (preferred; the
+             legacy MADDPG path uses these)
+          2. any '*reward*mean*' eval key  (always logged by BenchMARL)
+          3. any '*return*mean*' eval key
+        Returns None if nothing usable is found.
+        """
+        prec_keys = [k for k in aggregated if "anchor_precision" in k and "mean" in k and "evaluation" in k]
+        cov_keys = [k for k in aggregated if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
+        if prec_keys and cov_keys:
+            return float(aggregated[prec_keys[0]]) + float(aggregated[cov_keys[0]])
+        for needle in ("reward", "return", "episode_reward"):
+            cands = [k for k in aggregated if needle in k.lower() and "mean" in k.lower()]
+            if cands:
+                return float(aggregated[cands[0]])
+        return None
+
+    def _save_best_model_if_improved(self, aggregated: Dict[str, float]) -> None:
+        """Save best_model/best_checkpoint.pt whenever the eval score improves.
+
+        Algorithm-agnostic and independent of NashConv / equilibrium logic.
+        Tracks its own score in self._robust_best_score so it does not interfere
+        with the legacy per-class tracking further down on_evaluation_end.
+        """
+        if not self.save_best_model or self.experiment is None:
+            return
+        score = self._extract_eval_score(aggregated)
+        if score is None:
+            return
+        if not hasattr(self, "_robust_best_score"):
+            self._robust_best_score = -float("inf")
+        # First eval always saves (>-inf); thereafter only on improvement.
+        if score > self._robust_best_score:
+            best_model_dir = os.path.join(str(self.experiment.folder_name), "best_model")
+            os.makedirs(best_model_dir, exist_ok=True)
+            best_model_path = os.path.join(best_model_dir, "best_checkpoint.pt")
+            # BenchMARL Experiment has no public .save() — persist the state_dict
+            # directly (same format experiment._save_experiment writes, so it can
+            # be reloaded later via torch.load + experiment.load_state_dict).
+            torch.save(self.experiment.state_dict(), best_model_path)
+            prev = self._robust_best_score
+            self._robust_best_score = score
+            self.best_model_path = best_model_path
+            logger.info(
+                f"  ✓ best_model saved (robust path): eval score {score:.4f} "
+                f"(prev best {prev if prev != -float('inf') else 'none'}) -> {best_model_path}"
+            )
+
     # SS: This function is way too messy. We need to fix this. Its not working right now.
     def on_evaluation_end(self, rollouts: List[TensorDictBase]):
         if not self.log_evaluation_metrics:
@@ -1413,7 +1465,17 @@ class AnchorMetricsCallback(Callback):
                     aggregated[f"{key}_max"] = max(values)
         
         aggregated["evaluation/n_episodes"] = n_episodes
-        
+
+        # Algorithm-agnostic best-model save (Part 1 fix).
+        # The legacy save block further down is gated on string-matching
+        # 'anchor_precision'/'anchor_coverage' eval keys; for MASAC those keys
+        # are not produced, so best_model was never saved. This call runs
+        # unconditionally on every eval and owns best_model/best_checkpoint.pt.
+        try:
+            self._save_best_model_if_improved(aggregated)
+        except Exception as e:
+            logger.warning(f"best-model save (robust path) failed: {e}")
+
         # Compute NashConv/exploitability metrics (always compute, even if other metrics are empty)
         if self.compute_nashconv:
             try:

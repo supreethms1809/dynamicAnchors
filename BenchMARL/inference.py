@@ -749,25 +749,35 @@ def run_rollout_with_policy(
             # BenchMARL policies outputs action_dist_inputs-logits that need TanhNormal conversion
             if isinstance(fwd_outputs, dict):
                 if "action_dist_inputs" in fwd_outputs:
-                    # Policy outputs logits for TanhNormal distribution
+                    # Policy outputs raw [loc, scale] params for a TanhNormal.
+                    # TanhNormal.from_logits does not exist in this TorchRL
+                    # version, so split the params with NormalParamExtractor
+                    # (the same splitter BenchMARL's actor uses) and construct
+                    # the distribution directly. NormalParamExtractor halves the
+                    # last dim into loc/scale and applies the biased-softplus
+                    # scale mapping, matching conf/masac.yaml scale_mapping.
                     from torchrl.modules import TanhNormal
+                    from tensordict.nn.distributions import NormalParamExtractor
                     action_dist_inputs = fwd_outputs["action_dist_inputs"]
-                    action_dist = TanhNormal.from_logits(action_dist_inputs)
-                    # Use exploration mode for diversity: sample, mean, or noisy_mean
+                    loc, scale = NormalParamExtractor()(action_dist_inputs)
+                    action_dist = TanhNormal(loc, scale)
+                    # Deterministic action for a TanhNormal is `tanh(loc)`, exposed
+                    # by TorchRL as the `deterministic_sample` PROPERTY. `.mean`
+                    # and `.mode` both raise (no closed form for a squashed
+                    # Normal), so do not use them.
+                    det_action = action_dist.deterministic_sample
                     action_has_noise = False  # Track if noise was already added
                     if exploration_mode == "sample":
                         # Sample from distribution for diversity
                         action = action_dist.sample()
                         action_has_noise = True  # Sampling provides randomness
                     elif exploration_mode == "noisy_mean":
-                        # Add Gaussian noise to mean action.
-                        # TorchRL TanhNormal.mean is a property (not a method).
-                        mean_action = action_dist.mean if hasattr(action_dist, "mean") else action_dist.sample()
-                        noise = torch.randn_like(mean_action) * action_noise_scale
-                        action = torch.clamp(mean_action + noise, -1.0, 1.0)
+                        # Add Gaussian noise to the deterministic action.
+                        noise = torch.randn_like(det_action) * action_noise_scale
+                        action = torch.clamp(det_action + noise, -1.0, 1.0)
                         action_has_noise = True
                     else:
-                        action = action_dist.mean if hasattr(action_dist, "mean") else action_dist.sample()
+                        action = det_action
                         action_has_noise = False
                 elif "action" in fwd_outputs:
                     action = fwd_outputs["action"]
@@ -1118,16 +1128,31 @@ def extract_rules_from_policies(
     exploration_mode: str = "sample",
     action_noise_scale: float = 0.05,
     filter_by_prediction: bool = False,  # Default False for fair comparison (can be enabled if needed)
+    prefer_model: str = "final",  # "best" or "final" — which extracted-models folder to use
 ) -> Dict[str, Any]:
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
     logger.info("="*80)
     logger.info(f"Experiment directory: {experiment_dir}")
     logger.info(f"Dataset: {dataset_name}")
+    logger.info(f"Model preference: {prefer_model}")
     logger.info("="*80)
-    
-    # Find individual_models directory
-    individual_models_dir = os.path.join(experiment_dir, "individual_models")
+
+    # Resolve the models directory. "best" -> individual_models_best (extracted
+    # from best_model/best_checkpoint.pt); "final" -> individual_models. If the
+    # requested folder is missing, fall back to the other so inference still runs.
+    pm = str(prefer_model).lower()
+    final_dir = os.path.join(experiment_dir, "individual_models")
+    best_dir = os.path.join(experiment_dir, "individual_models_best")
+    if pm == "best":
+        individual_models_dir = best_dir if os.path.isdir(best_dir) else final_dir
+    else:
+        individual_models_dir = final_dir if os.path.isdir(final_dir) else best_dir
+    if individual_models_dir == best_dir:
+        logger.info(f"Using BEST extracted models: {best_dir}")
+    else:
+        logger.info(f"Using FINAL extracted models: {final_dir}")
+
     if not os.path.exists(individual_models_dir):
         raise ValueError(
             f"Individual models directory not found: {individual_models_dir}\n"
