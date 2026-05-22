@@ -740,13 +740,39 @@ def run_single_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwarg
 
 
 def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs) -> Optional[str]:
-    """Run multi-agent rule testing in-process. Returns path to saved test results."""
+    """Run multi-agent rule testing in-process. Returns path to saved test results.
+
+    Mirrors run_single_agent_test: alongside the JSON results it writes a
+    dedicated per-test log file and a human-readable Markdown summary into
+    <experiment_dir>/inference/, so the MA test report has the same artifacts
+    as the SA one (previously only the JSON was saved for MA).
+    """
     logger.info(f"\n{'='*80}")
     logger.info(f"Multi-Agent Test Rules: {dataset}")
     logger.info(f"{'='*80}")
 
+    inference_dir = Path(rules_file).parent
+    inference_dir.mkdir(parents=True, exist_ok=True)
+    test_log_path = str(inference_dir / "test_report_multi_agent.log")
+    test_md_path = str(inference_dir / "test_report_multi_agent.md")
+    test_results_file = str(inference_dir / "test_results_multi_agent.json")
+
+    file_handler = None
     try:
         from test_extracted_rules import test_rules_from_json as test_ma
+        # add_file_log_handler / _write_test_report_markdown are algorithm-agnostic
+        # (they only touch the logger and the results dict). Reuse the single-agent
+        # implementations so the MA and SA reports stay in lockstep instead of
+        # drifting as two copies.
+        from test_extracted_rules_single import (
+            add_file_log_handler,
+            _write_test_report_markdown,
+        )
+
+        # Attach a dedicated FileHandler so per-rule log output lands in the
+        # experiment folder, not buried in pipeline_run.log.
+        file_handler = add_file_log_handler(test_log_path)
+        logger.info(f"Per-test log file: {test_log_path}")
 
         results = test_ma(
             rules_file=rules_file,
@@ -755,28 +781,40 @@ def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs
             use_full_dataset=kwargs.get("use_full_dataset", True),
         )
 
-        # Save test results so summarize_and_plot can use them without re-running
-        def _convert(obj):
-            if isinstance(obj, np.ndarray): return obj.tolist()
-            if isinstance(obj, (np.integer, np.int_)): return int(obj)
-            if isinstance(obj, np.floating): return float(obj)
-            if isinstance(obj, (np.bool_, bool)): return bool(obj)
-            if isinstance(obj, dict): return {_convert(k): _convert(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)): return [_convert(i) for i in obj]
-            return obj
+        # The MA test-results dict doesn't carry these fields; tag them so the
+        # report header isn't 'unknown'.
+        results.setdefault("algorithm", kwargs.get("algorithm", "multi_agent"))
+        results.setdefault("model_type", "mlp")
 
-        inference_dir = Path(rules_file).parent
-        test_results_file = str(inference_dir / "test_results_multi_agent.json")
         with open(test_results_file, 'w') as f:
-            json.dump(_convert(results), f, indent=2)
+            json.dump(_convert_for_json(results), f, indent=2)
 
-        logger.info(f"OK: Multi-agent test completed, results saved to {test_results_file}")
+        try:
+            _write_test_report_markdown(results, test_md_path)
+        except Exception as e:
+            logger.warning(f"Could not write multi-agent markdown report: {e}")
+            test_md_path = None
+
+        logger.info(f"OK: Multi-agent test completed")
+        logger.info(f"  JSON:     {test_results_file}")
+        if test_md_path:
+            logger.info(f"  Markdown: {test_md_path}")
+        logger.info(f"  Log:      {test_log_path}")
         return test_results_file
     except Exception as e:
         logger.error(f"FAIL: Multi-agent test: {e}")
         import traceback
         traceback.print_exc()
         return None
+    finally:
+        # Detach the per-test file handler so the pipeline's root logger
+        # doesn't accumulate handlers across runs.
+        if file_handler is not None:
+            try:
+                logging.getLogger().removeHandler(file_handler)
+                file_handler.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1226,7 @@ Examples:
             ma_test_results = run_multi_agent_test(
                 rules_file=ma_rules, dataset=args.dataset,
                 seed=args.seed, use_full_dataset=True,
+                algorithm=args.algorithm,
             )
 
         # Summarize & Plot (subprocess — pass pre-computed test results)
