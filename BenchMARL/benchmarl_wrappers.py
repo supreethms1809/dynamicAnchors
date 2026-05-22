@@ -1466,6 +1466,44 @@ class AnchorMetricsCallback(Callback):
         
         aggregated["evaluation/n_episodes"] = n_episodes
 
+        # Mean episode reward across the eval rollouts. Unlike the info-derived
+        # anchor_precision/anchor_coverage keys, reward is ALWAYS present in the
+        # rollout tensors — MASAC eval rollouts don't carry anchor metrics in
+        # `info`, so all_metrics comes back empty and aggregated would otherwise
+        # have no scorable key. Injecting this gives _extract_eval_score a
+        # usable fallback so best_model/best_checkpoint.pt is saved for MASAC.
+        # Harmless for MADDPG: _extract_eval_score still prefers precision+coverage.
+        try:
+            groups_for_reward = (
+                list(self.experiment.group_map.keys())
+                if hasattr(self.experiment, "group_map") and self.experiment.group_map
+                else ["agent"]
+            )
+            ep_returns = []
+            for rollout in rollouts:
+                nxt = rollout.get("next", None) if hasattr(rollout, "get") else None
+                group_returns = []
+                for group in groups_for_reward:
+                    rew = None
+                    for src in (nxt, rollout):
+                        if src is None or not hasattr(src, "keys"):
+                            continue
+                        try:
+                            if group in src.keys() and "reward" in src[group].keys():
+                                rew = src[group]["reward"]
+                                break
+                        except Exception:
+                            continue
+                    if rew is not None:
+                        rew_t = rew if isinstance(rew, torch.Tensor) else torch.as_tensor(rew)
+                        group_returns.append(float(rew_t.sum()))
+                if group_returns:
+                    ep_returns.append(sum(group_returns) / len(group_returns))
+            if ep_returns:
+                aggregated["evaluation/episode_reward_mean"] = sum(ep_returns) / len(ep_returns)
+        except Exception as e:
+            logger.debug(f"Could not compute eval episode reward for best-model scoring: {e}")
+
         # Algorithm-agnostic best-model save (Part 1 fix).
         # The legacy save block further down is gated on string-matching
         # 'anchor_precision'/'anchor_coverage' eval keys; for MASAC those keys
