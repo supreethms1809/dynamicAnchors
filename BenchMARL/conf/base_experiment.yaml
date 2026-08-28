@@ -59,7 +59,11 @@ max_n_iters: null
 # Number of collected frames before ending, exclusive with max_n_iters
 # A frame is one shared-env transition; every agent in the group acts on each
 # frame, so max_n_frames is the per-agent timestep budget.
-max_n_frames: 600_000
+# 1_152_000: the kvdw_labeled MASAC run (aab2356b) plateaued by ~864k and hit
+# its best eval at 1,056k; nothing improved over the remaining 550k frames of
+# the old 1_600_000 budget. Must stay a multiple of evaluation_interval so the
+# final eval lands on the last frame.
+max_n_frames: 1_152_000
 
 # Number of frames collected and each experiment iteration
 # CPU-optimized: Reduced batch size to prevent CPU overload and hangs
@@ -84,10 +88,20 @@ on_policy_minibatch_size: 64
 off_policy_collected_frames_per_batch: 4800
 # Number of environments used for collection.
 off_policy_n_envs_per_worker: 12
-# Number of gradient updates per iteration.
+# Number of gradient updates per iteration. DO NOT reduce for speed: this is the
+# SAC update-to-data ratio (~1000/4800 = 0.21 updates per collected frame) and
+# it directly controls how fast the entropy temperature (alpha) anneals and the
+# critic trains. Cutting it to 250/125 starved the temperature auto-tuner (alpha
+# stayed ~0.6 instead of annealing to ~0.01), the policy never sharpened
+# (entropy pinned near max), and the critic diverged (actor loss -> -200,
+# Q-values detached from the true reward scale). These steps ARE the learning,
+# not per-step overhead — there is no free speedup here on a CPU with networks
+# this small (256-wide MLPs don't benefit from intra-op threading).
 off_policy_n_optimizer_steps: 1000
-# Number of frames used per minibatch during training.
-off_policy_train_batch_size: 1024
+# Number of frames used per minibatch during training. 2048 is the proven value.
+# Raising it (e.g. 4096) gives steadier gradients and uses more of an idle box,
+# but costs proportional wall-clock per step — it buys stability, NOT speed.
+off_policy_train_batch_size: 2048
 # Replay buffer size.
 off_policy_memory_size: 5_000_000
 # Number of random action frames to prefill the replay buffer with
@@ -107,8 +121,9 @@ render: True
 # Frequency of evaluation in terms of collected frames. MUST be a multiple of
 # the ACTUAL collected_frames_per_batch (4800) so total_frames lands on it
 # exactly and BenchMARL's `total_frames % evaluation_interval == 0` eval trigger
-# fires. 24_000 = 4800 * 5 -> evaluation every 5 iterations (~25 evals over a
-# 125-iteration run).
+# fires. 24_000 = 4800 * 5 -> evaluation every 5 iterations (48 evals over the
+# 1_152_000-frame run). Eval reward is spiky (periodic instability dips), so a
+# dense eval grid is what lets best_model checkpointing catch the good policies.
 evaluation_interval: 24_000
 # Number of episodes that evaluation is run on
 # Production setting: Increased for more reliable evaluation metrics

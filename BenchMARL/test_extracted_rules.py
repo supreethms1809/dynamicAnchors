@@ -30,6 +30,11 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Minimum fraction of a class's samples a rule must cover before we consider the
+# rule to "satisfy" (overlap with) that class. A handful of stray samples should
+# not flag a rule as belonging to that class.
+MIN_OVERLAP_COVERAGE = 0.05
+
 
 def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -589,30 +594,53 @@ def select_global_rules_per_class(
                 "n_selected_rules": 0,
                 "selected_rule_indices": [],
                 "selected_rules": [],
-                "class_union_coverage": 0.0,
-                "class_union_precision": 0.0,
+                # No samples of this class exist in the evaluation data, so both
+                # union metrics are undefined (0/0), not zero.
+                "class_union_coverage": None,
+                "class_union_precision": None,
                 "n_covered_class_samples": 0,
                 "n_union_samples_total": 0,
             }
             continue
 
         # Build candidate list for this class using unique_rules from per_class_results
-        # (same source as missed_samples_analysis to ensure consistency)
-        # Compute metrics directly from rule strings, matching missed_samples_analysis approach
+        # (same source as missed_samples_analysis to ensure consistency).
+        # We build candidates_all (everything that touches at least one class sample)
+        # AND candidates (the subset meeting precision_threshold). If candidates is
+        # empty but candidates_all is not, we fall back to candidates_all ranked by
+        # precision so the global-explanation report can show *something* instead
+        # of a misleading 0/0 — and we flag the fallback so the caller knows.
         candidates: List[Dict[str, Any]] = []
+        candidates_all: List[Dict[str, Any]] = []
         if class_key not in per_class_results:
             # Fallback: if class_key not in per_class_results, try to get from rule_results
             # This shouldn't happen if per_class_results is properly populated
             logger.warning(f"  Class key {class_key} not found in per_class_results. Available keys: {list(per_class_results.keys())}")
         else:
             unique_rules = per_class_results[class_key].get("unique_rules", [])
+            # Fallback: if the instance-based slot is empty (e.g. the classifier
+            # never predicted this class for any sampled instance, so no
+            # instance-based rollouts ran), borrow the class-based rules from
+            # the sibling "class_<N>_class_based" entry. These rules came from
+            # centroid-seeded class-based rollouts and don't depend on
+            # prediction routing — so they're available even when instance
+            # routing produces zero hits for the class.
+            cb_key = f"{class_key}_class_based"
+            if not unique_rules and cb_key in per_class_results:
+                cb_rules = per_class_results[cb_key].get("unique_rules", [])
+                if cb_rules:
+                    unique_rules = cb_rules
+                    logger.info(
+                        f"  Class {cls}: instance-based rules empty; falling back to "
+                        f"{len(cb_rules)} class-based rules from {cb_key} for global explanation."
+                    )
             if not unique_rules:
-                logger.debug(f"  No unique_rules found for {class_key} in per_class_results")
-            
+                logger.debug(f"  No unique_rules found for {class_key} or {cb_key} in per_class_results")
+
             for rule_str in unique_rules:
                 if rule_str == "any values (no tightened features)":
                     continue
-                
+
                 # Parse rule and compute metrics directly (same as missed_samples_analysis)
                 rule_conditions = parse_rule(rule_str)
                 if len(rule_conditions) == 0:
@@ -620,36 +648,56 @@ def select_global_rules_per_class(
                     satisfying_mask = np.ones(n_samples, dtype=bool)
                 else:
                     satisfying_mask = check_rule_satisfaction(X_data, feature_names, rule_conditions)
-                
+
                 # Get class-specific samples (same approach as missed_samples_analysis)
                 class_satisfying = satisfying_mask[class_mask]  # Index to get only class samples
                 n_satisfying_class = int(np.sum(class_satisfying))
                 if n_satisfying_class <= 0:
                     continue
-                
+
                 # Compute precision: fraction of satisfying samples that belong to this class
                 n_satisfying_total = int(np.sum(satisfying_mask))
                 if n_satisfying_total > 0:
                     rule_prec = float(n_satisfying_class / n_satisfying_total)
                 else:
                     rule_prec = 0.0
-                
-                if rule_prec < precision_threshold:
-                    continue
-                
+
                 # Get indices of satisfying class samples (in full dataset indices)
                 class_satisfying_mask = satisfying_mask & class_mask
                 satisfying_class_indices = set(np.where(class_satisfying_mask)[0].tolist())
-                
+
                 # Find rule index in rule_results for union precision calculation
                 rule_idx = rule_str_to_idx.get(rule_str, -1)
-                
-                candidates.append({
+
+                cand = {
                     "rule_idx": rule_idx,
                     "rule_str": rule_str,
                     "precision": rule_prec,
                     "class_indices": satisfying_class_indices,
-                })
+                }
+                candidates_all.append(cand)
+                if rule_prec >= precision_threshold:
+                    candidates.append(cand)
+
+        # Fallback: if no rule met precision_threshold but rules do exist that
+        # cover this class, surface the top-K-by-precision so the user can see
+        # what the policy actually produced. The report layer can flag these
+        # via "fallback_used" / "max_candidate_precision".
+        used_fallback = False
+        if not candidates and candidates_all:
+            used_fallback = True
+            # Sort by precision desc; tie-break by class coverage desc
+            candidates_all.sort(
+                key=lambda c: (c["precision"], len(c["class_indices"])),
+                reverse=True,
+            )
+            fallback_k = max_rules_per_class if (max_rules_per_class and max_rules_per_class > 0) else len(candidates_all)
+            candidates = candidates_all[:fallback_k]
+            logger.warning(
+                f"  Class {cls}: no rule met precision_threshold={precision_threshold:.2f}; "
+                f"falling back to top {len(candidates)} of {len(candidates_all)} rules by precision "
+                f"(max precision available: {candidates_all[0]['precision']:.4f})"
+            )
 
         selected: List[Dict[str, Any]] = []
         covered_class_indices: Set[int] = set()
@@ -715,8 +763,13 @@ def select_global_rules_per_class(
             n_union_class = sum(1 for idx in union_indices_global if y_data[idx] == cls)
             class_union_precision = n_union_class / n_union_total
         else:
-            class_union_precision = 0.0
+            # Precision of an empty rule set is UNDEFINED, not zero. Reporting 0.0
+            # here made "no rules were produced" indistinguishable from "the rules
+            # produced were completely wrong", and put a hard 0.000 into the paper's
+            # union columns for classes that simply had nothing to score.
+            class_union_precision = None
 
+        max_candidate_precision = max((c["precision"] for c in candidates_all), default=0.0)
         global_explanations["per_class"][class_key] = {
             "class": int(cls),
             "n_class_samples": int(n_class_samples),
@@ -724,9 +777,15 @@ def select_global_rules_per_class(
             "selected_rule_indices": [s["rule_idx"] for s in selected],
             "selected_rules": [s["rule_str"] for s in selected],
             "class_union_coverage": float(class_union_coverage),
-            "class_union_precision": float(class_union_precision),
+            "class_union_precision": (
+                float(class_union_precision) if class_union_precision is not None else None
+            ),
             "n_covered_class_samples": int(n_covered_class),
             "n_union_samples_total": int(n_union_total),
+            # Honesty fields: did we have to drop below the precision bar to show anything?
+            "fallback_used": bool(used_fallback),
+            "n_candidates_total": int(len(candidates_all)),
+            "max_candidate_precision": float(max_candidate_precision),
         }
 
     return global_explanations
@@ -1092,26 +1151,24 @@ def test_rules_from_json(
             
             rule_result["per_class_results"][f"class_{target_class}"] = class_result
             
+            # A rule meaningfully applies to a class only if it covers a real
+            # fraction of that class (or the class is a source class). This avoids
+            # attributing the rule to a class it merely grazes with a few samples.
+            is_source_class = target_class in rule_to_source_classes[rule_str]
+            rule_applies_to_class = coverage >= MIN_OVERLAP_COVERAGE or is_source_class
+
             logger.info(f"  Class {target_class}:")
             logger.info(f"    Samples satisfying: {n_satisfying_class}/{n_class_samples} ({100*coverage:.2f}% coverage)")
-            logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
-            
-            # Only display instance-level and class-level metrics if:
-            # 1. The rule matches samples from this class (n_satisfying_class > 0), OR
-            # 2. This class is a source class for this rule (where it was extracted from)
-            is_source_class = target_class in rule_to_source_classes[rule_str]
-            should_show_metrics = n_satisfying_class > 0 or is_source_class
-            
-            if should_show_metrics:
-                # Display instance-level and class-level metrics if available
-                if "instance_precision" in class_result:
-                    logger.info(f"    Instance-level precision: {class_result['instance_precision']:.4f} (from inference on {metrics_data_source})")
-                    logger.info(f"    Instance-level coverage: {class_result['instance_coverage']:.4f} (from inference on {metrics_data_source})")
-                if "class_precision" in class_result:
-                    logger.info(f"    Class-level precision: {class_result['class_precision']:.4f} (from inference on {metrics_data_source})")
-                    logger.info(f"    Class-level coverage: {class_result['class_coverage']:.4f} (from inference on {metrics_data_source})")
-            
-            if n_satisfying_class > 0:
+            # Rule-level precision is a single per-rule score, NOT a per-class quantity —
+            # only show it under classes the rule actually applies to.
+            if rule_applies_to_class:
+                logger.info(f"    Rule-level precision: {precision:.4f} (calculated from testing)")
+            # NOTE: per-class "Instance-level"/"Class-level" precision & coverage were
+            # removed here — they were pulled from per_class_results[class_key], a
+            # class-level aggregate keyed only by class, so they were printed identically
+            # for every rule touching that class and did NOT describe this rule.
+
+            if coverage >= MIN_OVERLAP_COVERAGE:
                 classes_satisfied.append(target_class)
         
         # Check if rule satisfies multiple classes
@@ -1154,10 +1211,8 @@ def test_rules_from_json(
                 # Calculate a combined score for ranking (weighted: precision more important)
                 # Using F1-like score: 2 * (precision * coverage) / (precision + coverage)
                 # But we'll prioritize precision, so use: precision * (1 + coverage)
-                if rule_precision > 0:
-                    combined_score = rule_precision * (1.0 + rule_coverage)
-                else:
-                    combined_score = 0.0
+                from utils.metrics import ranking_score as _ranking_score
+                combined_score = _ranking_score(rule_precision, rule_coverage, "precision_coverage")
                 
                 class_rules_with_metrics.append({
                     "rule": rule_str,
@@ -1369,8 +1424,10 @@ def test_rules_from_json(
         logger.info(f"Class {cls}:")
         logger.info(f"  Class samples: {n_class_samples}")
         logger.info(f"  Selected rules: {n_selected}")
-        logger.info(f"  Class-union coverage: {union_cov:.4f} ({n_covered}/{n_class_samples} samples covered)")
-        logger.info(f"  Class-union precision: {union_prec:.4f}")
+        cov_str = f"{union_cov:.4f}" if union_cov is not None else "N/A (no class samples)"
+        prec_str = f"{union_prec:.4f}" if union_prec is not None else "N/A (empty rule set)"
+        logger.info(f"  Class-union coverage: {cov_str} ({n_covered}/{n_class_samples} samples covered)")
+        logger.info(f"  Class-union precision: {prec_str}")
         
         if n_selected > 0:
             logger.info(f"  Selected rule indices: {selected_indices}")
@@ -1402,6 +1459,11 @@ Examples:
   # Save results to file
   python test_extracted_rules.py --rules_file path/to/extracted_rules.json --dataset breast_cancer --output results.json
         """
+    )
+    logger.warning(
+        "This script unions printed unique_rules strings and is NOT the paper "
+        "reporting path (C-01 / C-10). Use `python -m revision.evaluate` for "
+        "held-out Fid/Pur, n_covered, and top-k unions from stored boxes."
     )
     
     parser.add_argument(

@@ -28,6 +28,14 @@ import argparse
 import random
 import numpy as np
 import torch
+
+# The BLAS env caps above exist to keep the spawned collector workers from
+# creating thread-pool storms (12 workers x N BLAS threads), but when inherited
+# by THIS process they leave the training loop single-threaded (torch sizes its
+# intra-op pool from OMP_NUM_THREADS). Size the main process's pool explicitly:
+# the optimizer steps run here, not in the workers. Workers spawned later
+# re-import torch under the env caps and keep their small pools.
+torch.set_num_threads(max(1, (os.cpu_count() or 4) - 2))
 import json
 import shutil
 import logging

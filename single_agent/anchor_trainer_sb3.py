@@ -42,7 +42,11 @@ except ImportError:
     logger.error("Stable-Baselines3 not available. Please install: pip install stable-baselines3")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from single_agentENV import SingleAgentAnchorEnv
+from utils.metrics import ranking_score
 
 
 def _build_anchor_env_thunk(env_data, env_config, target_class, device, classifier, seed):
@@ -128,8 +132,16 @@ class LearningRateScheduleCallback(BaseCallback):
         self.patience = patience
         self.best_mean_reward = -float('inf')
         self.patience_counter = 0
+        self.eval_callback = None
         
     def _on_step(self) -> bool:
+        if (
+            self.eval_callback is not None
+            and self.eval_callback.eval_freq > 0
+            and self.n_calls % self.eval_callback.eval_freq == 0
+            and np.isfinite(getattr(self.eval_callback, "last_mean_reward", np.nan))
+        ):
+            self.on_evaluation_end(self.eval_callback)
         return True
     
     def _on_rollout_end(self) -> None:
@@ -142,8 +154,8 @@ class LearningRateScheduleCallback(BaseCallback):
         Called by EvalCallback when evaluation completes.
         Reduces learning rate if performance hasn't improved.
         """
-        if hasattr(eval_callback, 'best_mean_reward'):
-            current_reward = eval_callback.best_mean_reward
+        if hasattr(eval_callback, 'last_mean_reward'):
+            current_reward = float(eval_callback.last_mean_reward)
             
             if current_reward > self.best_mean_reward:
                 self.best_mean_reward = current_reward
@@ -156,15 +168,126 @@ class LearningRateScheduleCallback(BaseCallback):
                     new_lr = max(self.current_lr * self.reduction_factor, self.min_lr)
                     if new_lr < self.current_lr:
                         self.current_lr = new_lr
-                        # Update learning rate in the model
-                        if hasattr(self.model, 'actor') and hasattr(self.model.actor, 'optimizer'):
-                            for param_group in self.model.actor.optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                        if hasattr(self.model, 'critic') and hasattr(self.model.critic, 'optimizer'):
-                            for param_group in self.model.critic.optimizer.param_groups:
-                                param_group['lr'] = new_lr
+                        # SB3 refreshes optimizer rates from lr_schedule during
+                        # train(), so update both the schedule and all optimizers.
+                        self.model.lr_schedule = lambda _: self.current_lr
+                        for owner in (getattr(self.model, "actor", None),
+                                      getattr(self.model, "critic", None)):
+                            optimizer = getattr(owner, "optimizer", None)
+                            if optimizer is not None:
+                                for param_group in optimizer.param_groups:
+                                    param_group["lr"] = new_lr
+                        ent_optimizer = getattr(self.model, "ent_coef_optimizer", None)
+                        if ent_optimizer is not None:
+                            for param_group in ent_optimizer.param_groups:
+                                param_group["lr"] = new_lr
                         logger.info(f"  Learning rate reduced to: {new_lr:.2e} (patience: {self.patience_counter}/{self.patience})")
                         self.patience_counter = 0
+
+
+class FidCovEvalCallback(BaseCallback):
+    """Save best_model.zip on ranking_score(mean P, mean C), not episode reward.
+
+    Terminal bonuses make SB3 EvalCallback pick an early lucky episode.
+    This callback runs deterministic rollouts every eval_freq steps and
+    checkpoints when Fid×(1+Cov) improves.
+    """
+
+    def __init__(
+        self,
+        eval_env,
+        best_model_save_path: str,
+        eval_freq: int,
+        n_eval_episodes: int = 4,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.best_model_save_path = best_model_save_path
+        self.eval_freq = int(eval_freq)
+        self.n_eval_episodes = int(n_eval_episodes)
+        self.best_score = float("-inf")
+        self.last_mean_precision = float("nan")
+        self.last_mean_coverage = float("nan")
+        self.last_score = float("nan")
+
+    @staticmethod
+    def _reset(env):
+        out = env.reset()
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+    @staticmethod
+    def _step(env, action):
+        out = env.step(action)
+        if len(out) == 5:
+            obs, _reward, terminated, truncated, info = out
+            return obs, bool(terminated or truncated), info
+        obs, _reward, done, info = out
+        return obs, bool(done), info
+
+    @staticmethod
+    def _info_metric(info: Dict[str, Any], key: str) -> Optional[float]:
+        if not isinstance(info, dict):
+            return None
+        if info.get(key) is not None:
+            return float(info[key])
+        inner = info.get("episode")
+        if isinstance(inner, dict) and inner.get(key) is not None:
+            return float(inner[key])
+        return None
+
+    def _evaluate(self) -> Tuple[float, float]:
+        precs: List[float] = []
+        covs: List[float] = []
+        for _ in range(self.n_eval_episodes):
+            obs = self._reset(self.eval_env)
+            done = False
+            last_info: Dict[str, Any] = {}
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, done, info = self._step(self.eval_env, action)
+                last_info = info if isinstance(info, dict) else {}
+            p = self._info_metric(last_info, "anchor_precision")
+            c = self._info_metric(last_info, "anchor_coverage")
+            if p is None or c is None:
+                continue
+            precs.append(p)
+            covs.append(c)
+        if not precs:
+            return float("nan"), float("nan")
+        return float(np.mean(precs)), float(np.mean(covs))
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
+            return True
+        mean_p, mean_c = self._evaluate()
+        self.last_mean_precision = mean_p
+        self.last_mean_coverage = mean_c
+        score = ranking_score(mean_p, mean_c)
+        self.last_score = score
+        logger.info(
+            "  FidCov eval @ %s steps: mean P=%.4f C=%.4f score=%.4f (best=%.4f)",
+            self.n_calls,
+            mean_p,
+            mean_c,
+            score if np.isfinite(score) else float("nan"),
+            self.best_score if np.isfinite(self.best_score) else float("nan"),
+        )
+        if score > self.best_score:
+            os.makedirs(self.best_model_save_path, exist_ok=True)
+            zip_path = os.path.join(self.best_model_save_path, "best_model.zip")
+            self.model.save(zip_path)
+            prev = self.best_score
+            self.best_score = score
+            logger.info(
+                "  ✓ best_model.zip saved on ranking_score %.4f (prev %s) -> %s",
+                score,
+                f"{prev:.4f}" if prev != float("-inf") else "none",
+                zip_path,
+            )
+        return True
 
 
 class AnchorTrainerSB3:
@@ -284,7 +407,7 @@ class AnchorTrainerSB3:
         target_classes: Optional[List[int]] = None,
         max_cycles: Optional[int] = None,  # If None, will read from env_config
         device: str = "cpu",
-        eval_on_test_data: bool = True
+        eval_on_test_data: Optional[bool] = None
     ):
         """
         Set up the training experiment.
@@ -384,10 +507,33 @@ class AnchorTrainerSB3:
             "scaler_scale": env_data.get("scaler_scale"),
             "max_cycles": max_cycles,
             "min_coverage_floor": min_coverage_floor,  # Override with dynamic value
+            "categorical_indices": env_data.get("categorical_indices") or [],
+            "categorical_value_names": env_data.get("categorical_value_names") or {},
+            "X_val_unit": env_data.get("X_val_unit"),
+            "X_val_std": env_data.get("X_val_std"),
+            "y_val": env_data.get("y_val"),
+            "categorical_indices": env_data.get("categorical_indices") or [],
+            "categorical_value_names": env_data.get("categorical_value_names") or {},
+            "X_test_unit": env_data.get("X_test_unit"),
+            "X_test_std": env_data.get("X_test_std"),
+            "y_test": env_data.get("y_test"),
         }
         
         logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} for training (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
         
+        if eval_on_test_data is None:
+            eval_on_test_data = bool(env_config.get("eval_on_test_data", False))
+            logger.info(
+                f"  eval_on_test_data={eval_on_test_data} from YAML "
+                f"(eval_split={env_config.get('eval_split', 'val')})"
+            )
+        else:
+            yaml_value = bool(env_config.get("eval_on_test_data", False))
+            if eval_on_test_data != yaml_value:
+                logger.warning(
+                    f"  CLI eval_on_test_data={eval_on_test_data} overrides YAML ({yaml_value})"
+                )
+
         if eval_on_test_data:
             if env_data.get("X_test_unit") is None or env_data.get("X_test_std") is None or env_data.get("y_test") is None:
                 raise ValueError(
@@ -403,7 +549,10 @@ class AnchorTrainerSB3:
             logger.info(f"  Evaluation configured to use TEST data")
         else:
             env_config_with_data["eval_on_test_data"] = False
-            logger.info(f"  Evaluation configured to use TRAINING data")
+            logger.info(
+                f"  Evaluation split={env_config_with_data.get('eval_split', 'val')} "
+                "(training always uses D_train)"
+            )
         
         # Compute k-means centroids for diversity across episodes
         # This ensures each episode can start from a different cluster centroid
@@ -620,71 +769,28 @@ class AnchorTrainerSB3:
         logger.info("="*80)
     
     def _get_default_env_config(self) -> Dict[str, Any]:
-        """Get default environment configuration from YAML file if available, otherwise use defaults."""
-        # Try to load from config file
+        """Load env knobs from conf/anchor_single.yaml. Do not silently substitute stale defaults."""
         config_path = os.path.join(os.path.dirname(__file__), "conf", "anchor_single.yaml")
-        env_config = {}
-        
-        if os.path.exists(config_path):
-            try:
-                import yaml
-                with open(config_path, 'r') as f:
-                    config_data = yaml.safe_load(f)
-                    if config_data and "env_config" in config_data:
-                        env_config = config_data["env_config"]
-                        # Also load logging_verbosity and max_cycles from top-level YAML if present
-                        if "logging_verbosity" in config_data:
-                            env_config["logging_verbosity"] = config_data["logging_verbosity"]
-                        if "max_cycles" in config_data:
-                            env_config["max_cycles"] = config_data["max_cycles"]
-                        logger.info(f"Loaded environment config from: {config_path}")
-            except Exception as e:
-                logger.warning(f"Could not load config from {config_path}: {e}. Using defaults.")
-        
-        # Set defaults (will be overridden by config file values if present)
-        defaults = {
-            "precision_target": 0.95,
-            "coverage_target": 0.1,
-            "use_perturbation": True,
-            "perturbation_mode": "adaptive",
-            "n_perturb": 4096,
-            "step_fracs": [0.005, 0.01, 0.02],
-            "min_width": 0.05,
-            "alpha": 0.7,
-            "beta": 0.6,
-            "gamma": 0.1,
-            "precision_blend_lambda": 0.5,
-            "drift_penalty_weight": 0.05,
-            "min_coverage_floor": 0.005,
-            "js_penalty_weight": 0.05,
-            "initial_window": 0.1,
-            "max_action_scale": 0.1,
-            "min_absolute_step": 0.001,
-            "use_class_centroids": True,
-            # Coverage bonus weights (defaults match reduced values)
-            "coverage_bonus_weight_met": 0.01,
-            "coverage_bonus_weight_high_prec": 0.03,
-            "coverage_bonus_weight_high_prec_progress": 0.07,
-            "coverage_bonus_weight_high_prec_distance": 0.02,
-            "coverage_bonus_weight_reasonable_prec": 0.01,
-            "coverage_bonus_weight_reasonable_prec_progress": 0.02,
-            # Target class bonus weight
-            "target_class_bonus_weight": 0.02,
-            # Termination reason counters: disable overused reasons
-            # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
-            "max_termination_count_both_targets": -1,
-            "max_termination_count_high_precision": 200,
-            "max_termination_count_both_close": 50,
-            "max_termination_count_excellent_precision": 30,
-            "logging_verbosity": "normal",  # Default logging verbosity
-        }
-        
-        # Merge: defaults first, then config file values override
-        final_config = {**defaults, **env_config}
-        # Ensure logging_verbosity is set (default to "normal" if not in config)
-        if "logging_verbosity" not in final_config:
-            final_config["logging_verbosity"] = "normal"
-        return final_config
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Environment YAML not found: {config_path}. "
+                "YAML is the source of truth; refusing to train on hardcoded defaults."
+            )
+        try:
+            import yaml
+            with open(config_path, "r") as f:
+                config_data = yaml.safe_load(f)
+        except Exception as e:
+            raise ValueError(f"Could not load {config_path}: {e}") from e
+        if not config_data or "env_config" not in config_data:
+            raise ValueError(f"{config_path} is missing the env_config mapping.")
+        env_config = dict(config_data["env_config"])
+        if "logging_verbosity" in config_data:
+            env_config["logging_verbosity"] = config_data["logging_verbosity"]
+        if "max_cycles" in config_data and "max_cycles" not in env_config:
+            env_config["max_cycles"] = config_data["max_cycles"]
+        logger.info(f"Loaded environment config from: {config_path}")
+        return env_config
     
     def _setup_environments(
         self,
@@ -737,19 +843,26 @@ class AnchorTrainerSB3:
                     target_class=target_class,
                     device=device
                 )
+                train_env.reset(seed=self.seed + 1000 * target_class)
+                train_env.action_space.seed(self.seed + 1000 * target_class)
                 train_env = Monitor(train_env, filename=None, allow_early_resets=True)
             self.envs[target_class] = train_env
             
             # Create evaluation environment for this class (with evaluation mode)
             # Evaluation environments can use test data if eval_on_test_data is enabled
-            eval_env_config = {**env_config_with_data, "mode": "evaluation"}
-            # Note: eval_env_config already has eval_on_test_data from env_config_with_data
+            eval_env_config = {
+                **env_config_with_data,
+                "mode": "evaluation",
+                "eval_on_test_data": False,
+                "eval_split": "val",
+            }
             eval_env = self._create_env_for_class(
                 env_data=env_data,
                 env_config=eval_env_config,
                 target_class=target_class,
                 device=device
             )
+            eval_env.reset(seed=self.seed + 100000 + target_class)
             eval_env = Monitor(eval_env, filename=None, allow_early_resets=True)
             self.eval_envs[target_class] = eval_env
     
@@ -813,6 +926,7 @@ class AnchorTrainerSB3:
                 "policy_kwargs": self.algorithm_config["policy_kwargs"],
                 "verbose": 1,
                 "device": device_str,
+                "seed": self.seed + int(target_class),
             }
             
             if self.algorithm == "ddpg":
@@ -916,16 +1030,29 @@ class AnchorTrainerSB3:
             # will be automatically reset in reset() method
             eval_callback = None
             if self.experiment_config.get("eval_freq", 0) > 0:
+                n_eval_episodes = self.experiment_config.get("n_eval_episodes", 4)
+                # Keep EvalCallback for TensorBoard reward logs / LR schedule only.
+                # Do not let episode reward pick best_model.zip (terminal bonus trap).
                 eval_callback = EvalCallback(
                     eval_env,
-                    best_model_save_path=os.path.join(self.experiment_folder, "best_model", f"class_{target_class}"),
+                    best_model_save_path=None,
                     log_path=os.path.join(self.experiment_folder, "evaluations", f"class_{target_class}"),
                     eval_freq=self.experiment_config["eval_freq"],
-                    n_eval_episodes=self.experiment_config.get("n_eval_episodes", 4),
+                    n_eval_episodes=n_eval_episodes,
                     deterministic=True,
                     render=False
                 )
                 callbacks.append(eval_callback)
+                callbacks.append(
+                    FidCovEvalCallback(
+                        eval_env,
+                        best_model_save_path=os.path.join(
+                            self.experiment_folder, "best_model", f"class_{target_class}"
+                        ),
+                        eval_freq=self.experiment_config["eval_freq"],
+                        n_eval_episodes=n_eval_episodes,
+                    )
+                )
             
             # Learning rate scheduling callback (optional, reduces LR on plateau)
             use_lr_schedule = self.algorithm_config.get("use_lr_schedule", False)
@@ -937,11 +1064,8 @@ class AnchorTrainerSB3:
                     min_lr=1e-6,
                     patience=3
                 )
-                # Link LR schedule to eval callback
-                lr_schedule_callback.model = model
-                # Note: This is a simplified version. For full implementation, 
-                # you'd need to properly integrate with EvalCallback's evaluation results
-                # callbacks.append(lr_schedule_callback)
+                lr_schedule_callback.eval_callback = eval_callback
+                callbacks.append(lr_schedule_callback)
 
             # Train this model
             train_callbacks = callbacks.copy() if callbacks else []
@@ -959,6 +1083,22 @@ class AnchorTrainerSB3:
             os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
             model.save(final_model_path)
             logger.info(f"  Final model for class {target_class} saved to: {final_model_path}")
+            best_model_path = os.path.join(
+                self.experiment_folder,
+                "best_model",
+                f"class_{target_class}",
+                "best_model.zip",
+            )
+            if os.path.exists(best_model_path):
+                self.models[target_class] = self.algorithm_class.load(
+                    best_model_path,
+                    env=env,
+                    device=model.device,
+                )
+                logger.info(
+                    "  Restored validation-selected best model for class %s",
+                    target_class,
+                )
         
         logger.info("\n" + "="*80)
         logger.info("TRAINING COMPLETE!")
@@ -1047,7 +1187,7 @@ class AnchorTrainerSB3:
         target_classes: Optional[List[int]] = None,
         max_cycles: Optional[int] = None,  # If None, will read from env_config
         device: str = "cpu",
-        eval_on_test_data: bool = True
+        eval_on_test_data: bool = False
     ):
         """
         Reload an experiment from a checkpoint directory.
@@ -1098,6 +1238,10 @@ class AnchorTrainerSB3:
             "scaler_mean": env_data.get("scaler_mean"),
             "scaler_scale": env_data.get("scaler_scale"),
             "max_cycles": max_cycles,
+            "eval_split": "val",
+            "X_val_unit": env_data.get("X_val_unit"),
+            "X_val_std": env_data.get("X_val_std"),
+            "y_val": env_data.get("y_val"),
         }
         
         if eval_on_test_data:
@@ -1183,14 +1327,27 @@ class AnchorTrainerSB3:
         logger.info(f"\nLoading models from: {experiment_dir}")
         
         for target_class in self.target_classes:
-            # Try final model first
-            model_path = os.path.join(experiment_dir, "final_model", f"class_{target_class}")
-            if not os.path.exists(model_path + ".zip"):
-                # Try best model
-                model_path = os.path.join(experiment_dir, "best_model", f"class_{target_class}", f"class_{target_class}")
-            
-            if not os.path.exists(model_path + ".zip"):
-                logger.warning(f"Model for class {target_class} not found at {model_path}")
+            candidates = [
+                os.path.join(
+                    experiment_dir, "best_model", f"class_{target_class}",
+                    "best_model",
+                ),
+                os.path.join(
+                    experiment_dir, "best_model", f"class_{target_class}",
+                    f"class_{target_class}",
+                ),
+                os.path.join(
+                    experiment_dir, "final_model", f"class_{target_class}",
+                ),
+            ]
+            model_path = next(
+                (p for p in candidates if os.path.exists(p + ".zip")), None
+            )
+            if model_path is None:
+                logger.warning(
+                    "Model for class %s not found; tried %s",
+                    target_class, candidates,
+                )
                 # Create a new model for this class if not found
                 logger.info(f"  Creating new model for class {target_class}")
                 continue

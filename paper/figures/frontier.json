@@ -1,0 +1,866 @@
+[
+  {
+    "dataset": "breast_cancer",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.8695652173913043,
+    "cov_union": 0.8809523809523809
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.967741935483871,
+    "cov_union": 0.8333333333333334
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7380952380952381
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5138888888888888
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.023809523809523808
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.19444444444444445
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.1527777777777778
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7380952380952381
+  },
+  {
+    "dataset": "breast_cancer",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5138888888888888
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.7142857142857143,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9090909090909091,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "cart",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.8571428571428571,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.4
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.3
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.6
+  },
+  {
+    "dataset": "iris",
+    "method": "greedy_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.7142857142857143,
+    "cov_union": 0.6
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.4
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.4
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.4
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.6
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "mada",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.5,
+    "cov_union": 0.1
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.7,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.5454545454545454,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9090909090909091,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "iris",
+    "method": "random_search",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.4166666666666667,
+    "cov_union": 0.6
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.6666666666666666,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.6
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "rlda",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.6,
+    "cov_union": 0.3
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.6666666666666666,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.5454545454545454,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.3
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.6428571428571429,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "iris",
+    "method": "sp_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.8
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9354838709677419,
+    "cov_union": 0.7868852459016393
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9605263157894737,
+    "cov_union": 0.8051948051948052
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.9210526315789473,
+    "cov_union": 0.5573770491803278
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7012987012987013
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.11688311688311688
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.06557377049180328
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.012987012987012988
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.44525547445255476,
+    "cov_union": 1.0
+  },
+  {
+    "dataset": "uci_credit",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7012987012987013
+  },
+  {
+    "dataset": "wine",
+    "method": "cart",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.6666666666666666
+  },
+  {
+    "dataset": "wine",
+    "method": "cart",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5
+  },
+  {
+    "dataset": "wine",
+    "method": "cart",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.9
+  },
+  {
+    "dataset": "wine",
+    "method": "greedy_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5833333333333334
+  },
+  {
+    "dataset": "wine",
+    "method": "greedy_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.2857142857142857
+  },
+  {
+    "dataset": "wine",
+    "method": "greedy_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  },
+  {
+    "dataset": "wine",
+    "method": "mada",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.08333333333333333
+  },
+  {
+    "dataset": "wine",
+    "method": "mada",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.07142857142857142
+  },
+  {
+    "dataset": "wine",
+    "method": "mada",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "wine",
+    "method": "random_search",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.08333333333333333
+  },
+  {
+    "dataset": "wine",
+    "method": "random_search",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "wine",
+    "method": "random_search",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.1
+  },
+  {
+    "dataset": "wine",
+    "method": "rlda",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 0.75,
+    "cov_union": 0.25
+  },
+  {
+    "dataset": "wine",
+    "method": "rlda",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "wine",
+    "method": "rlda",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": null,
+    "cov_union": 0.0
+  },
+  {
+    "dataset": "wine",
+    "method": "sp_anchors",
+    "class": "class_0",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.5833333333333334
+  },
+  {
+    "dataset": "wine",
+    "method": "sp_anchors",
+    "class": "class_1",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.2857142857142857
+  },
+  {
+    "dataset": "wine",
+    "method": "sp_anchors",
+    "class": "class_2",
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "fid_union": 1.0,
+    "cov_union": 0.7
+  }
+]

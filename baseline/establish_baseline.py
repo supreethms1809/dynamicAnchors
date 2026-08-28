@@ -797,7 +797,7 @@ def compute_anchor_metrics_on_full_dataset(
         precision = float(n_matching_pred / n_in_anchor)
     
     # Sanity checks
-    assert 0.0 <= precision <= 1.0, f"Precision {precision} out of range [0, 1]"
+    assert np.isnan(precision) or 0.0 <= precision <= 1.0, f"Precision {precision} out of range [0, 1]"
     assert 0.0 <= coverage <= 1.0, f"Coverage {coverage} out of range [0, 1]"
     
     return precision, coverage
@@ -810,7 +810,8 @@ def compute_class_union_metrics(
     target_class: int,
     feature_names: List[str],
     X_train: np.ndarray,
-    explainer: Optional[Any] = None  # Optional anchor-exp explainer for proper discretization
+    explainer: Optional[Any] = None,  # Optional anchor-exp explainer for proper discretization
+    y_hat_data: Optional[np.ndarray] = None,  # A3: model predictions for fidelity
 ) -> Tuple[float, float]:
     """
     Compute class-level union metrics from a list of anchor rules.
@@ -938,16 +939,30 @@ def compute_class_union_metrics(
     else:
         coverage = float(n_class_in_union / n_class_samples)
     
-    # Precision: fraction of union samples that belong to class
-    # Formula: P(y = cls | x in union) = |{x: x in union AND y=cls}| / |{x: x in union}|
+    # A3: precision is model FIDELITY, P(f_hat(x) = cls | x in union), to match
+    # what RLDA/MADA report after C-09. Scoring the baseline on ground-truth
+    # labels while scoring our methods on model agreement compares two different
+    # quantities and makes the class-level table meaningless.
+    # Label purity is still computed and returned via the debug print for reference.
     n_union_samples = in_union.sum()
     if n_union_samples == 0:
-        # Union matches no samples - this indicates a bug in the union computation
-        # or the bounds are invalid. Log a warning but return 0.0
+        # A4: precision of an empty region is undefined, not 0.0. Returning 0.0
+        # made an unmeasurable cell look like a real, maximally-bad measurement.
         print(f"  WARNING: Union covers 0 samples for class {target_class}. "
-              f"This may indicate parsing issues or invalid bounds.")
-        precision = 0.0
+              f"Precision is undefined (NaN), not 0.0.")
+        precision = float("nan")
+    elif y_hat_data is not None:
+        y_hat_arr = np.asarray(y_hat_data)
+        n_fid_agree = int((in_union & (y_hat_arr == target_class)).sum())
+        precision = float(n_fid_agree / n_union_samples)
+        purity = float(n_class_in_union / n_union_samples)
+        print(f"    class {target_class} union: Fid={precision:.4f} Pur={purity:.4f} "
+              f"n={int(n_union_samples)}")
     else:
+        # No predictions supplied: fall back to label purity, but say so, because
+        # the number is then not comparable with the RLDA/MADA fidelity columns.
+        print(f"  NOTE: no model predictions passed for class {target_class}; "
+              f"reporting LABEL PURITY, which is not comparable to fidelity.")
         precision = float(n_class_in_union / n_union_samples)
     
     # Verification: Sanity checks
@@ -1469,7 +1484,8 @@ def run_static_anchors(
                 target_class=cls,
                 feature_names=feature_names,
                 X_train=X_train,
-                explainer=explainer  # Pass explainer to use proper discretization
+                explainer=explainer,  # Pass explainer to use proper discretization
+                y_hat_data=full_predictions,  # A3: fidelity, not label purity
             )
             
             # Debug: Warn if metrics are unexpectedly zero

@@ -50,11 +50,14 @@ sys.modules["BenchMARL.tabular_datasets"] = tabular_datasets
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Per-dataset training timesteps for single-agent
-# Target ~60-90k steps per class (5 classes for both WyoDOT datasets)
+# Per-dataset training timesteps for single-agent. NOTE: each class shard
+# trains for the FULL value below (it is per-shard, not divided across classes).
 DATASET_TIMESTEPS = {
-    "wyodot_kvdw_labeled": 480_000,   # 39,858 rows, 5 classes → 96k/class
-    "wyodot_testbed": 250_000,        # 691 rows, 5 classes → 30k/class
+    # All 5 classes plateau by ~600k (sac_..._26_06_09 evaluations.npz); classes
+    # 0 and 2 collapse past ~600-900k, so longer budgets only hurt final_model.
+    # Keep a multiple of the 6k eval grid so the last eval lands on the end.
+    "wyodot_kvdw_labeled": 750_000,
+    "wyodot_testbed": 250_000,        # 691 rows, 5 classes
 }
 
 # Both WyoDOT datasets have 5 classes after label remapping.
@@ -100,13 +103,16 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None,
         cwd = str(PROJECT_ROOT)
 
     n_threads = max(1, int(n_threads))
+    # The explicit n_threads cap must WIN over inherited shell values: with the
+    # old os.environ.get(...) precedence, a stray OMP_NUM_THREADS=1 in the parent
+    # pinned the MA training subprocess to one core despite ma_n_threads=12.
     child_env = {
         **os.environ,
-        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", str(n_threads)),
-        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", str(n_threads)),
-        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", str(n_threads)),
-        "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS", str(n_threads)),
-        "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", str(n_threads)),
+        "OMP_NUM_THREADS": str(n_threads),
+        "MKL_NUM_THREADS": str(n_threads),
+        "OPENBLAS_NUM_THREADS": str(n_threads),
+        "VECLIB_MAXIMUM_THREADS": str(n_threads),
+        "NUMEXPR_NUM_THREADS": str(n_threads),
         "JOBLIB_MULTIPROCESSING": os.environ.get("JOBLIB_MULTIPROCESSING", "0"),
         "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "false"),
     }
@@ -315,7 +321,6 @@ def run_multi_agent_training(
         output_dir = str(SCRIPT_DIR / "output" / f"{dataset}_{algorithm}")
 
     # Check existing experiment
-    force_retrain = True
     if not force_retrain:
         output_path = Path(output_dir)
         if output_path.exists():
@@ -347,14 +352,14 @@ def run_multi_agent_training(
             else:
                 cmd.extend([f"--{key}", str(value)])
 
-    # MA runs as a single subprocess (no class sharding), so it can safely
-    # use a generous BLAS thread pool. We aim for "physical cores minus a
-    # couple for the OS / wandb / pipeline" — capped so an unusually large
-    # box doesn't allocate hundreds of threads.
-    ma_n_threads = max(1, min((os.cpu_count() or 4) - 2, 12))
+    # Keep the env thread cap at 1: it is inherited by the 12 spawned collector
+    # workers, where N BLAS threads each would thrash collection (12x12 threads
+    # on 14 cores). The MAIN training process sizes its own torch intra-op pool
+    # explicitly via torch.set_num_threads() in driver_multi_agent.py — that is
+    # where the optimizer steps run, and it no longer depends on this env value.
     success, output = run_command(
         cmd, f"Multi-Agent Training: {dataset} with {algorithm.upper()}",
-        capture_output=True, n_threads=ma_n_threads,
+        capture_output=True, n_threads=1,
     )
 
     if success:
@@ -767,6 +772,7 @@ def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs
         from test_extracted_rules_single import (
             add_file_log_handler,
             _write_test_report_markdown,
+            enrich_results_posthoc,
         )
 
         # Attach a dedicated FileHandler so per-rule log output lands in the
@@ -785,6 +791,16 @@ def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs
         # report header isn't 'unknown'.
         results.setdefault("algorithm", kwargs.get("algorithm", "multi_agent"))
         results.setdefault("model_type", "mlp")
+
+        # The MA compute path (BenchMARL/test_extracted_rules.py) skips the
+        # base-rate/lift/feature-importance enrichment that the SA compute path
+        # runs inline, so without this call the MA report shows base rate 0.000,
+        # lift 0.00x, and per-class "n samples" 0. Recovers per-class totals
+        # from the results dict itself (no dataset reload), so y_data is None.
+        try:
+            enrich_results_posthoc(results, y_data=None)
+        except Exception as e:
+            logger.warning(f"Could not enrich multi-agent results (lift/base rate): {e}")
 
         with open(test_results_file, 'w') as f:
             json.dump(_convert_for_json(results), f, indent=2)

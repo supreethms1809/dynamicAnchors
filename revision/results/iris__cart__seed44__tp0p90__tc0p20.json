@@ -1,0 +1,646 @@
+{
+  "schema": "rlda_mada_result_v1",
+  "dataset": "iris",
+  "method": "cart",
+  "seed": 44,
+  "tau_p": 0.9,
+  "tau_c": 0.2,
+  "git_commit": "3f9a95ce32a71a037c8e0c3ea848c57a7ca0f5e0",
+  "config_hash": "acc60ec9dc7b53c2",
+  "created_utc": "2026-08-27T02:33:05.084163+00:00",
+  "classifier_accuracy": {
+    "train_accuracy": 0.9333333333333333,
+    "val_accuracy": 1.0,
+    "test_accuracy": 1.0,
+    "n": 30
+  },
+  "queries": {
+    "n_blackbox_queries": 120,
+    "n_reporting_queries": 180,
+    "query_policy": "n_blackbox_queries counts generation/selection calls; held-out test reporting calls are separate",
+    "n_cache_hits": 0,
+    "wall_train_seconds": 0.0007679462432861328,
+    "wall_infer_seconds": 0.0
+  },
+  "per_class": {
+    "class_0": {
+      "k": 5,
+      "n_selected": 1,
+      "best": {
+        "rule_id": "cart:0:1",
+        "display_rule": "petal width (cm) <= 0.800000",
+        "fidelity": {
+          "n_covered": 9,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 9,
+          "n_fid_agree": 9,
+          "n_pur_agree": 9,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.9,
+          "coverage_marginal": 0.3,
+          "fidelity_ci_low": 0.7008472464490406,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.7008472464490406,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 0,
+          "class_conditional": true
+        },
+        "score": 2.0,
+        "lower_bounds": [
+          4.300000190734863,
+          2.0,
+          1.100000023841858,
+          0.10000000149011612
+        ],
+        "upper_bounds": [
+          7.900000095367432,
+          4.400000095367432,
+          6.699999809265137,
+          0.800000011920929
+        ]
+      },
+      "union": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.9,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 0,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "cart:0:1"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "cart:0:1",
+          "display_rule": "petal width (cm) <= 0.800000",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            4.300000190734863,
+            2.0,
+            1.100000023841858,
+            0.10000000149011612
+          ],
+          "upper_bounds": [
+            7.900000095367432,
+            4.400000095367432,
+            6.699999809265137,
+            0.800000011920929
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.9,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.7008472464490406,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7008472464490406,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.3,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 0,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 1,
+        "mean_active_features": 1.0,
+        "total_active_features": 1,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 1,
+            "n_features": 4,
+            "sparsity": 0.75,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_1": {
+      "k": 5,
+      "n_selected": 2,
+      "best": {
+        "rule_id": "cart:1:5",
+        "display_rule": "petal width (cm) > 0.800000 and petal length (cm) <= 4.750000 and petal width (cm) <= 1.450000",
+        "fidelity": {
+          "n_covered": 9,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 9,
+          "n_fid_agree": 9,
+          "n_pur_agree": 9,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.9,
+          "coverage_marginal": 0.3,
+          "fidelity_ci_low": 0.7008472464490406,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.7008472464490406,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 1,
+          "class_conditional": true
+        },
+        "score": 1.6,
+        "lower_bounds": [
+          4.300000190734863,
+          2.0,
+          1.100000023841858,
+          0.800000011920929
+        ],
+        "upper_bounds": [
+          7.900000095367432,
+          4.400000095367432,
+          4.75,
+          1.4500000476837158
+        ]
+      },
+      "union": {
+        "n_covered": 10,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 10,
+        "n_fid_agree": 10,
+        "n_pur_agree": 10,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 1.0,
+        "coverage_marginal": 0.3333333333333333,
+        "fidelity_ci_low": 0.7224598312333834,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7224598312333834,
+        "purity_ci_high": 1.0,
+        "below_min_support": false,
+        "target_class": 1,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "cart:1:5",
+        "cart:1:8"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "cart:1:5",
+          "display_rule": "petal width (cm) > 0.800000 and petal length (cm) <= 4.750000 and petal width (cm) <= 1.450000",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            4.300000190734863,
+            2.0,
+            1.100000023841858,
+            0.800000011920929
+          ],
+          "upper_bounds": [
+            7.900000095367432,
+            4.400000095367432,
+            4.75,
+            1.4500000476837158
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.9,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.7008472464490406,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7008472464490406,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "cart:1:8",
+          "display_rule": "petal width (cm) > 0.800000 and petal length (cm) <= 4.750000 and petal width (cm) > 1.450000 and sepal width (cm) > 2.900000",
+          "selection_score": 1.2,
+          "lower_bounds": [
+            4.300000190734863,
+            2.9000000953674316,
+            1.100000023841858,
+            1.4500000476837158
+          ],
+          "upper_bounds": [
+            7.900000095367432,
+            4.400000095367432,
+            4.75,
+            2.5
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 2,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 2,
+            "n_fid_agree": 2,
+            "n_pur_agree": 2,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.2,
+            "coverage_marginal": 0.06666666666666667,
+            "fidelity_ci_low": 0.3423719528896193,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.3423719528896193,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.3,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 1,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 2,
+        "mean_active_features": 0.5,
+        "total_active_features": 1,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 1,
+            "n_features": 4,
+            "sparsity": 0.75,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 0,
+            "n_features": 4,
+            "sparsity": 1.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_2": {
+      "k": 5,
+      "n_selected": 2,
+      "best": {
+        "rule_id": "cart:2:4",
+        "display_rule": "petal width (cm) > 0.800000 and petal length (cm) > 4.750000",
+        "fidelity": {
+          "n_covered": 9,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 9,
+          "n_fid_agree": 9,
+          "n_pur_agree": 9,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.9,
+          "coverage_marginal": 0.3,
+          "fidelity_ci_low": 0.7008472464490406,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.7008472464490406,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 2,
+          "class_conditional": true
+        },
+        "score": 1.5545454545454547,
+        "lower_bounds": [
+          4.300000190734863,
+          2.0,
+          4.75,
+          0.800000011920929
+        ],
+        "upper_bounds": [
+          7.900000095367432,
+          4.400000095367432,
+          6.699999809265137,
+          2.5
+        ]
+      },
+      "union": {
+        "n_covered": 10,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 0.9,
+        "purity": 0.9,
+        "coverage": 0.9,
+        "coverage_marginal": 0.3333333333333333,
+        "fidelity_ci_low": 0.5958436145024277,
+        "fidelity_ci_high": 0.9821242504842789,
+        "purity_ci_low": 0.5958436145024277,
+        "purity_ci_high": 0.9821242504842789,
+        "below_min_support": false,
+        "target_class": 2,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "cart:2:4",
+        "cart:2:7"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "cart:2:4",
+          "display_rule": "petal width (cm) > 0.800000 and petal length (cm) > 4.750000",
+          "selection_score": 1.5545454545454547,
+          "lower_bounds": [
+            4.300000190734863,
+            2.0,
+            4.75,
+            0.800000011920929
+          ],
+          "upper_bounds": [
+            7.900000095367432,
+            4.400000095367432,
+            6.699999809265137,
+            2.5
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.9,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.7008472464490406,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7008472464490406,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 11,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 0.8181818181818182,
+            "purity": 0.8181818181818182,
+            "coverage": 0.9,
+            "coverage_marginal": 0.36666666666666664,
+            "fidelity_ci_low": 0.5230138624217553,
+            "fidelity_ci_high": 0.9486333993289994,
+            "purity_ci_low": 0.5230138624217553,
+            "purity_ci_high": 0.9486333993289994,
+            "below_min_support": false,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "cart:2:7",
+          "display_rule": "petal width (cm) > 0.800000 and petal length (cm) <= 4.750000 and petal width (cm) > 1.450000 and sepal width (cm) <= 2.900000",
+          "selection_score": 1.1,
+          "lower_bounds": [
+            4.300000190734863,
+            2.0,
+            1.100000023841858,
+            1.4500000476837158
+          ],
+          "upper_bounds": [
+            7.900000095367432,
+            2.9000000953674316,
+            4.75,
+            2.5
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 0,
+            "n_fid_agree": 0,
+            "n_pur_agree": 0,
+            "fidelity": 0.0,
+            "purity": 0.0,
+            "coverage": 0.0,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.0,
+            "fidelity_ci_high": 0.7934567085261071,
+            "purity_ci_low": 0.0,
+            "purity_ci_high": 0.7934567085261071,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.3,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 2,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 2,
+        "mean_active_features": 0.5,
+        "total_active_features": 1,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 0,
+            "n_features": 4,
+            "sparsity": 1.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 1,
+            "n_features": 4,
+            "sparsity": 0.75,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    }
+  },
+  "global_ruleset": {
+    "n_eval": 30,
+    "n_abstain": 2,
+    "n_conflict": 1,
+    "n_decided": 28,
+    "n_fid_agree": 28,
+    "n_pur_agree": 28,
+    "global_fidelity": 1.0,
+    "global_purity": 1.0,
+    "abstention_rate": 0.06666666666666667,
+    "conflict_rate": 0.03333333333333333,
+    "coverage": 0.9333333333333333,
+    "per_class_fired": {
+      "0": 9,
+      "1": 10,
+      "2": 10
+    }
+  },
+  "success_rate": null,
+  "compactness": {
+    "mean_rules_per_class": 5.0,
+    "mean_active_features": 0.6666666666666666,
+    "sparsity_width_ratio": 0.95
+  },
+  "ranking_formula": "precision_coverage",
+  "min_support": 10,
+  "notes": "Baseline cart; selection on D_val and reporting on D_test; union over top-k=5; min_support=10.",
+  "extra": {
+    "max_leaf_nodes": 15,
+    "k": 5,
+    "classifier_path": "/Users/ssuresh/dynamicAnchors/output/iris_rlda_ddpg_seed44/training/ddpg_single_agent_sb3_26_08_26-20_26_15/classifier.pth",
+    "selection_split": "val",
+    "report_split": "test",
+    "ranking_formula": "precision_coverage",
+    "min_support": 10
+  }
+}

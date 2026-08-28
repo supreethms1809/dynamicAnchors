@@ -52,7 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description="Anchor Training Pipeline")
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "bank_marketing"]
     
     # Add UCIML datasets if available
     try:
@@ -256,7 +256,9 @@ def main():
     elif not args.skip_classifier:
         classifier = dataset_loader.create_classifier(
             classifier_type=args.classifier_type,
-            dropout_rate=0.3,
+            # dropout_rate omitted on purpose: create_classifier picks it by dataset
+            # size (0.1 for >10k train rows, 0.3 otherwise). Passing 0.3 here pinned
+            # large datasets to a rate that measurably underfit them.
             use_batch_norm=True,
             device=args.device
         )
@@ -296,13 +298,12 @@ def main():
         classifier_path = os.path.join(classifier_output_dir, "classifier.pth")
         dataset_loader.save_classifier(trained_classifier, classifier_path)
         logger.info(f"Classifier saved to: {classifier_path}")
-    else:
-        if dataset_loader.classifier is None:
-            raise ValueError(
-                "Classifier not found. Either train a classifier first "
-                "or remove --skip_classifier flag."
-            )
-        logger.info("\nUsing existing classifier from dataset_loader")
+
+    if dataset_loader.classifier is None and not args.load_checkpoint:
+        raise ValueError(
+            "Classifier not found. Either train a classifier first "
+            "or remove --skip_classifier flag."
+        )
     
     logger.info(f"\n{'='*80}")
     logger.info("SETTING UP BANCHMARL TRAINER")
@@ -361,6 +362,53 @@ def main():
             device=args.device,
             eval_on_test_data=args.eval_on_test_data
         )
+
+        try:
+            from utils.eval_harness import config_snapshot, dump_reproducibility_artifact
+            env_cfg = trainer._load_env_config_from_yaml()
+            if isinstance(env_cfg.get("env_config"), dict):
+                env_cfg = {**env_cfg["env_config"], **{
+                    k: v for k, v in env_cfg.items() if k != "env_config"
+                }}
+            reward_keys = (
+                "alpha", "beta", "gamma", "precision_blend_lambda",
+                "drift_penalty_weight", "inter_class_overlap_weight",
+                "shared_reward_weight", "shared_terminal_bonus",
+                "terminal_bonus", "coverage_target", "precision_target",
+            )
+            dump_reproducibility_artifact(
+                os.path.join(str(trainer.experiment.folder_name), "reproducibility.json"),
+                dataset=args.dataset,
+                method=f"mada_{args.algorithm}",
+                seed=args.seed,
+                tau_p=float(env_cfg["precision_target"]),
+                tau_c=float(env_cfg["coverage_target"]),
+                split_sizes=dataset_loader.get_anchor_env_data().get("split_sizes", {}),
+                classifier_info={
+                    "type": args.classifier_type,
+                    "accuracy": getattr(dataset_loader, "classifier_accuracy", {}),
+                    "epochs": args.classifier_epochs,
+                },
+                rl_info={
+                    "algorithm": args.algorithm,
+                    "experiment_config": config_snapshot(trainer.experiment_config),
+                    "algorithm_config": config_snapshot(trainer.algorithm_config),
+                    "model_config": config_snapshot(trainer.model_config),
+                },
+                reward_info={k: env_cfg.get(k) for k in reward_keys},
+                env_info=config_snapshot(env_cfg),
+                rule_reporting={
+                    "ranking_score_formula": env_cfg["ranking_score_formula"],
+                    "sparsity_width_ratio": env_cfg["sparsity_width_ratio"],
+                    "top_k": env_cfg["top_k_rules_by_score"],
+                    "min_support": env_cfg["min_support"],
+                    "selection_split": "val",
+                    "report_split": "test",
+                    "bounds_space": "unit",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Could not dump reproducibility artifact: {e}")
         
         trainer.train()
         
@@ -412,9 +460,13 @@ def main():
     # SS: This is nasty workaround for json serialization issues. TODO: Create a function in utils 
     evaluation_anchor_data = eval_results.get("evaluation_anchor_data", [])
     if evaluation_anchor_data:
+        # NOTE: no `import numpy as np` here. numpy is already imported at module
+        # scope, and a function-local import would make `np` local to all of
+        # main(), so the `np.random.seed(args.seed)` call near the top of main()
+        # would raise UnboundLocalError before this branch is ever reached.
         import json
-        import numpy as np
-        
+
+
         # Convert numpy arrays to lists for JSON serialization
         def convert_to_serializable(obj):
             """Recursively convert numpy arrays and other non-serializable types to JSON-compatible types."""
@@ -491,12 +543,21 @@ def main():
         models_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models")
         logger.info(f"\n✓ Individual models extracted successfully!")
         logger.info(f"  Final models saved to: {models_dir}")
+        best_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models_best")
         if extracted.get("best"):
-            best_dir = os.path.join(str(trainer.experiment.folder_name), "individual_models_best")
             logger.info(f"  Best models saved to: {best_dir}")
+        else:
+            best_ckpt = os.path.join(
+                str(trainer.experiment.folder_name), "best_model", "best_checkpoint.pt"
+            )
+            if os.path.exists(best_ckpt):
+                logger.error(
+                    "best_checkpoint.pt exists but individual_models_best was not extracted. "
+                    "Inference with prefer_model=best will fail."
+                )
     except Exception as e:
-        logger.warning(f"\n⚠ Warning: Could not extract individual models: {e}")
-        logger.info("  You can still use the full BenchMARL checkpoint for inference")
+        logger.error(f"\nCould not extract individual models: {e}")
+        raise
     
     # Note: Rule extraction should be done separately using inference.py
     logger.info(f"\n{'='*80}")

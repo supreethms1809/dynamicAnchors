@@ -221,6 +221,15 @@ class AnchorTrainer:
             "scaler_scale": env_data.get("scaler_scale"),
             "max_cycles": max_cycles,  # Ensure max_cycles is in env_config for the environment
             "min_coverage_floor": min_coverage_floor,  # Override with dynamic value
+            # C-07 / C-10: pass categorical freeze info and the val split through.
+            "categorical_indices": env_data.get("categorical_indices") or [],
+            "categorical_value_names": env_data.get("categorical_value_names") or {},
+            "X_val_unit": env_data.get("X_val_unit"),
+            "X_val_std": env_data.get("X_val_std"),
+            "y_val": env_data.get("y_val"),
+            "X_test_unit": env_data.get("X_test_unit"),
+            "X_test_std": env_data.get("X_test_std"),
+            "y_test": env_data.get("y_test"),
         }
         
         logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} for training (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
@@ -505,7 +514,10 @@ class AnchorTrainer:
             save_to_file=True,
             collect_anchor_data=True,
             compute_nashconv=compute_nashconv,
-            nashconv_threshold=nashconv_threshold
+            nashconv_threshold=nashconv_threshold,
+            ranking_score_formula=env_config.get(
+                "ranking_score_formula", "precision_coverage"
+            ),
         )
         self.experiment = Experiment(
             config=self.experiment_config,
@@ -515,6 +527,23 @@ class AnchorTrainer:
             critic_model_config=self.critic_model_config,
             seed=self.seed,
             callbacks=[self.callback]
+        )
+        # Extract individual_models_best from in-memory actors whenever eval
+        # improves. Experiment.state_dict() can fail after training (collector
+        # has no .env), so this is the reliable path to BEST weights.
+        self.callback.extract_best_fn = lambda: self.extract_and_save_individual_models(
+            save_policies=True,
+            save_critics=False,
+            models_subdir="individual_models_best",
+        )
+
+        # BenchMARL constructs a dedicated ``test_env`` for periodic evaluation,
+        # but both environments originate from the same task config. Mark only
+        # that realized environment as evaluation so checkpoint selection reads
+        # D_val while collectors continue to read D_train.
+        self._set_benchmarl_eval_split(
+            self.experiment.test_env,
+            split=str(env_config.get("eval_split", "val")),
         )
         
         # Set experiment folder on callback for periodic saving during training
@@ -530,6 +559,43 @@ class AnchorTrainer:
         logger.info("="*80)
         
         return self.experiment
+
+    @staticmethod
+    def _set_benchmarl_eval_split(env: Any, split: str = "val") -> None:
+        if split != "val":
+            raise ValueError(
+                "Training-time BenchMARL evaluation must use split='val'; "
+                f"got {split!r}"
+            )
+        seen = set()
+
+        def _visit(obj: Any) -> bool:
+            if obj is None or id(obj) in seen:
+                return False
+            seen.add(id(obj))
+            configured = False
+            if isinstance(obj, AnchorEnv):
+                if obj.X_val_unit is None or obj.X_val_std is None or obj.y_val is None:
+                    raise ValueError(
+                        "BenchMARL validation environment is missing X_val/y_val"
+                    )
+                obj.mode = "evaluation"
+                obj.eval_split = "val"
+                obj.eval_on_test_data = False
+                return True
+            for attr in ("base_env", "_env", "env"):
+                try:
+                    configured = _visit(getattr(obj, attr, None)) or configured
+                except (AttributeError, RuntimeError):
+                    continue
+            return configured
+
+        if not _visit(env):
+            raise RuntimeError(
+                "Could not locate AnchorEnv inside BenchMARL test_env; "
+                "validation checkpoint selection cannot be guaranteed"
+            )
+        logger.info("BenchMARL periodic evaluation configured on VALIDATION split")
     
     def train(self) -> Experiment:
         if self.experiment is None:
@@ -1275,32 +1341,47 @@ class AnchorTrainer:
             models_subdir="individual_models",
         )
 
-        # 2. Best checkpoint, if the callback saved one.
+        # 2. Best actors. Prefer the copy extracted at save-best time (in-memory
+        # actors, no Experiment.state_dict). Fall back to reloading the .pt.
+        best_dir = os.path.join(str(self.experiment.folder_name), "individual_models_best")
+        best_index = os.path.join(best_dir, "policies_index.json")
+        if os.path.isfile(best_index):
+            logger.info(
+                "individual_models_best already extracted at save-best time; keeping %s",
+                best_dir,
+            )
+            results["best"] = {"existing": best_dir}
+            return results
+
         best_ckpt = os.path.join(str(self.experiment.folder_name), "best_model", "best_checkpoint.pt")
-        if os.path.exists(best_ckpt):
-            logger.info(f"Best checkpoint found — extracting individual_models_best from: {best_ckpt}")
-            # Snapshot the final state so we can restore it after extraction.
+        if not os.path.exists(best_ckpt):
+            logger.info("No best_model/best_checkpoint.pt found — only final individual_models extracted.")
+            results["best"] = {}
+            return results
+
+        logger.info(f"Best checkpoint found — extracting individual_models_best from: {best_ckpt}")
+        final_state = None
+        try:
             final_state = self.experiment.state_dict()
-            try:
-                best_state = torch.load(best_ckpt, map_location="cpu")
-                self.experiment.load_state_dict(best_state)
-                results["best"] = self.extract_and_save_individual_models(
-                    save_policies=save_policies, save_critics=save_critics,
-                    models_subdir="individual_models_best",
-                )
-            except Exception as e:
-                logger.warning(f"Could not extract from best checkpoint ({e}); "
-                               f"multi-agent inference will fall back to final models.")
-                results["best"] = {}
-            finally:
-                # Restore final state so any later use of the experiment is unaffected.
+            best_state = torch.load(best_ckpt, map_location="cpu")
+            self.experiment.load_state_dict(best_state)
+            results["best"] = self.extract_and_save_individual_models(
+                save_policies=save_policies, save_critics=save_critics,
+                models_subdir="individual_models_best",
+            )
+        except Exception as e:
+            logger.error(
+                "Could not extract individual_models_best from checkpoint (%s). "
+                "Inference with prefer_model=best will fail until this is fixed.",
+                e,
+            )
+            results["best"] = {}
+        finally:
+            if final_state is not None:
                 try:
                     self.experiment.load_state_dict(final_state)
                 except Exception as e:
                     logger.warning(f"Could not restore final experiment state after best extraction: {e}")
-        else:
-            logger.info("No best_model/best_checkpoint.pt found — only final individual_models extracted.")
-            results["best"] = {}
 
         return results
 
@@ -2658,53 +2739,22 @@ class AnchorTrainer:
                     self._anchor_env_config = env_config.copy()
                     return env_config
                 else:
-                    logger.warning(f"  Warning: {config_path} exists but doesn't contain 'env_config' key. Using defaults.")
+                    logger.warning(f"  Warning: {config_path} exists but doesn't contain 'env_config' key.")
+                    raise ValueError(f"{config_path} is missing the env_config mapping.")
+            except ValueError:
+                raise
             except Exception as e:
-                logger.warning(f"  Warning: Could not load config from {config_path}: {e}. Using defaults.")
+                logger.warning(f"  Warning: Could not load config from {config_path}: {e}.")
+                raise ValueError(f"Could not load {config_path}: {e}") from e
         else:
-            logger.warning(f"  Warning: Anchor config file not found at {config_path}. Using defaults.")
-        
-        # Fallback to hardcoded defaults
-        default_config = self._get_default_env_config()
-        self._anchor_env_config = default_config.copy()
-        return default_config
+            logger.warning(f"  Warning: Anchor config file not found at {config_path}.")
+            raise FileNotFoundError(
+                f"Environment YAML not found: {config_path}. "
+                "YAML is the source of truth; refusing to train on hardcoded defaults."
+            )
     
     def _get_default_env_config(self) -> Dict[str, Any]:
-        # Try to load from YAML first, then fall back to defaults
-        try:
-            config = self._load_env_config_from_yaml()
-            # Ensure logging_verbosity is set (default to "normal" if not in YAML)
-            if "logging_verbosity" not in config:
-                config["logging_verbosity"] = "normal"
-            return config
-        except Exception:
-            # Fallback to hardcoded defaults if loading fails
-            pass
-        
-        return {
-            "precision_target": 0.8,
-            "coverage_target": 0.1,
-            "use_perturbation": False,
-            "perturbation_mode": "bootstrap",
-            "n_perturb": 1024,
-            "step_fracs": (0.005, 0.01, 0.02),
-            "min_width": 0.05,
-            "alpha": 0.7,
-            "beta": 0.6,
-            "gamma": 0.1,
-            "precision_blend_lambda": 0.5,
-            "drift_penalty_weight": 0.05,
-            "min_coverage_floor": 0.005,
-            "js_penalty_weight": 0.05,
-            "initial_window": 0.1,
-            "max_action_scale": 0.1,
-            "min_absolute_step": 0.001,
-            "inter_class_overlap_weight": 0.1,
-            "shared_reward_weight": 0.2,
-            "use_class_centroids": True,
-            "max_termination_count_excellent_precision": 100,
-            "max_termination_count_both_targets": -1,
-            "max_termination_count_high_precision": 200,
-            "max_termination_count_both_close": 100,
-            "logging_verbosity": "normal",  # Default logging verbosity
-        }
+        config = self._load_env_config_from_yaml()
+        if "logging_verbosity" not in config:
+            config["logging_verbosity"] = "normal"
+        return config

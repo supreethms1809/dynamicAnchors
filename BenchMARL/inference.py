@@ -8,8 +8,15 @@ This script:
 4. Saves evaluation data and rules
 """
 
+import sys
+from pathlib import Path as _Path
+_REPO = _Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
 from tabular_datasets import TabularDatasetLoader
 from environment import AnchorEnv
+from utils.eval_harness import apply_train_val_slots, resolve_extracted_models_dir
 from benchmarl.models.mlp import MlpConfig
 from benchmarl_wrappers import AnchorTask
 import argparse
@@ -303,8 +310,176 @@ def nms_deduplicate_anchors(
         if not is_duplicate:
             kept.append(current)
     
-    # Return original anchor dictionaries in order
-    return [anchor_data[i]["anchor"] for i in sorted(a["index"] for a in kept)]
+    # Return kept anchor dictionaries in their kept order (sorted by precision desc,
+    # tie-broken by coverage desc — matches the NMS sort at the top of this function).
+    # Earlier code indexed `anchor_data[i]` by original anchors_list index, which is
+    # wrong after the precision sort and off-by-N when anchors were skipped for
+    # missing bounds — it could return suppressed anchors and drop kept ones.
+    return [a["anchor"] for a in kept]
+
+
+def compute_class_precision_floor(
+    precision_target: float,
+    class_prior: float,
+    lift_k: Optional[float] = 3.0,
+) -> float:
+    """
+    Lift-aware precision floor for class-level rule filtering and union selection.
+
+    An absolute floor (precision_target * 0.8) is unattainable for minority classes:
+    a class with a 2% prior can carry a 10x lift at precision 0.2 yet never reach an
+    absolute 0.72 floor, while a majority-class box passes it almost by default.
+    The floor is therefore the absolute floor capped by lift_k times the class prior:
+
+        floor = min(precision_target * 0.8, lift_k * class_prior)
+
+    For majority classes (lift_k * prior >= absolute floor) this reduces to the
+    original absolute floor; for minority classes it asks for a lift_k-fold
+    improvement over the base rate instead. lift_k comes from env_config
+    "union_lift_k" (see conf/anchor.yaml). Matches single_agent_inference.py.
+    """
+    absolute_floor = precision_target * 0.8
+    if lift_k is None or lift_k <= 0 or class_prior <= 0:
+        return absolute_floor
+    return min(absolute_floor, lift_k * class_prior)
+
+
+def greedy_set_cover_union(
+    candidate_anchors: List[Dict[str, Any]],
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    target_class: int,
+    precision_floor: float,
+) -> Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]:
+    """
+    Select class-based anchors for the class union via greedy set cover.
+
+    Repeatedly adds the candidate that most increases class-conditional coverage
+    (newly covered target-class samples) while keeping the union's precision
+    P(y = target_class | x in union) at or above precision_floor. Ties are broken
+    by the resulting union precision.
+
+    Unlike filter-then-union, this directly optimizes the stated goal — the
+    smallest set of general rules that explains the class — and degrades
+    gracefully: if no candidate satisfies the floor even alone, the single anchor
+    with the best precision (tie-break: class coverage) is returned, so the union
+    is never empty when candidates exist. Matches single_agent_inference.py.
+
+    Returns:
+        (selected_anchors, union_mask, info) where info records the selection
+        method ("greedy_set_cover" or "fallback_best_single"), candidate/selected
+        counts, and the floor used.
+    """
+    n_samples = X_data.shape[0] if X_data is not None else 0
+    empty_info = {"method": "none", "n_candidates": 0, "n_selected": 0,
+                  "precision_floor": float(precision_floor)}
+    if not candidate_anchors or n_samples == 0:
+        return [], np.zeros(n_samples, dtype=bool), empty_info
+
+    class_mask = (y_data == target_class)
+
+    # Precompute in-box masks; drop anchors without bounds or without any samples
+    valid_anchors = []
+    masks = []
+    for anchor_data in candidate_anchors:
+        if "lower_bounds_normalized" not in anchor_data or "upper_bounds_normalized" not in anchor_data:
+            continue
+        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
+        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
+        if lower.shape[0] != X_data.shape[1] or upper.shape[0] != X_data.shape[1]:
+            continue
+        in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
+        if in_box.any():
+            valid_anchors.append(anchor_data)
+            masks.append(in_box)
+
+    if not valid_anchors:
+        return [], np.zeros(n_samples, dtype=bool), empty_info
+
+    selected = []
+    union_mask = np.zeros(n_samples, dtype=bool)
+    remaining = list(range(len(valid_anchors)))
+
+    while remaining:
+        union_class_count = int((union_mask & class_mask).sum())
+        best_idx = None
+        best_gain = 0
+        best_precision = -1.0
+        for i in remaining:
+            cand_mask = union_mask | masks[i]
+            gain = int((cand_mask & class_mask).sum()) - union_class_count
+            if gain <= 0:
+                continue
+            cand_precision = float((y_data[cand_mask] == target_class).mean())
+            if cand_precision < precision_floor:
+                continue
+            if gain > best_gain or (gain == best_gain and cand_precision > best_precision):
+                best_idx = i
+                best_gain = gain
+                best_precision = cand_precision
+        if best_idx is None:
+            break
+        selected.append(best_idx)
+        union_mask |= masks[best_idx]
+        remaining.remove(best_idx)
+
+    method = "greedy_set_cover"
+    if not selected:
+        # No candidate meets the floor even alone — return the single best anchor
+        # (precision, tie-break class coverage) so the union is never empty.
+        def anchor_quality(i):
+            precision = float((y_data[masks[i]] == target_class).mean())
+            class_cov = int((masks[i] & class_mask).sum())
+            return (precision, class_cov)
+        best = max(range(len(valid_anchors)), key=anchor_quality)
+        selected = [best]
+        union_mask = masks[best].copy()
+        method = "fallback_best_single"
+
+    info = {
+        "method": method,
+        "n_candidates": len(valid_anchors),
+        "n_selected": len(selected),
+        "precision_floor": float(precision_floor),
+    }
+    return [valid_anchors[i] for i in selected], union_mask, info
+
+
+def build_class_start_points(
+    centroids: Optional[List],
+    X_unit: np.ndarray,
+    y: np.ndarray,
+    target_class: int,
+    n_points: int,
+    rng: np.random.Generator,
+) -> List[np.ndarray]:
+    """
+    Build diversified start points for class-based rollouts: all k-means
+    centroids for the class (snapped to the nearest class sample when a mean
+    centroid lands far from actual data), then random class samples to fill up
+    to n_points. Rollouts cycle through this list deterministically, so the
+    policy explores different class regions instead of reusing the same
+    agent-indexed centroid for every rollout. Matches single_agent_inference.py.
+    """
+    class_points = X_unit[y == target_class]
+    starts: List[np.ndarray] = []
+
+    if centroids is not None:
+        for centroid in centroids:
+            point = np.asarray(centroid, dtype=np.float32)
+            if len(class_points) > 0:
+                distances = np.linalg.norm(class_points - point, axis=1)
+                # Same snap threshold the environments use for off-data mean centroids
+                if distances.min() > 0.5:
+                    point = class_points[distances.argmin()].astype(np.float32)
+            starts.append(point)
+
+    n_extra = n_points - len(starts)
+    if n_extra > 0 and len(class_points) > 0:
+        idx = rng.choice(len(class_points), size=min(n_extra, len(class_points)), replace=False)
+        starts.extend(class_points[i].astype(np.float32) for i in np.atleast_1d(idx))
+
+    return starts
 
 
 def _load_nashconv_metrics(experiment_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -525,6 +700,30 @@ def load_policy_model(
     return mlp
 
 
+def _generation_split_arrays(env_data, env_config):
+    """A2: which split seeds candidate boxes (instances and class centroids).
+
+    Seeding is part of *fitting*, so it draws on train by default. Seeding on the
+    same split used to select rules (val) is doubly harmful: val holds ~20% of the
+    data, so a class region with no val representative never gets a candidate box,
+    and a box built around a val point necessarily contains that point, scoring
+    fidelity 1.0 on n=1 when selection then evaluates it on val. Those rules won
+    selection and covered nothing at test.
+
+    Selection stays on validation (revision.evaluate) and reporting on test, so
+    seeding from train introduces no leakage into the reported numbers.
+
+    Set env_config["generation_split"] to "val" to restore the old behaviour for
+    ablation.
+    """
+    split = str(env_config.get("generation_split", "train") or "train").lower()
+    if split == "val" and env_data.get("X_val_unit") is not None:
+        return (env_data["X_val_unit"], env_data["X_val_std"], env_data["y_val"], "validation")
+    if split == "test" and env_data.get("X_test_unit") is not None:
+        return (env_data["X_test_unit"], env_data["X_test_std"], env_data["y_test"], "test")
+    return (env_data["X_unit"], env_data["X_std"], env_data["y"], "train")
+
+
 def _should_log_verbose(env_config: Optional[Dict[str, Any]] = None) -> bool:
     """Check if verbose logging is enabled from env_config."""
     if env_config is None:
@@ -599,7 +798,7 @@ def run_rollout_with_policy(
     max_steps: Optional[int] = None,  # If None, will read from env_config.max_cycles
     device: str = "cpu",
     seed: Optional[int] = None,
-    exploration_mode: str = "sample",  # "sample", "mean", or "noisy_mean"
+    exploration_mode: str = "mean",  # "sample", "mean", or "noisy_mean"
     action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
     verbose_logging: bool = False,  # Enable verbose debug logging
 ) -> Dict[str, Any]:
@@ -643,6 +842,11 @@ def run_rollout_with_policy(
             logger.warning(f"  Agent '{agent_id}' not found in reset obs, using '{agent_id}' from possible_agents")
         else:
             raise ValueError(f"Agent '{agent_id}' not found in environment. Available agents: {list(obs_dict.keys())}")
+
+    # Single-agent inference rollouts: exclude idle agents' init boxes from
+    # unions and from the step loop.
+    if hasattr(env, "agents"):
+        env.agents = [agent_id]
     
     # Debug: Check initial box state and verify x_star_unit is still set after reset
     if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
@@ -698,7 +902,7 @@ def run_rollout_with_policy(
             break
         
         # Get observation for this agent
-        # shape: (2*n_features + 2,) - [lower, upper, precision, coverage]
+        # shape: (2*n_features + 3,) - [lower, upper, precision, coverage, episode_phase]
         obs_vec = obs_dict[agent_id]
         
         # Convert to tensor for policy
@@ -1110,6 +1314,9 @@ def run_rollout_with_policy(
             "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
     
+    episode_data["n_blackbox_queries"] = int(
+        getattr(env, "n_blackbox_queries", 0)
+    )
     return episode_data
 
 
@@ -1120,15 +1327,15 @@ def extract_rules_from_policies(
     max_features_in_rule: int = -1,
     steps_per_episode: Optional[int] = None,
     n_instances_per_class: int = 20,
-    eval_on_test_data: bool = True,
-    coverage_on_all_data: bool = True,  # Default True for fair comparison with single-agent and baseline
+    eval_on_test_data: bool = False,
+    coverage_on_all_data: bool = False,
     output_dir: Optional[str] = None,
     seed: int = 42,
     device: str = "cpu",
-    exploration_mode: str = "sample",
+    exploration_mode: str = "mean",
     action_noise_scale: float = 0.05,
     filter_by_prediction: bool = False,  # Default False for fair comparison (can be enabled if needed)
-    prefer_model: str = "final",  # "best" or "final" — which extracted-models folder to use
+    prefer_model: str = "best",  # "best" or "final" — which extracted-models folder to use
 ) -> Dict[str, Any]:
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
@@ -1138,20 +1345,11 @@ def extract_rules_from_policies(
     logger.info(f"Model preference: {prefer_model}")
     logger.info("="*80)
 
-    # Resolve the models directory. "best" -> individual_models_best (extracted
-    # from best_model/best_checkpoint.pt); "final" -> individual_models. If the
-    # requested folder is missing, fall back to the other so inference still runs.
-    pm = str(prefer_model).lower()
-    final_dir = os.path.join(experiment_dir, "individual_models")
-    best_dir = os.path.join(experiment_dir, "individual_models_best")
-    if pm == "best":
-        individual_models_dir = best_dir if os.path.isdir(best_dir) else final_dir
+    individual_models_dir = resolve_extracted_models_dir(experiment_dir, prefer_model)
+    if os.path.basename(individual_models_dir) == "individual_models_best":
+        logger.info(f"Using BEST extracted models: {individual_models_dir}")
     else:
-        individual_models_dir = final_dir if os.path.isdir(final_dir) else best_dir
-    if individual_models_dir == best_dir:
-        logger.info(f"Using BEST extracted models: {best_dir}")
-    else:
-        logger.info(f"Using FINAL extracted models: {final_dir}")
+        logger.info(f"Using FINAL extracted models: {individual_models_dir}")
 
     if not os.path.exists(individual_models_dir):
         raise ValueError(
@@ -1316,6 +1514,23 @@ def extract_rules_from_policies(
         nested = env_config.get("env_config", {})
         top = {k: v for k, v in env_config.items() if k != "env_config"}
         env_config = {**nested, **top}
+
+    # C-10 / A2: candidate rules are GENERATED on the generation split (train by
+    # default) and SELECTED on validation by revision.evaluate; D_test is reserved
+    # for reporting. The live rollout metrics must come from the same split that
+    # seeds the boxes, otherwise boxes are shaped on val and then also selected on
+    # val, which is what let single-sample rules score perfectly.
+    _gen_split = str(env_config.get("generation_split", "train") or "train").lower()
+    if _gen_split not in ("train", "val", "test"):
+        _gen_split = "train"
+    env_config.update({
+        "eval_split": _gen_split,
+        "X_val_unit": env_data.get("X_val_unit"),
+        "X_val_std": env_data.get("X_val_std"),
+        "y_val": env_data.get("y_val"),
+        "categorical_indices": env_data.get("categorical_indices") or [],
+        "categorical_value_names": env_data.get("categorical_value_names") or {},
+    })
 
     # Resolve rollout length: if not explicitly provided, use env_config.max_cycles.
     if steps_per_episode is None:
@@ -1608,6 +1823,8 @@ def extract_rules_from_policies(
             n_samples = None
     elif eval_on_test_data and env_data.get("X_test_unit") is not None:
         n_samples = env_data["X_test_unit"].shape[0]
+    elif env_data.get("X_val_unit") is not None:
+        n_samples = env_data["X_val_unit"].shape[0]
     elif env_data.get("X_unit") is not None:
         n_samples = env_data["X_unit"].shape[0]
     else:
@@ -1732,14 +1949,15 @@ def extract_rules_from_policies(
     if verbose_logging:
         logger.info("Verbose logging enabled - showing detailed debug information")
     
-    # Always use test data for inference (unless explicitly overridden)
+    # Paper path: validation-only rule generation. Full/test modes remain explicit
+    # diagnostics and must not feed reported revision tables.
     if coverage_on_all_data:
         # When coverage_on_all_data=True, we use combined data for coverage but still need to set eval_on_test_data=False
         # since we're providing combined data directly to the environment
         env_config.update({
             "eval_on_test_data": False,  # Use combined data, not test-only
         })
-        logger.info("Using ALL data (train+test combined) for coverage calculation (matches baseline)")
+        logger.warning("Using ALL data is diagnostic-only and must not feed paper metrics")
     elif eval_on_test_data:
         if env_data.get("X_test_unit") is None:
             raise ValueError("Test data not available for evaluation. Inference requires test data.")
@@ -1749,27 +1967,39 @@ def extract_rules_from_policies(
             "X_test_std": env_data["X_test_std"],
             "y_test": env_data["y_test"],
         })
-        logger.info("Using test data for inference (default behavior)")
+        logger.warning("Using test data for rule generation is diagnostic-only")
     else:
-        logger.warning("WARNING: Using training data for inference (not recommended!)")
-        logger.warning("  This may lead to overoptimistic results. Use test data for proper evaluation.")
+        if env_data.get("X_val_unit") is None:
+            raise ValueError("Validation data is required for rule generation")
+        env_config.update({
+            "eval_on_test_data": False,
+            # A2: generation split (train by default); selection stays on val in
+            # revision.evaluate, reporting on test.
+            "eval_split": _gen_split,
+            "X_val_unit": env_data["X_val_unit"],
+            "X_val_std": env_data["X_val_std"],
+            "y_val": env_data["y_val"],
+        })
+        logger.info(f"Generating candidate rules on {_gen_split.upper()}; selection on validation")
     
     # Create config for direct AnchorEnv creation
-    # If coverage_on_all_data is True, combine train and test data (matches baseline behavior)
+    # Constructor slots stay train. Val/test live only in env_config eval_split
+    # so init hull / class-aware τ_P / min_coverage_floor source stay consistent
+    # with training. Live P/C during generation use the metric split.
     if coverage_on_all_data:
         # Combine train and test data for coverage calculation (matches baseline)
         anchor_X_unit = np.vstack([env_data["X_unit"], env_data.get("X_test_unit", [])])
         anchor_X_std = np.vstack([env_data["X_std"], env_data.get("X_test_std", [])])
         anchor_y = np.concatenate([env_data["y"], env_data.get("y_test", [])])
         logger.info(f"Using ALL data (train+test combined) for coverage calculation: {len(anchor_y)} samples")
-    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
-        anchor_X_unit = env_data["X_test_unit"]
-        anchor_X_std = env_data["X_test_std"]
-        anchor_y = env_data["y_test"]
     else:
         anchor_X_unit = env_data["X_unit"]
         anchor_X_std = env_data["X_std"]
         anchor_y = env_data["y"]
+        logger.info(
+            f"Constructor X_unit/X_std/y stay train ({len(anchor_y)} samples); "
+            f"live metrics use eval_split={env_config.get('eval_split', 'val')}"
+        )
     
     # Ensure normalize_data=False to avoid double normalization
     # get_anchor_env_data() already returns X_unit (normalized to [0,1]) and X_std (standardized)
@@ -1923,6 +2153,7 @@ def extract_rules_from_policies(
         "metadata": {
             "dataset": dataset_name,
             "experiment_dir": experiment_dir,
+            "seed": int(seed),
             "target_classes": target_classes,
             "class_names": {
                 f"class_{int(cls)}": (
@@ -1938,8 +2169,18 @@ def extract_rules_from_policies(
             "coverage_on_all_data": coverage_on_all_data,
             "n_instances_per_class": n_instances_per_class,
             "steps_per_episode": steps_per_episode,
+            "selection_split": "test" if eval_on_test_data else "val",
+            "report_split": "test",
+            "bounds_space": "unit",
+            "ranking_score_formula": env_config["ranking_score_formula"],
+            "sparsity_width_ratio": env_config["sparsity_width_ratio"],
+            "top_k_rules_by_score": env_config["top_k_rules_by_score"],
+            "min_support": env_config["min_support"],
+            "precision_target": env_config["precision_target"],
+            "coverage_target": env_config["coverage_target"],
         },
     }
+    total_blackbox_queries = 0
     
     # Map agent names to target classes
     # Agent names can be:
@@ -2043,13 +2284,15 @@ def extract_rules_from_policies(
             else:
                 raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
         else:
-            # When eval_on_test_data=False and coverage_on_all_data=False, use training data
-            class_mask = (env_data["y"] == target_class)
+            # C-10 / A2: candidate explanations are seeded from the generation
+            # split (train by default), never test. Selection happens on val in
+            # revision.evaluate, so the two splits stay distinct.
+            X_data_unit, X_data_std, y_gen, data_source_name = _generation_split_arrays(
+                env_data, env_config
+            )
+            class_mask = (y_gen == target_class)
             class_instances = np.where(class_mask)[0]
-            X_data_unit = env_data["X_unit"]
-            X_data_std = env_data["X_std"]
-            y_data_for_filtering = env_data["y"]
-            data_source_name = "training"
+            y_data_for_filtering = y_gen
         
         # Optional prediction-match filtering: ensure original_pred == target_class
         # NOTE: This matches training behavior when enabled, but for fair baseline comparison
@@ -2132,6 +2375,7 @@ def extract_rules_from_policies(
             _X_recompute_tensor = torch.from_numpy(X_data_std.astype(np.float32)).to(torch.device(device))
             _full_logits = classifier_for_recompute(_X_recompute_tensor)
             full_predictions_recompute = _full_logits.argmax(dim=1).cpu().numpy()
+        total_blackbox_queries += int(len(X_data_std))
 
         for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
             # Get the actual instance from the dataset
@@ -2250,6 +2494,9 @@ def extract_rules_from_policies(
                 action_noise_scale=action_noise_scale,  # Pass action noise scale
                 verbose_logging=verbose_logging,  # Pass verbosity setting
             )
+            total_blackbox_queries += int(
+                episode_data.get("n_blackbox_queries", 0)
+            )
             
             # Debug logging for first episode of each class
             if verbose_logging and instance_idx_in_range == 0:
@@ -2324,9 +2571,19 @@ def extract_rules_from_policies(
             
             if episode_data and "final_observation" in episode_data:
                 obs = np.array(episode_data["final_observation"], dtype=np.float32)
-                if len(obs) == 2 * n_features + 2:
-                    lower_normalized = obs[:n_features].copy()
-                    upper_normalized = obs[n_features:2*n_features].copy()
+                # >= not ==: the env observation gained an episode_phase entry
+                # (2n+3); older records are 2n+2. Only the first 2n entries
+                # (the box bounds) are read below, so both layouts are valid.
+                if len(obs) >= 2 * n_features + 2:
+                    policy_lower_normalized = obs[:n_features].copy()
+                    policy_upper_normalized = obs[n_features:2*n_features].copy()
+                    from utils.metrics import sparsify_box
+                    lower_normalized, upper_normalized, _ = sparsify_box(
+                        policy_lower_normalized,
+                        policy_upper_normalized,
+                        sparsity_width_ratio=env_config["sparsity_width_ratio"],
+                        max_features=max_features_in_rule,
+                    )
                     
                     # Denormalize bounds to original feature space:
                     # unit [0,1] -> standardized (X_min/X_range) -> raw (scaler_mean/scale)
@@ -2425,6 +2682,8 @@ def extract_rules_from_policies(
                     # Also save normalized bounds for reference
                     "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                    "policy_lower_bounds_normalized": policy_lower_normalized.tolist(),
+                    "policy_upper_bounds_normalized": policy_upper_normalized.tolist(),
                 })
 
                 # Recompute precision/coverage on the full evaluation dataset.
@@ -2574,7 +2833,9 @@ def extract_rules_from_policies(
             for anchor in anchors_after_nms:
                 precision = anchor.get("instance_precision", anchor.get("anchor_precision", 0.0))
                 coverage = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
-                score = precision * (1 + coverage)  # Score formula: precision * (1 + coverage)
+                from utils.metrics import ranking_score as _ranking_score
+                formula = env_config.get("ranking_score_formula", "precision_coverage")
+                score = _ranking_score(precision, coverage, formula)
                 rule_scores.append({
                     "anchor": anchor,
                     "score": float(score)
@@ -2894,7 +3155,17 @@ def extract_rules_from_policies(
         early_stop_iou_threshold = env_config.get("early_stop_iou_threshold", 0.95)  # Default: 0.95 (very similar)
         
         class_based_start_time = time.perf_counter()
-        
+
+        # Diversified class-based starts: built once per agent/class on the first
+        # rollout (the data selection below is loop-invariant), then cycled with an
+        # agent-specific offset so multiple agents per class explore different regions
+        # instead of all reusing the same agent-indexed centroid every rollout.
+        class_start_points: List[np.ndarray] = []
+        start_agent_idx = 0
+        agent_name_parts = agent_name.split("_")
+        if len(agent_name_parts) >= 3 and agent_name_parts[2].isdigit():
+            start_agent_idx = int(agent_name_parts[2])
+
         # Run class-based rollouts (NOT setting x_star_unit, so environment uses cluster centroids)
         for rollout_idx in range(n_class_based_rollouts_per_agent):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
@@ -2931,22 +3202,37 @@ def extract_rules_from_policies(
                 else:
                     raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
             else:
-                # When eval_on_test_data=False and coverage_on_all_data=False, use training data only
-                full_X_unit = env_data["X_unit"]
-                full_X_std = env_data["X_std"]
-                full_y = env_data["y"]
+                # C-10 / A2: class-level candidates are seeded from the generation
+                # split (train by default), never test.
+                full_X_unit, full_X_std, full_y, _gen_name = _generation_split_arrays(
+                    env_data, env_config
+                )
                 use_full_dataset = False
                 if rollout_idx == 0:
-                    logger.info(f"  Using TRAINING data only for class-based rollouts (eval_on_test_data=False, coverage_on_all_data=False)")
-                    logger.info(f"    Training samples: {len(full_y)}")
+                    logger.info(f"  Using {_gen_name.upper()} data for class-based rollouts")
+                    logger.info(f"    {_gen_name} samples: {len(full_y)}")
             
+            # Build the diversified start list once per agent/class: k-means centroids
+            # (snapped to class data) plus random class samples up to the rollout count
+            if rollout_idx == 0:
+                centroids_for_class = (env_config.get("cluster_centroids_per_class") or {}).get(target_class)
+                start_rng = np.random.default_rng(
+                    (seed if seed is not None else 42) + 20000 + int(target_class) * 100 + start_agent_idx
+                )
+                class_start_points = build_class_start_points(
+                    centroids_for_class, full_X_unit, full_y, target_class,
+                    n_class_based_rollouts_per_agent, start_rng
+                )
+                n_centroid_starts = len(centroids_for_class) if centroids_for_class is not None else 0
+                logger.info(f"  Diversified starts for class {target_class} (agent {agent_name}): "
+                            f"{len(class_start_points)} points ({n_centroid_starts} centroids + "
+                            f"{len(class_start_points) - n_centroid_starts} random class samples)")
+
             # Create environment config for this class with full dataset
             class_based_config = anchor_config.copy()
             class_based_config["target_classes"] = [target_class]
-            # Override with full dataset
-            class_based_config["X_unit"] = full_X_unit
-            class_based_config["X_std"] = full_X_std
-            class_based_config["y"] = full_y
+            # Keep train constructor slots. Live P/C use eval_split (val/test)
+            # already attached on env_config. Do not stuff val into X_unit.
             
             # Ensure env_config is properly set up
             if "env_config" not in class_based_config:
@@ -2963,6 +3249,12 @@ def extract_rules_from_policies(
             class_based_config["env_config"]["use_class_centroids"] = True
             if rollout_idx == 0:  # Log once per class
                 logger.info(f"  Enforced use_class_centroids=True for class-based rollouts (required for class-based mode)")
+
+            # Cycle through diversified starts with an agent-specific offset so
+            # different agents of the same class cover different start regions
+            if class_start_points:
+                start_idx = (rollout_idx + start_agent_idx * n_class_based_rollouts_per_agent) % len(class_start_points)
+                class_based_config["env_config"]["class_init_point"] = class_start_points[start_idx]
             
             # Ensure cluster centroids are available
             if "cluster_centroids_per_class" not in class_based_config["env_config"]:
@@ -3010,6 +3302,9 @@ def extract_rules_from_policies(
                 action_noise_scale=action_noise_scale,
                 verbose_logging=verbose_logging,
             )
+            total_blackbox_queries += int(
+                episode_data.get("n_blackbox_queries", 0)
+            )
             
             # Extract metrics
             instance_precision = 0.0
@@ -3040,9 +3335,19 @@ def extract_rules_from_policies(
             
             if episode_data and "final_observation" in episode_data:
                 obs = np.array(episode_data["final_observation"], dtype=np.float32)
-                if len(obs) == 2 * n_features + 2:
-                    lower_normalized = obs[:n_features].copy()
-                    upper_normalized = obs[n_features:2*n_features].copy()
+                # >= not ==: the env observation gained an episode_phase entry
+                # (2n+3); older records are 2n+2. Only the first 2n entries
+                # (the box bounds) are read below, so both layouts are valid.
+                if len(obs) >= 2 * n_features + 2:
+                    policy_lower_normalized = obs[:n_features].copy()
+                    policy_upper_normalized = obs[n_features:2*n_features].copy()
+                    from utils.metrics import sparsify_box
+                    lower_normalized, upper_normalized, _ = sparsify_box(
+                        policy_lower_normalized,
+                        policy_upper_normalized,
+                        sparsity_width_ratio=env_config["sparsity_width_ratio"],
+                        max_features=max_features_in_rule,
+                    )
                     
                     # Denormalize bounds: unit -> standardized -> raw
                     X_min = env_config.get("X_min")
@@ -3119,6 +3424,8 @@ def extract_rules_from_policies(
                     "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
                     "lower_bounds_normalized": lower_normalized.tolist() if lower_normalized is not None else None,
                     "upper_bounds_normalized": upper_normalized.tolist() if upper_normalized is not None else None,
+                    "policy_lower_bounds_normalized": policy_lower_normalized.tolist(),
+                    "policy_upper_bounds_normalized": policy_upper_normalized.tolist(),
                 })
             
             # CRITICAL: Check for near-duplicates using quantization and IoU (early stopping)
@@ -3212,7 +3519,9 @@ def extract_rules_from_policies(
             for anchor in class_based_anchors_after_nms:
                 precision = anchor.get("class_precision", anchor.get("instance_precision", 0.0))
                 coverage = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
-                score = precision * (1 + coverage)  # Score formula: precision * (1 + coverage)
+                from utils.metrics import ranking_score as _ranking_score
+                formula = env_config.get("ranking_score_formula", "precision_coverage")
+                score = _ranking_score(precision, coverage, formula)
                 rule_scores.append({
                     "anchor": anchor,
                     "score": float(score)
@@ -3248,27 +3557,47 @@ def extract_rules_from_policies(
         # We only trust high-precision anchors, so average should reflect quality of trusted anchors only
         # This matches the filtering used for union computation
         precision_target = env_config.get("precision_target", 0.95)
-        precision_threshold = precision_target * 0.8
-        
+        union_lift_k = env_config.get("union_lift_k", 3.0)
+
         # CRITICAL FIX: Use same dataset as class-based rollouts for consistency
         # Respect eval_on_test_data and coverage_on_all_data to match rollout behavior
         if coverage_on_all_data:
             if env_data.get("X_test_unit") is not None:
                 X_data_filter = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+                X_std_filter = np.vstack([env_data["X_std"], env_data["X_test_std"]])
                 y_data_filter = np.concatenate([env_data["y"], env_data["y_test"]])
             else:
                 X_data_filter = env_data["X_unit"]
+                X_std_filter = env_data["X_std"]
                 y_data_filter = env_data["y"]
         elif eval_on_test_data:
             if env_data.get("X_test_unit") is not None:
                 X_data_filter = env_data["X_test_unit"]
+                X_std_filter = env_data["X_test_std"]
                 y_data_filter = env_data["y_test"]
             else:
                 raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
         else:
-            X_data_filter = env_data["X_unit"]
-            y_data_filter = env_data["y"]
+            X_data_filter = env_data["X_val_unit"]
+            X_std_filter = env_data["X_val_std"]
+            y_data_filter = env_data["y_val"]
+
+        classifier_for_filter = dataset_loader.get_classifier()
+        classifier_for_filter.eval()
+        with torch.no_grad():
+            logits_filter = classifier_for_filter(
+                torch.from_numpy(X_std_filter.astype(np.float32)).to(torch.device(device))
+            )
+            predictions_filter = logits_filter.argmax(dim=1).cpu().numpy()
+        total_blackbox_queries += int(len(X_std_filter))
         
+        # Lift-aware precision floor: judge class-level anchors by lift over the class
+        # prior, capped by the absolute floor (see compute_class_precision_floor)
+        class_prior_filter = float((predictions_filter == target_class).mean())
+        precision_threshold = compute_class_precision_floor(precision_target, class_prior_filter, union_lift_k)
+        logger.info(f"  Precision floor for class {target_class}: {precision_threshold:.4f} "
+                    f"(absolute={precision_target * 0.8:.4f}, lift_k={union_lift_k} x prior={class_prior_filter:.4f})")
+
         # Filter anchors by recomputing precision on actual dataset
         filtered_class_based_instance_precisions = []
         filtered_class_based_instance_coverages = []
@@ -3286,9 +3615,15 @@ def extract_rules_from_policies(
                     in_box = np.all((X_data_filter >= lower) & (X_data_filter <= upper), axis=1)
                     
                     if in_box.sum() > 0:
-                        # Compute actual precision on the dataset
-                        y_in_box = y_data_filter[in_box]
-                        actual_precision = float((y_in_box == target_class).mean())
+                        # C-09 PRIMARY: model fidelity, not ground-truth purity.
+                        actual_precision = float(
+                            (predictions_filter[in_box] == target_class).mean()
+                        )
+                        actual_purity = float(
+                            (y_data_filter[in_box] == target_class).mean()
+                        )
+                        anchor_data["class_fidelity"] = actual_precision
+                        anchor_data["class_purity"] = actual_purity
                         
                         # Only include high-precision anchors in average
                         if actual_precision >= precision_threshold:
@@ -3418,133 +3753,89 @@ def extract_rules_from_policies(
                 if r and r != "any values (no tightened features)"
             ]))
         
-        # Filter anchors by precision threshold before computing union
-        # This ensures we only include high-quality rules in the union
-        # Use the same precision threshold as used during training/inference
-        # precision_threshold = precision_target * 0.8 (same as in environment.py)
+        # Select anchors for the union via greedy set cover with a lift-aware
+        # precision floor. This replaces the old filter-then-union: instead of
+        # unioning everything above an absolute precision threshold (which left
+        # minority classes with an empty union and 0.0 metrics), greedily add the
+        # anchor that most increases class-conditional coverage while the union
+        # precision stays at or above the floor. Falls back to the single best
+        # anchor when nothing meets the floor, so the union is never empty.
+        # Matches single_agent_inference.py for fair comparison.
         precision_target = env_config.get("precision_target", 0.95)
-        precision_threshold = precision_target * 0.8
-        filtered_anchors_for_union = []
-        filtered_rules_for_union = []
-        
-        # CRITICAL: Recompute precision on actual dataset for filtering
-        # The stored instance_precision uses perturbation sampling which may not match actual dataset precision
-        if X_data_union is not None and y_data_union is not None:
-            for anchor_data in all_anchors_for_union:
-                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                    
-                    # Check which points fall in this anchor box
-                    in_box = np.all((X_data_union >= lower) & (X_data_union <= upper), axis=1)
-                    
-                    if in_box.sum() > 0:
-                        # Compute actual precision on the dataset
-                        y_in_box = y_data_union[in_box]
-                        actual_precision = float((y_in_box == target_class).mean())
-                        
-                        # Use actual precision for filtering, not stored instance_precision
-                        if actual_precision >= precision_threshold:
-                            filtered_anchors_for_union.append(anchor_data)
-                            # Also track the corresponding rule if available
-                            rule = anchor_data.get("rule", "")
-                            if rule and rule != "any values (no tightened features)":
-                                filtered_rules_for_union.append(rule)
-                    else:
-                        # No samples in box - skip this anchor
-                        continue
-        else:
-            # Fallback: use stored precision if dataset not available
-            logger.warning(f"  Class {target_class} - Cannot recompute precision on dataset, using stored values")
-            for anchor_data in all_anchors_for_union:
-                # Get precision from anchor data (prefer instance_precision, fallback to anchor_precision)
-                anchor_precision = anchor_data.get("instance_precision", anchor_data.get("anchor_precision", 0.0))
-                
-                if anchor_precision >= precision_threshold:
-                    filtered_anchors_for_union.append(anchor_data)
-                    # Also track the corresponding rule if available
-                    rule = anchor_data.get("rule", "")
-                    if rule and rule != "any values (no tightened features)":
-                        filtered_rules_for_union.append(rule)
-        
-        # Update class_based_unique_rules to only include rules from high-precision anchors
-        if filtered_rules_for_union:
-            class_based_unique_rules = list(set(filtered_rules_for_union))
-        
-        # Log filtering statistics
-        n_total_anchors = len(all_anchors_for_union)
-        n_filtered_anchors = len(filtered_anchors_for_union)
-        if n_total_anchors > 0:
-            logger.info(f"  Class {target_class} - Filtered {n_total_anchors} anchors to {n_filtered_anchors} high-precision anchors (precision >= {precision_threshold:.2f})")
-        
-        # Compute union of class-based anchors only (smallest set of general rules)
-        # Use filtered anchors instead of all anchors
-        if X_data_union is not None and y_data_union is not None and len(filtered_anchors_for_union) > 0:
-            n_samples = X_data_union.shape[0]
-            union_mask = np.zeros(n_samples, dtype=bool)
-            
-            # Build union mask from filtered high-precision anchors only
-            for anchor_data in filtered_anchors_for_union:
-                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                    
-                    # Check which points fall in this anchor box
-                    in_box = np.all((X_data_union >= lower) & (X_data_union <= upper), axis=1)
-                    union_mask |= in_box
-            
-            # Class-level coverage: fraction of class samples that are in the union
-            mask_cls = (y_data_union == target_class)
-            if mask_cls.sum() > 0:
-                class_coverage_combined = float(union_mask[mask_cls].mean())
-            else:
-                class_coverage_combined = 0.0
-            
-            # Class-level precision: fraction of points in union that belong to target class
-            if union_mask.any():
-                y_union = y_data_union[union_mask]
-                class_precision_combined = float((y_union == target_class).mean())
-            else:
-                class_precision_combined = 0.0
-            
-            # Update class-level metrics with class-based union only
-            class_data["class_precision"] = class_precision_combined
-            class_data["class_coverage"] = class_coverage_combined
-            
-            # CRITICAL: Store union rules in class_data so they can be accessed later
-            # These are the deduplicated class-based rules that form the union
-            class_data["class_level_unique_rules"] = class_based_unique_rules
-            class_data["class_union_unique_rules"] = class_based_unique_rules  # Alias for clarity
-            
-            # Log the final union metrics
-            n_class_based_anchors = len(filtered_anchors_for_union)
-            n_unique_rules = len(class_based_unique_rules)
-            logger.info(f"\n  Class {target_class} - Final Union Metrics (High-Precision Class-Based Anchors Only):")
-            logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}")
-            logger.info(f"    Anchors used: {n_class_based_anchors} high-precision class-based anchors (precision >= {precision_threshold:.2f})")
-            logger.info(f"    Unique Rules: {n_unique_rules}")
-            logger.info(f"    Note: Only includes anchors with precision >= {precision_threshold:.2f} to ensure high-quality union")
-            
-            # Log the actual rules
-            if class_based_unique_rules:
-                logger.info(f"\n  Class {target_class} - Class-Based Union Rules:")
-                for i, rule in enumerate(class_based_unique_rules, 1):
-                    logger.info(f"    Rule {i}: {rule}")
-            else:
-                logger.info(f"\n  Class {target_class} - No unique rules found in class-based anchors")
-        elif X_data_union is not None and y_data_union is not None and len(filtered_anchors_for_union) == 0 and len(all_anchors_for_union) > 0:
-            # All anchors were filtered out due to low precision
-            logger.warning(f"  Class {target_class} - All {len(all_anchors_for_union)} anchors filtered out (precision < {precision_threshold:.2f})")
+        union_lift_k = env_config.get("union_lift_k", 3.0)
+
+        if X_data_union is None or y_data_union is None:
+            logger.warning(f"  Class {target_class} - Dataset not available, cannot compute class union metrics")
+            continue
+
+        class_prior = float((y_data_union == target_class).mean())
+        precision_floor = compute_class_precision_floor(precision_target, class_prior, union_lift_k)
+
+        selected_anchors, union_mask, selection_info = greedy_set_cover_union(
+            all_anchors_for_union, X_data_union, y_data_union, target_class, precision_floor
+        )
+
+        class_data["class_prior"] = class_prior
+        class_data["class_union_precision_floor"] = precision_floor
+        class_data["class_union_selection"] = selection_info
+
+        if not selected_anchors:
+            logger.warning(f"  Class {target_class}: No class-based anchors with valid bounds/samples. "
+                           f"Class union metrics set to 0.0")
             class_data["class_precision"] = 0.0
             class_data["class_coverage"] = 0.0
-            class_data["class_level_unique_rules"] = []
-            class_data["class_union_unique_rules"] = []
+            continue
+
+        # Class-level union metrics
+        # Precision: P(y = target_class | x in union)
+        # Coverage: P(x in union | y = target_class) - class-conditional coverage
+        mask_cls = (y_data_union == target_class)
+        n_class_samples = int(mask_cls.sum())
+        if union_mask.any():
+            class_precision_combined = float((y_data_union[union_mask] == target_class).mean())
+            class_coverage_combined = float((union_mask & mask_cls).sum() / n_class_samples) if n_class_samples > 0 else 0.0
         else:
-            # No class-based anchors available - set union metrics to 0.0
-            if len(all_anchors_for_union) == 0:
-                logger.warning(f"  Class {target_class}: No class-based anchors found. Class union metrics set to 0.0")
-                class_data["class_precision"] = 0.0
-                class_data["class_coverage"] = 0.0
+            class_precision_combined = 0.0
+            class_coverage_combined = 0.0
+        class_union_lift = class_precision_combined / class_prior if class_prior > 0 else 0.0
+
+        # Union rules = rules of the selected anchors only (order of selection, deduped)
+        selected_rules = list(dict.fromkeys(
+            a.get("rule", "") for a in selected_anchors
+            if a.get("rule") and a.get("rule") != "any values (no tightened features)"
+        ))
+        if selected_rules:
+            class_based_unique_rules = selected_rules
+
+        # Update class-level metrics with class-based union only
+        class_data["class_precision"] = class_precision_combined
+        class_data["class_coverage"] = class_coverage_combined
+        class_data["class_union_lift"] = class_union_lift  # Precision relative to class prior
+
+        # CRITICAL: Store union rules in class_data so they can be accessed later
+        # These are the rules of the set-cover-selected class-based anchors
+        class_data["class_level_unique_rules"] = class_based_unique_rules
+        class_data["class_union_unique_rules"] = class_based_unique_rules  # Alias for clarity
+
+        # Log the final union metrics
+        n_unique_rules = len(class_based_unique_rules)
+        logger.info(f"\n  Class {target_class} - Final Union Metrics (Greedy Set-Cover over Class-Based Anchors):")
+        logger.info(f"    Selection: {selection_info['method']} picked {selection_info['n_selected']}/{selection_info['n_candidates']} anchors "
+                    f"(precision floor={precision_floor:.4f}, class prior={class_prior:.4f}, lift_k={union_lift_k})")
+        if selection_info["method"] == "fallback_best_single":
+            logger.warning(f"  Class {target_class}: no anchor met the precision floor even alone; "
+                           f"union is the single best anchor (graceful degradation)")
+        logger.info(f"    Union precision: {class_precision_combined:.4f}, Union coverage: {class_coverage_combined:.4f}, "
+                    f"Lift: {class_union_lift:.2f}x over class prior {class_prior:.4f}")
+        logger.info(f"    Unique Rules: {n_unique_rules}")
+
+        # Log the actual rules
+        if class_based_unique_rules:
+            logger.info(f"\n  Class {target_class} - Class-Based Union Rules:")
+            for i, rule in enumerate(class_based_unique_rules, 1):
+                logger.info(f"    Rule {i}: {rule}")
+        else:
+            logger.info(f"\n  Class {target_class} - No unique rules found in class-based anchors")
     
     # End overall timing
     overall_end_time = time.perf_counter()
@@ -3635,6 +3926,14 @@ def extract_rules_from_policies(
     # Add timing summary to metadata
     results["metadata"]["total_inference_time_seconds"] = float(overall_total_time)
     results["metadata"]["total_rollout_time_seconds"] = float(total_rollout_time_all_classes)
+    results["queries"] = {
+        "n_blackbox_queries": int(total_blackbox_queries),
+        "n_reporting_queries": 0,
+        "query_policy": (
+            "Generation and validation-selection classifier calls; "
+            "held-out test reporting occurs in revision.evaluate"
+        ),
+    }
     
     # Save results if output_dir is provided
     if output_dir is not None:
@@ -3739,8 +4038,8 @@ def main():
     parser.add_argument(
         "--steps_per_episode",
         type=int,
-        default=100,
-        help="Maximum steps per rollout episode (default: 100, matches config max_cycles)"
+        default=None,
+        help="Maximum steps per rollout episode (default: env max_cycles from YAML, typically 200)"
     )
     
     parser.add_argument(
@@ -3753,7 +4052,12 @@ def main():
     parser.add_argument(
         "--eval_on_train_data",
         action="store_true",
-        help="Override default and evaluate on training data instead of test data (not recommended). Default: uses test data."
+        help="Legacy diagnostic mode; validation is the default paper rule-generation split."
+    )
+    parser.add_argument(
+        "--eval_on_test_data",
+        action="store_true",
+        help="Diagnostic only: generate rules on test. Never use this for reported revision results."
     )
     
     parser.add_argument(
@@ -3804,9 +4108,9 @@ def main():
     parser.add_argument(
         "--exploration_mode",
         type=str,
-        default="sample",
+        default="mean",
         choices=["sample", "mean", "noisy_mean"],
-        help="Exploration mode for rule diversity: 'sample' (sample from policy distribution), 'mean' (deterministic), 'noisy_mean' (mean + noise)"
+        help="Exploration mode: 'mean' (greedy / TanhNormal.deterministic_sample, default), 'sample' (stochastic), 'noisy_mean'"
     )
     
     parser.add_argument(
@@ -3823,6 +4127,14 @@ def main():
         help="Path to debug log file (default: /tmp/inference_debug_<timestamp>.log)"
     )
     
+    parser.add_argument(
+        "--prefer_model",
+        type=str,
+        default="best",
+        choices=["best", "final"],
+        help="Which extracted models to load: 'best' (individual_models_best, fail if missing) or 'final'"
+    )
+    
     args = parser.parse_args()
     
     # Reconfigure logging with custom log file if provided
@@ -3830,14 +4142,16 @@ def main():
         log_file = setup_logging(args.log_file)
         logger.info(f"Using custom debug log file: {log_file}")
     
-    # Always use test data by default (can be overridden with --eval_on_train_data)
-    use_test_data = not args.eval_on_train_data
-    
+    if args.eval_on_train_data and args.eval_on_test_data:
+        parser.error("--eval_on_train_data and --eval_on_test_data are mutually exclusive")
+    use_test_data = bool(args.eval_on_test_data)
+    if args.eval_on_train_data:
+        logger.warning(
+            "--eval_on_train_data is deprecated; the revision pipeline generates "
+            "rules on validation. Falling back to validation."
+        )
     if not use_test_data:
-        logger.warning("WARNING: Running inference on training data is not recommended!")
-        logger.warning("  Inference should typically use test data to evaluate generalization.")
-    else:
-        logger.info("Using test data for inference (default behavior)")
+        logger.info("Using validation data for rule generation (paper protocol)")
     
     # Extract rules
     results = extract_rules_from_policies(
@@ -3855,6 +4169,7 @@ def main():
         exploration_mode=args.exploration_mode,
         action_noise_scale=args.action_noise_scale,
         filter_by_prediction=args.filter_by_prediction,
+        prefer_model=args.prefer_model,
     )
     
     # Save results

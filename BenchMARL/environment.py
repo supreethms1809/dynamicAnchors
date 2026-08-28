@@ -114,32 +114,20 @@ class AnchorEnv(ParallelEnv):
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
         self.gamma = env_config.get("gamma", 0.1)
-        # IMPORTANT: Default should match config file (0.3), but kept at 0.1 for backward compatibility
-        # Config file sets coverage_target: 0.3, so this default should rarely be used
-        self.coverage_target = env_config.get("coverage_target", 0.1)  # Config default is 0.3
-        # if self.coverage_target == 0.1 and "coverage_target" not in env_config:
-        #     logger.warning(
-        #         f"coverage_target not found in env_config, using default 0.1. "
-        #         f"Expected value from config: 0.3. Check if config is being passed correctly."
-        #     )
-        # else:
-        #     logger.info(f"coverage_target set to: {self.coverage_target} (from config: {env_config.get('coverage_target', 'NOT SET')})")
-        self.precision_target = env_config.get("precision_target", 0.95)
-        self.precision_blend_lambda = env_config.get("precision_blend_lambda", 0.5)
+        self.coverage_target = env_config.get("coverage_target", 0.2)
+        self.precision_target = env_config.get("precision_target", 0.9)
+        self.precision_blend_lambda = env_config.get("precision_blend_lambda", 1.0)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
         
-        # SS - Termination reason counters: track usage and disable overused reasons per agent
-        self.termination_reason_max_counts = {
-            "both_targets_met": env_config.get("max_termination_count_both_targets", -1),
-            "excellent_precision": env_config.get("max_termination_count_excellent_precision", 100),
-            "high_precision_reasonable_coverage": env_config.get("max_termination_count_high_precision", 200),
-            "both_reasonably_close": env_config.get("max_termination_count_both_close", 100)
-        }
+        # SS - Termination reason counters (diagnostics only). The old max-count
+        # mechanism that permanently disabled overused reasons mid-training was
+        # removed: it made the MDP non-stationary under the replay buffer. The
+        # terminal bonus now provides the incentive it was approximating.
         self._reset_termination_counters()
 
         self.use_perturbation = env_config.get("use_perturbation", False)
         self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
-        self.n_perturb = env_config.get("n_perturb", 1024)
+        self.n_perturb = env_config.get("n_perturb", 2048)
         
         # # Log perturbation settings during initialization
         # logger.info(f"AnchorEnv initialized with perturbation settings: "
@@ -163,15 +151,99 @@ class AnchorEnv(ParallelEnv):
         self.min_coverage_floor = env_config.get("min_coverage_floor", 0.005)
         self.js_penalty_weight = env_config.get("js_penalty_weight", 0.05)
         self.initial_window = env_config.get("initial_window", 0.1)
+        # Neighborhood-hull init: cover k nearest class points around the start,
+        # not a ±initial_window cube (high-d cubes are singletons and do not transfer).
+        self.init_min_neighbors = int(env_config.get("init_min_neighbors", 5))
+        self.init_neighbor_frac = float(env_config.get("init_neighbor_frac", 0.1))
+        self.init_max_neighbors = int(env_config.get("init_max_neighbors", 20))
+        # Cap start hull so class-cond C is at most this fraction of τ_C.
+        # Wins over init_min_neighbors (wine n≈35, τ_C=0.2 → k=3, not 5).
+        self.init_coverage_frac_of_target = float(
+            env_config.get("init_coverage_frac_of_target", 0.5)
+        )
+        # Only terminate on both_targets_met (disable excellent/high_prec/close).
+        self.strict_target_termination = bool(
+            env_config.get("strict_target_termination", True)
+        )
+        # Terminal bonus / target termination require C > C_init + 1/n_class.
+        self.require_coverage_gain_to_terminate = bool(
+            env_config.get("require_coverage_gain_to_terminate", True)
+        )
+        self._coverage_at_reset: Dict[str, float] = {}
+        self._coverage_gain_eps: Dict[str, float] = {}
+        self._union_coverage_at_reset: Dict[int, float] = {}
+        # 0.0 = always snap a mean/cluster centroid to the nearest class row.
+        # A 0.5 threshold left means sitting in empty space at distance 0.3.
+        self.centroid_snap_threshold = float(env_config.get("centroid_snap_threshold", 0.0))
         self.fixed_instances_per_class = env_config.get("fixed_instances_per_class", None)
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
         self.training_instances_per_class = env_config.get("training_instances_per_class", None)
-        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.3)  # Base ratio (fallback)
+        self.training_instance_ratio = env_config.get("training_instance_ratio", 0.5)  # Base ratio (fallback)
         self.training_instance_ratios_per_class = env_config.get("training_instance_ratios_per_class", None)  # Class-specific ratios
         self.use_random_sampling = env_config.get("use_random_sampling", False)
-        self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
-        
+        self.use_class_centroids = env_config.get("use_class_centroids", True)
+        # B2 rebalance: precision ramp width for the coverage gate (mirrors SA env).
+        self.gate_margin = float(env_config.get("gate_margin", 0.10))  # Default: use centroids for initialization
+        # Explicit class-based start point (unit space). Set per rollout by inference
+        # to cycle through diversified starts (k-means centroids + random class
+        # samples) instead of reusing the same agent-indexed centroid every rollout.
+        self.class_init_point = env_config.get("class_init_point", None)
+
         self.eval_on_test_data = env_config.get("eval_on_test_data", False)
+        # C-10: eval_split in {train, val, test}. eval_on_test_data=True maps to
+        # "test" for backward compatibility. Training must stay on train.
+        self.eval_split = env_config.get("eval_split", "test" if self.eval_on_test_data else "train")
+        self.X_val_unit = env_config.get("X_val_unit", None)
+        self.X_val_std = env_config.get("X_val_std", None)
+        self.y_val = None if env_config.get("y_val") is None else np.asarray(env_config["y_val"]).astype(int)
+
+        # --- Potential-based reward shaping state (mirrors single_agentENV.py) ---
+        # Terminal bonus paid when an agent's episode terminates with targets met.
+        self.terminal_bonus = env_config.get("terminal_bonus", 5.0)
+        # Cooperative analogue of terminal_bonus: paid once per episode per class
+        # the first step that class's UNION of boxes meets both targets
+        # (union_precision >= effective target AND union_coverage >= coverage_target).
+        # The local terminal_bonus is unreachable for minority classes — a
+        # high-precision box on a 2%-prior class covers far fewer than
+        # coverage_target samples — so those agents only ever see the smooth
+        # shaping signal (~0). The class union IS reachable (multiple boxes cover
+        # more than one), and the union is exactly what inference extracts, so a
+        # union-target bonus gives the failing classes an attainable discrete goal.
+        # Latched per episode (see _class_union_bonus_paid) so it cannot be farmed.
+        # Default 0.0 = opt-in: existing runs are unchanged unless the config sets it.
+        self.shared_terminal_bonus = env_config.get("shared_terminal_bonus", 0.0)
+        # Cached classifier probabilities over the train/val/test sets (lazy, once).
+        self._cached_probs = {"train": None, "val": None, "test": None}
+        # C-12: black-box query counter (cache fills count as queries; lookups do not).
+        self.n_blackbox_queries = 0
+        # C-07: freeze these feature indices to the instance/class-mode value.
+        self.categorical_indices = list(env_config.get("categorical_indices") or [])
+        self.categorical_value_names = {
+            int(k): list(v)
+            for k, v in (env_config.get("categorical_value_names") or {}).items()
+        }
+        self.categorical_freeze = env_config.get("categorical_freeze", "instance")  # instance | class_mode | none
+        # C-08: drop a printed feature when its width >= this fraction of the full range.
+        self.sparsity_width_ratio = float(env_config.get("sparsity_width_ratio", 0.95))
+        # C-52: ranking score formula used at inference (documented hyperparameter).
+        self.ranking_score_formula = env_config.get("ranking_score_formula", "precision_coverage")
+        self.top_k_rules_by_score = env_config.get("top_k_rules_by_score", 5)
+        self.min_support = int(env_config.get("min_support", 10))
+        # Per-agent metrics from the last reset()/step(), reused as prev metrics by
+        # the next step() (halves classifier calls; common-random-number gains).
+        self._last_step_metrics: Dict[str, Tuple[float, float, Dict[str, Any]]] = {}
+        # Class-aware effective precision targets (lazy per class).
+        self.use_class_aware_targets = env_config.get("use_class_aware_targets", True)
+        self._effective_precision_targets: Dict[int, float] = {}
+        # Per-class union potential from the previous step, for the same-class
+        # shared reward (class-union potential gain).
+        self._prev_class_phi: Dict[int, float] = {}
+        # Latch: has the one-time shared_terminal_bonus already been paid for this
+        # class this episode? Reset in reset() alongside _prev_class_phi.
+        self._class_union_bonus_paid: Dict[int, bool] = {}
+        # Per-agent inter-class overlap level from the previous step (the overlap
+        # penalty charges the change in this level; seeded in reset())
+        self._prev_inter_overlap: Dict[str, float] = {}
         
         # Track warnings per agent per episode to reduce log spam
         # Only warn once per episode about adaptive mode switching and precision-coverage mismatch
@@ -200,7 +272,7 @@ class AnchorEnv(ParallelEnv):
         
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
         # Shared reward weight for cooperative behavior (applied to all agents)
-        self.shared_reward_weight = env_config.get("shared_reward_weight", 0.2)
+        self.shared_reward_weight = env_config.get("shared_reward_weight", 0.5)
         
         # Weights for class-level rewards and within-class diversity.
         # Defaults are 0.0 so the existing reward structure remains unchanged
@@ -251,6 +323,12 @@ class AnchorEnv(ParallelEnv):
         # Stabilization-based early termination (per-agent)
         # -----------------------------
         # If an agent's box and metrics stop changing for a window of steps, terminate early.
+        # Minimum steps before target-based termination is allowed. Without this,
+        # an agent can terminate on step 1 from the initial box (the degenerate
+        # 1-step termination), claiming the terminal bonus without ever shaping
+        # the anchor. Mirrors single_agentENV.min_steps_before_termination (=2)
+        # so MA and SA training dynamics match.
+        self.min_steps_before_termination = int(env_config.get("min_steps_before_termination", 2))
         self.enable_stability_termination = env_config.get("enable_stability_termination", True)
         self.stability_window = int(env_config.get("stability_window", 10))
         self.stability_min_steps = int(env_config.get("stability_min_steps", 20))
@@ -260,6 +338,36 @@ class AnchorEnv(ParallelEnv):
 
         # Counter of consecutive "stable" steps per agent
         self._stable_counts: Dict[str, int] = {}
+        self._log_effective_config()
+
+    def _log_effective_config(self) -> None:
+        """Print the knobs this env actually uses (YAML/CLI after any trainer merge)."""
+        bits = [
+            f"mode={self.mode}",
+            f"precision_target={self.precision_target}",
+            f"coverage_target={self.coverage_target}",
+            f"max_cycles={self.max_cycles}",
+            f"use_perturbation={self.use_perturbation}",
+            f"precision_blend_lambda={self.precision_blend_lambda}",
+            f"training_instance_ratio={self.training_instance_ratio}",
+            f"eval_split={self.eval_split}",
+            f"eval_on_test_data={self.eval_on_test_data}",
+            f"strict_target_termination={self.strict_target_termination}",
+            f"require_coverage_gain_to_terminate={self.require_coverage_gain_to_terminate}",
+            f"init_coverage_frac_of_target={self.init_coverage_frac_of_target}",
+            f"init_min_neighbors={self.init_min_neighbors}",
+            f"centroid_snap_threshold={self.centroid_snap_threshold}",
+            f"min_steps_before_termination={self.min_steps_before_termination}",
+            f"alpha={self.alpha} beta={self.beta} gamma={self.gamma}",
+            f"terminal_bonus={self.terminal_bonus}",
+            f"shared_terminal_bonus={self.shared_terminal_bonus}",
+            f"shared_reward_weight={self.shared_reward_weight}",
+            f"agents_per_class={self.agents_per_class}",
+            f"min_coverage_floor={self.min_coverage_floor}",
+            f"use_class_aware_targets={self.use_class_aware_targets}",
+            f"categorical_freeze={self.categorical_freeze}",
+        ]
+        logger.info("EFFECTIVE ENV CONFIG (honored YAML/CLI): " + " ".join(bits))
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
@@ -279,10 +387,7 @@ class AnchorEnv(ParallelEnv):
 
     # SS: It is used to mask the data in the box for the perturbation sampling.
     def _mask_in_box(self, agent: str) -> np.ndarray:
-        if self.eval_on_test_data:
-            X_eval_unit = self.X_test_unit
-        else:
-            X_eval_unit = self.X_unit
+        X_eval_unit, _, _, _ = self._active_data()
         
         # FIX: Ensure we have valid data and box bounds
         if X_eval_unit is None or X_eval_unit.shape[0] == 0:
@@ -325,7 +430,128 @@ class AnchorEnv(ParallelEnv):
 
     def _unit_to_orig(self, X_unit_samples: np.ndarray) -> np.ndarray:
         return self._std_to_orig(self._unit_to_std(X_unit_samples))
-    
+
+    def _active_split(self) -> str:
+        """Which split the live metrics (reward / termination) are computed on.
+
+        Training: always 'train'. Inference/eval: env_config['eval_split']
+        (val for rule generation, test only in the post-hoc evaluator).
+        C-06: this choice is an env constant, not a joint-action-dependent ξ_t.
+        """
+        if getattr(self, "mode", "training") == "training":
+            return "train"
+        split = getattr(self, "eval_split", None)
+        if split in ("train", "val", "test"):
+            return split
+        return "test" if self.eval_on_test_data else "train"
+
+    def _active_data(self):
+        split = self._active_split()
+        if split == "test":
+            if self.X_test_unit is None:
+                raise ValueError("eval_split='test' but X_test_unit is not set")
+            return self.X_test_unit, self.X_test_std, self.y_test, "test"
+        if split == "val":
+            if self.X_val_unit is None:
+                logger.warning("eval_split='val' but no val data; falling back to test")
+                return self.X_test_unit, self.X_test_std, self.y_test, "test"
+            return self.X_val_unit, self.X_val_std, self.y_val, "val"
+        return self.X_unit, self.X_std, self.y, "training"
+
+    def _init_n_neighbors(self, n_class: int) -> int:
+        """Size the start hull so class-cond C starts below τ_C.
+
+        k is min(frac·n_class, init_max_neighbors, n_class, cap_tau), then
+        floored at init_min_neighbors unless that would exceed cap_tau.
+        cap_tau = max(1, int(init_coverage_frac_of_target · τ_C · n_class)),
+        so wine n≈35, τ_C=0.2, frac=0.5 → k=3 (C≈0.086), not min_neighbors=5.
+        """
+        n_class = int(max(1, n_class))
+        cap_tau = max(
+            1,
+            int(self.init_coverage_frac_of_target * float(self.coverage_target) * n_class),
+        )
+        n = max(1, int(self.init_neighbor_frac * n_class))
+        n = max(n, int(self.init_min_neighbors))
+        n = min(n, int(self.init_max_neighbors), n_class, cap_tau)
+        return int(max(1, n))
+
+    @staticmethod
+    def _class_conditional_coverage(
+        mask: np.ndarray, y_data: np.ndarray, target_class: int
+    ) -> Tuple[float, float, int, int]:
+        """Return (class_cond_C, marginal_C, n_class_in_box, n_class)."""
+        coverage_marginal = float(mask.mean()) if len(mask) else 0.0
+        class_mask = y_data == target_class
+        n_class = int(class_mask.sum())
+        if n_class == 0 or len(mask) != len(class_mask):
+            return 0.0, coverage_marginal, 0, n_class
+        n_in = int((mask & class_mask).sum())
+        return float(n_in / n_class), coverage_marginal, n_in, n_class
+
+    def _coverage_improved(self, agent: str, coverage: float) -> bool:
+        if not self.require_coverage_gain_to_terminate:
+            return True
+        c_reset = float(self._coverage_at_reset.get(agent, 0.0))
+        # Already at τ_C at reset: extra gain is not required to terminate.
+        if c_reset >= float(self.coverage_target):
+            return True
+        return float(coverage) > (
+            c_reset + float(self._coverage_gain_eps.get(agent, 0.0))
+        )
+
+    def _snap_to_nearest_class_point(self, point: np.ndarray, class_data: np.ndarray) -> np.ndarray:
+        """Snap a mean/cluster centroid onto the nearest real class row.
+
+        Threshold 0.0 means any positive distance snaps. A 0.5 cutoff left
+        high-d means sitting in empty space (distance ~0.3) unsnapped.
+        """
+        point = np.asarray(point, dtype=np.float32).reshape(-1)
+        if class_data is None or len(class_data) == 0:
+            return point
+        distances = np.linalg.norm(class_data - point, axis=1)
+        nearest = class_data[int(np.argmin(distances))]
+        if float(distances.min()) > self.centroid_snap_threshold:
+            return np.asarray(nearest, dtype=np.float32)
+        return point.astype(np.float32)
+
+    def _include_point_in_box(self, agent: str, point: np.ndarray) -> None:
+        point = np.asarray(point, dtype=np.float32).reshape(-1)
+        self.lower[agent] = np.minimum(self.lower[agent], point).astype(np.float32)
+        self.upper[agent] = np.maximum(self.upper[agent], point).astype(np.float32)
+        self.lower[agent] = np.clip(self.lower[agent], 0.0, 1.0).astype(np.float32)
+        self.upper[agent] = np.clip(self.upper[agent], 0.0, 1.0).astype(np.float32)
+
+    def _window_box_around(self, point: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        w = max(self.initial_window, self.min_width)
+        point = np.asarray(point, dtype=np.float32).reshape(-1)
+        lower = np.clip(point - w, 0.0, 1.0).astype(np.float32)
+        upper = np.clip(point + w, 0.0, 1.0).astype(np.float32)
+        return lower, upper
+
+    def _freeze_categorical_bounds(self, agent: str) -> None:
+        """C-07 option (a): do not refine categorical dimensions; pin to instance/mode."""
+        if not self.categorical_indices or self.categorical_freeze == "none":
+            return
+        x_star = self.x_star_unit.get(agent)
+        cls = self._get_class_for_agent(agent)
+        X_data, _, y_data, _ = self._active_data()
+        for j in self.categorical_indices:
+            if x_star is not None and self.categorical_freeze == "instance":
+                v = float(np.asarray(x_star).reshape(-1)[j])
+            elif cls is not None:
+                class_rows = X_data[y_data == cls]
+                if class_rows.shape[0] == 0:
+                    continue
+                # mode in unit space (label-encoded -> scaled -> unit, still unimodal)
+                vals, counts = np.unique(np.round(class_rows[:, j], 6), return_counts=True)
+                v = float(vals[int(np.argmax(counts))])
+            else:
+                continue
+            # Tight interval around the frozen value so the mask is an equality.
+            self.lower[agent][j] = np.clip(v - 1e-4, 0.0, 1.0)
+            self.upper[agent][j] = np.clip(v + 1e-4, 0.0, 1.0)
+
     def _get_class_for_agent(self, agent: str) -> Optional[int]:
         if agent in self.agent_to_class:
             return self.agent_to_class[agent]
@@ -356,7 +582,13 @@ class AnchorEnv(ParallelEnv):
         target_class = self._get_class_for_agent(agent)
         if target_class is None:
             return None
-        
+
+        # Priority 0: Explicit start point set by inference for diversified
+        # class-based rollouts. Inference snaps these to class data when needed,
+        # so use the point as-is.
+        if self.class_init_point is not None:
+            return np.array(self.class_init_point, dtype=np.float32)
+
         # Extract agent index from agent name (e.g., "agent_0_1" -> 1, "agent_0" -> 0)
         agent_idx = 0
         if self.agents_per_class > 1 and "_" in agent:
@@ -376,27 +608,11 @@ class AnchorEnv(ParallelEnv):
                     
                     # CRITICAL FIX: For scattered data, centroids might be mean centroids (not actual data points)
                     # Check if centroid is close to any actual data point. If not, use the nearest data point instead.
-                    X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
-                    y_data = self.y_test if self.eval_on_test_data else self.y
+                    X_data, _, y_data, _ = self._active_data()
                     class_mask = (y_data == target_class)
                     
                     if class_mask.sum() > 0:
-                        class_data = X_data[class_mask]
-                        # Find nearest data point to centroid
-                        distances = np.linalg.norm(class_data - centroid, axis=1)
-                        nearest_idx = np.argmin(distances)
-                        nearest_point = class_data[nearest_idx]
-                        
-                        # If centroid is far from nearest point (distance > threshold), use the data point instead
-                        # This handles the case where scattered data produces mean centroids far from actual data
-                        max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
-                        if distances[nearest_idx] > max_distance_threshold:
-                            logger.debug(
-                                f"Agent {agent}: Centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
-                                f"Using nearest data point instead to ensure non-zero coverage."
-                            )
-                            return nearest_point.astype(np.float32)
-                    
+                        return self._snap_to_nearest_class_point(centroid, X_data[class_mask])
                     return centroid
         
         # Use fixed instances if its instance level
@@ -411,8 +627,7 @@ class AnchorEnv(ParallelEnv):
         
         # Fallback: Sample different instances from class data for each agent
         # This ensures different agents get different starting points even without precomputed centroids
-        X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
-        y_data = self.y_test if self.eval_on_test_data else self.y
+        X_data, _, y_data, _ = self._active_data()
         
         class_mask = (y_data == target_class)
         if class_mask.sum() == 0:
@@ -451,24 +666,7 @@ class AnchorEnv(ParallelEnv):
                     f"fixed_instances_per_class to ensure diversity."
                 )
             mean_centroid = np.mean(class_data, axis=0).astype(np.float32)
-            
-            # CRITICAL FIX: For scattered data, mean centroid might be far from actual data points
-            # Find nearest data point and use it if mean is too far
-            distances = np.linalg.norm(class_data - mean_centroid, axis=1)
-            nearest_idx = np.argmin(distances)
-            nearest_point = class_data[nearest_idx]
-            
-            # If mean centroid is far from nearest point, use the data point instead
-            # This ensures we always start from an actual data point with non-zero coverage
-            max_distance_threshold = 0.5  # Reasonable threshold in [0,1] space
-            if distances[nearest_idx] > max_distance_threshold:
-                logger.debug(
-                    f"Agent {agent}: Mean centroid is far from data (distance={distances[nearest_idx]:.4f} > {max_distance_threshold}). "
-                    f"Using nearest data point instead to ensure non-zero coverage."
-                )
-                return nearest_point.astype(np.float32)
-            
-            centroid = mean_centroid
+            centroid = self._snap_to_nearest_class_point(mean_centroid, class_data)
         
         return centroid
     
@@ -479,8 +677,7 @@ class AnchorEnv(ParallelEnv):
             return None
         
         # Get class data
-        X_data = self.X_test_unit if self.eval_on_test_data else self.X_unit
-        y_data = self.y_test if self.eval_on_test_data else self.y
+        X_data, _, y_data, _ = self._active_data()
         
         class_mask = (y_data == target_class)
         if class_mask.sum() == 0:
@@ -488,9 +685,7 @@ class AnchorEnv(ParallelEnv):
         
         class_data = X_data[class_mask]
         
-        # Find points closest to the centroid
-        n_neighbors = max(5, int(0.1 * len(class_data)))
-        n_neighbors = min(n_neighbors, len(class_data))
+        n_neighbors = self._init_n_neighbors(len(class_data))
         
         # Compute distances to centroid
         distances = np.linalg.norm(class_data - centroid, axis=1)
@@ -524,17 +719,10 @@ class AnchorEnv(ParallelEnv):
         if target_class is None:
             raise KeyError(f"Could not determine class for agent '{agent}'")
         
-        # Determine which dataset to use (test or training)
-        if self.eval_on_test_data:
-            X_data_unit = self.X_test_unit
-            X_data_std = self.X_test_std
-            y_data = self.y_test
-            data_source = "test"
-        else:
-            X_data_unit = self.X_unit
-            X_data_std = self.X_std
-            y_data = self.y
-            data_source = "training"
+        # C-10: metrics on the active split (train during training; val at
+        # inference/selection; never D_test inside the env — D_test is for
+        # revision.evaluate only).
+        X_data_unit, X_data_std, y_data, data_source = self._active_data()
         
         mask = self._mask_in_box(agent)
         covered = np.where(mask)[0]
@@ -546,26 +734,26 @@ class AnchorEnv(ParallelEnv):
                 f"This indicates a data mismatch. eval_on_test_data={self.eval_on_test_data}"
             )
             # Try to fix: use the data source that matches the mask
-            if len(mask) == len(self.y_test) if self.eval_on_test_data else len(self.y):
+            expected_len = (
+                len(self.y_test) if self.eval_on_test_data and self.y_test is not None
+                else len(self.y)
+            )
+            if len(mask) == expected_len:
                 # Mask seems to be from test, but we're using train y_data (or vice versa)
                 y_data = self.y_test if self.eval_on_test_data else self.y
                 logger.warning(f"  Corrected y_data to match mask length")
         
-        # Determine coverage calculation based on mode:
-        # - Instance-based (x_star_unit set): Overall coverage P(x in box) - like original Anchor
-        # - Class-based (x_star_unit not set): Class-conditional coverage P(x in box | y = target_class)
+        # Coverage is always class-conditional P(x in box | y = target_class),
+        # including instance-based episodes. Marginal P(x in box) is logged only.
+        # Precision stays instance prediction-matching when x_star is set.
         is_instance_based = self.x_star_unit.get(agent) is not None
         
-        # CRITICAL: Log if instance-based mode is not detected when it should be
-        # This helps catch bugs where x_star_unit is not preserved during reset
         if self.mode == "inference" and not is_instance_based:
             logger.debug(
                 f"Agent {agent}: Instance-based mode not detected during inference (x_star_unit is None). "
-                f"This may indicate x_star_unit was not set before reset() or was cleared during reset(). "
-                f"Will use class-conditional coverage instead of overall coverage."
+                f"This may indicate x_star_unit was not set before reset() or was cleared during reset()."
             )
         
-        # If instance-based and original prediction not stored, compute it now
         if is_instance_based and agent not in self.original_predictions:
             x_star = self.x_star_unit[agent]
             x_star_std = self._unit_to_std(x_star.reshape(1, -1))[0]
@@ -581,45 +769,19 @@ class AnchorEnv(ParallelEnv):
                 self.original_predictions[agent] = int(np.argmax(probs))
                 logger.debug(f"Agent {agent}: Computed original prediction {self.original_predictions[agent]} for instance-based anchor")
         
-        if is_instance_based:
-            # Instance-based mode: Overall coverage P(x in box)
-            # This matches the original Anchor paper definition
-            coverage = float(mask.mean())
-            logger.debug(f"Agent {agent}: Instance-based coverage calculation - coverage={coverage:.4f}, covered points={covered.size}/{len(mask)}")
-        else:
-            # Class-based mode: Class-conditional coverage P(x in box | y = target_class)
-            # This is the fraction of target class samples that fall within the box
-            class_mask = (y_data == target_class)
-            n_class_samples = class_mask.sum()
-            
-            if n_class_samples == 0:
-                coverage = 0.0
-                logger.warning(
-                    f"Agent {agent}: No samples found for target class {target_class} in {data_source} data. "
-                    f"Total samples: {len(y_data)}, Classes present: {sorted(np.unique(y_data).tolist())}"
-                )
-            else:
-                # Coverage = number of target class samples in box / total target class samples
-                # This is class-conditional coverage: P(x in box | y = target_class)
-                # Ensure mask and class_mask are aligned
-                if len(mask) != len(class_mask):
-                    logger.error(
-                        f"Agent {agent}: Mask length ({len(mask)}) != class_mask length ({len(class_mask)})"
-                    )
-                    coverage = 0.0
-                else:
-                    n_class_in_box = (mask & class_mask).sum()
-                    coverage = float(n_class_in_box / n_class_samples)
-                    
-                    # Debug: Log if coverage is unexpectedly zero but box covers samples
-                    if coverage == 0.0 and covered.size > 0:
-                        # Box covers some samples but none from target class - log this for debugging
-                        n_covered_total = mask.sum()
-                        logger.debug(
-                            f"Agent {agent}: Box covers {n_covered_total} total samples but 0 target class samples. "
-                            f"Target class: {target_class}, Class samples in dataset: {n_class_samples}, "
-                            f"Box bounds: lower={self.lower[agent][:3]}, upper={self.upper[agent][:3]} (first 3 dims)"
-                        )
+        coverage, coverage_marginal, n_class_in_box, n_class_samples = (
+            self._class_conditional_coverage(mask, y_data, target_class)
+        )
+        if n_class_samples == 0:
+            logger.warning(
+                f"Agent {agent}: No samples found for target class {target_class} in {data_source} data. "
+                f"Total samples: {len(y_data)}, Classes present: {sorted(np.unique(y_data).tolist())}"
+            )
+        elif coverage == 0.0 and covered.size > 0:
+            logger.debug(
+                f"Agent {agent}: Box covers {int(mask.sum())} total samples but 0 target class samples. "
+                f"Target class: {target_class}, Class samples in dataset: {n_class_samples}"
+            )
         
         if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
             logger.debug(f"Agent {agent}: No covered points (coverage={coverage:.4f}) and perturbation not enabled for uniform/adaptive modes - returning precision=0")
@@ -628,12 +790,21 @@ class AnchorEnv(ParallelEnv):
                 "avg_prob": 0.0, 
                 "n_points": 0, 
                 "sampler": "none",
-                "data_source": data_source
+                "data_source": data_source,
+                "coverage_marginal": float(coverage_marginal),
+                "n_class_in_box": int(n_class_in_box),
+                "n_class_samples": int(n_class_samples),
             }
+
+        # Row indices into the active dataset when evaluation uses real rows
+        # (empirical/bootstrap paths). Lets us look up cached classifier
+        # probabilities instead of re-running the classifier every step.
+        eval_row_idx = None
 
         if not self.use_perturbation:
             X_eval = X_data_std[covered]
             y_eval = y_data[covered]
+            eval_row_idx = covered
             n_points = int(X_eval.shape[0])
             sampler_note = f"empirical_{data_source}"
             logger.debug(f"Agent {agent}: Perturbation disabled - using {n_points} empirical points from {data_source} data")
@@ -647,12 +818,16 @@ class AnchorEnv(ParallelEnv):
                         "avg_prob": 0.0, 
                         "n_points": 0, 
                         "sampler": "none",
-                        "data_source": data_source
+                        "data_source": data_source,
+                        "coverage_marginal": float(coverage_marginal),
+                        "n_class_in_box": int(n_class_in_box),
+                        "n_class_samples": int(n_class_samples),
                     }
                 n_samp = min(self.n_perturb, max(1, covered.size))
                 idx = self.rng.choice(covered, size=n_samp, replace=True)
                 X_eval = X_data_std[idx]
                 y_eval = y_data[idx]
+                eval_row_idx = idx
                 n_points = int(n_samp)
                 sampler_note = f"bootstrap_{data_source}"
                 logger.debug(f"Agent {agent}: Bootstrap mode - sampled {n_points} points from {covered.size} covered points (n_perturb={self.n_perturb})")
@@ -691,6 +866,7 @@ class AnchorEnv(ParallelEnv):
                     idx = self.rng.choice(covered, size=n_samp, replace=True)
                     X_eval = X_data_std[idx]
                     y_eval = y_data[idx]
+                    eval_row_idx = idx
                     n_points = int(n_samp)
                     sampler_note = f"adaptive_bootstrap_{data_source}"
                     logger.debug(f"Agent {agent}: Adaptive mode - using bootstrap sampling: {n_points} points from {covered.size} covered points "
@@ -733,14 +909,20 @@ class AnchorEnv(ParallelEnv):
             else:
                 raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap', 'uniform', or 'adaptive'.")
 
-        if hasattr(self.classifier, 'eval'):
-            self.classifier.eval()
-        if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
-            self.classifier.model.eval()
-        
-        with torch.no_grad():
-            inputs = torch.from_numpy(X_eval).float().to(self.device)
-            probs = predict_proba_torch(self.classifier, inputs).cpu().numpy()
+        if eval_row_idx is not None:
+            # Dataset rows: look up cached probabilities (computed once per env)
+            probs = self._get_cached_probs(self._active_split())[eval_row_idx]
+        else:
+            # Fresh uniform samples: must run the classifier
+            if hasattr(self.classifier, 'eval'):
+                self.classifier.eval()
+            if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+                self.classifier.model.eval()
+
+            with torch.no_grad():
+                inputs = torch.from_numpy(X_eval).float().to(self.device)
+                probs = predict_proba_torch(self.classifier, inputs).cpu().numpy()
+            self.n_blackbox_queries += int(X_eval.shape[0])
 
         preds = probs.argmax(axis=1)
         positive_idx = (preds == target_class)
@@ -764,20 +946,16 @@ class AnchorEnv(ParallelEnv):
                 if y_eval is None:
                     hard_precision = float(positive_idx.mean())
                 else:
-                    hard_precision = float((y_eval == target_class).mean())
+                    hard_precision = float((preds == target_class).mean())
+            purity = float((y_eval == (self.original_predictions.get(agent, target_class))).mean()) if y_eval is not None else float("nan")
         else:
-            # Class-based mode: P(y = target_class | x in box)
-            # When ground truth labels are available, use them directly
-            # When labels are not available (uniform sampling), use model predictions as proxy
-            if y_eval is None:
-                # Uniform sampling: no ground truth labels, use model predictions as proxy
-                hard_precision = float(positive_idx.mean())
-                using_synthetic_samples = True
-            else:
-                # Bootstrap/empirical sampling: ground truth labels available
-                # Precision = fraction of samples in box that are actually target class
-                hard_precision = float((y_eval == target_class).mean())
-                using_synthetic_samples = False
+            # C-09: class-based PRIMARY is model fidelity P(f_hat(x) = c | x in B).
+            # Label purity is logged as a secondary diagnostic and is NOT the
+            # optimization target. Training previously used y here, so class-mode
+            # policies must be retrained after this change.
+            hard_precision = float(positive_idx.mean())
+            using_synthetic_samples = y_eval is None
+            purity = float((y_eval == target_class).mean()) if y_eval is not None else float("nan")
 
         # CRITICAL FIX: For instance-based mode, use original prediction probability instead of target_class
         # This ensures reward signal matches single-agent behavior and original Anchor paper
@@ -795,30 +973,22 @@ class AnchorEnv(ParallelEnv):
         )
         target_class_fraction = hard_precision  # Same as hard_precision when y_eval is available
         
-        # # Warn if there's a precision-coverage mismatch (synthetic precision vs real coverage)
-        # # Only warn once per episode to reduce log spam
-        # if using_synthetic_samples and coverage == 0.0:
-        #     if not self._precision_coverage_mismatch_warned_this_episode[agent]:
-        #         logger.warning(f"Agent {agent}: PRECISION-COVERAGE MISMATCH! "
-        #                      f"Precision={precision_proxy:.4f} (from {n_points} synthetic samples) but "
-        #                      f"coverage={coverage:.4f} (from real data points). "
-        #                      f"Box may have shrunk away from real data. sampler={sampler_note} "
-        #                      f"(This warning will appear once per episode)")
-        #         self._precision_coverage_mismatch_warned_this_episode[agent] = True
-        #     else:
-        #         logger.debug(f"Agent {agent}: Precision-coverage mismatch (precision={precision_proxy:.4f} from synthetic, coverage={coverage:.4f} from real data)")
-        # elif using_synthetic_samples and coverage > 0.0:
-        #     logger.debug(f"Agent {agent}: Using synthetic samples for precision (sampler={sampler_note}), "
-        #                 f"but coverage={coverage:.4f} from real data. precision_proxy={precision_proxy:.4f}, "
-        #                 f"hard_precision={hard_precision:.4f}")
-        
-        return precision_proxy, coverage, {
+        # Control signal is hard Fid. Softmax blend made τ_P unreachable on
+        # low-confidence but accurate DNNs (wine p̂_max≈0.37 → proxy 0.68).
+        return hard_precision, coverage, {
             "hard_precision": hard_precision,
+            "precision_proxy": precision_proxy,
+            "purity": purity,
             "avg_prob": avg_prob,
             "n_points": int(n_points),
+            "n_covered": int(covered.size),
             "sampler": sampler_note,
             "target_class_fraction": target_class_fraction,
             "data_source": data_source,
+            "cov_real": float(coverage),
+            "coverage_marginal": float(coverage_marginal),
+            "n_class_in_box": int(n_class_in_box),
+            "n_class_samples": int(n_class_samples),
         }
 
     # SS: Added as part of the termination reason counters
@@ -841,6 +1011,13 @@ class AnchorEnv(ParallelEnv):
             "high_precision_reasonable_coverage": True,
             "both_reasonably_close": True
         } for agent in agents_list}
+        if getattr(self, "strict_target_termination", True) or getattr(self, "mode", "training") == "inference":
+            for agent in agents_list:
+                self.termination_reason_enabled[agent]["excellent_precision"] = False
+                self.termination_reason_enabled[agent]["high_precision_reasonable_coverage"] = False
+        if getattr(self, "strict_target_termination", True):
+            for agent in agents_list:
+                self.termination_reason_enabled[agent]["both_reasonably_close"] = False
     
     def reset(
         self, 
@@ -855,13 +1032,24 @@ class AnchorEnv(ParallelEnv):
         
         self.agents = copy(self.possible_agents)
         self.timestep = 0
-        
+
+        # Rebuild termination-enabled flags against the CURRENT mode. __init__ runs
+        # this once with mode="training"; inference sets env.mode="inference" only
+        # afterwards, so without this call the inference-mode disabling of lenient
+        # conditions (excellent_precision / high_precision_reasonable_coverage)
+        # would never take effect. Re-running it here honors the mode set before
+        # the rollout, matching the "reset in reset()" intent in inference.py.
+        self._reset_termination_counters()
+        self._coverage_at_reset = {}
+        self._coverage_gain_eps = {}
+        self._union_coverage_at_reset = {}
+
         observations = {}
         infos = {}
         
         # CRITICAL: Preserve x_star_unit during inference/evaluation mode
         # During inference, x_star_unit is set externally (e.g., by inference code) to indicate instance-based mode
-        # We must preserve it to ensure correct coverage calculation (overall vs class-conditional)
+        # We must preserve it so precision stays instance prediction-matching.
         x_star_unit_preserved = {}
         if self.mode in ["inference", "evaluation"]:
             for agent in self.possible_agents:
@@ -930,13 +1118,13 @@ class AnchorEnv(ParallelEnv):
                 # Get target_class for this agent (needed for validation and logging)
                 target_class = self._get_class_for_agent(agent)
                 
-                # Guard: never start narrower than min_width (e.g. if a YAML sets
-                # initial_window < min_width). For a centroid at the [0,1] boundary
-                # the box half-width collapses to w, so w itself must be >= min_width.
-                w = max(self.initial_window, self.min_width)
                 centroid = self.x_star_unit[agent]
-                self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
-                self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
+                box_bounds = self._compute_box_from_centroid(agent, centroid)
+                if box_bounds is not None:
+                    self.lower[agent], self.upper[agent] = box_bounds
+                    self._include_point_in_box(agent, centroid)
+                else:
+                    self.lower[agent], self.upper[agent] = self._window_box_around(centroid)
                 
                 # Compute and store original prediction for instance-based anchors (matches original Anchor paper)
                 # This is used for precision calculation: P(prediction matches original | anchor conditions hold)
@@ -971,10 +1159,9 @@ class AnchorEnv(ParallelEnv):
                     box_bounds = self._compute_box_from_centroid(agent, centroid)
                     if box_bounds is not None:
                         self.lower[agent], self.upper[agent] = box_bounds
+                        self._include_point_in_box(agent, centroid)
                     else:
-                        w = self.initial_window
-                        self.lower[agent] = np.clip(centroid - w, 0.0, 1.0)
-                        self.upper[agent] = np.clip(centroid + w, 0.0, 1.0)
+                        self.lower[agent], self.upper[agent] = self._window_box_around(centroid)
                 else:
                     self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
                     self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
@@ -982,6 +1169,9 @@ class AnchorEnv(ParallelEnv):
             else:
                 self.lower[agent] = np.zeros(self.n_features, dtype=np.float32)
                 self.upper[agent] = np.ones(self.n_features, dtype=np.float32)
+
+            # Pin categoricals before the first metric computation (not after step 1).
+            self._freeze_categorical_bounds(agent)
             
             self.prev_lower[agent] = self.lower[agent].copy()
             self.prev_upper[agent] = self.upper[agent].copy()
@@ -993,12 +1183,46 @@ class AnchorEnv(ParallelEnv):
             self._adaptive_uniform_warned_this_episode[agent] = False
             self._precision_coverage_mismatch_warned_this_episode[agent] = False
             
-            precision, coverage, _ = self._current_metrics(agent)
-            state = np.concatenate([self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)])
-            
+            precision, coverage, initial_details = self._current_metrics(agent)
+            # Seed the prev-metrics cache for the first step of the episode
+            self._last_step_metrics[agent] = (precision, coverage, initial_details)
+            n_class = int(initial_details.get("n_class_samples") or 0)
+            if n_class <= 0:
+                cls = self._get_class_for_agent(agent)
+                if cls is not None:
+                    n_class = int((self._active_data()[2] == cls).sum())
+            self._coverage_at_reset[agent] = float(coverage)
+            self._coverage_gain_eps[agent] = 1.0 / max(n_class, 1)
+            # episode_phase is 0.0 at reset (self.timestep was just set to 0)
+            state = np.concatenate([
+                self.lower[agent],
+                self.upper[agent],
+                np.array([precision, coverage, 0.0], dtype=np.float32),
+            ])
+
             observations[agent] = np.array(state, dtype=np.float32)
+            # Keep reset infos empty. TorchRL infers the info spec from reset;
+            # a short dict here drops step keys (coverage_at_reset is in step info).
             infos[agent] = {}
-        
+
+        # Reset the per-class union potential used by the same-class shared reward
+        # so the first step of an episode measures gain from the initial boxes.
+        self._prev_class_phi = {}
+        # Clear the shared-terminal-bonus latch so each episode can pay it once.
+        self._class_union_bonus_paid = {}
+        self._union_coverage_at_reset = {}
+        if (
+            len(self.agents) > 1
+            and self.shared_terminal_bonus != 0.0
+        ):
+            for cls, m in self._compute_class_union_metrics().items():
+                self._union_coverage_at_reset[cls] = float(m.get("union_coverage", 0.0))
+        # Seed inter-class overlap levels from the initial boxes so the first
+        # step charges only the overlap CHANGE the first actions cause.
+        self._prev_inter_overlap = {
+            agent: self._compute_inter_class_overlap_penalty(agent) for agent in self.agents
+        }
+
         return observations, infos
 
     # Discrete action: Older version (not used anymore)
@@ -1134,6 +1358,7 @@ class AnchorEnv(ParallelEnv):
             if lower_diff < 1e-6 and upper_diff < 1e-6:
                 logger.warning(f"  ⚠ Action did not change box for {agent}! lower_deltas mean={lower_deltas.mean():.4f}, upper_deltas mean={upper_deltas.mean():.4f}, max_delta={max_delta.max():.6f}")
             self._action_debug_logged.add(agent)
+        self._freeze_categorical_bounds(agent)
     
     def step(
         self, 
@@ -1201,10 +1426,10 @@ class AnchorEnv(ParallelEnv):
                     "coverage_floor_penalty": 0.0,
                     # Shared reward and global coverage are added after all agents have been processed
                     "shared_reward": 0.0,
+                    "shared_terminal_bonus": 0.0,
                     "global_coverage": 0.0,
                     "total_reward": 0.0,
                 }
-                self._stable_counts[agent] = 0
             
             # Read and apply action (only reached for agents with actions in the else branch)
             action = actions[agent]
@@ -1212,13 +1437,16 @@ class AnchorEnv(ParallelEnv):
                 action = action.cpu().numpy()
             action = np.array(action, dtype=np.float32)
             
-            # CRITICAL FIX: Single call to _current_metrics for prev metrics (before action)
-            # This ensures consistent prev_precision/prev_coverage without stochastic variance
-            prev_precision, prev_coverage, _ = self._current_metrics(agent)
+            # Prev metrics: reuse the metrics computed at the end of the previous
+            # step()/reset() for this agent. This halves classifier work and makes
+            # prev and current come from the same sample draw, so the shaping gain
+            # below measures the action's effect rather than resampling noise.
+            if agent in self._last_step_metrics:
+                prev_precision, prev_coverage, _ = self._last_step_metrics[agent]
+            else:
+                prev_precision, prev_coverage, _ = self._current_metrics(agent)
             prev_lower = self.lower[agent].copy()
             prev_upper = self.upper[agent].copy()
-            prev_widths = np.maximum(prev_upper - prev_lower, 1e-9)
-            prev_vol = float(np.prod(prev_widths))
             
             #SS: Apply either continuous or discrete action (currently only continuous is used)
             if isinstance(action, np.ndarray) and action.shape[0] == 2 * self.n_features:
@@ -1333,145 +1561,105 @@ class AnchorEnv(ParallelEnv):
             if not np.isfinite(coverage_gain):
                 coverage_gain = 0.0
             
-            # Clip precision_gain to prevent reward explosions, similar to coverage_gain
-            # Normalize by previous precision to make gains relative
-            min_denominator_prec = max(prev_precision, 1e-6)
-            precision_gain_normalized = precision_gain / min_denominator_prec
-            precision_gain_scaled = precision_gain_normalized * 0.5
-            precision_gain_scaled = np.clip(precision_gain_scaled, -0.5, 0.5)
-            precision_gain_for_reward = precision_gain_scaled
-            
-            min_denominator = max(prev_coverage, 1e-6)
-            coverage_gain_normalized = coverage_gain / min_denominator
-            # INCREASED coverage gain scaling from 0.5 to 1.0 to give stronger signal for coverage expansion
-            # This helps agents learn to expand boxes to achieve higher coverage
-            coverage_gain_scaled = coverage_gain_normalized * 1.0  # Increased from 0.5 to 1.0
-            coverage_gain_scaled = np.clip(coverage_gain_scaled, -1.0, 1.0)  # Increased clip range from ±0.5 to ±1.0
-            coverage_gain_for_reward = coverage_gain_scaled
-            
-            if not np.isfinite(coverage_gain_for_reward):
-                coverage_gain_for_reward = 0.0
-            
+            # Potential-based shaping: reward = Phi(s') - Phi(s) (see _potential).
+            # Telescoping makes any A->B->A oscillation net exactly zero. The previous
+            # relative-gain normalization (gain / prev value) paid more on the way up
+            # than it charged on the way back down, so wiggling a bound forever was the
+            # return-maximizing policy. The clips, phase weights, JS proxy, and
+            # coverage/target-class bonuses existed to manage that scheme and are
+            # retired with it. Mirrors single_agentENV.py for fair comparison.
+            agent_target_class = self._get_class_for_agent(agent)
+            phi_prev = self._potential(prev_precision, prev_coverage, agent_target_class)
+            phi_curr = self._potential(precision, coverage, agent_target_class)
+            shaping_gain = phi_curr - phi_prev
+            coverage_gain_for_reward = coverage_gain  # raw gain, kept for logging
+
             widths = self.upper[agent] - self.lower[agent]
             overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
-            
+
             drift = float(
                 np.linalg.norm(self.upper[agent] - prev_upper)
                 + np.linalg.norm(self.lower[agent] - prev_lower)
             )
             drift_penalty = self.drift_penalty_weight * drift
-            
+
             anchor_drift_penalty = self._compute_anchor_drift_penalty(agent, prev_lower, prev_upper)
-            inter_class_overlap_penalty = self._compute_inter_class_overlap_penalty(agent)
+            # Inter-class overlap is charged AFTER the agent loop as a potential-style
+            # delta (change in overlap level), not a per-step level: the level form
+            # accumulated 0.15-0.3/step (~30-60 per episode) against a positive
+            # signal bounded by ~7, so penalty avoidance dominated the learned policy.
             same_class_overlap_penalty = self._compute_same_class_overlap_penalty(agent)
-            
-            # JS-like proxy for change in box volume / overlap with previous box
-            # This is something that I am not sure about. (maybe we can remove this)
-            inter_lower = np.maximum(self.lower[agent], prev_lower)
-            inter_upper = np.minimum(self.upper[agent], prev_upper)
-            inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
-            inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
-            curr_widths = np.maximum(self.upper[agent] - self.lower[agent], 1e-9)
-            curr_vol = float(np.prod(curr_widths))
-            eps = 1e-12
-            if inter_vol <= eps:
-                js_proxy = 1.0
-            else:
-                js_proxy = 1.0 - float(inter_vol / (0.5 * (prev_vol + curr_vol) + eps))
-                js_proxy = float(np.clip(js_proxy, 0.0, 1.0))
-            
-            precision_threshold = self.precision_target * 0.8
-            (
-                precision_weight,
-                coverage_weight,
-                js_penalty,
-            ) = self._compute_reward_weights_and_penalties(
-                precision,
-                precision_gain_for_reward,
-                coverage_gain_for_reward,
-                js_proxy,
-                precision_threshold,
-                eps,
-            )
-            
-            coverage_bonus = self._compute_coverage_bonus(
-                precision,
-                coverage,
-                coverage_gain_for_reward,
-                precision_threshold,
-                eps,
-            )
-            target_class_bonus = self._compute_target_class_bonus(
-                details,
-                precision,
-                precision_threshold,
-                eps,
-            )
-            
+
+            # Retired terms (keys kept for logging compatibility): the JS proxy was a
+            # third movement penalty; the bonuses belonged to the relative-gain scheme.
+            js_penalty = 0.0
+            coverage_bonus = 0.0
+            target_class_bonus = 0.0
+
             # When action is reverted (coverage_clipped), reduce penalties significantly
             coverage_floor_penalty = 0.0
             if coverage_clipped:
                 # Reduce all penalties since action didn't actually take effect
+                # (the inter-class overlap delta needs no reduction: a reverted box
+                # leaves the overlap level unchanged, so its delta is already ~0)
                 penalty_reduction_factor = 0.1
                 overlap_penalty *= penalty_reduction_factor
                 anchor_drift_penalty *= penalty_reduction_factor
-                js_penalty *= penalty_reduction_factor
-                inter_class_overlap_penalty *= penalty_reduction_factor
                 same_class_overlap_penalty *= penalty_reduction_factor
                 # Give a small negative reward for attempting invalid action
                 coverage_floor_penalty = -0.05
-            
-            # Scale penalties based on progress: reduce penalties when making progress
-            progress_factor = 1.0
-            if precision_gain_for_reward > 0 or coverage_gain_for_reward > 0:
-                # Reduce penalties when making progress (encourage exploration)
-                progress_factor = 0.5
-            elif precision >= precision_threshold * 0.8:
-                # Reduce penalties when close to target
-                progress_factor = 0.7
-            
-            # SS: R_local: Local reward component
-            # Note: survival_bonus removed - it was causing positive rewards for long episodes
-            # without progress. Episodes should terminate early when targets are met.
-            
-            # SS: R_local: Local reward component
-            # Note: survival_bonus removed - it was causing positive rewards for long episodes
-            # without progress. Episodes should terminate early when targets are met.
+
+            # SS: R_local: Local reward component (inter-class overlap delta added post-loop)
             reward_local = (
-                self.alpha * precision_weight * precision_gain_for_reward
-                + coverage_weight * coverage_gain_for_reward
-                + coverage_bonus
-                + target_class_bonus
-                - progress_factor * overlap_penalty
-                - progress_factor * drift_penalty
-                - progress_factor * anchor_drift_penalty
-                - progress_factor * js_penalty
-                - progress_factor * inter_class_overlap_penalty
-                - progress_factor * same_class_overlap_penalty
+                shaping_gain
+                - overlap_penalty
+                - drift_penalty
+                - anchor_drift_penalty
+                - same_class_overlap_penalty
                 + coverage_floor_penalty )
-            
+
+            if not np.isfinite(reward_local):
+                reward_local = 0.0
+
             reward_without_shared[agent] = float(reward_local)
             
             self.box_history[agent].append((self.lower[agent].copy(), self.upper[agent].copy()))
             self.prev_lower[agent] = prev_lower
             self.prev_upper[agent] = prev_upper
+            # Cache final metrics for the next step's prev (common random numbers)
+            self._last_step_metrics[agent] = (precision, coverage, details)
             
+            # self.timestep is incremented after this agent loop, so the state being
+            # observed here belongs to time (timestep + 1).
+            episode_phase = min(1.0, float(self.timestep + 1) / float(self.max_cycles))
             state = np.concatenate(
-                [self.lower[agent], self.upper[agent], np.array([precision, coverage], dtype=np.float32)]
+                [
+                    self.lower[agent],
+                    self.upper[agent],
+                    np.array([precision, coverage, episode_phase], dtype=np.float32),
+                ]
             )
             
-            ## SS: Target change here: 
-            both_targets_met = precision >= self.precision_target and coverage >= self.coverage_target
+            ## SS: Target change here:
+            # Termination uses the class-aware effective target so minority/overlapping
+            # classes have reachable conditions (see _get_effective_precision_target).
+            agent_precision_target = self._get_effective_precision_target(agent_target_class) \
+                if agent_target_class is not None else self.precision_target
+            both_targets_met = (
+                precision >= agent_precision_target
+                and coverage >= self.coverage_target
+                and self._coverage_improved(agent, coverage)
+            )
             high_precision_with_reasonable_coverage = (
-                precision >= 0.95 * self.precision_target
+                precision >= 0.95 * agent_precision_target
                 and coverage >= 0.7 * self.coverage_target
             )
             both_reasonably_close = (
-                precision >= 0.90 * self.precision_target
+                precision >= 0.90 * agent_precision_target
                 and coverage >= 0.90 * self.coverage_target
             )
             excellent_precision = (
-                precision >= self.precision_target
+                precision >= agent_precision_target
                 and coverage >= 0.5 * self.coverage_target
             )
             
@@ -1512,9 +1700,15 @@ class AnchorEnv(ParallelEnv):
                     f"Preventing termination until bounds are fixed."
                 )
             
-            # Only allow termination if bounds are valid AND targets are met
+            # Require a minimum number of steps before termination is allowed, so
+            # an agent cannot terminate straight from the initial box. self.timestep
+            # is 0 on the first step (incremented post-loop), so +1 = steps taken.
+            # Matches SA's `can_terminate = step_count >= min_steps_before_termination`.
+            can_terminate = (self.timestep + 1) >= self.min_steps_before_termination
+
+            # Only allow termination if bounds are valid AND minimum steps taken AND targets are met
             done = bool(
-                bounds_valid and (
+                bounds_valid and can_terminate and (
                     both_targets_met
                     or high_precision_with_reasonable_coverage
                     or both_reasonably_close
@@ -1535,30 +1729,22 @@ class AnchorEnv(ParallelEnv):
                 elif both_reasonably_close and both_close_enabled:
                     termination_reason = "both_reasonably_close"
                 
-                # Increment counter and check if we should disable this reason
+                # Track counts for diagnostics only. The old mechanism that permanently
+                # DISABLED a termination reason after N uses changed the MDP mid-training
+                # while stale transitions sat in the replay buffer — removed. The
+                # terminal bonus below makes terminating at targets strictly better
+                # than hovering below them.
                 if termination_reason:
                     self.termination_reason_counts[agent][termination_reason] += 1
-                    count = self.termination_reason_counts[agent][termination_reason]
-                    max_count = self.termination_reason_max_counts[termination_reason]
-                    
-                    # Disable reason if it exceeds max count (unless max_count is -1 for unlimited)
-                    if max_count > 0 and count >= max_count and self.termination_reason_enabled[agent][termination_reason]:
-                        self.termination_reason_enabled[agent][termination_reason] = False
-                        logger.warning(
-                            f"Agent {agent}: Termination reason '{termination_reason}' disabled "
-                            f"after {count} uses (max: {max_count}). Agent must now meet other conditions."
-                        )
-                    
-                    # # Log which termination condition was met (SS: Debugging (disable later))
-                    # logger.info(
-                    #     f"Agent {agent} episode terminated (step {self.timestep}): "
-                    #     f"{termination_reason} (count: {count}/{max_count if max_count > 0 else 'unlimited'}). "
-                    #     f"Precision: {precision:.4f}, Coverage: {coverage:.4f}. "
-                    #     f"Targets: P>={self.precision_target:.2f}, C>={self.coverage_target:.4f}"
-                    # )
-            
-            precision_gain_component = self.alpha * precision_weight * precision_gain
-            coverage_gain_component = coverage_weight * coverage_gain_for_reward
+
+                    # Terminal bonus: pays once, dwarfs anything farmable from
+                    # per-step terms in the remaining steps of the episode.
+                    reward_without_shared[agent] = float(reward_without_shared.get(agent, 0.0) + self.terminal_bonus)
+
+            # Decompose the shaping gain for logging: precision part is exact, the
+            # remainder is the gated-coverage part of the potential.
+            precision_gain_component = self.alpha * precision_gain
+            coverage_gain_component = shaping_gain - precision_gain_component
             
             termination_reason_code = 0.0
             if termination_reason == "both_targets_met":
@@ -1591,11 +1777,15 @@ class AnchorEnv(ParallelEnv):
                 "overlap_penalty": float(overlap_penalty),
                 "drift_penalty": float(drift_penalty),
                 "anchor_drift_penalty": float(anchor_drift_penalty),
-                "inter_class_overlap_penalty": float(inter_class_overlap_penalty),
+                # Placeholder: replaced with the post-loop overlap delta below
+                "inter_class_overlap_penalty": 0.0,
                 "same_class_overlap_penalty": float(same_class_overlap_penalty),
                 "coverage_floor_penalty": float(coverage_floor_penalty),
+                "coverage_at_reset": float(self._coverage_at_reset.get(agent, 0.0)),
+                "coverage_improved": float(1.0 if self._coverage_improved(agent, coverage) else 0.0),
                 # Shared reward will be added later once we have processed all agents
                 "shared_reward": 0.0,
+                "shared_terminal_bonus": 0.0,
                 "total_reward": float(reward_local),
             }
             
@@ -1623,47 +1813,109 @@ class AnchorEnv(ParallelEnv):
             truncations[agent] = False
             infos[agent] = info
         
-        # SS: R_shared: compute the shared reward based on the post-action state.
-        if len(self.agents) > 1:
-            # Compute global coverage - This was not part of the original design.
-            global_coverage = self._compute_global_coverage()
-            shared_reward = self._compute_shared_reward(metrics_cache=metrics_cache, global_coverage=global_coverage)
-        else:
-            shared_reward = 0.0
-            global_coverage = 0.0
-        
-        # Optional: compute per-class union coverage/precision if enabled.
+        # SS: R_shared: same-class cooperative reward as a class-union potential gain.
+        # Each class c has Phi_c = alpha * union_precision(c) + beta * sqrt(union_coverage(c)),
+        # and every agent of class c receives w_shared * (Phi_c(s') - Phi_c(s)).
+        # This replaces the old global shared reward, which (a) was identical for ALL
+        # agents regardless of class — an Ice agent was rewarded when Snow improved —
+        # (b) was positive-only and clipped to [0, 1.25] per step, a farmable income
+        # stream that dwarfed the local signal, and (c) had no credit assignment.
+        # As a potential gain it is oscillation-proof for the same reason the local
+        # term is, and the cooperative task it rewards (grow YOUR class's union) is
+        # exactly what inference extracts.
+        shared_by_class: Dict[int, float] = {}
         class_union_metrics: Dict[int, Dict[str, float]] = {}
-        if (self.class_union_cov_weight != 0.0) or (self.class_union_prec_weight != 0.0):
+        union_terminal_bonus_by_class: Dict[int, float] = {}
+        # Compute union metrics when EITHER the smooth shared term or the one-time
+        # union-target bonus is active — the bonus is an independent lever and must
+        # work even if shared_reward_weight is 0.
+        if len(self.agents) > 1 and (
+            self.shared_reward_weight != 0.0 or self.shared_terminal_bonus != 0.0
+        ):
             class_union_metrics = self._compute_class_union_metrics()
-        
-        # Add the shared reward and any class-level bonus to each agent's local reward and update infos
+            for cls, m in class_union_metrics.items():
+                union_prec = max(0.0, float(m.get("union_precision", 0.0)))
+                union_cov = max(0.0, float(m.get("union_coverage", 0.0)))
+                # Gate the coverage term by union precision, mirroring _potential:
+                # ungated, the shared term paid for raw union-coverage expansion
+                # regardless of precision, rewarding box inflation.
+                cls_target = self._get_effective_precision_target(cls)
+                gate = min(1.0, union_prec / max(cls_target * 0.8, 1e-6))
+                phi_class = self.alpha * union_prec + self.beta * np.sqrt(union_cov) * gate
+                prev_phi = self._prev_class_phi.get(cls)
+                shared_by_class[cls] = (
+                    self.shared_reward_weight * (phi_class - prev_phi) if prev_phi is not None else 0.0
+                ) if self.shared_reward_weight != 0.0 else 0.0
+                self._prev_class_phi[cls] = phi_class
+
+                # One-time cooperative terminal bonus: the first step this class's
+                # union of boxes clears BOTH targets, pay every agent of the class
+                # (added per-agent below) and latch so it can't be re-collected this
+                # episode. Uses the same effective per-class precision target and the
+                # same coverage_target as local termination, so "union hits target"
+                # means the same thing for the cooperative objective as for the local.
+                if (
+                    self.shared_terminal_bonus != 0.0
+                    and not self._class_union_bonus_paid.get(cls, False)
+                    and union_prec >= cls_target
+                    and union_cov >= self.coverage_target
+                    and (
+                        not self.require_coverage_gain_to_terminate
+                        or union_cov
+                        > self._union_coverage_at_reset.get(cls, 0.0)
+                        + (1.0 / max(int((self._active_data()[2] == cls).sum()), 1))
+                    )
+                ):
+                    union_terminal_bonus_by_class[cls] = float(self.shared_terminal_bonus)
+                    self._class_union_bonus_paid[cls] = True
+
+        # Inter-class overlap as a potential-style delta: charge each agent the
+        # CHANGE in its (Jaccard-normalized, weighted) overlap level, computed here
+        # from everyone's post-action boxes so all agents see a consistent state.
+        # Telescoping bounds the episode total by level_final - level_init (|.| <= 1)
+        # instead of growing linearly with episode length.
+        inter_overlap_delta: Dict[str, float] = {}
+        for agent in self.agents:
+            level = self._compute_inter_class_overlap_penalty(agent)
+            prev_level = self._prev_inter_overlap.get(agent, level)
+            inter_overlap_delta[agent] = level - prev_level
+            self._prev_inter_overlap[agent] = level
+
+        # Global coverage kept for logging only (weight-gated; no longer a reward stream)
+        global_coverage = self._compute_global_coverage() if self.global_coverage_weight > 0 else 0.0
+
+        # Add the shared reward to each agent's local reward and update infos
         for agent in self.agents:
             local_r = reward_without_shared.get(agent, 0.0)
-            
-            # Class-level bonus based on union coverage/precision for this agent's class
+
             cls = self._get_class_for_agent(agent)
+            shared_reward = float(shared_by_class.get(cls, 0.0)) if cls is not None else 0.0
             union_cov = 0.0
             union_prec = 0.0
-            class_bonus = 0.0
+            union_purity = 0.0
             if class_union_metrics and cls is not None and cls in class_union_metrics:
                 m = class_union_metrics[cls]
                 union_cov = float(m.get("union_coverage", 0.0))
                 union_prec = float(m.get("union_precision", 0.0))
-                class_bonus = (
-                    self.class_union_cov_weight * union_cov
-                    + self.class_union_prec_weight * union_prec
-                )
-            
-            final_reward = float(local_r + shared_reward + class_bonus)
+                union_purity = float(m.get("union_purity", 0.0))
+
+            overlap_delta = float(inter_overlap_delta.get(agent, 0.0))
+            # One-time union-target bonus for this class (latched), paid to every
+            # agent of the class on the step the union first clears both targets.
+            union_bonus = float(union_terminal_bonus_by_class.get(cls, 0.0)) if cls is not None else 0.0
+            final_reward = float(local_r + shared_reward + union_bonus - overlap_delta)
             rewards[agent] = final_reward
-            
+
             # Update info to reflect the final reward decomposition
             if agent in infos:
+                infos[agent]["inter_class_overlap_penalty"] = overlap_delta
                 infos[agent]["shared_reward"] = float(shared_reward)
+                infos[agent]["shared_terminal_bonus"] = float(union_bonus)
                 infos[agent]["class_union_coverage"] = float(union_cov)
                 infos[agent]["class_union_precision"] = float(union_prec)
-                infos[agent]["class_union_bonus"] = float(class_bonus)
+                infos[agent]["class_union_fidelity"] = float(union_prec)
+                infos[agent]["class_union_purity"] = float(union_purity)
+                infos[agent]["class_union_bonus"] = 0.0  # retired level bonus (was w*cov + w*prec per step)
                 infos[agent]["global_coverage"] = float(global_coverage)
                 infos[agent]["total_reward"] = float(final_reward)
             else:
@@ -1689,13 +1941,16 @@ class AnchorEnv(ParallelEnv):
                     "overlap_penalty": 0.0,
                     "drift_penalty": 0.0,
                     "anchor_drift_penalty": 0.0,
-                    "inter_class_overlap_penalty": 0.0,
+                    "inter_class_overlap_penalty": overlap_delta,
                     "same_class_overlap_penalty": 0.0,
                     "coverage_floor_penalty": 0.0,
                     "class_union_coverage": float(union_cov),
                     "class_union_precision": float(union_prec),
-                    "class_union_bonus": float(class_bonus),
+                    "class_union_fidelity": float(union_prec),
+                    "class_union_purity": float(union_purity),
+                    "class_union_bonus": 0.0,  # retired level bonus (see above)
                     "shared_reward": float(shared_reward),
+                    "shared_terminal_bonus": float(union_bonus),
                     "global_coverage": float(global_coverage),
                     "total_reward": float(final_reward),
                 }
@@ -1742,46 +1997,57 @@ class AnchorEnv(ParallelEnv):
     
     # SS: Competative part of the game
     def _compute_inter_class_overlap_penalty(self, agent: str) -> float:
-        if len(self.agents) <= 1:
-            return 0.0
-        
+        """
+        Weighted inter-class overlap LEVEL for this agent's box (clipped to [0, 1]).
+        Jaccard-normalized (inter / union): the old inter / own_volume form punished
+        being contained rather than overlapping, so inflating to a near-full-space
+        box drove the penalty to ~0 — the degenerate minority-class solution.
+        Iterates over all agents with boxes (not just alive ones) so another agent
+        terminating does not discontinuously change this level mid-episode; step()
+        charges the CHANGE in this level, not the level itself.
+        """
         cls_agent = self._get_class_for_agent(agent)
         if cls_agent is None:
             return 0.0
-        
+
         agent_lower = self.lower[agent]
         agent_upper = self.upper[agent]
         agent_vol = float(np.prod(np.maximum(agent_upper - agent_lower, 1e-9)))
-        
+
         if agent_vol <= 1e-12:
             return 0.0
-        
+
         total_overlap_vol = 0.0
-        
-        for other_agent in self.agents:
+
+        agents_with_boxes = set(self.lower.keys()) & set(self.upper.keys())
+        for other_agent in agents_with_boxes:
             if other_agent == agent:
                 continue
-            
+
             cls_other = self._get_class_for_agent(other_agent)
             # Only penalize overlap with agents belonging to different classes
             if cls_other is None or cls_other == cls_agent:
                 continue
-            
+
             other_lower = self.lower[other_agent]
             other_upper = self.upper[other_agent]
-            
+            other_vol = float(np.prod(np.maximum(other_upper - other_lower, 1e-9)))
+            if other_vol <= 1e-12:
+                continue
+
             inter_lower = np.maximum(agent_lower, other_lower)
             inter_upper = np.minimum(agent_upper, other_upper)
             inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
             inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
-            
+
             if inter_vol > 1e-12:
-                overlap_ratio = inter_vol / (agent_vol + 1e-12)
-                total_overlap_vol += overlap_ratio
-        
+                union_vol = agent_vol + other_vol - inter_vol
+                if union_vol > 1e-12:
+                    total_overlap_vol += inter_vol / union_vol
+
         inter_class_overlap_weight = getattr(self, 'inter_class_overlap_weight', 0.1)
         penalty = inter_class_overlap_weight * total_overlap_vol
-        
+
         return float(np.clip(penalty, 0.0, 1.0))
 
     def _compute_same_class_overlap_penalty(self, agent: str) -> float:
@@ -1838,13 +2104,95 @@ class AnchorEnv(ParallelEnv):
         penalty = self.same_class_diversity_weight * avg_jacc
         return float(np.clip(penalty, 0.0, 1.0))
 
-    def _compute_class_union_metrics(self) -> Dict[int, Dict[str, float]]:
-        if self.eval_on_test_data:
-            X_data = self.X_test_unit
-            y_data = self.y_test
+    def _get_cached_probs(self, split: str) -> np.ndarray:
+        """
+        Classifier probabilities for every row of the given split, computed once
+        and cached. C-12: filling the cache counts as black-box queries.
+        """
+        if isinstance(split, bool):
+            split = "test" if split else "train"
+        if split == "training":
+            split = "train"
+        key = split
+        if self._cached_probs.get(key) is None:
+            if key == "test":
+                X = self.X_test_std
+            elif key == "val":
+                X = self.X_val_std
+            else:
+                X = self.X_std
+            if X is None:
+                raise ValueError(f"No {key} data available for cached predictions")
+            if hasattr(self.classifier, 'eval'):
+                self.classifier.eval()
+            if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
+                self.classifier.model.eval()
+            with torch.no_grad():
+                inputs = torch.from_numpy(X.astype(np.float32)).to(self.device)
+                self._cached_probs[key] = predict_proba_torch(self.classifier, inputs).cpu().numpy()
+            self.n_blackbox_queries += int(X.shape[0])
+        return self._cached_probs[key]
+
+    def _get_effective_precision_target(self, target_class: int) -> float:
+        """
+        Class-aware precision target: min(precision_target, max(prior, 0.9 x the
+        classifier's own precision for this class on training data)). The classifier's
+        per-class precision is an upper bound on what any anchor box can achieve, so
+        an absolute target above it makes the precision gate and the termination
+        conditions unreachable for minority/overlapping classes.
+        """
+        if not self.use_class_aware_targets:
+            return float(self.precision_target)
+        if target_class in self._effective_precision_targets:
+            return self._effective_precision_targets[target_class]
+        try:
+            probs = self._get_cached_probs("train")
+        except Exception as e:
+            logger.warning(f"Could not compute class-aware precision target ({e}); "
+                           f"falling back to absolute target {self.precision_target}")
+            self._effective_precision_targets[target_class] = float(self.precision_target)
+            return self._effective_precision_targets[target_class]
+        preds = probs.argmax(axis=1)
+        prior = float((self.y == target_class).mean())
+        pred_mask = (preds == target_class)
+        if pred_mask.any():
+            clf_class_precision = float((self.y[pred_mask] == target_class).mean())
         else:
-            X_data = self.X_unit
-            y_data = self.y
+            clf_class_precision = prior
+        ceiling = max(prior, 0.9 * clf_class_precision)
+        effective = float(np.clip(min(self.precision_target, ceiling), 0.05, self.precision_target))
+        if effective < self.precision_target:
+            logger.info(f"Class {target_class}: effective precision target {effective:.4f} "
+                        f"(absolute={self.precision_target}, prior={prior:.4f}, "
+                        f"classifier class precision={clf_class_precision:.4f})")
+        self._effective_precision_targets[target_class] = effective
+        return effective
+
+    def _potential(self, precision: float, coverage: float, target_class: Optional[int]) -> float:
+        """
+        State potential for reward shaping: Phi(s) = alpha * precision +
+        beta * sqrt(coverage) * gate(precision). sqrt amplifies the early-coverage
+        signal; the gate scales coverage credit by precision quality relative to the
+        class-aware threshold, preserving the precision-first curriculum without any
+        non-potential bonus terms. Phi depends only on state, so shaping with
+        Phi(s') - Phi(s) leaves the optimal policy unchanged (Ng et al., 1999).
+        Mirrors single_agentENV.py for fair comparison.
+        """
+        precision = max(0.0, float(precision))
+        coverage = max(0.0, float(coverage))
+        target = self._get_effective_precision_target(target_class) if target_class is not None else self.precision_target
+        # B2 rebalance (mirrors single_agentENV._potential): gate coverage credit on
+        # precision relative to the target. The old gate saturated at 0.8*target,
+        # granting full coverage credit below target; with beta raised so coverage
+        # drives the policy, that becomes a licence to trade fidelity for coverage.
+        target = max(float(target), 1e-6)
+        margin = max(float(getattr(self, "gate_margin", 0.10)), 1e-6)
+        gate = (precision - (target - margin)) / margin
+        gate = float(min(1.0, max(0.0, gate)))
+        return float(self.alpha * precision + self.beta * np.sqrt(coverage) * gate)
+
+    def _compute_class_union_metrics(self) -> Dict[int, Dict[str, float]]:
+        X_data, _, y_data, _ = self._active_data()
         
         if X_data is None or y_data is None or X_data.shape[0] == 0:
             return {}
@@ -1852,7 +2200,9 @@ class AnchorEnv(ParallelEnv):
         n_samples = X_data.shape[0]
         class_ids = set()
 
-        agents_with_boxes = set(self.lower.keys()) | set(self.upper.keys())
+        # Only agents currently in the episode. Idle init boxes of other
+        # agents (single-agent inference rollouts) must not enter the union.
+        agents_with_boxes = [a for a in self.agents if a in self.lower and a in self.upper]
         for agent in agents_with_boxes:
             cls = self._get_class_for_agent(agent)
             if cls is not None:
@@ -1895,16 +2245,21 @@ class AnchorEnv(ParallelEnv):
             else:
                 cov_union = 0.0
             
-            # Union precision: P(y = cls | x in union)
+            # C-09: union PRIMARY is model fidelity, matching local rewards and
+            # the revision evaluator. Ground-truth purity remains diagnostic.
             if union_mask.any():
-                y_union = y_data[union_mask]
-                prec_union = float((y_union == cls).mean())
+                preds = self._get_cached_probs(self._active_split()).argmax(axis=1)
+                fidelity_union = float((preds[union_mask] == cls).mean())
+                purity_union = float((y_data[union_mask] == cls).mean())
             else:
-                prec_union = 0.0
+                fidelity_union = 0.0
+                purity_union = 0.0
             
             metrics[cls] = {
                 "union_coverage": cov_union,
-                "union_precision": prec_union,
+                "union_precision": fidelity_union,
+                "union_fidelity": fidelity_union,
+                "union_purity": purity_union,
             }
         
         return metrics
@@ -1914,12 +2269,7 @@ class AnchorEnv(ParallelEnv):
         if len(self.agents) == 0:
             return 0.0
         
-        if self.eval_on_test_data:
-            X_data = self.X_test_unit
-            y_data = self.y_test
-        else:
-            X_data = self.X_unit
-            y_data = self.y
+        X_data, _, y_data, _ = self._active_data()
         
         if X_data is None or y_data is None or X_data.shape[0] == 0:
             return 0.0
@@ -1952,183 +2302,10 @@ class AnchorEnv(ParallelEnv):
         return anchor_drift_penalty
     
     # SS: Reward weights and penalties
-    def _compute_reward_weights_and_penalties(
-        self, precision: float, precision_gain: float, coverage_gain: float, 
-        js_proxy: float, precision_threshold: float, eps: float
-    ) -> tuple:
-        if precision >= precision_threshold:
-            precision_weight = max(2.0, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
-            # INCREASED coverage_weight to give coverage equal or higher emphasis than precision
-            # When precision is high, we want to strongly encourage coverage expansion
-            # Use beta (now 1.0) with a multiplier to match precision_weight scale
-            coverage_weight = self.beta * max(1.5, 1.0 + (precision - precision_threshold) / (1.0 - precision_threshold + eps))
-            
-            if precision >= self.precision_target * 0.95 and coverage_gain > 0:
-                js_penalty = self.js_penalty_weight * js_proxy * 0.3
-            else:
-                js_penalty = self.js_penalty_weight * js_proxy
-        else:
-            precision_weight = 2.0
-            # INCREASED coverage_weight when precision is low to encourage both precision and coverage
-            # Give coverage higher weight when precision is low to encourage exploration
-            coverage_weight = self.beta * max(1.0, 0.5 + 0.5 * (precision / (precision_threshold + eps)) + 0.5)
-            if coverage_gain > 0:
-                js_penalty = self.js_penalty_weight * js_proxy * 0.5
-            else:
-                js_penalty = self.js_penalty_weight * js_proxy
-        
-        return precision_weight, coverage_weight, js_penalty
-    
-    # SS: Coverage bonus
-    def _compute_coverage_bonus(
-        self, precision: float, coverage: float, coverage_gain: float, 
-        precision_threshold: float, eps: float
-    ) -> float:
-        coverage_bonus = 0.0
-        
-        # Read weights from config (defaults match reduced values for fair comparison with single-agent)
-        # This prevents high cumulative rewards over long episodes after survival bonus removal
-        if precision >= precision_threshold and coverage >= self.coverage_target:
-            coverage_bonus = self.coverage_bonus_weight_met * (coverage / self.coverage_target)
-        elif precision >= precision_threshold and coverage_gain > 0:
-            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            coverage_bonus = (self.coverage_bonus_weight_high_prec + 
-                            self.coverage_bonus_weight_high_prec_progress * progress_to_target) * coverage_gain
-            distance_to_target = (self.coverage_target - coverage) / (self.coverage_target + eps)
-            coverage_bonus += self.coverage_bonus_weight_high_prec_distance * coverage_gain * (1.0 - distance_to_target)
-        elif precision >= precision_threshold * 0.8 and coverage_gain > 0:
-            progress_to_target = min(1.0, coverage / (self.coverage_target + eps))
-            coverage_bonus = (self.coverage_bonus_weight_reasonable_prec + 
-                            self.coverage_bonus_weight_reasonable_prec_progress * progress_to_target) * coverage_gain
-        
-        return coverage_bonus
-    
-    # SS: Target class bonus
-    def _compute_target_class_bonus(
-        self, details: dict, precision: float, precision_threshold: float, eps: float
-    ) -> float:
-        target_class_bonus = 0.0
-        target_class_fraction = details.get("target_class_fraction", 0.0)
-        
-        # Read weight from config (default matches reduced value for fair comparison with single-agent)
-        if target_class_fraction > 0.0 and precision < precision_threshold:
-            precision_ratio = 1.0 - precision / (precision_threshold + eps)
-            target_class_bonus = self.target_class_bonus_weight * target_class_fraction * precision_ratio
-            target_class_bonus *= max(0.1, precision_ratio)
-        
-        return target_class_bonus
-    
-    # SS: Shared reward
-    def _compute_shared_reward(
-        self,
-        metrics_cache: Optional[Dict[str, Tuple[float, float, Dict[str, Any]]]] = None,
-        global_coverage: Optional[float] = None,
-    ) -> float:
-        if len(self.agents) <= 1:
-            return 0.0
-        
-        # Collect metrics for all agents
-        all_precisions: List[float] = []
-        all_coverages: List[float] = []
-        all_targets_met: List[bool] = []
-        
-        for agent in self.agents:
-            if metrics_cache is not None and agent in metrics_cache:
-                precision, coverage, _ = metrics_cache[agent]
-            else:
-                precision, coverage, _ = self._current_metrics(agent)
-            
-            all_precisions.append(precision)
-            all_coverages.append(coverage)
-            both_targets_met = (
-                precision >= self.precision_target
-                and coverage >= self.coverage_target
-            )
-            all_targets_met.append(both_targets_met)
-        
-        shared_reward = 0.0
-        shared_reward_weight = getattr(self, "shared_reward_weight", 0.2)
-        
-        # Bonus when ALL agents meet their targets (strong cooperative signal)
-        if all(all_targets_met):
-            shared_reward += shared_reward_weight * 1.0
-        
-        # Bonus for fraction of agents meeting targets (partial cooperation)
-        fraction_meeting_targets = sum(all_targets_met) / len(self.agents)
-        if fraction_meeting_targets > 0:
-            shared_reward += shared_reward_weight * 0.5 * fraction_meeting_targets
-        
-        # Bonus for low overall overlap (complement to inter_class_overlap_penalty)
-        total_overlap = 0.0
-        n_pairs = 0
-        
-        for i, agent_i in enumerate(self.agents):
-            lower_i = self.lower[agent_i]
-            upper_i = self.upper[agent_i]
-            vol_i = float(np.prod(np.maximum(upper_i - lower_i, 1e-9)))
-            
-            if vol_i <= 1e-12:
-                continue
-            
-            for j, agent_j in enumerate(self.agents):
-                if i >= j:
-                    continue
-                
-                lower_j = self.lower[agent_j]
-                upper_j = self.upper[agent_j]
-                
-                inter_lower = np.maximum(lower_i, lower_j)
-                inter_upper = np.minimum(upper_i, upper_j)
-                inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
-                inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
-                
-                if inter_vol > 1e-12:
-                    # Normalize by average volume of the two boxes
-                    vol_j = float(np.prod(np.maximum(upper_j - lower_j, 1e-9)))
-                    avg_vol = 0.5 * (vol_i + vol_j)
-                    overlap_ratio = inter_vol / (avg_vol + 1e-12)
-                    total_overlap += overlap_ratio
-                    n_pairs += 1
-        
-        if n_pairs > 0:
-            avg_overlap = total_overlap / n_pairs
-            # Reward low overlap (inverse relationship)
-            overlap_bonus = shared_reward_weight * 0.3 * (1.0 - min(1.0, avg_overlap))
-            shared_reward += overlap_bonus
-        
-        # Bonus for good average precision/coverage across all agents
-        avg_precision = float(np.mean(all_precisions)) if all_precisions else 0.0
-        avg_coverage = float(np.mean(all_coverages)) if all_coverages else 0.0
-        
-        eps = 1e-12
-        precision_progress = min(1.0, avg_precision / (self.precision_target + eps))
-        coverage_progress = min(1.0, avg_coverage / (self.coverage_target + eps))
-        
-        # Reward when average performance is good
-        # INCREASED coverage reward to strongly incentivize coverage expansion
-        if avg_precision >= self.precision_target * 0.8:
-            shared_reward += shared_reward_weight * 0.2 * precision_progress
-        if avg_coverage >= self.coverage_target * 0.5:
-            # Increased from 0.2 to 0.5 to give stronger signal for coverage
-            shared_reward += shared_reward_weight * 0.5 * coverage_progress
-        # Also reward coverage even when below 0.5 * target to encourage early expansion
-        if avg_coverage > 0:
-            shared_reward += shared_reward_weight * 0.1 * coverage_progress
-        
-        # Global coverage bonus: reward when union of all agents covers the dataset well
-        if self.global_coverage_weight > 0:
-            if global_coverage is None:
-                global_coverage = self._compute_global_coverage()
-            # Only reward if global coverage exceeds threshold
-            if global_coverage >= self.global_coverage_threshold:
-                global_coverage_target = 1.0
-                global_coverage_progress = min(1.0, global_coverage / (global_coverage_target + eps))
-                global_coverage_bonus = self.global_coverage_weight * (global_coverage_progress ** 2)
-                if global_coverage >= 0.9:
-                    global_coverage_bonus += self.global_coverage_weight * 0.2 * (global_coverage - 0.9) / 0.1
-                shared_reward += global_coverage_bonus
-        
-        return float(np.clip(shared_reward, 0.0, shared_reward_weight * 2.5))
+    # NOTE: _compute_reward_weights_and_penalties, _compute_coverage_bonus,
+    # _compute_target_class_bonus and _compute_shared_reward were removed with the
+    # move to potential-based reward shaping (see _potential and the same-class
+    # shared reward in step()).
 
     def _compute_group_map(self) -> Dict[str, List[str]]:
         group_map = {}
@@ -2147,7 +2324,17 @@ class AnchorEnv(ParallelEnv):
         return spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(2 * self.n_features + 2,),
+            # [lower(n), upper(n), precision, coverage, episode_phase]
+            # C-06: episode_phase = t / max_cycles is the quantity the paper called
+            # ξ_t. It is a shared clock (same t for every agent) but it does NOT
+            # depend on joint actions — it just increments. That is agent-wise
+            # decoupled (Condition B for a Markov potential game). The old shared
+            # termination-reason counters that disabled conditions mid-training
+            # WERE joint-history-dependent; they are deprecated (config comment)
+            # and no longer couple the agents.
+            # episode_phase also makes the observation time-aware so the critic
+            # has a consistent value function under per-step costs.
+            shape=(2 * self.n_features + 3,),
             dtype=np.float32
         )
     
@@ -2171,8 +2358,14 @@ class AnchorEnv(ParallelEnv):
         initial_upper: Optional[np.ndarray] = None,
         denormalize: bool = False
     ) -> str:
-        lower = self.lower[agent].copy()
-        upper = self.upper[agent].copy()
+        from utils.metrics import sparsify_box
+
+        lower, upper, active = sparsify_box(
+            self.lower[agent],
+            self.upper[agent],
+            sparsity_width_ratio=self.sparsity_width_ratio,
+            max_features=max_features_in_rule,
+        )
 
         # Denormalize bounds if requested: unit [0,1] -> standardized -> original raw units
         if denormalize:
@@ -2183,85 +2376,19 @@ class AnchorEnv(ParallelEnv):
                 lower = self._unit_to_orig(lower)
                 upper = self._unit_to_orig(upper)
 
-        # Full-range reference in the same space as `lower`/`upper`. In raw-units, a unit-space
-        # width of 1.0 corresponds to X_range * scaler_scale.
-        scaler_scale = self.scaler_scale if self.scaler_scale is not None else 1.0
-        full_range_scale = self.X_range * scaler_scale if (denormalize and self.X_range is not None) else 1.0
-
-        if initial_lower is None or initial_upper is None:
-            initial_width_normalized = np.ones(self.n_features, dtype=np.float32)
-            if denormalize and self.X_min is not None and self.X_range is not None:
-                initial_width = initial_width_normalized * full_range_scale
-            else:
-                initial_width = initial_width_normalized
-        else:
-            initial_width = initial_upper - initial_lower
-            if denormalize and self.X_min is not None and self.X_range is not None:
-                if np.all(initial_lower >= 0) and np.all(initial_lower <= 1) and np.all(initial_upper >= 0) and np.all(initial_upper <= 1):
-                    initial_lower_denorm = self._unit_to_orig(initial_lower)
-                    initial_upper_denorm = self._unit_to_orig(initial_upper)
-                    initial_width = initial_upper_denorm - initial_lower_denorm
-
-        current_width = upper - lower
-
-        if np.any(initial_width <= 0) or np.any(np.isnan(initial_width)) or np.any(np.isinf(initial_width)):
-            initial_width_ref = np.ones_like(initial_width)
-        else:
-            initial_width_ref = initial_width.copy()
-
-        if np.any(current_width <= 0) or np.any(np.isnan(current_width)) or np.any(np.isinf(current_width)):
-            tightened = np.array([], dtype=int)
-        else:
-            # Use more lenient thresholds (matching single-agent version) to include more features in rules
-            # This helps rules cover more samples by being less restrictive about what counts as "tightened"
-            tightened = np.where(current_width < initial_width_ref * 0.95)[0]
-            if tightened.size == 0:
-                tightened = np.where(current_width < initial_width_ref * 0.98)[0]
-            if tightened.size == 0:
-                tightened = np.where(current_width < initial_width_ref * 0.99)[0]
-
-            if tightened.size == 0:
-                if denormalize and self.X_range is not None:
-                    threshold_90 = 0.90 * full_range_scale
-                    tightened = np.where(current_width < threshold_90)[0]
-                else:
-                    tightened = np.where(current_width < 0.90)[0]
-
-            if tightened.size == 0:
-                if denormalize and self.X_range is not None:
-                    threshold_85 = 0.85 * full_range_scale
-                    tightened = np.where(current_width < threshold_85)[0]
-                else:
-                    tightened = np.where(current_width < 0.85)[0]
-
-            if tightened.size == 0:
-                if denormalize and self.X_range is not None:
-                    threshold_80 = 0.8 * full_range_scale
-                    if np.all(initial_width_ref >= threshold_80):
-                        tightened = np.where(current_width < threshold_80)[0]
-                else:
-                    if np.all(initial_width_ref >= 0.8):
-                        tightened = np.where(current_width < 0.8)[0]
-
-            # Final fallback: any feature that tightened
-            if tightened.size == 0:
-                tightened = np.where(current_width < initial_width_ref)[0]
-        
-        if tightened.size == 0:
-            return "any values (no tightened features)"
-        
-        tightened_sorted = np.argsort(current_width[tightened])
-        if max_features_in_rule is None or max_features_in_rule == -1 or max_features_in_rule == 0:
-            to_show_idx = tightened
-        else:
-            to_show_idx = tightened[tightened_sorted[:max_features_in_rule]]
-        
+        to_show_idx = np.flatnonzero(active)
         if to_show_idx.size == 0:
             return "any values (no tightened features)"
         
         cond_parts = []
         for i in to_show_idx:
-            cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.6f}, {upper[i]:.6f}]")
+            if i in self.categorical_indices and denormalize:
+                code = int(round(float((lower[i] + upper[i]) / 2.0)))
+                labels = self.categorical_value_names.get(int(i), [])
+                value = labels[code] if 0 <= code < len(labels) else str(code)
+                cond_parts.append(f"{self.feature_names[i]} = {value!r}")
+            else:
+                cond_parts.append(f"{self.feature_names[i]} ∈ [{lower[i]:.6f}, {upper[i]:.6f}]")
         
         return " and ".join(cond_parts)
     

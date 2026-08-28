@@ -101,7 +101,18 @@ def train_classifier(classifier, X, y, device, epochs=1000, batch_size=256, lr=1
                 print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(train_loader):.4f} | Test Acc: {test_acc:.3f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
-                best_model_state = classifier.state_dict().copy()
+                # Clone: dict.copy() on a state_dict aliases the live parameter
+                # tensors, so an uncloned snapshot tracks later optimizer steps.
+                best_model_state = {
+                    k: v.detach().clone() for k, v in classifier.state_dict().items()
+                }
+
+    # Restore the best epoch. The loop above tracked it but never applied it, so the
+    # caller was left holding the final-epoch weights. classifier is mutated in place,
+    # which is how the caller receives it (this function returns None).
+    if best_model_state is not None:
+        classifier.load_state_dict(best_model_state)
+    classifier.eval()
 
 class PolicyNet(nn.Module):
     def __init__(self, agent_id, input_size, hidden_size, output_size, device):

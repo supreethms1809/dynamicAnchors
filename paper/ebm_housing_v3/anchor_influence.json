@@ -1,0 +1,662 @@
+{
+  "dataset": "housing",
+  "rules_file": "BenchMARL/output/housing_masac/training/masac_anchor_mlp__f544c1cb_26_08_17-12_34_09/inference/extracted_rules.json",
+  "experiment_dir": "/Users/ssuresh/dynamicAnchors/BenchMARL/output/housing_masac/training/masac_anchor_mlp__f544c1cb_26_08_17-12_34_09",
+  "feature_names": [
+    "MedInc",
+    "HouseAge",
+    "AveRooms",
+    "AveBedrms",
+    "Population",
+    "AveOccup",
+    "Latitude",
+    "Longitude"
+  ],
+  "bound_space": "raw",
+  "mlp_accuracy_full_data": 0.7642926356589147,
+  "method": {
+    "influence": "precision(box) - precision(box with feature j relaxed), precision = P(MLP predicts class c | x in box)",
+    "aggregation": "unweighted mean over the class's anchor boxes (each rule counts once)",
+    "tightness": "1 - (box width on j / data range on j)"
+  },
+  "anchor_influence": {
+    "class_0": {
+      "n_anchors_used": 60,
+      "n_anchors_total": 60,
+      "mean_precision_prediction_match": 0.42858127143494706,
+      "mean_precision_class_label": 0.42585554828900196,
+      "mean_coverage": 0.03403827519379844,
+      "influence": {
+        "MedInc": 0.018590478131950153,
+        "HouseAge": 0.03962312633413716,
+        "AveRooms": -9.188005771079156e-05,
+        "AveBedrms": 0.01760876144931175,
+        "Population": -0.00025195572428259754,
+        "AveOccup": 0.031466470182611776,
+        "Latitude": 0.017865749597294797,
+        "Longitude": 0.12133956215643822
+      },
+      "influence_share": {
+        "MedInc": 0.07541955171743697,
+        "HouseAge": 0.16074672230339865,
+        "AveRooms": 0.0,
+        "AveBedrms": 0.07143683370488252,
+        "Population": 0.0,
+        "AveOccup": 0.12765605373129413,
+        "Latitude": 0.0724794067242534,
+        "Longitude": 0.4922614318187343
+      },
+      "tightness": {
+        "MedInc": 0.3633087212300711,
+        "HouseAge": 0.7052960130903455,
+        "AveRooms": 0.7436900432364851,
+        "AveBedrms": 0.950164692609142,
+        "Population": 0.9370026294800874,
+        "AveOccup": 0.9348401595380648,
+        "Latitude": 0.6611011610976545,
+        "Longitude": 0.41391860308129247
+      },
+      "tightness_share": {
+        "MedInc": 0.06363430189142841,
+        "HouseAge": 0.1235341096901174,
+        "AveRooms": 0.1302589064328878,
+        "AveBedrms": 0.16642338419885386,
+        "Population": 0.1641180206066105,
+        "AveOccup": 0.16373925935734596,
+        "Latitude": 0.11579328655703067,
+        "Longitude": 0.07249873126572547
+      },
+      "influence_coverage_weighted": {
+        "MedInc": -0.030589840866899205,
+        "HouseAge": 0.007353171706023326,
+        "AveRooms": -0.00022648582011220464,
+        "AveBedrms": 0.0014893177619284502,
+        "Population": 0.0007248756066727208,
+        "AveOccup": 0.008443394457383992,
+        "Latitude": -0.01229172851782835,
+        "Longitude": 0.031030438868365273
+      },
+      "tightness_coverage_weighted": {
+        "MedInc": 0.12109284386621066,
+        "HouseAge": 0.5322398181233107,
+        "AveRooms": 0.9312680151878966,
+        "AveBedrms": 0.9501646925997973,
+        "Population": 0.9299381596196616,
+        "AveOccup": 0.9477338555047818,
+        "Latitude": 0.615217677017665,
+        "Longitude": 0.47232206910083424
+      },
+      "binding_fraction": {
+        "MedInc": 0.9166666666666666,
+        "HouseAge": 1.0,
+        "AveRooms": 0.6,
+        "AveBedrms": 0.55,
+        "Population": 0.8833333333333333,
+        "AveOccup": 0.2833333333333333,
+        "Latitude": 0.8833333333333333,
+        "Longitude": 0.5666666666666667
+      },
+      "influence_featureset_dedup": {
+        "MedInc": 0.024456684092018007,
+        "HouseAge": 0.03655787089705946,
+        "AveRooms": 0.0020165403052490424,
+        "AveBedrms": 0.013212301859089457,
+        "Population": -0.00547695086071181,
+        "AveOccup": 0.01439220866084964,
+        "Latitude": 0.06596347291608072,
+        "Longitude": 0.09569182421121017
+      },
+      "influence_featureset_dedup_share": {
+        "MedInc": 0.09693843022823312,
+        "HouseAge": 0.1449036428615428,
+        "AveRooms": 0.007992917230615234,
+        "AveBedrms": 0.052369315361918155,
+        "Population": 0.0,
+        "AveOccup": 0.05704608645434835,
+        "Latitude": 0.2614579921312551,
+        "Longitude": 0.37929161573208725
+      },
+      "n_distinct_feature_sets": 13,
+      "rule_overlap": {
+        "median_pairwise_jaccard": 0.0,
+        "max_pairwise_jaccard": 0.6188204683434518,
+        "frac_pairs_jaccard_gt_0.5": 0.0039548022598870055
+      },
+      "coverage_weight_concentration": {
+        "top1": 0.15628780869688993,
+        "top5": 0.5132019073375561,
+        "median": 0.0033449576542594842
+      }
+    },
+    "class_1": {
+      "n_anchors_used": 60,
+      "n_anchors_total": 60,
+      "mean_precision_prediction_match": 0.5132205556050242,
+      "mean_precision_class_label": 0.4753424688947356,
+      "mean_coverage": 0.013951873385012921,
+      "influence": {
+        "MedInc": 0.1160325717814762,
+        "HouseAge": 0.05162210731292753,
+        "AveRooms": 0.014127259787713165,
+        "AveBedrms": 0.0019335852291285044,
+        "Population": 0.04488319061935771,
+        "AveOccup": 0.012466645611563746,
+        "Latitude": 0.017794592995827366,
+        "Longitude": 0.07989366172873072
+      },
+      "influence_share": {
+        "MedInc": 0.3425279218308004,
+        "HouseAge": 0.1523883584320109,
+        "AveRooms": 0.041703642881952684,
+        "AveBedrms": 0.005707939762495649,
+        "Population": 0.13249508971444326,
+        "AveOccup": 0.036801513126607274,
+        "Latitude": 0.05252960324075753,
+        "Longitude": 0.23584593101093226
+      },
+      "tightness": {
+        "MedInc": 0.9422757685324974,
+        "HouseAge": 0.6061123271393619,
+        "AveRooms": 0.9511746306611271,
+        "AveBedrms": 0.6795214951757651,
+        "Population": 0.878559919010692,
+        "AveOccup": 0.8315638787164011,
+        "Latitude": 0.6440690848037084,
+        "Longitude": 0.43885494247685286
+      },
+      "tightness_share": {
+        "MedInc": 0.15777879008588477,
+        "HouseAge": 0.10149010812527368,
+        "AveRooms": 0.15926885461548948,
+        "AveBedrms": 0.11378206139499808,
+        "Population": 0.14710992860969366,
+        "AveOccup": 0.13924070536944327,
+        "Latitude": 0.10784575421091021,
+        "Longitude": 0.07348379758830695
+      },
+      "influence_coverage_weighted": {
+        "MedInc": 0.11799142763995331,
+        "HouseAge": 0.04413066368342305,
+        "AveRooms": -0.0013862229919057052,
+        "AveBedrms": 2.562073294581757e-05,
+        "Population": 0.02147186276529723,
+        "AveOccup": 0.001504898626837725,
+        "Latitude": -0.019008481435800598,
+        "Longitude": 0.09171288065134053
+      },
+      "tightness_coverage_weighted": {
+        "MedInc": 0.9215331025942651,
+        "HouseAge": 0.4808023242198433,
+        "AveRooms": 0.9462674805903045,
+        "AveBedrms": 0.8470637480603938,
+        "Population": 0.8204197602483249,
+        "AveOccup": 0.8212154523774563,
+        "Latitude": 0.43331433630129257,
+        "Longitude": 0.5581521258229851
+      },
+      "binding_fraction": {
+        "MedInc": 0.9833333333333333,
+        "HouseAge": 0.9666666666666667,
+        "AveRooms": 0.6833333333333333,
+        "AveBedrms": 0.2,
+        "Population": 0.7833333333333333,
+        "AveOccup": 0.03333333333333333,
+        "Latitude": 0.8833333333333333,
+        "Longitude": 0.6666666666666666
+      },
+      "influence_featureset_dedup": {
+        "MedInc": 0.1432002867483889,
+        "HouseAge": 0.06878204777496857,
+        "AveRooms": 0.010890771797642612,
+        "AveBedrms": 0.001890332018353664,
+        "Population": 0.07654528168358361,
+        "AveOccup": 0.004791154521724516,
+        "Latitude": 0.02242457322414411,
+        "Longitude": 0.08305173948826874
+      },
+      "influence_featureset_dedup_share": {
+        "MedInc": 0.3479314187313381,
+        "HouseAge": 0.16711862810470762,
+        "AveRooms": 0.02646113194794752,
+        "AveBedrms": 0.004592909106213531,
+        "Population": 0.18598083186910092,
+        "AveOccup": 0.01164099058707668,
+        "Latitude": 0.054484622576421046,
+        "Longitude": 0.20178946707719456
+      },
+      "n_distinct_feature_sets": 15,
+      "rule_overlap": {
+        "median_pairwise_jaccard": 0.0,
+        "max_pairwise_jaccard": 0.5773657289002557,
+        "frac_pairs_jaccard_gt_0.5": 0.0011299435028248588
+      },
+      "coverage_weight_concentration": {
+        "top1": 0.08588957055214723,
+        "top5": 0.347262414631323,
+        "median": 0.004225026044681097
+      }
+    },
+    "class_2": {
+      "n_anchors_used": 60,
+      "n_anchors_total": 60,
+      "mean_precision_prediction_match": 0.2690499582899483,
+      "mean_precision_class_label": 0.26316388677652275,
+      "mean_coverage": 0.295592700258398,
+      "influence": {
+        "MedInc": 0.0004541054841200052,
+        "HouseAge": -0.003129918481484603,
+        "AveRooms": 0.005467927365743911,
+        "AveBedrms": -0.0006863881307894522,
+        "Population": -0.00414240963933957,
+        "AveOccup": 1.1298231025992181e-06,
+        "Latitude": -0.00222221697638311,
+        "Longitude": 0.012530047324997058
+      },
+      "influence_share": {
+        "MedInc": 0.024608481893942498,
+        "HouseAge": 0.0,
+        "AveRooms": 0.2963130732456484,
+        "AveBedrms": 0.0,
+        "Population": 0.0,
+        "AveOccup": 6.122637214467842e-05,
+        "Latitude": 0.0,
+        "Longitude": 0.6790172184882646
+      },
+      "tightness": {
+        "MedInc": 0.30150940854681213,
+        "HouseAge": 0.36879128568312713,
+        "AveRooms": 0.9334965586419343,
+        "AveBedrms": 0.9299421449110092,
+        "Population": 0.917048375117859,
+        "AveOccup": 0.5032969874325967,
+        "Latitude": 0.21409443504170428,
+        "Longitude": 0.466339643794443
+      },
+      "tightness_share": {
+        "MedInc": 0.06505732720267529,
+        "HouseAge": 0.07957488112168624,
+        "AveRooms": 0.20142254051322803,
+        "AveBedrms": 0.20065559709271924,
+        "Population": 0.1978734809247632,
+        "AveOccup": 0.10859746284315211,
+        "Latitude": 0.04619561220298554,
+        "Longitude": 0.10062309809879032
+      },
+      "influence_coverage_weighted": {
+        "MedInc": 0.0009398359733149015,
+        "HouseAge": 0.00016847395666990392,
+        "AveRooms": 0.003443770285759467,
+        "AveBedrms": -0.00040299655457471317,
+        "Population": -0.00464603503672173,
+        "AveOccup": 1.8284807967024941e-06,
+        "Latitude": 0.0012784426890930791,
+        "Longitude": 0.01079293024856397
+      },
+      "tightness_coverage_weighted": {
+        "MedInc": 0.3184410253668363,
+        "HouseAge": 0.2610595194143691,
+        "AveRooms": 0.9247728177010548,
+        "AveBedrms": 0.9326346675882295,
+        "Population": 0.9010931752979361,
+        "AveOccup": 0.45198141429266975,
+        "Latitude": 0.12583279703514325,
+        "Longitude": 0.3100806800539127
+      },
+      "binding_fraction": {
+        "MedInc": 0.7666666666666667,
+        "HouseAge": 0.9833333333333333,
+        "AveRooms": 0.9666666666666667,
+        "AveBedrms": 0.6666666666666666,
+        "Population": 0.9833333333333333,
+        "AveOccup": 0.03333333333333333,
+        "Latitude": 0.75,
+        "Longitude": 0.9166666666666666
+      },
+      "influence_featureset_dedup": {
+        "MedInc": 0.005937530070679694,
+        "HouseAge": -0.0073079539937536304,
+        "AveRooms": 0.008480472672086327,
+        "AveBedrms": -0.0010850417435932082,
+        "Population": -0.0014606421373089893,
+        "AveOccup": 6.162671468723008e-06,
+        "Latitude": -0.002662960582115959,
+        "Longitude": 0.017216358842737773
+      },
+      "influence_featureset_dedup_share": {
+        "MedInc": 0.18765586886163116,
+        "HouseAge": 0.0,
+        "AveRooms": 0.2680256687029297,
+        "AveBedrms": 0.0,
+        "Population": 0.0,
+        "AveOccup": 0.00019477147150508928,
+        "Latitude": 0.0,
+        "Longitude": 0.5441236909639341
+      },
+      "n_distinct_feature_sets": 11,
+      "rule_overlap": {
+        "median_pairwise_jaccard": 0.1450322999508611,
+        "max_pairwise_jaccard": 0.9024068868587491,
+        "frac_pairs_jaccard_gt_0.5": 0.11073446327683616
+      },
+      "coverage_weight_concentration": {
+        "top1": 0.044746518349350645,
+        "top5": 0.2065879550458665,
+        "median": 0.015351224655932598
+      }
+    },
+    "class_3": {
+      "n_anchors_used": 60,
+      "n_anchors_total": 60,
+      "mean_precision_prediction_match": 0.2450605815608981,
+      "mean_precision_class_label": 0.2728967860002977,
+      "mean_coverage": 0.0815406976744186,
+      "influence": {
+        "MedInc": -0.05776507179933325,
+        "HouseAge": 0.04767641014677846,
+        "AveRooms": -0.002658627932571855,
+        "AveBedrms": 0.023564126237099487,
+        "Population": 0.0074093909130612725,
+        "AveOccup": -0.005553095618348489,
+        "Latitude": 0.02180009951413122,
+        "Longitude": 0.01668279002418838
+      },
+      "influence_share": {
+        "MedInc": 0.0,
+        "HouseAge": 0.4070286315562003,
+        "AveRooms": 0.0,
+        "AveBedrms": 0.20117441784262044,
+        "Population": 0.06325631973388117,
+        "AveOccup": 0.0,
+        "Latitude": 0.18611436233785716,
+        "Longitude": 0.14242626852944082
+      },
+      "tightness": {
+        "MedInc": 0.478579719198751,
+        "HouseAge": 0.5898576418558757,
+        "AveRooms": 0.9159269634729902,
+        "AveBedrms": 0.8518637394576112,
+        "Population": 0.1427491253081677,
+        "AveOccup": 0.8951372306007029,
+        "Latitude": 0.821229500055741,
+        "Longitude": 0.5628855573193675
+      },
+      "tightness_share": {
+        "MedInc": 0.09101537338140196,
+        "HouseAge": 0.11217799535105315,
+        "AveRooms": 0.17418923373969308,
+        "AveBedrms": 0.16200581262954228,
+        "Population": 0.0271477549477933,
+        "AveOccup": 0.17023548220371332,
+        "Latitude": 0.15617985171735713,
+        "Longitude": 0.10704849602944579
+      },
+      "influence_coverage_weighted": {
+        "MedInc": -0.0524893873644061,
+        "HouseAge": 0.0033688183505418165,
+        "AveRooms": -0.0024276660410657075,
+        "AveBedrms": -0.00025001156607412536,
+        "Population": 0.00045758853975563514,
+        "AveOccup": -0.001684283455019662,
+        "Latitude": 0.013197197626005156,
+        "Longitude": 0.008739985451251344
+      },
+      "tightness_coverage_weighted": {
+        "MedInc": 0.41782020010435533,
+        "HouseAge": 0.49261593313030005,
+        "AveRooms": 0.9092149133664251,
+        "AveBedrms": 0.8468160471929932,
+        "Population": 0.21561116882955816,
+        "AveOccup": 0.8813187664873906,
+        "Latitude": 0.8301079787532175,
+        "Longitude": 0.5568718196545054
+      },
+      "binding_fraction": {
+        "MedInc": 0.85,
+        "HouseAge": 1.0,
+        "AveRooms": 0.8,
+        "AveBedrms": 0.48333333333333334,
+        "Population": 0.5333333333333333,
+        "AveOccup": 0.15,
+        "Latitude": 0.9666666666666667,
+        "Longitude": 0.7333333333333333
+      },
+      "influence_featureset_dedup": {
+        "MedInc": -0.059578771223429035,
+        "HouseAge": 0.08105194664397225,
+        "AveRooms": 6.368593175897809e-05,
+        "AveBedrms": 0.0625732693571078,
+        "Population": 0.01303135705826839,
+        "AveOccup": -0.003511978525769118,
+        "Latitude": 0.016531654564318793,
+        "Longitude": 0.01779862325433106
+      },
+      "influence_featureset_dedup_share": {
+        "MedInc": 0.0,
+        "HouseAge": 0.42424349074026146,
+        "AveRooms": 0.0003333459974645072,
+        "AveBedrms": 0.32752208081684947,
+        "Population": 0.06820895285546696,
+        "AveOccup": 0.0,
+        "Latitude": 0.08653027015977739,
+        "Longitude": 0.09316185943018011
+      },
+      "n_distinct_feature_sets": 24,
+      "rule_overlap": {
+        "median_pairwise_jaccard": 0.0,
+        "max_pairwise_jaccard": 0.7996497373029773,
+        "frac_pairs_jaccard_gt_0.5": 0.020338983050847456
+      },
+      "coverage_weight_concentration": {
+        "top1": 0.07040007922360865,
+        "top5": 0.255684293919588,
+        "median": 0.014116656763715589
+      }
+    }
+  },
+  "comparison_vs_ebm": {
+    "per_class": {
+      "class_0": {
+        "spearman_rho": 0.523809523809524,
+        "spearman_p": 0.18272075053971484,
+        "anchor_share": {
+          "MedInc": 0.07541955171743697,
+          "HouseAge": 0.16074672230339865,
+          "AveRooms": 0.0,
+          "AveBedrms": 0.07143683370488252,
+          "Population": 0.0,
+          "AveOccup": 0.12765605373129413,
+          "Latitude": 0.0724794067242534,
+          "Longitude": 0.4922614318187343
+        },
+        "ebm_share": {
+          "MedInc": 0.14234520156629327,
+          "HouseAge": 0.017198670212301162,
+          "AveRooms": 0.04750967354435845,
+          "AveBedrms": 0.012524796891158306,
+          "Population": 0.009163434606983895,
+          "AveOccup": 0.06446557707625351,
+          "Latitude": 0.37410499414904314,
+          "Longitude": 0.3326876519536082
+        },
+        "anchor_top3": [
+          "Longitude",
+          "HouseAge",
+          "AveOccup"
+        ],
+        "ebm_top3": [
+          "Latitude",
+          "Longitude",
+          "MedInc"
+        ]
+      },
+      "class_1": {
+        "spearman_rho": 0.4047619047619048,
+        "spearman_p": 0.3198886412288162,
+        "anchor_share": {
+          "MedInc": 0.3425279218308004,
+          "HouseAge": 0.1523883584320109,
+          "AveRooms": 0.041703642881952684,
+          "AveBedrms": 0.005707939762495649,
+          "Population": 0.13249508971444326,
+          "AveOccup": 0.036801513126607274,
+          "Latitude": 0.05252960324075753,
+          "Longitude": 0.23584593101093226
+        },
+        "ebm_share": {
+          "MedInc": 0.12119531883516198,
+          "HouseAge": 0.04825604122117465,
+          "AveRooms": 0.059922155761826794,
+          "AveBedrms": 0.01130698106751707,
+          "Population": 0.006582455061430134,
+          "AveOccup": 0.10041479211454216,
+          "Latitude": 0.30754798593490734,
+          "Longitude": 0.34477427000343996
+        },
+        "anchor_top3": [
+          "MedInc",
+          "Longitude",
+          "HouseAge"
+        ],
+        "ebm_top3": [
+          "Longitude",
+          "Latitude",
+          "MedInc"
+        ]
+      },
+      "class_2": {
+        "spearman_rho": 0.523809523809524,
+        "spearman_p": 0.18272075053971484,
+        "anchor_share": {
+          "MedInc": 0.024608481893942498,
+          "HouseAge": 0.0,
+          "AveRooms": 0.2963130732456484,
+          "AveBedrms": 0.0,
+          "Population": 0.0,
+          "AveOccup": 6.122637214467842e-05,
+          "Latitude": 0.0,
+          "Longitude": 0.6790172184882646
+        },
+        "ebm_share": {
+          "MedInc": 0.11334223872694915,
+          "HouseAge": 0.031046253257699035,
+          "AveRooms": 0.031079179300816797,
+          "AveBedrms": 0.01467659285165268,
+          "Population": 0.012237213509033467,
+          "AveOccup": 0.061673325364340545,
+          "Latitude": 0.40430094368334446,
+          "Longitude": 0.33164425330616387
+        },
+        "anchor_top3": [
+          "Longitude",
+          "AveRooms",
+          "MedInc"
+        ],
+        "ebm_top3": [
+          "Latitude",
+          "Longitude",
+          "MedInc"
+        ]
+      },
+      "class_3": {
+        "spearman_rho": -0.28571428571428575,
+        "spearman_p": 0.4927262450169573,
+        "anchor_share": {
+          "MedInc": 0.0,
+          "HouseAge": 0.4070286315562003,
+          "AveRooms": 0.0,
+          "AveBedrms": 0.20117441784262044,
+          "Population": 0.06325631973388117,
+          "AveOccup": 0.0,
+          "Latitude": 0.18611436233785716,
+          "Longitude": 0.14242626852944082
+        },
+        "ebm_share": {
+          "MedInc": 0.14189125716116205,
+          "HouseAge": 0.025875115958473388,
+          "AveRooms": 0.07048692049680791,
+          "AveBedrms": 0.008194586478517958,
+          "Population": 0.009487713587235998,
+          "AveOccup": 0.08770445385863625,
+          "Latitude": 0.3401591774849082,
+          "Longitude": 0.3162007749742583
+        },
+        "anchor_top3": [
+          "HouseAge",
+          "AveBedrms",
+          "Latitude"
+        ],
+        "ebm_top3": [
+          "Latitude",
+          "Longitude",
+          "MedInc"
+        ]
+      }
+    },
+    "global": {
+      "spearman_rho": 0.3571428571428572,
+      "spearman_p": 0.38512064355625636,
+      "spearman_rho_featureset_dedup": 0.3333333333333334,
+      "spearman_p_featureset_dedup": 0.4197530864197531,
+      "anchor_influence": {
+        "MedInc": 0.01932802089955328,
+        "HouseAge": 0.03394793132808964,
+        "AveRooms": 0.004211169790793607,
+        "AveBedrms": 0.010605021196187572,
+        "Population": 0.011974554042199204,
+        "AveOccup": 0.00959528749973241,
+        "Latitude": 0.013809556282717567,
+        "Longitude": 0.057611515308588594
+      },
+      "anchor_share": {
+        "MedInc": 0.1199879201311779,
+        "HouseAge": 0.21074799608208603,
+        "AveRooms": 0.026142847586027338,
+        "AveBedrms": 0.0658357336682626,
+        "Population": 0.07433776285160576,
+        "AveOccup": 0.05956732953347499,
+        "Latitude": 0.08572941559350333,
+        "Longitude": 0.357650994553862
+      },
+      "ebm_importance": {
+        "MedInc": 1.3297727921054194,
+        "HouseAge": 0.29333632380492364,
+        "AveRooms": 0.5405154217189423,
+        "AveBedrms": 0.1118235152269775,
+        "Population": 0.09306276888176217,
+        "AveOccup": 0.7948722589941923,
+        "Latitude": 3.574132132690547,
+        "Longitude": 3.268795939297008
+      },
+      "ebm_share": {
+        "MedInc": 0.13289340815111267,
+        "HouseAge": 0.02931513115352136,
+        "AveRooms": 0.054017450933656716,
+        "AveBedrms": 0.011175298621069087,
+        "Population": 0.009300407259119377,
+        "AveOccup": 0.079437091937536,
+        "Latitude": 0.35718778660196643,
+        "Longitude": 0.3266734253420183
+      },
+      "anchor_ranking": [
+        "Longitude",
+        "HouseAge",
+        "MedInc",
+        "Latitude",
+        "Population",
+        "AveBedrms",
+        "AveOccup",
+        "AveRooms"
+      ],
+      "ebm_ranking": [
+        "Latitude",
+        "Longitude",
+        "MedInc",
+        "AveOccup",
+        "AveRooms",
+        "HouseAge",
+        "AveBedrms",
+        "Population"
+      ]
+    }
+  }
+}

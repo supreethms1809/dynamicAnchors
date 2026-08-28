@@ -235,4 +235,5 @@ comparison_results/*
 wandb/*
 final_results/*
 tests/*
+!tests/test_revision_metrics.py
 models/*

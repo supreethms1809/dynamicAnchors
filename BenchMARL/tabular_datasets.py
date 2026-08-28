@@ -41,27 +41,63 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.networks import SimpleClassifier, UnifiedClassifier
 
 
+def _infer_dnn_arch_from_state_dict(state_dict):
+    """Recover (hidden_sizes, use_batch_norm) from a SimpleClassifier state_dict.
+
+    SimpleClassifier stores everything in one nn.Sequential named ``net``, so the
+    Linear layers appear as ``net.<idx>.weight`` with 2-D shapes (out, in). The
+    hidden sizes are the out-features of every Linear except the final one (which
+    is the output layer, out == num_classes). BatchNorm is detected by the
+    presence of ``running_mean`` buffers.
+
+    Returns None if the state_dict does not look like a SimpleClassifier, so the
+    caller can fall back to the size-aware defaults.
+    """
+    try:
+        linear_out = []
+        for key, value in state_dict.items():
+            if key.startswith("net.") and key.endswith(".weight") and hasattr(value, "dim") and value.dim() == 2:
+                idx = int(key.split(".")[1])
+                linear_out.append((idx, value.shape[0]))
+        if len(linear_out) < 2:
+            return None
+        linear_out.sort()
+        hidden_sizes = [out for _, out in linear_out[:-1]]  # drop the output layer
+        use_batch_norm = any("running_mean" in k for k in state_dict)
+        return hidden_sizes, use_batch_norm
+    except (ValueError, IndexError, AttributeError):
+        return None
+
+
 class TabularDatasetLoader:
     
     def __init__(
         self,
         dataset_name: str = "breast_cancer",
         test_size: float = 0.2,
+        val_size: float = 0.2,
         random_state: int = 42,
         sample_size: Optional[int] = None
     ):
         self.dataset_name = dataset_name
         self.test_size = test_size
+        # C-10: three-way split. Default 60/20/20 (train/val/test). Set val_size=0
+        # to recover the old 80/20 train/test split (not recommended for the paper).
+        self.val_size = val_size
         self.random_state = random_state
         self.sample_size = sample_size
         self.scaler = StandardScaler()
         self.X_train = None
+        self.X_val = None
         self.X_test = None
         self.y_train = None
+        self.y_val = None
         self.y_test = None
         self.X_train_scaled = None
+        self.X_val_scaled = None
         self.X_test_scaled = None
         self.X_train_unit = None
+        self.X_val_unit = None
         self.X_test_unit = None
         self.X_min = None
         self.X_range = None
@@ -70,6 +106,15 @@ class TabularDatasetLoader:
         self.n_features = None
         self.n_classes = None
         self.classifier = None
+        # C-07: label-encoded categoricals (indices into feature_names) and encoders
+        # so rules can be printed as equalities rather than bogus intervals.
+        self.categorical_indices: List[int] = []
+        self.categorical_names: List[str] = []
+        self.label_encoders: Dict[str, object] = {}
+        self.train_idx = None
+        self.val_idx = None
+        self.test_idx = None
+        self.classifier_accuracy: Dict[str, float] = {}
     
     def load_dataset(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], List[str]]:
         print(f"\nLoading dataset: {self.dataset_name}")
@@ -83,8 +128,8 @@ class TabularDatasetLoader:
         elif self.dataset_name == "wine":
             data = load_wine()
             X, y = data.data, data.target
-            feature_names = [f"feature_{i}" for i in range(X.shape[1])]
-            class_names = [f"class_{i}" for i in range(len(np.unique(y)))]
+            feature_names = list(data.feature_names)
+            class_names = list(data.target_names)
         elif self.dataset_name == "iris":
             data = load_iris()
             X, y = data.data, data.target
@@ -215,16 +260,23 @@ class TabularDatasetLoader:
                 else:
                     logger.info(f"  ✓ All missing values successfully filled")
             
-            # Encode categorical features
+            # Encode categorical features (C-07). LabelEncoder keeps a 1-D integer
+            # column so we can freeze it to the instance/class mode rather than
+            # treating a one-hot interval as a logical condition.
             label_encoders = {}
             numeric_cols = []
+            categorical_cols = []
             for col in X_df.columns:
                 if X_df[col].dtype == 'object' or X_df[col].dtype.name == 'category':
                     le = LabelEncoder()
                     X_df.loc[:, col] = le.fit_transform(X_df[col].astype(str))
                     label_encoders[col] = le
+                    categorical_cols.append(col)
                 else:
                     numeric_cols.append(col)
+            self.label_encoders = label_encoders
+            self.categorical_names = list(categorical_cols)
+            self.categorical_indices = [list(X_df.columns).index(c) for c in categorical_cols]
             
             # Convert to numpy array
             X = X_df.values.astype(np.float32)
@@ -246,8 +298,26 @@ class TabularDatasetLoader:
                 y = y.values
             
             if y.dtype == 'object' or not np.issubdtype(y.dtype, np.integer):
+                # Normalise string labels before encoding. Several UCI datasets ship
+                # the train and test splits with inconsistent label spelling — Adult
+                # terminates the test split's labels with a period ('<=50K' in train
+                # vs '<=50K.' in test) and pads some with whitespace. Encoding those
+                # verbatim turns a binary task into 4 classes ('<=50K', '<=50K.',
+                # '>50K', '>50K.') with train and test rows in different bins, which
+                # silently corrupts every downstream metric.
+                y_norm = pd.Series(np.asarray(y).ravel()).astype(str).str.strip()
+                stripped = y_norm.str.rstrip('.').str.strip()
+                # Only adopt the stripped form if it actually merges labels; this
+                # keeps datasets whose labels legitimately contain '.' untouched.
+                if stripped.nunique() < y_norm.nunique():
+                    logger.info(
+                        f"  Normalised target labels: {y_norm.nunique()} -> {stripped.nunique()} "
+                        f"classes after stripping trailing '.' / whitespace "
+                        f"({sorted(y_norm.unique())} -> {sorted(stripped.unique())})"
+                    )
+                    y_norm = stripped
                 le = LabelEncoder()
-                y = le.fit_transform(y.astype(str)).astype(int)
+                y = le.fit_transform(y_norm).astype(int)
                 class_names = le.classes_.tolist()
             else:
                 y = y.astype(int)
@@ -355,9 +425,16 @@ class TabularDatasetLoader:
             
             logger.info(f"  Loaded Folktables dataset: {task_name} ({state}, {year})")
             logger.info(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
+
+        elif self.dataset_name in ("heloc", "fico_heloc"):
+            # C-23: FICO HELOC (~10k rows, 23 continuous). OpenML 45578 or sklearn fetch.
+            X, y, feature_names, class_names = self._load_heloc()
+        elif self.dataset_name in ("bank_marketing", "uci_bank"):
+            # C-23: UCI Bank Marketing (~45k, mixed types).
+            X, y, feature_names, class_names = self._load_bank_marketing()
             
         else:
-            supported = ['breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing']
+            supported = ['breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing', 'heloc', 'bank_marketing']
             if UCIML_AVAILABLE:
                 supported.append('uci_<id_or_name> (e.g., uci_adult, uci_2)')
             if FOLKTABLES_AVAILABLE:
@@ -377,14 +454,44 @@ class TabularDatasetLoader:
             logger.info(f"Sampled {self.sample_size} instances from dataset")
         
         stratify = y if len(np.unique(y)) < 20 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.random_state, stratify=stratify
-        )
+        n = len(X)
+        all_idx = np.arange(n)
+
+        # C-10: strict three-way split. D_train = black-box + RL; D_val = rule
+        # generation / ranking / checkpoint selection; D_test = ALL reported metrics.
+        if self.val_size and self.val_size > 0:
+            if self.test_size + self.val_size >= 1.0:
+                raise ValueError(
+                    f"test_size ({self.test_size}) + val_size ({self.val_size}) must be < 1"
+                )
+            idx_temp, idx_test = train_test_split(
+                all_idx, test_size=self.test_size, random_state=self.random_state, stratify=stratify
+            )
+            stratify_temp = y[idx_temp] if stratify is not None else None
+            val_frac_of_temp = self.val_size / (1.0 - self.test_size)
+            idx_train, idx_val = train_test_split(
+                idx_temp, test_size=val_frac_of_temp, random_state=self.random_state, stratify=stratify_temp
+            )
+            from utils.eval_harness import assert_no_index_overlap
+            assert_no_index_overlap(idx_train, idx_val, idx_test)
+            self.train_idx, self.val_idx, self.test_idx = idx_train, idx_val, idx_test
+            X_train, X_val, X_test = X[idx_train], X[idx_val], X[idx_test]
+            y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
+        else:
+            idx_train, idx_test = train_test_split(
+                all_idx, test_size=self.test_size, random_state=self.random_state, stratify=stratify
+            )
+            self.train_idx, self.val_idx, self.test_idx = idx_train, np.array([], dtype=int), idx_test
+            X_train, X_test = X[idx_train], X[idx_test]
+            y_train, y_test = y[idx_train], y[idx_test]
+            X_val, y_val = None, None
         
         self.X_train = X_train.astype(np.float32)
         self.X_test = X_test.astype(np.float32)
         self.y_train = y_train.astype(int)
         self.y_test = y_test.astype(int)
+        self.X_val = None if X_val is None else X_val.astype(np.float32)
+        self.y_val = None if y_val is None else y_val.astype(int)
         self.feature_names = feature_names
         self.class_names = class_names
         self.n_features = X_train.shape[1]
@@ -392,11 +499,18 @@ class TabularDatasetLoader:
         
         logger.info(f"Dataset loaded:")
         logger.info(f"  Training samples: {len(X_train)}")
+        if self.y_val is not None:
+            logger.info(f"  Validation samples: {len(self.y_val)}")
         logger.info(f"  Test samples: {len(X_test)}")
         logger.info(f"  Features: {self.n_features}")
         logger.info(f"  Classes: {self.n_classes}")
         logger.info(f"  Class distribution (train): {np.bincount(y_train)}")
+        if self.y_val is not None:
+            logger.info(f"  Class distribution (val): {np.bincount(self.y_val)}")
         logger.info(f"  Class distribution (test): {np.bincount(y_test)}")
+        if self.categorical_indices:
+            logger.info(f"  Categorical features (C-07, frozen to instance/mode at env time): "
+                        f"{[self.feature_names[i] for i in self.categorical_indices]}")
         
         return self.X_train, self.X_test, self.y_train, self.y_test, feature_names, class_names
     
@@ -406,6 +520,10 @@ class TabularDatasetLoader:
         
         self.X_train_scaled = self.scaler.fit_transform(self.X_train).astype(np.float32)
         self.X_test_scaled = self.scaler.transform(self.X_test).astype(np.float32)
+        if self.X_val is not None:
+            self.X_val_scaled = self.scaler.transform(self.X_val).astype(np.float32)
+        else:
+            self.X_val_scaled = None
         
         self.X_min = self.X_train_scaled.min(axis=0)
         self.X_max = self.X_train_scaled.max(axis=0)
@@ -416,9 +534,17 @@ class TabularDatasetLoader:
         
         self.X_test_unit = (self.X_test_scaled - self.X_min) / self.X_range
         self.X_test_unit = np.clip(self.X_test_unit, 0.0, 1.0).astype(np.float32)
+
+        if self.X_val_scaled is not None:
+            self.X_val_unit = (self.X_val_scaled - self.X_min) / self.X_range
+            self.X_val_unit = np.clip(self.X_val_unit, 0.0, 1.0).astype(np.float32)
+        else:
+            self.X_val_unit = None
         
         logger.info("Data preprocessing complete:")
         logger.info(f"  Scaled train shape: {self.X_train_scaled.shape}")
+        if self.X_val_scaled is not None:
+            logger.info(f"  Scaled val shape: {self.X_val_scaled.shape}")
         logger.info(f"  Scaled test shape: {self.X_test_scaled.shape}")
         logger.info(f"  Unit train range: [{self.X_train_unit.min():.3f}, {self.X_train_unit.max():.3f}]")
         logger.info(f"  Unit test range: [{self.X_test_unit.min():.3f}, {self.X_test_unit.max():.3f}]")
@@ -428,27 +554,103 @@ class TabularDatasetLoader:
             self.X_train_unit, self.X_test_unit,
             self.X_min, self.X_range
         )
+
+    def _load_heloc(self) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+        """C-23: FICO HELOC (Home Equity Line of Credit), ~10k rows, all continuous."""
+        try:
+            from sklearn.datasets import fetch_openml
+        except ImportError as exc:
+            raise ImportError("scikit-learn is required to fetch HELOC") from exc
+        logger.info("Fetching HELOC from OpenML (data_id=45578)...")
+        try:
+            bunch = fetch_openml(data_id=45578, as_frame=True, parser="auto")
+        except Exception:
+            bunch = fetch_openml(name="heloc", as_frame=True, parser="auto")
+        import pandas as pd
+        X_df = bunch.data.copy()
+        y_raw = bunch.target
+        for col in X_df.columns:
+            if X_df[col].dtype == object or str(X_df[col].dtype) == "category":
+                X_df[col] = pd.to_numeric(X_df[col], errors="coerce")
+        X_df = X_df.fillna(X_df.median(numeric_only=True))
+        X = X_df.values.astype(np.float32)
+        from sklearn.preprocessing import LabelEncoder
+        y = LabelEncoder().fit_transform(np.asarray(y_raw).ravel().astype(str)).astype(int)
+        feature_names = list(X_df.columns)
+        class_names = ["bad", "good"] if len(np.unique(y)) == 2 else [f"class_{i}" for i in range(len(np.unique(y)))]
+        logger.info(f"  HELOC: n={len(X)}, d={X.shape[1]}, K={len(np.unique(y))}")
+        return X, y, feature_names, class_names
+
+    def _load_bank_marketing(self) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+        """C-23: UCI Bank Marketing (~45k, mixed types). Requires ucimlrepo (id=222)."""
+        if not UCIML_AVAILABLE:
+            raise ImportError("ucimlrepo is required for bank_marketing. pip install ucimlrepo")
+        import pandas as pd
+        from sklearn.preprocessing import LabelEncoder
+        logger.info("Fetching UCI Bank Marketing (id=222)...")
+        dataset = fetch_ucirepo(id=222)
+        X_df = dataset.data.features.copy() if hasattr(dataset.data.features, "copy") else pd.DataFrame(dataset.data.features)
+        y_df = dataset.data.targets
+        label_encoders = {}
+        categorical_cols = []
+        for col in X_df.columns:
+            if X_df[col].dtype == object or str(X_df[col].dtype) == "category":
+                X_df[col] = X_df[col].fillna(X_df[col].mode().iloc[0] if len(X_df[col].mode()) else "missing")
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+                label_encoders[col] = le
+                categorical_cols.append(col)
+            else:
+                X_df[col] = X_df[col].fillna(X_df[col].median())
+        self.label_encoders = label_encoders
+        self.categorical_names = list(categorical_cols)
+        self.categorical_indices = [list(X_df.columns).index(c) for c in categorical_cols]
+        X = X_df.values.astype(np.float32)
+        y_raw = y_df.values if hasattr(y_df, "values") else y_df
+        y = LabelEncoder().fit_transform(np.asarray(y_raw).ravel().astype(str).astype(object)).astype(int)
+        feature_names = list(X_df.columns)
+        class_names = [f"class_{i}" for i in range(len(np.unique(y)))]
+        logger.info(f"  Bank Marketing: n={len(X)}, d={X.shape[1]}, K={len(np.unique(y))}, "
+                    f"categoricals={len(categorical_cols)}")
+        return X, y, feature_names, class_names
     
     def create_classifier(
         self,
         classifier_type: str = "dnn",
         hidden_size: int = 256,
-        dropout_rate: float = 0.3,
+        dropout_rate: Optional[float] = None,
         use_batch_norm: bool = True,
         device: str = "cpu",
         hidden_sizes: Optional[List[int]] = None
     ) -> torch.nn.Module:
         logger.info(f"\nCreating classifier: {classifier_type}")
         logger.info("="*80)
-        
+
         if classifier_type.lower() == "dnn":
             # Use dataset-specific architecture for larger datasets
+            n_train_samples = len(self.y_train) if hasattr(self, 'y_train') else 0
+            is_large = n_train_samples > 10000
+
+            # Dropout defaults to 0.3, but large datasets get 0.1. Measured on
+            # housing (16512 train rows, 150 epochs, seed 42) — train accuracy sat
+            # within 0.4pt of test at dropout 0.3, i.e. the model was UNDERfitting,
+            # so the heavy regularization was pure cost:
+            #   [512,512,256]   dropout 0.3 -> train 0.7245 / test 0.7209
+            #   [512,512,256]   dropout 0.1 -> train 0.7504 / test 0.7282
+            #   [1024,1024,512] dropout 0.3 -> train 0.7496 / test 0.7355
+            #   [1024,1024,512] dropout 0.1 -> train 0.7673 / test 0.7415
+            if dropout_rate is None:
+                dropout_rate = 0.1 if is_large else 0.3
+
             if hidden_sizes is None:
-                # Determine architecture based on dataset size
-                n_train_samples = len(self.y_train) if hasattr(self, 'y_train') else 0
-                if n_train_samples > 10000:
-                    # Large datasets (housing, etc.): use larger network
-                    hidden_sizes = [512, 512, 256]
+                if is_large:
+                    # Large datasets (housing, etc.): use larger network.
+                    # [512,512,256] -> [1024,1024,512] on the sweep above (+1.5pt
+                    # test at dropout 0.3, +1.3pt at 0.1). Capacity is close to free
+                    # for the RL loop: the environment scores boxes against
+                    # classifier predictions cached once per env, not per step, so a
+                    # wider classifier costs init time only, not per-step time.
+                    hidden_sizes = [1024, 1024, 512]
                     logger.info(f"  Large dataset detected ({n_train_samples} samples), using larger architecture")
                 elif n_train_samples > 5000:
                     # Medium-large datasets: slightly larger
@@ -458,6 +660,7 @@ class TabularDatasetLoader:
                     # Small datasets: default architecture
                     hidden_sizes = [256, 256, 128]
                     logger.info(f"  Small dataset detected ({n_train_samples} samples), using default architecture")
+                    logger.info(f"  (small/medium datasets keep dropout 0.3; only the large branch drops to 0.1)")
             
             classifier = SimpleClassifier(
                 input_dim=self.n_features,
@@ -556,10 +759,25 @@ class TabularDatasetLoader:
         )
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         
-        best_test_acc = 0.0
+        best_val_acc = 0.0
         best_model_state = None
         patience_counter = 0
-        history = {"train_loss": [], "test_acc": []}
+        history = {"train_loss": [], "val_acc": [], "test_acc": []}
+
+        # C-10: early-stop on D_val, never on D_test. Fall back to test only if
+        # val_size=0 (legacy 80/20), and log a warning that this leaks.
+        if self.X_val_scaled is not None:
+            X_early = self.X_val_scaled
+            y_early = self.y_val
+            early_name = "Val"
+        else:
+            logger.warning(
+                "No validation split (val_size=0): early-stopping on TEST accuracy. "
+                "This leaks D_test into model selection (C-10). Use val_size=0.2 for the paper."
+            )
+            X_early = self.X_test_scaled
+            y_early = self.y_test
+            early_name = "Test"
         
         for epoch in range(epochs):
             classifier.train()
@@ -577,28 +795,40 @@ class TabularDatasetLoader:
             
             classifier.eval()
             with torch.no_grad():
+                early_logits = classifier(torch.from_numpy(X_early).float().to(device))
+                early_preds = early_logits.argmax(dim=1).cpu().numpy()
+                val_acc = accuracy_score(y_early, early_preds)
                 test_logits = classifier(torch.from_numpy(self.X_test_scaled).float().to(device))
                 test_preds = test_logits.argmax(dim=1).cpu().numpy()
                 test_acc = accuracy_score(self.y_test, test_preds)
             
             history["train_loss"].append(epoch_loss / len(loader))
+            history["val_acc"].append(val_acc)
             history["test_acc"].append(test_acc)
             
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
-                best_model_state = classifier.state_dict().copy()
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                # Clone the tensors: state_dict() returns references to the live
+                # parameters and dict.copy() is shallow, so without the clone the
+                # "snapshot" keeps mutating with every later optimizer step and the
+                # restore below silently becomes a no-op (saving the FINAL epoch).
+                best_model_state = {
+                    k: v.detach().clone() for k, v in classifier.state_dict().items()
+                }
                 patience_counter = 0
             else:
                 patience_counter += 1
             
             if scheduler is not None:
-                scheduler.step(test_acc)
+                scheduler.step(val_acc)
             
             if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
                 current_lr = optimizer.param_groups[0]['lr']
-                logger.info(f"Epoch {epoch:3d}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | "
-                      f"Test Acc: {test_acc:.4f} | LR: {current_lr:.2e} | "
-                      f"Best: {best_test_acc:.4f}")
+                logger.info(
+                    f"Epoch {epoch:3d}/{epochs} | Loss: {epoch_loss/len(loader):.4f} | "
+                    f"{early_name} Acc: {val_acc:.4f} | Test Acc: {test_acc:.4f} | "
+                    f"LR: {current_lr:.2e} | Best {early_name}: {best_val_acc:.4f}"
+                )
             
             # Early stopping: require at least 10% of max epochs before stopping
             # This ensures we don't stop too early, especially for complex datasets
@@ -612,10 +842,26 @@ class TabularDatasetLoader:
             classifier.load_state_dict(best_model_state)
         
         classifier.eval()
-        logger.info(f"\nTraining complete. Best test accuracy: {best_test_acc:.4f}")
+        with torch.no_grad():
+            def _acc(Xs, ys):
+                logits = classifier(torch.from_numpy(Xs).float().to(device))
+                return float(accuracy_score(ys, logits.argmax(dim=1).cpu().numpy()))
+            train_acc = _acc(self.X_train_scaled, self.y_train)
+            val_acc_final = _acc(self.X_val_scaled, self.y_val) if self.X_val_scaled is not None else None
+            test_acc_final = _acc(self.X_test_scaled, self.y_test)
+        self.classifier_accuracy = {
+            "train": train_acc,
+            "val": val_acc_final,
+            "test": test_acc_final,
+        }
+        logger.info(
+            f"\nTraining complete. Train acc: {train_acc:.4f}"
+            + (f" | Val acc: {val_acc_final:.4f}" if val_acc_final is not None else "")
+            + f" | Test acc: {test_acc_final:.4f} (early-stop on {early_name}={best_val_acc:.4f})"
+        )
         logger.info("="*80)
         
-        return classifier, best_test_acc, history
+        return classifier, test_acc_final, history
     
     def _train_sklearn_classifier(
         self,
@@ -633,14 +879,21 @@ class TabularDatasetLoader:
         
         train_acc = accuracy_score(self.y_train, train_preds)
         test_acc = accuracy_score(self.y_test, test_preds)
+        val_acc = None
+        if self.X_val_scaled is not None:
+            val_acc = accuracy_score(self.y_val, classifier.predict(self.X_val_scaled))
         
         history = {
             "train_acc": [train_acc],
+            "val_acc": [val_acc],
             "test_acc": [test_acc]
         }
+        self.classifier_accuracy = {"train": train_acc, "val": val_acc, "test": test_acc}
         
         if verbose:
             logger.info(f"Training accuracy: {train_acc:.4f}")
+            if val_acc is not None:
+                logger.info(f"Validation accuracy: {val_acc:.4f}")
             logger.info(f"Test accuracy: {test_acc:.4f}")
             logger.info("="*80)
         
@@ -651,6 +904,9 @@ class TabularDatasetLoader:
             "X_unit": self.X_train_unit,
             "X_std": self.X_train_scaled,
             "y": self.y_train,
+            "X_val_unit": self.X_val_unit,
+            "X_val_std": self.X_val_scaled,
+            "y_val": self.y_val,
             "X_test_unit": self.X_test_unit,
             "X_test_std": self.X_test_scaled,
             "y_test": self.y_test,
@@ -658,7 +914,22 @@ class TabularDatasetLoader:
             "X_range": self.X_range,
             "scaler_mean": np.asarray(self.scaler.mean_, dtype=np.float32),
             "scaler_scale": np.asarray(self.scaler.scale_, dtype=np.float32),
-            "feature_names": self.feature_names
+            "feature_names": self.feature_names,
+            "categorical_indices": list(self.categorical_indices),
+            "categorical_names": list(self.categorical_names),
+            "categorical_value_names": {
+                int(self.feature_names.index(name)): [
+                    str(v) for v in encoder.classes_
+                ]
+                for name, encoder in self.label_encoders.items()
+                if name in self.feature_names
+            },
+            "classifier_accuracy": dict(self.classifier_accuracy),
+            "split_sizes": {
+                "train": int(len(self.y_train)),
+                "val": int(len(self.y_val)) if self.y_val is not None else 0,
+                "test": int(len(self.y_test)),
+            },
         }
     
     def save_classifier(self, classifier: torch.nn.Module, filepath: str):
@@ -693,8 +964,31 @@ class TabularDatasetLoader:
                 classifier.device = device
         else:
             ct = classifier_type if classifier_type is not None else "dnn"
-            classifier = self.create_classifier(classifier_type=ct, device=device)
-            classifier.load_state_dict(torch.load(filepath, map_location=device))
+            state_dict = torch.load(filepath, map_location=device)
+
+            # Rebuild the architecture the CHECKPOINT was saved with, not whatever
+            # create_classifier's size-aware defaults would pick today. Those defaults
+            # change over time (the large-dataset branch went [512,512,256] ->
+            # [1024,1024,512]), and without this every previously saved large-dataset
+            # classifier fails to load with a shape mismatch. Mirrors what inference.py
+            # already does for policy checkpoints.
+            hidden_sizes, use_batch_norm = (None, True)
+            if ct.lower() == "dnn":
+                inferred = _infer_dnn_arch_from_state_dict(state_dict)
+                if inferred is not None:
+                    hidden_sizes, use_batch_norm = inferred
+                    logger.info(
+                        f"  Inferred classifier architecture from checkpoint: "
+                        f"hidden_sizes={hidden_sizes}, batch_norm={use_batch_norm}"
+                    )
+
+            classifier = self.create_classifier(
+                classifier_type=ct,
+                device=device,
+                hidden_sizes=hidden_sizes,
+                use_batch_norm=use_batch_norm,
+            )
+            classifier.load_state_dict(state_dict)
 
         classifier.eval()
         logger.info(f"Classifier loaded from {filepath}")

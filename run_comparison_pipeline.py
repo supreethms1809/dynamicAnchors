@@ -170,16 +170,21 @@ def build_dataset_choices() -> list:
     return dataset_choices
 
 
-def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_output: bool = False) -> Tuple[bool, Optional[str]]:
+def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_output: bool = False,
+                n_threads: Optional[int] = None) -> Tuple[bool, Optional[str]]:
     """
     Run a command and return True if successful, False otherwise.
-    
+
     Args:
         cmd: Command to run as a list
         description: Description of what the command does
         cwd: Working directory for the command (defaults to project root)
         capture_output: If True, capture stdout/stderr and return it (while still showing in real-time)
-    
+        n_threads: If set, cap OMP/MKL/OpenBLAS thread pools in the child. Needed when
+            the child fans out into K sibling processes (parallel class shards): K shards
+            each spawning a core-count-wide BLAS pool oversubscribes the machine and runs
+            slower than sequential. Mirrors wyodot/run_pipeline.py's run_command.
+
     Returns:
         Tuple of (success: bool, output: Optional[str])
     """
@@ -187,17 +192,32 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
     logger.info(f"{description}")
     logger.info(f"{'='*80}")
     logger.info(f"Running: {' '.join(cmd)}")
-    
+
     # Default to project root if cwd not specified
     if cwd is None:
         cwd = str(PROJECT_ROOT)
-    
+
+    # The explicit cap must win over any inherited value, so it is applied last.
+    child_env = None
+    if n_threads is not None:
+        n_threads = max(1, int(n_threads))
+        child_env = {
+            **os.environ,
+            "OMP_NUM_THREADS": str(n_threads),
+            "MKL_NUM_THREADS": str(n_threads),
+            "OPENBLAS_NUM_THREADS": str(n_threads),
+            "VECLIB_MAXIMUM_THREADS": str(n_threads),
+            "NUMEXPR_NUM_THREADS": str(n_threads),
+        }
+        logger.info(f"  (child OMP/MKL/OpenBLAS thread cap: {n_threads})")
+
     try:
         if capture_output:
             # Use Popen to stream output in real-time while also capturing it
             process = subprocess.Popen(
                 cmd,
                 cwd=cwd,
+                env=child_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # Combine stderr into stdout
                 text=True,
@@ -231,13 +251,14 @@ def run_command(cmd: list, description: str, cwd: Optional[str] = None, capture_
             process = subprocess.Popen(
                 cmd,
                 cwd=cwd,
+                env=child_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 universal_newlines=True
             )
-            
+
             # Stream output in real-time and log to file
             for line in process.stdout:
                 line = line.rstrip()
@@ -329,6 +350,35 @@ def check_existing_experiment(
     return None
 
 
+_N_CLASSES_CACHE: Dict[str, int] = {}
+
+
+def detect_n_classes(dataset: str) -> Optional[int]:
+    """Return the number of classes in `dataset`, or None if it cannot be determined.
+
+    Used only to shard single-agent training across classes. Loads the dataset via
+    TabularDatasetLoader (cheap for the benchmark datasets; UCIML fetches are cached
+    by ucimlrepo) and caches the result for the life of the process.
+    """
+    if dataset in _N_CLASSES_CACHE:
+        return _N_CLASSES_CACHE[dataset]
+
+    benchmarl_dir = PROJECT_ROOT / "BenchMARL"
+    if str(benchmarl_dir) not in sys.path:
+        sys.path.insert(0, str(benchmarl_dir))
+    try:
+        from tabular_datasets import TabularDatasetLoader
+        loader = TabularDatasetLoader(dataset_name=dataset, random_state=42)
+        _, _, _, _, _, class_names = loader.load_dataset()
+        n_classes = len(class_names)
+    except Exception as e:
+        logger.warning(f"⚠ Could not determine class count for '{dataset}': {e}")
+        return None
+
+    _N_CLASSES_CACHE[dataset] = n_classes
+    return n_classes
+
+
 def run_single_agent_training(
     dataset: str,
     algorithm: str,
@@ -337,11 +387,12 @@ def run_single_agent_training(
     output_dir: Optional[str] = None,
     force_retrain: bool = False,
     total_timesteps: Optional[int] = None,
+    parallel_classes: int = 1,
     **kwargs
 ) -> Optional[str]:
     """
     Run single-agent training.
-    
+
     Args:
         dataset: Dataset name
         algorithm: Algorithm name (ddpg or sac)
@@ -350,8 +401,11 @@ def run_single_agent_training(
         output_dir: Output directory (optional)
         force_retrain: If True, retrain even if experiment exists
         total_timesteps: Total timesteps for training
+        parallel_classes: If > 1, train classes concurrently in that many worker
+            processes (via single_agent/run_parallel_classes.py) instead of
+            sequentially in one process. Per-class step budget is unchanged.
         **kwargs: Additional arguments to pass to driver
-    
+
     Returns:
         Path to experiment directory if successful, None otherwise
     """
@@ -384,7 +438,80 @@ def run_single_agent_training(
     if not driver_script.exists():
         logger.error(f"✗ Single-agent driver script not found: {driver_script}")
         return None
-    
+
+    # ---- Parallel-classes branch -------------------------------------------
+    # The sequential trainer walks the classes one at a time on a single core
+    # (AnchorTrainerSB3.train), which leaves most of the machine idle. The
+    # launcher shards classes across worker processes that share one experiment
+    # folder, so the resulting layout is identical either way.
+    shard_threads = None
+    if parallel_classes > 1:
+        n_classes = detect_n_classes(dataset)
+        if n_classes is None or n_classes < 2:
+            logger.warning("⚠ Falling back to sequential single-agent training "
+                           "(class count unavailable or single-class dataset)")
+        else:
+            launcher = PROJECT_ROOT / "single_agent" / "run_parallel_classes.py"
+            if not launcher.exists():
+                logger.warning(f"⚠ {launcher} not found — falling back to sequential training")
+            else:
+                k = min(parallel_classes, n_classes)
+                # AnchorTrainerSB3 divides its --total_timesteps by the number of
+                # classes IT was given, so a shard holding one class must be handed
+                # the per-class budget, not the whole-run budget. k == n_classes
+                # gives exactly one class per shard; below that, round-robin makes
+                # shards of unequal size, and the launcher forwards one
+                # --total_timesteps to all of them, so a 2-class shard would split
+                # the per-class budget in half. Only shard 1:1.
+                if k < n_classes:
+                    logger.warning(
+                        f"⚠ parallel_classes={parallel_classes} < n_classes={n_classes}: "
+                        f"raising to {n_classes} so each shard trains exactly one class "
+                        f"(uneven shards would halve the per-class budget)"
+                    )
+                    k = n_classes
+                per_class_timesteps = total_timesteps // n_classes
+                cmd = [
+                    sys.executable,
+                    str(launcher),
+                    "--dataset", dataset,
+                    "--algorithm", algorithm,
+                    "--seed", str(seed),
+                    "--device", device,
+                    "--n_classes", str(n_classes),
+                    "--parallel_classes", str(k),
+                    "--total_timesteps", str(per_class_timesteps),
+                    "--n_envs", "1",  # n_envs>1 + sharding deadlocks SubprocVecEnv/spawn
+                    "--output_dir", output_dir,
+                ]
+                extra = ["--skip_eda"]  # shards would race on the shared {output_dir}eda/
+                for key, value in kwargs.items():
+                    if value is None:
+                        continue
+                    if isinstance(value, bool):
+                        if value:
+                            extra.append(f"--{key}")
+                    else:
+                        extra.extend([f"--{key}", str(value)])
+                # argparse.REMAINDER rejects a leading "--" here (it is consumed as
+                # the parser's own end-of-options marker), so pass the flags bare.
+                cmd.extend(["--extra_args", *extra])
+
+                # K shards x uncapped BLAS pools oversubscribes the machine.
+                shard_threads = max(1, (os.cpu_count() or 4) // (2 * k))
+                logger.info(
+                    f"Single-agent class sharding: {k} workers x 1 class, "
+                    f"{per_class_timesteps:,} timesteps/class "
+                    f"(sequential equivalent: {total_timesteps:,} total)"
+                )
+                success, _ = run_command(
+                    cmd,
+                    f"Single-Agent Training (sharded, {k} classes in parallel): "
+                    f"{dataset} with {algorithm.upper()}",
+                    n_threads=shard_threads,
+                )
+                return _resolve_single_agent_experiment_dir(output_dir, algorithm) if success else None
+
     cmd = [
         sys.executable,
         str(driver_script),
@@ -395,7 +522,7 @@ def run_single_agent_training(
         "--total_timesteps", str(total_timesteps),
         "--output_dir", output_dir,
     ]
-    
+
     # Add additional arguments
     for key, value in kwargs.items():
         if value is not None:
@@ -404,61 +531,65 @@ def run_single_agent_training(
                     cmd.append(f"--{key}")
             else:
                 cmd.extend([f"--{key}", str(value)])
-    
+
     success, _ = run_command(cmd, f"Single-Agent Training: {dataset} with {algorithm.upper()}")
-    
+
     if success:
-        # Find the experiment directory (checkpoint path)
-        # The checkpoint can be in different locations:
-        # 1. output_dir/training/<experiment_name>/ (standard structure with trailing slash)
-        # 2. output_dir/<experiment_name>/ (direct structure)
-        
-        # Remove trailing slash if present for Path operations
-        output_dir_clean = output_dir.rstrip("/")
-        output_path = Path(output_dir_clean)
-        
-        # First, try the standard structure: output_dir/training/<experiment_name>/
-        training_dir = output_path / "training"
-        if training_dir.exists():
-            experiment_dirs = [d for d in training_dir.iterdir() if d.is_dir()]
-            if experiment_dirs:
-                # Filter for experiment directories (should contain final_model or best_model)
-                valid_dirs = [
-                    d for d in experiment_dirs
-                    if (d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists()
-                ]
-                if valid_dirs:
-                    experiment_dir = max(valid_dirs, key=lambda p: p.stat().st_mtime)
-                    logger.info(f"✓ Found experiment directory: {experiment_dir}")
-                    return str(experiment_dir)
-                # If no valid dirs, use most recent anyway
-                experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
-                logger.info(f"✓ Found experiment directory: {experiment_dir}")
-                return str(experiment_dir)
-        
-        # Second, try direct structure: output_dir/<experiment_name>/
-        # Look for directories that look like experiment directories
-        if output_path.exists():
-            experiment_dirs = [
-                d for d in output_path.iterdir()
-                if d.is_dir() and not d.name.startswith('.') and
-                ((d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists() or
-                 d.name.startswith(f"{algorithm}_single_agent_sb3_"))
-            ]
-            if experiment_dirs:
-                experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
-                logger.info(f"✓ Found experiment directory: {experiment_dir}")
-                return str(experiment_dir)
-        
-        # Fallback: return training directory if it exists, otherwise output_dir
-        if training_dir.exists():
-            logger.warning(f"⚠ Could not find experiment directory, using training directory: {training_dir}")
-            return str(training_dir)
-        else:
-            logger.warning(f"⚠ Could not find experiment directory, using output directory: {output_path}")
-            return str(output_path)
-    
+        return _resolve_single_agent_experiment_dir(output_dir, algorithm)
+
     return None
+
+
+def _resolve_single_agent_experiment_dir(output_dir: str, algorithm: str) -> str:
+    """Locate the experiment (checkpoint) folder produced by single-agent training.
+
+    The checkpoint can live in either of two layouts:
+      1. output_dir/training/<experiment_name>/  (standard, with trailing slash)
+      2. output_dir/<experiment_name>/           (direct structure)
+    """
+    # Remove trailing slash if present for Path operations
+    output_dir_clean = output_dir.rstrip("/")
+    output_path = Path(output_dir_clean)
+
+    # First, try the standard structure: output_dir/training/<experiment_name>/
+    training_dir = output_path / "training"
+    if training_dir.exists():
+        experiment_dirs = [d for d in training_dir.iterdir() if d.is_dir()]
+        if experiment_dirs:
+            # Filter for experiment directories (should contain final_model or best_model)
+            valid_dirs = [
+                d for d in experiment_dirs
+                if (d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists()
+            ]
+            if valid_dirs:
+                experiment_dir = max(valid_dirs, key=lambda p: p.stat().st_mtime)
+                logger.info(f"✓ Found experiment directory: {experiment_dir}")
+                return str(experiment_dir)
+            # If no valid dirs, use most recent anyway
+            experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
+            logger.info(f"✓ Found experiment directory: {experiment_dir}")
+            return str(experiment_dir)
+
+    # Second, try direct structure: output_dir/<experiment_name>/
+    # Look for directories that look like experiment directories
+    if output_path.exists():
+        experiment_dirs = [
+            d for d in output_path.iterdir()
+            if d.is_dir() and not d.name.startswith('.') and
+            ((d / "final_model").exists() or (d / "best_model").exists() or (d / "classifier.pth").exists() or
+             d.name.startswith(f"{algorithm}_single_agent_sb3_"))
+        ]
+        if experiment_dirs:
+            experiment_dir = max(experiment_dirs, key=lambda p: p.stat().st_mtime)
+            logger.info(f"✓ Found experiment directory: {experiment_dir}")
+            return str(experiment_dir)
+
+    # Fallback: return training directory if it exists, otherwise output_dir
+    if training_dir.exists():
+        logger.warning(f"⚠ Could not find experiment directory, using training directory: {training_dir}")
+        return str(training_dir)
+    logger.warning(f"⚠ Could not find experiment directory, using output directory: {output_path}")
+    return str(output_path)
 
 
 def run_single_agent_inference(
@@ -2167,6 +2298,18 @@ Examples:
         action="store_true",
         help="Skip single-agent pipeline (only run multi-agent)"
     )
+
+    parser.add_argument(
+        "--parallel_classes",
+        type=int,
+        default=1,
+        help="Train single-agent classes concurrently in this many worker processes "
+             "(default: 1 = sequential, one class at a time in one process). Values "
+             "below the dataset's class count are raised to it so each worker trains "
+             "exactly one class; the per-class timestep budget is unchanged either way. "
+             "Multi-agent training is unaffected (it parallelizes via "
+             "off_policy_n_envs_per_worker)."
+    )
     
     parser.add_argument(
         "--skip_multi_agent",
@@ -2421,7 +2564,8 @@ Examples:
                 device=args.device,
                 output_dir=args.single_agent_output_dir,
                 force_retrain=args.force_retrain,
-                total_timesteps=args.total_timesteps
+                total_timesteps=args.total_timesteps,
+                parallel_classes=args.parallel_classes
             )
         else:
             # Try to find existing experiment directory
@@ -2570,7 +2714,11 @@ Examples:
                 device=args.device,
                 coverage_on_all_data=True,
                 filter_by_prediction=False,
-                use_prediction_routing=args.use_prediction_routing,
+                # NOTE: no use_prediction_routing here. It is a single-agent-only
+                # concept; BenchMARL/inference.py has never defined the flag, and
+                # kwargs are forwarded verbatim to it, so passing it made every
+                # multi-agent inference exit 2 on an argparse error. The
+                # multi-agent analogue is filter_by_prediction, set above.
             )
         elif args.skip_inference:
             logger.info("Inference skipped (--skip_inference). Looking for existing rules file...")

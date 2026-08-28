@@ -1,0 +1,1266 @@
+{
+  "schema": "rlda_mada_result_v1",
+  "dataset": "iris",
+  "method": "random_search",
+  "seed": 44,
+  "tau_p": 0.9,
+  "tau_c": 0.2,
+  "git_commit": "3f9a95ce32a71a037c8e0c3ea848c57a7ca0f5e0",
+  "config_hash": "913cc63c9134ad06",
+  "created_utc": "2026-08-27T02:33:05.150826+00:00",
+  "classifier_accuracy": {
+    "train_accuracy": 0.9333333333333333,
+    "val_accuracy": 1.0,
+    "test_accuracy": 1.0,
+    "n": 30
+  },
+  "queries": {
+    "n_blackbox_queries": 30,
+    "n_reporting_queries": 180,
+    "query_policy": "n_blackbox_queries counts generation/selection calls; held-out test reporting calls are separate",
+    "n_cache_hits": 0,
+    "wall_train_seconds": 0.0,
+    "wall_infer_seconds": 0.0311429500579834
+  },
+  "per_class": {
+    "class_0": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "rs:0:45",
+        "display_rule": "random box 45",
+        "fidelity": {
+          "n_covered": 9,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 9,
+          "n_fid_agree": 9,
+          "n_pur_agree": 9,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.9,
+          "coverage_marginal": 0.3,
+          "fidelity_ci_low": 0.7008472464490406,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.7008472464490406,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 0,
+          "class_conditional": true
+        },
+        "score": 2.0,
+        "lower_bounds": [
+          0.0,
+          0.36101827025413513,
+          0.0,
+          0.0
+        ],
+        "upper_bounds": [
+          0.49933093786239624,
+          0.8889816999435425,
+          0.23326507210731506,
+          0.1605713665485382
+        ]
+      },
+      "union": {
+        "n_covered": 10,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 10,
+        "n_fid_agree": 10,
+        "n_pur_agree": 10,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 1.0,
+        "coverage_marginal": 0.3333333333333333,
+        "fidelity_ci_low": 0.7224598312333834,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7224598312333834,
+        "purity_ci_high": 1.0,
+        "below_min_support": false,
+        "target_class": 0,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "rs:0:45",
+        "rs:0:62",
+        "rs:0:81",
+        "rs:0:10",
+        "rs:0:84"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "rs:0:45",
+          "display_rule": "random box 45",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.0,
+            0.36101827025413513,
+            0.0,
+            0.0
+          ],
+          "upper_bounds": [
+            0.49933093786239624,
+            0.8889816999435425,
+            0.23326507210731506,
+            0.1605713665485382
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.9,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.7008472464490406,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7008472464490406,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:0:62",
+          "display_rule": "random box 62",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.04056224226951599,
+            0.28508231043815613,
+            0.0,
+            0.04026982933282852
+          ],
+          "upper_bounds": [
+            0.5705487728118896,
+            0.8815844058990479,
+            0.31745460629463196,
+            0.20973017811775208
+          ],
+          "report_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:0:81",
+          "display_rule": "random box 81",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.05354714393615723,
+            0.35984718799591064,
+            0.0,
+            0.0
+          ],
+          "upper_bounds": [
+            0.39089712500572205,
+            0.8901528120040894,
+            0.1870577484369278,
+            0.1517835557460785
+          ],
+          "report_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:0:10",
+          "display_rule": "random box 10",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.0,
+            0.48598194122314453,
+            0.0,
+            0.0
+          ],
+          "upper_bounds": [
+            0.4653488099575043,
+            0.8473513126373291,
+            0.27775779366493225,
+            0.14295005798339844
+          ],
+          "report_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:0:84",
+          "display_rule": "random box 84",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.07311993837356567,
+            0.3288247585296631,
+            0.0333402119576931,
+            0.0
+          ],
+          "upper_bounds": [
+            0.5379911065101624,
+            0.8378419876098633,
+            0.10951684415340424,
+            0.27770930528640747
+          ],
+          "report_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.3,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 0,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_1": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "rs:1:116",
+        "display_rule": "random box 116",
+        "fidelity": {
+          "n_covered": 9,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 9,
+          "n_fid_agree": 9,
+          "n_pur_agree": 9,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.9,
+          "coverage_marginal": 0.3,
+          "fidelity_ci_low": 0.7008472464490406,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.7008472464490406,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 1,
+          "class_conditional": true
+        },
+        "score": 2.0,
+        "lower_bounds": [
+          0.2589651942253113,
+          0.13512365520000458,
+          0.38490772247314453,
+          0.309032142162323
+        ],
+        "upper_bounds": [
+          0.7965901494026184,
+          0.6148764491081238,
+          0.7579494714736938,
+          0.690967857837677
+        ]
+      },
+      "union": {
+        "n_covered": 11,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 10,
+        "n_fid_agree": 10,
+        "n_pur_agree": 10,
+        "fidelity": 0.9090909090909091,
+        "purity": 0.9090909090909091,
+        "coverage": 1.0,
+        "coverage_marginal": 0.36666666666666664,
+        "fidelity_ci_low": 0.6226353745137962,
+        "fidelity_ci_high": 0.9837682477371741,
+        "purity_ci_low": 0.6226353745137962,
+        "purity_ci_high": 0.9837682477371741,
+        "below_min_support": false,
+        "target_class": 1,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "rs:1:116",
+        "rs:1:74",
+        "rs:1:175",
+        "rs:1:219",
+        "rs:1:14"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "rs:1:116",
+          "display_rule": "random box 116",
+          "selection_score": 2.0,
+          "lower_bounds": [
+            0.2589651942253113,
+            0.13512365520000458,
+            0.38490772247314453,
+            0.309032142162323
+          ],
+          "upper_bounds": [
+            0.7965901494026184,
+            0.6148764491081238,
+            0.7579494714736938,
+            0.690967857837677
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 9,
+            "n_fid_agree": 9,
+            "n_pur_agree": 9,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.9,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.7008472464490406,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7008472464490406,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 10,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 1.0,
+            "coverage_marginal": 0.3333333333333333,
+            "fidelity_ci_low": 0.7224598312333834,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.7224598312333834,
+            "purity_ci_high": 1.0,
+            "below_min_support": false,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:1:74",
+          "display_rule": "random box 74",
+          "selection_score": 1.8,
+          "lower_bounds": [
+            0.08003729581832886,
+            0.13819974660873413,
+            0.18841677904129028,
+            0.33448880910873413
+          ],
+          "upper_bounds": [
+            0.6421847939491272,
+            0.6118003726005554,
+            0.7044403553009033,
+            0.6655111908912659
+          ],
+          "report_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:1:175",
+          "display_rule": "random box 175",
+          "selection_score": 1.8,
+          "lower_bounds": [
+            0.2310531735420227,
+            0.1329299956560135,
+            0.39967626333236694,
+            0.404377818107605
+          ],
+          "upper_bounds": [
+            0.824502170085907,
+            0.6170701384544373,
+            0.7431809306144714,
+            0.595622181892395
+          ],
+          "report_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:1:219",
+          "display_rule": "random box 219",
+          "selection_score": 1.8,
+          "lower_bounds": [
+            0.3556292951107025,
+            0.07604104280471802,
+            0.3908509612083435,
+            0.31172025203704834
+          ],
+          "upper_bounds": [
+            0.8110373020172119,
+            0.6739590764045715,
+            0.7520062327384949,
+            0.6882797479629517
+          ],
+          "report_metrics": {
+            "n_covered": 9,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 0.8888888888888888,
+            "purity": 0.8888888888888888,
+            "coverage": 0.8,
+            "coverage_marginal": 0.3,
+            "fidelity_ci_low": 0.5649937852319398,
+            "fidelity_ci_high": 0.9801096286728695,
+            "purity_ci_low": 0.5649937852319398,
+            "purity_ci_high": 0.9801096286728695,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:1:14",
+          "display_rule": "random box 14",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.09965908527374268,
+            0.0,
+            0.15963312983512878,
+            0.15746484696865082
+          ],
+          "upper_bounds": [
+            0.6781184673309326,
+            0.5225968956947327,
+            0.697509765625,
+            0.5925351977348328
+          ],
+          "report_metrics": {
+            "n_covered": 11,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 10,
+            "n_fid_agree": 10,
+            "n_pur_agree": 10,
+            "fidelity": 0.9090909090909091,
+            "purity": 0.9090909090909091,
+            "coverage": 1.0,
+            "coverage_marginal": 0.36666666666666664,
+            "fidelity_ci_low": 0.6226353745137962,
+            "fidelity_ci_high": 0.9837682477371741,
+            "purity_ci_low": 0.6226353745137962,
+            "purity_ci_high": 0.9837682477371741,
+            "below_min_support": false,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.3,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 1,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_2": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "rs:2:87",
+        "display_rule": "random box 87",
+        "fidelity": {
+          "n_covered": 4,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 4,
+          "n_fid_agree": 4,
+          "n_pur_agree": 4,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.4,
+          "coverage_marginal": 0.13333333333333333,
+          "fidelity_ci_low": 0.5100999795960008,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.5100999795960008,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 2,
+          "class_conditional": true
+        },
+        "score": 1.7,
+        "lower_bounds": [
+          0.32515451312065125,
+          0.16701771318912506,
+          0.6116926670074463,
+          0.604170560836792
+        ],
+        "upper_bounds": [
+          0.8415120840072632,
+          0.49964892864227295,
+          0.9954501390457153,
+          1.0
+        ]
+      },
+      "union": {
+        "n_covered": 5,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 5,
+        "n_fid_agree": 5,
+        "n_pur_agree": 5,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.5,
+        "coverage_marginal": 0.16666666666666666,
+        "fidelity_ci_low": 0.565508505247919,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.565508505247919,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 2,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "rs:2:87",
+        "rs:2:117",
+        "rs:2:46",
+        "rs:2:101",
+        "rs:2:10"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "rs:2:87",
+          "display_rule": "random box 87",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.32515451312065125,
+            0.16701771318912506,
+            0.6116926670074463,
+            0.604170560836792
+          ],
+          "upper_bounds": [
+            0.8415120840072632,
+            0.49964892864227295,
+            0.9954501390457153,
+            1.0
+          ],
+          "report_metrics": {
+            "n_covered": 4,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 4,
+            "n_fid_agree": 4,
+            "n_pur_agree": 4,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.4,
+            "coverage_marginal": 0.13333333333333333,
+            "fidelity_ci_low": 0.5100999795960008,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.5100999795960008,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:2:117",
+          "display_rule": "random box 117",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.3224727511405945,
+            0.2834102511405945,
+            0.7034434676170349,
+            0.6139439344406128
+          ],
+          "upper_bounds": [
+            0.8997493386268616,
+            0.5499230623245239,
+            0.9751281142234802,
+            1.0
+          ],
+          "report_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:2:46",
+          "display_rule": "random box 46",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.3644558787345886,
+            0.059521645307540894,
+            0.664804220199585,
+            0.6447492837905884
+          ],
+          "upper_bounds": [
+            0.8022107481956482,
+            0.6071449518203735,
+            0.9423385858535767,
+            1.0
+          ],
+          "report_metrics": {
+            "n_covered": 4,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 4,
+            "n_fid_agree": 4,
+            "n_pur_agree": 4,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.4,
+            "coverage_marginal": 0.13333333333333333,
+            "fidelity_ci_low": 0.5100999795960008,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.5100999795960008,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:2:101",
+          "display_rule": "random box 101",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.38736608624458313,
+            0.1876494139432907,
+            0.6137862205505371,
+            0.6336148977279663
+          ],
+          "upper_bounds": [
+            0.8348560333251953,
+            0.6456838846206665,
+            1.0,
+            1.0
+          ],
+          "report_metrics": {
+            "n_covered": 4,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 4,
+            "n_fid_agree": 4,
+            "n_pur_agree": 4,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.4,
+            "coverage_marginal": 0.13333333333333333,
+            "fidelity_ci_low": 0.5100999795960008,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.5100999795960008,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "rs:2:10",
+          "display_rule": "random box 10",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.10370191931724548,
+            0.0,
+            0.4101649224758148,
+            0.6985874176025391
+          ],
+          "upper_bounds": [
+            0.6740756034851074,
+            0.4742753505706787,
+            0.9826922416687012,
+            0.8847460746765137
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 4,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 4,
+        "n_fid_agree": 4,
+        "n_pur_agree": 4,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.13333333333333333,
+        "coverage_marginal": 0.13333333333333333,
+        "fidelity_ci_low": 0.5100999795960008,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.5100999795960008,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 2,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    }
+  },
+  "global_ruleset": {
+    "n_eval": 30,
+    "n_abstain": 4,
+    "n_conflict": 0,
+    "n_decided": 26,
+    "n_fid_agree": 25,
+    "n_pur_agree": 25,
+    "global_fidelity": 0.9615384615384616,
+    "global_purity": 0.9615384615384616,
+    "abstention_rate": 0.13333333333333333,
+    "conflict_rate": 0.0,
+    "coverage": 0.8666666666666667,
+    "per_class_fired": {
+      "0": 10,
+      "1": 11,
+      "2": 5
+    }
+  },
+  "success_rate": null,
+  "compactness": {
+    "mean_rules_per_class": 5.0,
+    "mean_active_features": 4.0,
+    "sparsity_width_ratio": 0.95
+  },
+  "ranking_formula": "precision_coverage",
+  "min_support": 10,
+  "notes": "Baseline random_search; selection on D_val and reporting on D_test; union over top-k=5; min_support=10.",
+  "extra": {
+    "n_candidates": 256,
+    "k": 5,
+    "classifier_path": "/Users/ssuresh/dynamicAnchors/output/iris_rlda_ddpg_seed44/training/ddpg_single_agent_sb3_26_08_26-20_26_15/classifier.pth",
+    "selection_split": "val",
+    "report_split": "test",
+    "ranking_formula": "precision_coverage",
+    "min_support": 10
+  }
+}

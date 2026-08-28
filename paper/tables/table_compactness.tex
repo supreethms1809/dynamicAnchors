@@ -1,0 +1,31 @@
+% Active features per selected rule (C-36 / C-08). Threshold = sparsity_width_ratio.
+\begin{tabular}{llrrr}
+\toprule
+Dataset & Method & Rules / class & Mean active features & Sparsity ratio \\
+\midrule
+breast_cancer & cart & 5.0 & 16.63 & 0.95 \\
+breast_cancer & greedy_anchors & 5.0 & 16.00 & 0.95 \\
+breast_cancer & mada & 5.0 & 30.00 & 0.95 \\
+breast_cancer & random_search & 5.0 & 30.00 & 0.95 \\
+breast_cancer & rlda & 5.0 & 22.60 & 0.95 \\
+breast_cancer & sp_anchors & 5.0 & 16.00 & 0.95 \\
+iris & cart & 5.0 $\pm$ 0.0 & 0.28 $\pm$ 0.28 & 0.95 \\
+iris & greedy_anchors & 5.0 $\pm$ 0.0 & 0.59 $\pm$ 0.43 & 0.95 \\
+iris & mada & 5.0 $\pm$ 0.0 & 3.78 $\pm$ 0.44 & 0.95 \\
+iris & random_search & 5.0 $\pm$ 0.0 & 4.00 $\pm$ 0.00 & 0.95 \\
+iris & rlda & 5.0 $\pm$ 0.0 & 3.84 $\pm$ 0.31 & 0.95 \\
+iris & sp_anchors & 5.0 $\pm$ 0.0 & 0.58 $\pm$ 0.42 & 0.95 \\
+uci_credit & cart & 5.0 & 2.00 & 0.95 \\
+uci_credit & greedy_anchors & 5.0 & 0.50 & 0.95 \\
+uci_credit & mada & 5.0 & 14.70 & 0.95 \\
+uci_credit & random_search & 5.0 & 15.00 & 0.95 \\
+uci_credit & rlda & 5.0 & 13.20 & 0.95 \\
+uci_credit & sp_anchors & 5.0 & 0.50 & 0.95 \\
+wine & cart & 5.0 & 1.17 & 0.95 \\
+wine & greedy_anchors & 5.0 & 1.67 & 0.95 \\
+wine & mada & 5.0 & 13.00 & 0.95 \\
+wine & random_search & 5.0 & 13.00 & 0.95 \\
+wine & rlda & 5.0 & 9.40 & 0.95 \\
+wine & sp_anchors & 5.0 & 1.67 & 0.95 \\
+\bottomrule
+\end{tabular}

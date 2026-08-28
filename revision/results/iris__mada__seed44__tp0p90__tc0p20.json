@@ -1,0 +1,1426 @@
+{
+  "schema": "rlda_mada_result_v1",
+  "dataset": "iris",
+  "method": "mada",
+  "seed": 44,
+  "tau_p": 0.9,
+  "tau_c": 0.2,
+  "git_commit": "3f9a95ce32a71a037c8e0c3ea848c57a7ca0f5e0",
+  "config_hash": "56703e634948b1ee",
+  "created_utc": "2026-08-27T06:33:41.715378+00:00",
+  "classifier_accuracy": {
+    "selection_split": "val",
+    "report_split": "test",
+    "n": 30,
+    "test_accuracy": 1.0,
+    "split_accuracy": 1.0,
+    "train_accuracy": 0.9333333333333333,
+    "val_accuracy": 1.0
+  },
+  "queries": {
+    "n_blackbox_queries": 8640,
+    "n_reporting_queries": 150,
+    "query_policy": "Generation and validation-selection classifier calls; held-out test reporting occurs in revision.evaluate"
+  },
+  "per_class": {
+    "class_0": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "0:37:sepal length (cm) \u2208 [4.928585, 5.883289] and sepal width (cm) \u2208 [3.283009, 4.015",
+        "display_rule": "sepal length (cm) \u2208 [4.928585, 5.883289] and sepal width (cm) \u2208 [3.283009, 4.015111] and petal length (cm) \u2208 [1.102299, 1.988131] and petal width (cm) \u2208 [0.181220, 0.518578]",
+        "fidelity": {
+          "n_covered": 4,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 4,
+          "n_fid_agree": 4,
+          "n_pur_agree": 4,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.4,
+          "coverage_marginal": 0.13333333333333333,
+          "fidelity_ci_low": 0.5100999795960008,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.5100999795960008,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 0,
+          "class_conditional": true
+        },
+        "score": 1.8,
+        "lower_bounds": [
+          0.17460672557353973,
+          0.5345872044563293,
+          0.00041044538374990225,
+          0.03384176641702652
+        ],
+        "upper_bounds": [
+          0.4398025870323181,
+          0.8396298289299011,
+          0.15859489142894745,
+          0.17440737783908844
+        ]
+      },
+      "union": {
+        "n_covered": 6,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 6,
+        "n_fid_agree": 6,
+        "n_pur_agree": 6,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.6,
+        "coverage_marginal": 0.2,
+        "fidelity_ci_low": 0.6096569663469354,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.6096569663469354,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 0,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "0:37:sepal length (cm) \u2208 [4.928585, 5.883289] and sepal width (cm) \u2208 [3.283009, 4.015",
+        "0:30:sepal length (cm) \u2208 [4.815616, 5.587896] and sepal width (cm) \u2208 [3.384156, 4.020",
+        "0:31:sepal length (cm) \u2208 [4.412750, 5.389248] and sepal width (cm) \u2208 [3.083765, 3.724",
+        "0:34:sepal length (cm) \u2208 [4.433662, 5.378627] and sepal width (cm) \u2208 [3.080909, 3.720",
+        "0:38:sepal length (cm) \u2208 [4.432750, 5.376578] and sepal width (cm) \u2208 [3.081116, 3.714"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "0:37:sepal length (cm) \u2208 [4.928585, 5.883289] and sepal width (cm) \u2208 [3.283009, 4.015",
+          "display_rule": "sepal length (cm) \u2208 [4.928585, 5.883289] and sepal width (cm) \u2208 [3.283009, 4.015111] and petal length (cm) \u2208 [1.102299, 1.988131] and petal width (cm) \u2208 [0.181220, 0.518578]",
+          "selection_score": 1.8,
+          "lower_bounds": [
+            0.17460672557353973,
+            0.5345872044563293,
+            0.00041044538374990225,
+            0.03384176641702652
+          ],
+          "upper_bounds": [
+            0.4398025870323181,
+            0.8396298289299011,
+            0.15859489142894745,
+            0.17440737783908844
+          ],
+          "report_metrics": {
+            "n_covered": 4,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 4,
+            "n_fid_agree": 4,
+            "n_pur_agree": 4,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.4,
+            "coverage_marginal": 0.13333333333333333,
+            "fidelity_ci_low": 0.5100999795960008,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.5100999795960008,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 8,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 8,
+            "n_fid_agree": 8,
+            "n_pur_agree": 8,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.8,
+            "coverage_marginal": 0.26666666666666666,
+            "fidelity_ci_low": 0.6755843804891231,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6755843804891231,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "0:30:sepal length (cm) \u2208 [4.815616, 5.587896] and sepal width (cm) \u2208 [3.384156, 4.020",
+          "display_rule": "sepal length (cm) \u2208 [4.815616, 5.587896] and sepal width (cm) \u2208 [3.384156, 4.020935] and petal length (cm) \u2208 [1.100328, 1.982367] and petal width (cm) \u2208 [0.104301, 0.510351]",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.14322665333747864,
+            0.5767316222190857,
+            5.8477919083088636e-05,
+            0.001792091061361134
+          ],
+          "upper_bounds": [
+            0.35774892568588257,
+            0.8420562148094177,
+            0.1575654298067093,
+            0.17097975313663483
+          ],
+          "report_metrics": {
+            "n_covered": 2,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 2,
+            "n_fid_agree": 2,
+            "n_pur_agree": 2,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.2,
+            "coverage_marginal": 0.06666666666666667,
+            "fidelity_ci_low": 0.3423719528896193,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.3423719528896193,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "0:31:sepal length (cm) \u2208 [4.412750, 5.389248] and sepal width (cm) \u2208 [3.083765, 3.724",
+          "display_rule": "sepal length (cm) \u2208 [4.412750, 5.389248] and sepal width (cm) \u2208 [3.083765, 3.724276] and petal length (cm) \u2208 [1.114905, 1.875097] and petal width (cm) \u2208 [0.101370, 0.420642]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.03131936118006706,
+            0.45156869292259216,
+            0.0026615699753165245,
+            0.0005706367664970458
+          ],
+          "upper_bounds": [
+            0.30256879329681396,
+            0.7184484004974365,
+            0.13841013610363007,
+            0.13360098004341125
+          ],
+          "report_metrics": {
+            "n_covered": 3,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 3,
+            "n_fid_agree": 3,
+            "n_pur_agree": 3,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.3,
+            "coverage_marginal": 0.1,
+            "fidelity_ci_low": 0.4384939195509822,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.4384939195509822,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "0:34:sepal length (cm) \u2208 [4.433662, 5.378627] and sepal width (cm) \u2208 [3.080909, 3.720",
+          "display_rule": "sepal length (cm) \u2208 [4.433662, 5.378627] and sepal width (cm) \u2208 [3.080909, 3.720759] and petal length (cm) \u2208 [1.114785, 1.886523] and petal width (cm) \u2208 [0.100000, 0.420642]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.0371282584965229,
+            0.4503787159919739,
+            0.002640179358422756,
+            0.0
+          ],
+          "upper_bounds": [
+            0.2996184527873993,
+            0.7169830203056335,
+            0.14045050740242004,
+            0.13360083103179932
+          ],
+          "report_metrics": {
+            "n_covered": 3,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 3,
+            "n_fid_agree": 3,
+            "n_pur_agree": 3,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.3,
+            "coverage_marginal": 0.1,
+            "fidelity_ci_low": 0.4384939195509822,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.4384939195509822,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "0:38:sepal length (cm) \u2208 [4.432750, 5.376578] and sepal width (cm) \u2208 [3.081116, 3.714",
+          "display_rule": "sepal length (cm) \u2208 [4.432750, 5.376578] and sepal width (cm) \u2208 [3.081116, 3.714950] and petal length (cm) \u2208 [1.114537, 1.883345] and petal width (cm) \u2208 [0.102869, 0.416682]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.03687494993209839,
+            0.45046523213386536,
+            0.002595860045403242,
+            0.0011953575303778052
+          ],
+          "upper_bounds": [
+            0.29904940724372864,
+            0.7145624756813049,
+            0.13988296687602997,
+            0.13195081055164337
+          ],
+          "report_metrics": {
+            "n_covered": 3,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 3,
+            "n_fid_agree": 3,
+            "n_pur_agree": 3,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.3,
+            "coverage_marginal": 0.1,
+            "fidelity_ci_low": 0.4384939195509822,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.4384939195509822,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 0,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 4,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 4,
+        "n_fid_agree": 4,
+        "n_pur_agree": 4,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.13333333333333333,
+        "coverage_marginal": 0.13333333333333333,
+        "fidelity_ci_low": 0.5100999795960008,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.5100999795960008,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 0,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_1": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "1:30:sepal length (cm) \u2208 [5.312973, 6.400809] and sepal width (cm) \u2208 [2.290963, 3.023",
+        "display_rule": "sepal length (cm) \u2208 [5.312973, 6.400809] and sepal width (cm) \u2208 [2.290963, 3.023413] and petal length (cm) \u2208 [3.217423, 4.593916] and petal width (cm) \u2208 [0.883054, 1.418642]",
+        "fidelity": {
+          "n_covered": 6,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 6,
+          "n_fid_agree": 6,
+          "n_pur_agree": 6,
+          "fidelity": 1.0,
+          "purity": 1.0,
+          "coverage": 0.6,
+          "coverage_marginal": 0.2,
+          "fidelity_ci_low": 0.6096569663469354,
+          "fidelity_ci_high": 1.0,
+          "purity_ci_low": 0.6096569663469354,
+          "purity_ci_high": 1.0,
+          "below_min_support": true,
+          "target_class": 1,
+          "class_conditional": true
+        },
+        "score": 1.6,
+        "lower_bounds": [
+          0.28138118982315063,
+          0.12123475968837738,
+          0.37811124324798584,
+          0.32627254724502563
+        ],
+        "upper_bounds": [
+          0.5835581421852112,
+          0.4264221787452698,
+          0.6239136457443237,
+          0.5494341254234314
+        ]
+      },
+      "union": {
+        "n_covered": 9,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 9,
+        "n_fid_agree": 9,
+        "n_pur_agree": 9,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.9,
+        "coverage_marginal": 0.3,
+        "fidelity_ci_low": 0.7008472464490406,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.7008472464490406,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 1,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "1:30:sepal length (cm) \u2208 [5.312973, 6.400809] and sepal width (cm) \u2208 [2.290963, 3.023",
+        "1:32:sepal length (cm) \u2208 [5.626281, 7.096196] and sepal width (cm) \u2208 [2.485346, 3.231",
+        "1:0:sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905",
+        "1:15:sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905",
+        "1:31:sepal length (cm) \u2208 [5.823923, 7.069818] and sepal width (cm) \u2208 [2.676694, 3.511"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "1:30:sepal length (cm) \u2208 [5.312973, 6.400809] and sepal width (cm) \u2208 [2.290963, 3.023",
+          "display_rule": "sepal length (cm) \u2208 [5.312973, 6.400809] and sepal width (cm) \u2208 [2.290963, 3.023413] and petal length (cm) \u2208 [3.217423, 4.593916] and petal width (cm) \u2208 [0.883054, 1.418642]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.28138118982315063,
+            0.12123475968837738,
+            0.37811124324798584,
+            0.32627254724502563
+          ],
+          "upper_bounds": [
+            0.5835581421852112,
+            0.4264221787452698,
+            0.6239136457443237,
+            0.5494341254234314
+          ],
+          "report_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "1:32:sepal length (cm) \u2208 [5.626281, 7.096196] and sepal width (cm) \u2208 [2.485346, 3.231",
+          "display_rule": "sepal length (cm) \u2208 [5.626281, 7.096196] and sepal width (cm) \u2208 [2.485346, 3.231698] and petal length (cm) \u2208 [3.713872, 5.184864] and petal width (cm) \u2208 [1.080019, 1.621563]",
+          "selection_score": 1.5,
+          "lower_bounds": [
+            0.3684113621711731,
+            0.20222751796245575,
+            0.46676281094551086,
+            0.40834131836891174
+          ],
+          "upper_bounds": [
+            0.7767210006713867,
+            0.5132073760032654,
+            0.7294400334358215,
+            0.6339846849441528
+          ],
+          "report_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "1:0:sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905",
+          "display_rule": "sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905655] and petal length (cm) \u2208 [3.468292, 4.537946] and petal width (cm) \u2208 [0.920687, 1.452219]",
+          "selection_score": 1.5,
+          "lower_bounds": [
+            0.3319026231765747,
+            0.15117284655570984,
+            0.42290931940078735,
+            0.34195277094841003
+          ],
+          "upper_bounds": [
+            0.5324381589889526,
+            0.3773561418056488,
+            0.6139189600944519,
+            0.5634245872497559
+          ],
+          "report_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "1:15:sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905",
+          "display_rule": "sepal length (cm) \u2208 [5.494850, 6.216777] and sepal width (cm) \u2208 [2.362815, 2.905655] and petal length (cm) \u2208 [3.468292, 4.537946] and petal width (cm) \u2208 [0.920687, 1.452219]",
+          "selection_score": 1.5,
+          "lower_bounds": [
+            0.3319026231765747,
+            0.15117284655570984,
+            0.42290931940078735,
+            0.34195277094841003
+          ],
+          "upper_bounds": [
+            0.5324381589889526,
+            0.3773561418056488,
+            0.6139189600944519,
+            0.5634245872497559
+          ],
+          "report_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "1:31:sepal length (cm) \u2208 [5.823923, 7.069818] and sepal width (cm) \u2208 [2.676694, 3.511",
+          "display_rule": "sepal length (cm) \u2208 [5.823923, 7.069818] and sepal width (cm) \u2208 [2.676694, 3.511494] and petal length (cm) \u2208 [4.023405, 5.171916] and petal width (cm) \u2208 [1.185152, 1.719318]",
+          "selection_score": 1.5,
+          "lower_bounds": [
+            0.4233119785785675,
+            0.281955748796463,
+            0.5220364928245544,
+            0.4521466791629791
+          ],
+          "upper_bounds": [
+            0.769393801689148,
+            0.6297892928123474,
+            0.7271279096603394,
+            0.6747159361839294
+          ],
+          "report_metrics": {
+            "n_covered": 3,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 3,
+            "n_fid_agree": 3,
+            "n_pur_agree": 3,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.3,
+            "coverage_marginal": 0.1,
+            "fidelity_ci_low": 0.4384939195509822,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.4384939195509822,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 5,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 5,
+            "n_fid_agree": 5,
+            "n_pur_agree": 5,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.5,
+            "coverage_marginal": 0.16666666666666666,
+            "fidelity_ci_low": 0.565508505247919,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.565508505247919,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 1,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 6,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 6,
+        "n_fid_agree": 6,
+        "n_pur_agree": 6,
+        "fidelity": 1.0,
+        "purity": 1.0,
+        "coverage": 0.2,
+        "coverage_marginal": 0.2,
+        "fidelity_ci_low": 0.6096569663469354,
+        "fidelity_ci_high": 1.0,
+        "purity_ci_low": 0.6096569663469354,
+        "purity_ci_high": 1.0,
+        "below_min_support": true,
+        "target_class": 1,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    },
+    "class_2": {
+      "k": 5,
+      "n_selected": 5,
+      "best": {
+        "rule_id": "2:30:sepal length (cm) \u2208 [5.412356, 6.577825] and sepal width (cm) \u2208 [2.373458, 3.207",
+        "display_rule": "sepal length (cm) \u2208 [5.412356, 6.577825] and sepal width (cm) \u2208 [2.373458, 3.207827] and petal length (cm) \u2208 [4.620770, 5.880230] and petal width (cm) \u2208 [1.271359, 2.220601]",
+        "fidelity": {
+          "n_covered": 2,
+          "n_eval": 30,
+          "n_class": 10,
+          "n_covered_class": 1,
+          "n_fid_agree": 1,
+          "n_pur_agree": 1,
+          "fidelity": 0.5,
+          "purity": 0.5,
+          "coverage": 0.1,
+          "coverage_marginal": 0.06666666666666667,
+          "fidelity_ci_low": 0.09452865480086611,
+          "fidelity_ci_high": 0.905471345199134,
+          "purity_ci_low": 0.09452865480086611,
+          "purity_ci_high": 0.905471345199134,
+          "below_min_support": true,
+          "target_class": 2,
+          "class_conditional": true
+        },
+        "score": 1.7,
+        "lower_bounds": [
+          0.3089878261089325,
+          0.1556076556444168,
+          0.6287088394165039,
+          0.48806631565093994
+        ],
+        "upper_bounds": [
+          0.6327289342880249,
+          0.5032613277435303,
+          0.85361248254776,
+          0.8835835456848145
+        ]
+      },
+      "union": {
+        "n_covered": 2,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 1,
+        "n_fid_agree": 1,
+        "n_pur_agree": 1,
+        "fidelity": 0.5,
+        "purity": 0.5,
+        "coverage": 0.1,
+        "coverage_marginal": 0.06666666666666667,
+        "fidelity_ci_low": 0.09452865480086611,
+        "fidelity_ci_high": 0.905471345199134,
+        "purity_ci_low": 0.09452865480086611,
+        "purity_ci_high": 0.905471345199134,
+        "below_min_support": true,
+        "target_class": 2,
+        "class_conditional": true
+      },
+      "selected_ids": [
+        "2:30:sepal length (cm) \u2208 [5.412356, 6.577825] and sepal width (cm) \u2208 [2.373458, 3.207",
+        "2:34:sepal length (cm) \u2208 [5.420960, 6.573823] and sepal width (cm) \u2208 [2.380292, 3.226",
+        "2:38:sepal length (cm) \u2208 [4.721044, 6.688949] and sepal width (cm) \u2208 [2.376792, 3.116",
+        "2:31:sepal length (cm) \u2208 [5.424430, 6.694089] and sepal width (cm) \u2208 [2.372250, 3.236",
+        "2:35:sepal length (cm) \u2208 [5.417292, 6.683225] and sepal width (cm) \u2208 [2.383150, 3.212"
+      ],
+      "selected_rules": [
+        {
+          "rule_id": "2:30:sepal length (cm) \u2208 [5.412356, 6.577825] and sepal width (cm) \u2208 [2.373458, 3.207",
+          "display_rule": "sepal length (cm) \u2208 [5.412356, 6.577825] and sepal width (cm) \u2208 [2.373458, 3.207827] and petal length (cm) \u2208 [4.620770, 5.880230] and petal width (cm) \u2208 [1.271359, 2.220601]",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.3089878261089325,
+            0.1556076556444168,
+            0.6287088394165039,
+            0.48806631565093994
+          ],
+          "upper_bounds": [
+            0.6327289342880249,
+            0.5032613277435303,
+            0.85361248254776,
+            0.8835835456848145
+          ],
+          "report_metrics": {
+            "n_covered": 2,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 0.5,
+            "purity": 0.5,
+            "coverage": 0.1,
+            "coverage_marginal": 0.06666666666666667,
+            "fidelity_ci_low": 0.09452865480086611,
+            "fidelity_ci_high": 0.905471345199134,
+            "purity_ci_low": 0.09452865480086611,
+            "purity_ci_high": 0.905471345199134,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "2:34:sepal length (cm) \u2208 [5.420960, 6.573823] and sepal width (cm) \u2208 [2.380292, 3.226",
+          "display_rule": "sepal length (cm) \u2208 [5.420960, 6.573823] and sepal width (cm) \u2208 [2.380292, 3.226079] and petal length (cm) \u2208 [4.601954, 5.884753] and petal width (cm) \u2208 [1.277000, 2.216392]",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.3113776743412018,
+            0.15845495462417603,
+            0.6253490447998047,
+            0.4904167652130127
+          ],
+          "upper_bounds": [
+            0.6316174268722534,
+            0.5108664631843567,
+            0.8544203042984009,
+            0.8818299770355225
+          ],
+          "report_metrics": {
+            "n_covered": 2,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 0.5,
+            "purity": 0.5,
+            "coverage": 0.1,
+            "coverage_marginal": 0.06666666666666667,
+            "fidelity_ci_low": 0.09452865480086611,
+            "fidelity_ci_high": 0.905471345199134,
+            "purity_ci_low": 0.09452865480086611,
+            "purity_ci_high": 0.905471345199134,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "2:38:sepal length (cm) \u2208 [4.721044, 6.688949] and sepal width (cm) \u2208 [2.376792, 3.116",
+          "display_rule": "sepal length (cm) \u2208 [4.721044, 6.688949] and sepal width (cm) \u2208 [2.376792, 3.116369] and petal length (cm) \u2208 [4.222043, 5.867632] and petal width (cm) \u2208 [1.587575, 2.214434]",
+          "selection_score": 1.7,
+          "lower_bounds": [
+            0.11695663630962372,
+            0.15699681639671326,
+            0.5575076937675476,
+            0.6198228001594543
+          ],
+          "upper_bounds": [
+            0.6635967493057251,
+            0.46515390276908875,
+            0.8513628244400024,
+            0.8810142874717712
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 7,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 7,
+            "n_fid_agree": 7,
+            "n_pur_agree": 7,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.7,
+            "coverage_marginal": 0.23333333333333334,
+            "fidelity_ci_low": 0.6456611570247934,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6456611570247934,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "2:31:sepal length (cm) \u2208 [5.424430, 6.694089] and sepal width (cm) \u2208 [2.372250, 3.236",
+          "display_rule": "sepal length (cm) \u2208 [5.424430, 6.694089] and sepal width (cm) \u2208 [2.372250, 3.236291] and petal length (cm) \u2208 [4.636690, 5.882548] and petal width (cm) \u2208 [1.681759, 2.222229]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.3123416006565094,
+            0.15510426461696625,
+            0.6315517425537109,
+            0.6590661406517029
+          ],
+          "upper_bounds": [
+            0.6650246977806091,
+            0.515121340751648,
+            0.8540264964103699,
+            0.8842622637748718
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        },
+        {
+          "rule_id": "2:35:sepal length (cm) \u2208 [5.417292, 6.683225] and sepal width (cm) \u2208 [2.383150, 3.212",
+          "display_rule": "sepal length (cm) \u2208 [5.417292, 6.683225] and sepal width (cm) \u2208 [2.383150, 3.212057] and petal length (cm) \u2208 [4.612379, 5.879079] and petal width (cm) \u2208 [1.679507, 2.224162]",
+          "selection_score": 1.6,
+          "lower_bounds": [
+            0.3103588819503784,
+            0.1596457064151764,
+            0.6272105574607849,
+            0.658128023147583
+          ],
+          "upper_bounds": [
+            0.6620067954063416,
+            0.5050237774848938,
+            0.8534070253372192,
+            0.8850675821304321
+          ],
+          "report_metrics": {
+            "n_covered": 1,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 1,
+            "n_fid_agree": 1,
+            "n_pur_agree": 1,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.1,
+            "coverage_marginal": 0.03333333333333333,
+            "fidelity_ci_low": 0.20654329147389294,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.20654329147389294,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          },
+          "selection_metrics": {
+            "n_covered": 6,
+            "n_eval": 30,
+            "n_class": 10,
+            "n_covered_class": 6,
+            "n_fid_agree": 6,
+            "n_pur_agree": 6,
+            "fidelity": 1.0,
+            "purity": 1.0,
+            "coverage": 0.6,
+            "coverage_marginal": 0.2,
+            "fidelity_ci_low": 0.6096569663469354,
+            "fidelity_ci_high": 1.0,
+            "purity_ci_low": 0.6096569663469354,
+            "purity_ci_high": 1.0,
+            "below_min_support": true,
+            "target_class": 2,
+            "class_conditional": true
+          }
+        }
+      ],
+      "instance": {
+        "n_covered": 2,
+        "n_eval": 30,
+        "n_class": 10,
+        "n_covered_class": 1,
+        "n_fid_agree": 1,
+        "n_pur_agree": 1,
+        "fidelity": 0.5,
+        "purity": 0.5,
+        "coverage": 0.06666666666666667,
+        "coverage_marginal": 0.06666666666666667,
+        "fidelity_ci_low": 0.09452865480086611,
+        "fidelity_ci_high": 0.905471345199134,
+        "purity_ci_low": 0.09452865480086611,
+        "purity_ci_high": 0.905471345199134,
+        "below_min_support": true,
+        "target_class": 2,
+        "class_conditional": false
+      },
+      "compactness": {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    }
+  },
+  "global_ruleset": {
+    "n_eval": 30,
+    "n_abstain": 14,
+    "n_conflict": 1,
+    "n_decided": 16,
+    "n_fid_agree": 16,
+    "n_pur_agree": 16,
+    "global_fidelity": 1.0,
+    "global_purity": 1.0,
+    "abstention_rate": 0.4666666666666667,
+    "conflict_rate": 0.03333333333333333,
+    "coverage": 0.5333333333333333,
+    "per_class_fired": {
+      "0": 6,
+      "1": 9,
+      "2": 2
+    }
+  },
+  "success_rate": {
+    "n_episodes": 90,
+    "n_success": 82,
+    "success_rate": 0.9111111111111111,
+    "tau_p": 0.9,
+    "tau_c": 0.2,
+    "t_max": 100,
+    "per_class": {
+      "class_0": {
+        "n_episodes": 30,
+        "n_success": 30,
+        "success_rate": 1.0,
+        "tau_p": 0.9,
+        "tau_c": 0.2,
+        "t_max": 100
+      },
+      "class_1": {
+        "n_episodes": 30,
+        "n_success": 28,
+        "success_rate": 0.9333333333333333,
+        "tau_p": 0.9,
+        "tau_c": 0.2,
+        "t_max": 100
+      },
+      "class_2": {
+        "n_episodes": 30,
+        "n_success": 24,
+        "success_rate": 0.8,
+        "tau_p": 0.9,
+        "tau_c": 0.2,
+        "t_max": 100
+      }
+    }
+  },
+  "compactness": {
+    "sparsity_width_ratio": 0.95,
+    "n_classes_with_rules": 3,
+    "mean_active_features": 4.0,
+    "mean_rules_per_class": 5.0,
+    "per_class": [
+      {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      },
+      {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      },
+      {
+        "n_rules": 5,
+        "mean_active_features": 4.0,
+        "total_active_features": 20,
+        "n_features": 4,
+        "sparsity_width_ratio": 0.95,
+        "per_rule": [
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          },
+          {
+            "n_active_features": 4,
+            "n_features": 4,
+            "sparsity": 0.0,
+            "sparsity_width_ratio": 0.95
+          }
+        ]
+      }
+    ]
+  },
+  "ranking_formula": "precision_coverage",
+  "min_support": 10,
+  "notes": "Rules selected/ranked on D_val; all reported metrics on D_test (n=30). Union over top-k=5 ranked by precision_coverage (score = fid * (1 + cov) when formula is precision_coverage); best = rank-1 of that same set. Empty boxes -> NaN precision. min_support=10. Cells with n_covered < min_support are statistically uninformative.",
+  "extra": {
+    "rules_file": "/Users/ssuresh/dynamicAnchors/output/iris_mada_maddpg_seed44/training/maddpg_anchor_mlp__a9a15ff5_26_08_26-22_51_40/inference/extracted_rules.json",
+    "selection_split": "val",
+    "report_split": "test",
+    "bounds_space": "unit",
+    "k": 5,
+    "ranking_formula": "precision_coverage",
+    "sparsity_width_ratio": 0.95,
+    "print_box_mismatches": [],
+    "split_sizes": {
+      "train": 90,
+      "val": 30,
+      "test": 30
+    },
+    "min_support": 10
+  }
+}

@@ -1,0 +1,31 @@
+% Query budget / wall-clock (C-12). Generation queries exclude held-out reporting.
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Method & Black-box queries & Reporting queries & Train s & Infer s \\
+\midrule
+breast_cancer & cart & 455 & 683 & 0.00 & 0.00 \\
+breast_cancer & greedy_anchors & 725384 & 1252 & 0.00 & 11.49 \\
+breast_cancer & mada & 42408 & 569 & — & — \\
+breast_cancer & random_search & 114 & 683 & 0.00 & 0.07 \\
+breast_cancer & rlda & 105148 & 569 & — & — \\
+breast_cancer & sp_anchors & 725384 & 683 & 0.00 & 11.49 \\
+iris & cart & 120 $\pm$ 0 & 180 $\pm$ 0 & 0.00 $\pm$ 0.00 & 0.00 $\pm$ 0.00 \\
+iris & greedy_anchors & 75312 $\pm$ 2038 & 330 $\pm$ 0 & 0.00 $\pm$ 0.00 & 0.85 $\pm$ 0.21 \\
+iris & mada & 11100 $\pm$ 2460 & 150 $\pm$ 0 & — & — \\
+iris & random_search & 30 $\pm$ 0 & 180 $\pm$ 0 & 0.00 $\pm$ 0.00 & 0.04 $\pm$ 0.02 \\
+iris & rlda & 29820 $\pm$ 7200 & 150 $\pm$ 0 & — & — \\
+iris & sp_anchors & 75312 $\pm$ 2038 & 180 $\pm$ 0 & 0.00 $\pm$ 0.00 & 0.85 $\pm$ 0.21 \\
+uci_credit & cart & 552 & 828 & 0.00 & 0.00 \\
+uci_credit & greedy_anchors & 47646 & 1518 & 0.00 & 0.89 \\
+uci_credit & mada & 59616 & 690 & — & — \\
+uci_credit & random_search & 138 & 828 & 0.00 & 0.02 \\
+uci_credit & rlda & 156266 & 690 & — & — \\
+uci_credit & sp_anchors & 47646 & 828 & 0.00 & 0.89 \\
+wine & cart & 142 & 214 & 0.00 & 0.00 \\
+wine & greedy_anchors & 316553 & 392 & 0.00 & 3.94 \\
+wine & mada & 11448 & 178 & — & — \\
+wine & random_search & 36 & 214 & 0.00 & 0.09 \\
+wine & rlda & 31680 & 178 & — & — \\
+wine & sp_anchors & 316553 & 214 & 0.00 & 3.94 \\
+\bottomrule
+\end{tabular}

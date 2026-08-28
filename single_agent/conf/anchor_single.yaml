@@ -4,12 +4,29 @@
 # Environment configuration dictionary
 env_config:
   # Target metrics
-  precision_target: 0.90
+  # Paper rerun (Table 1 setting): Pthr = 0.90, Cthr = 0.2. Kept in sync with
+  # BenchMARL/conf/anchor.yaml so RLDA and MADA stay directly comparable.
+  # NOTE: shared with the WyoDOT/CDEA pipeline — restore to 0.90 / 0.1 before
+  # running CDEA experiments.
+  precision_target: 0.9
   coverage_target: 0.05
+
+  # Class-level rule selection (inference)
+  # Precision floor for class-level filtering/union is lift-aware:
+  #   floor = min(precision_target * 0.8, union_lift_k * class_prior)
+  # so minority-class rules are judged by lift over base rate, not an
+  # absolute threshold a 2%-prior class can never meet.
+  union_lift_k: 3.0
   
-  # Data perturbation settings
-  use_perturbation: True
-  perturbation_mode: "uniform"  # "bootstrap", "uniform", or "adaptive"
+  # Metric estimation: exact empirical evaluation over all real data rows in the
+  # box, using cached classifier predictions (computed once per env). Deterministic
+  # and matches the definitions used at inference/evaluation.
+  # - "uniform" measured model predictions on synthetic points the data never
+  #   visits (boxes scored well in empty space).
+  # - "adaptive" switched estimators mid-episode (bootstrap <-> uniform), which made
+  #   precision jump without the box changing and produced wrong results.
+  use_perturbation: False
+  perturbation_mode: "bootstrap"  # Only used if use_perturbation is re-enabled. Avoid "adaptive"/"uniform" (see above).
   n_perturb: 2048
   
   # Action and step settings
@@ -18,27 +35,67 @@ env_config:
   max_action_scale: 0.1
   min_absolute_step: 0.001
   initial_window: 0.1
+  init_min_neighbors: 5
+  init_neighbor_frac: 0.1
+  init_max_neighbors: 20
+  # Hull k is also capped so start class-cond C <= this fraction of τ_C
+  # (wins over init_min_neighbors). wine n≈35, τ_C=0.2 → k=3 not 5.
+  init_coverage_frac_of_target: 0.5
+  centroid_snap_threshold: 0.0
+  # Training and inference: terminate only on both_targets_met (not
+  # excellent_precision / high_prec / reasonably_close), and only if
+  # class-cond C rose by at least one extra class point vs reset.
+  strict_target_termination: true
+  require_coverage_gain_to_terminate: true
+  min_steps_before_termination: 2
   
-  # Reward weight parameters
-  alpha: 0.7              # Weight for precision gain component
-  beta: 0.6               # Weight for coverage gain component (reduced from 1.0 to prevent over-expansion)
-  gamma: 0.1              # Weight for overlap penalty (increased from 0.02 to prevent box collapse)
-  precision_blend_lambda: 0.5
-  drift_penalty_weight: 0.05  # Increased from 0.01 for more stable boxes
-  js_penalty_weight: 0.05  # Increased from 0.01 to prevent distribution drift
+  # Reward weight parameters (potential-based shaping: reward = Phi(s') - Phi(s),
+  # Phi = alpha * precision + beta * sqrt(coverage) * gate(precision); see
+  # single_agentENV._potential)
+  alpha: 0.7              # Weight of precision in the potential
+  # B2 rebalance: 0.6 -> 5.0. Measured precision was exactly 1.000 in all 10
+  # dataset x class probes, so alpha*P is a constant that cancels in the
+  # potential difference and beta*sqrt(C) is the ENTIRE smooth signal. At 0.6,
+  # driving coverage from 0.014 to the 0.10 target was worth 0.119 against
+  # per-episode penalties of 0.3-1.6, so shrinking dominated. At 5.0 the same
+  # improvement is worth 0.99, comparable to the penalties it costs.
+  beta: 0.6
+  gamma: 0.1              # Weight for narrow-width penalty (prevents box collapse)
+  precision_blend_lambda: 1.0
+  drift_penalty_weight: 0.05  # Single movement penalty (JS proxy retired)
+  js_penalty_weight: 0.05  # DEPRECATED: JS proxy retired with potential-based reward
+  # B2: precision ramp width for the coverage gate; credit is 0 below
+  # (target - gate_margin) and 1 at the target.
+  gate_margin: 0.10
+  # B2 fix 1: penalty when an action is reverted at the coverage floor.
+  # 0.0 = no double jeopardy; -0.05 restores the old behaviour.
+  coverage_floor_penalty: 0.0
+  coverage_floor_projection_steps: 6
   min_coverage_floor: 0.005  # Lower default (will be set dynamically in inference to 1/n_samples)
-  
-  # Coverage bonus weights (reduced from original values to prevent high cumulative rewards)
-  # These bonuses reward good coverage behavior
-  coverage_bonus_weight_met: 0.01          # When targets are met: weight * (coverage / target) (reduced from 0.05)
-  coverage_bonus_weight_high_prec: 0.03    # When precision >= threshold and making progress: base weight (reduced from 0.10)
-  coverage_bonus_weight_high_prec_progress: 0.07  # Progress multiplier when precision >= threshold (reduced from 0.20)
-  coverage_bonus_weight_high_prec_distance: 0.02  # Distance to target multiplier when precision >= threshold
-  coverage_bonus_weight_reasonable_prec: 0.01     # When precision >= 0.8 * threshold and making progress: base weight
-  coverage_bonus_weight_reasonable_prec_progress: 0.02  # Progress multiplier when precision >= 0.8 * threshold (reduced from 0.30)
-  
-  # Target class bonus weight (reduced from 0.2 to prevent high cumulative rewards)
-  target_class_bonus_weight: 0.02  # Weight for target class fraction bonus
+  # Floor enforcement: "terminal" lets the box move freely during the episode
+  # and enforces the floor only at the end; "step" is the original per-step
+  # enforcement, which bound on 197/200 steps and discarded 82% of all
+  # requested movement (measured, breast_cancer d=30).
+  coverage_floor_mode: terminal
+  # Floor of min_support samples rather than 1 -- a one-sample box is not a
+  # measurement. Set false to use min_coverage_floor verbatim.
+  coverage_floor_relative: true
+  terminal_bonus: 5.0           # One-time bonus when an episode terminates with targets met
+  # B1: partial terminal credit, terminal_bonus * (C / tau_C) at episode end
+  # when precision holds. The all-or-nothing bonus was unreachable above ~13
+  # dims (0% termination on 6 of 10 dataset x class combos), leaving movement
+  # penalties as the only non-potential signal. 0.0 = old behaviour.
+  partial_terminal_credit: 1.0
+  use_class_aware_targets: true # Cap per-class precision target by classifier's own per-class precision
+
+  # DEPRECATED: coverage/target-class bonuses retired with potential-based reward
+  coverage_bonus_weight_met: 0.01
+  coverage_bonus_weight_high_prec: 0.03
+  coverage_bonus_weight_high_prec_progress: 0.07
+  coverage_bonus_weight_high_prec_distance: 0.02
+  coverage_bonus_weight_reasonable_prec: 0.01
+  coverage_bonus_weight_reasonable_prec_progress: 0.02
+  target_class_bonus_weight: 0.02
   
   # Multi-agent compatibility fields (not used in single-agent, but kept for API consistency)
   inter_class_overlap_weight: 0.0   # Not applicable: single agent per environment
@@ -53,26 +110,46 @@ env_config:
   fixed_instances_per_class: null
   use_random_sampling: false
   # Training initialization: ratio of instance-based vs centroid-based episodes
-  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% centroid-based
-  training_instance_ratio: 1.0  # 10% instance-based (prediction matching), 90% class-based (class correctness)
+  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% class-based
+  # A5: was 1.0 (instance-only). Inference still generates class-level rules from
+  # centroid/k-means starts, so an instance-only policy was deployed on an initial
+  # state distribution it never trained on — the class rules that carry MADA's
+  # headline claims came from an off-distribution mode. The original reason to
+  # avoid class-based episodes (they optimised ground-truth label purity) was
+  # removed by C-09: that path now optimises model fidelity, the same objective as
+  # the instance path. Mixing the two therefore no longer mixes objectives, it just
+  # covers both initial-state distributions.
+  training_instance_ratio: 0.5
   # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
   use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
   
   # Evaluation settings
-  # RECOMMENDED: Set to true to evaluate on test data during training for better model selection
-  # This helps catch models that generalize well and avoids overfitting to training data
-  # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
-  eval_on_test_data: false  # Changed to true for better model selection based on generalization
-  
+  # Training envs always use D_train. EvalCallback / inference use eval_split
+  # (D_val). Reported paper metrics are computed by revision.evaluate on D_test.
+  eval_on_test_data: false
+  # C-10: checkpoint selection / rule generation on D_val. Reported metrics
+  # come from revision.evaluate on D_test.
+  eval_split: val
+
+  # C-08 / C-52
+  sparsity_width_ratio: 0.95
+  # A1: wilson_low(fid) * (1 + cov) — see BenchMARL/conf/anchor.yaml for rationale.
+  ranking_score_formula: lcb_coverage
+  top_k_rules_by_score: 5
+  min_support: 10
+  categorical_freeze: instance
+
   # Episode length (kept here so it is passed directly into SingleAgentAnchorEnv.__init__)
-  max_cycles: 500  # Increased from 100 to allow boxes more time to expand for better coverage
+  # Reduced from 500: with the noise-free potential-based reward, box shaping
+  # converges in tens of steps; long episodes only added noise-farming room.
+  max_cycles: 200
   
   # Termination reason counters: disable overused reasons
   # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes
   max_termination_count_both_targets: -1
-  max_termination_count_high_precision: 200
-  max_termination_count_both_close: 100
-  max_termination_count_excellent_precision: 100
+  max_termination_count_high_precision: -1
+  max_termination_count_both_close: -1
+  max_termination_count_excellent_precision: -1
 
 # Logging verbosity control
 # Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs

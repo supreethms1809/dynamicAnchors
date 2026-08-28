@@ -1,0 +1,7 @@
+% Reporting notes (C-02, C-10, C-51, C-52).
+% ranking_formula: ['precision_coverage']
+% min_support: [10]
+% seeds: [42, 43, 44]
+% methods: ['cart', 'greedy_anchors', 'mada', 'random_search', 'rlda', 'sp_anchors']
+% splits: ['breast_cancer: train=341 val=114 test=114', 'iris: train=90 val=30 test=30', 'uci_credit: train=414 val=138 test=138', 'wine: train=106 val=36 test=36']
+Ranking score: $\mathrm{fid}\times(1+\mathrm{cov})$ (C-52). $k$ is the top-$k$ pool shared by best and union (C-01). All metrics on $D_{\mathrm{test}}$; selection on $D_{\mathrm{val}}$ (C-10). $\dagger$: $n < $ min\_support$=10$ (C-02). Single-seed cells show a Wilson 95\% CI on Fid; multi-seed cells show bootstrap mean $\pm$ 95\% CI (C-11).

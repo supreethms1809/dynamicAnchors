@@ -50,7 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description="Single-Agent Anchor Training Pipeline (SB3)")
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "bank_marketing"]
     
     # Add UCIML datasets if available
     try:
@@ -143,8 +143,11 @@ def main():
     
     parser.add_argument(
         "--eval_on_test_data",
-        action="store_true",
-        help="Evaluate on test data instead of training data (for final evaluation)"
+        nargs="?",
+        const=True,
+        default=None,
+        help="Evaluate on test data instead of training data (for final evaluation). "
+             "If omitted, uses eval_on_test_data / eval_split from conf/anchor_single.yaml."
     )
     
     parser.add_argument(
@@ -250,7 +253,9 @@ def main():
     elif not args.skip_classifier:
         classifier = dataset_loader.create_classifier(
             classifier_type=args.classifier_type,
-            dropout_rate=0.3,
+            # dropout_rate omitted on purpose: create_classifier picks it by dataset
+            # size (0.1 for >10k train rows, 0.3 otherwise). Kept identical to the
+            # multi-agent driver so both pipelines explain the same classifier.
             use_batch_norm=True,
             device=args.device
         )
@@ -428,6 +433,48 @@ def main():
             device=args.device,
             eval_on_test_data=args.eval_on_test_data
         )
+
+        try:
+            from utils.eval_harness import config_snapshot, dump_reproducibility_artifact
+            env_cfg = trainer._get_default_env_config()
+            reward_keys = (
+                "alpha", "beta", "gamma", "precision_blend_lambda",
+                "drift_penalty_weight", "terminal_bonus",
+                "coverage_target", "precision_target",
+            )
+            dump_reproducibility_artifact(
+                os.path.join(trainer.experiment_folder, "reproducibility.json"),
+                dataset=args.dataset,
+                method=f"rlda_{args.algorithm}",
+                seed=args.seed,
+                tau_p=float(env_cfg["precision_target"]),
+                tau_c=float(env_cfg["coverage_target"]),
+                split_sizes=dataset_loader.get_anchor_env_data().get("split_sizes", {}),
+                classifier_info={
+                    "type": args.classifier_type,
+                    "accuracy": getattr(dataset_loader, "classifier_accuracy", {}),
+                    "epochs": args.classifier_epochs,
+                },
+                rl_info={
+                    "algorithm": args.algorithm,
+                    "experiment_config": config_snapshot(experiment_config),
+                    "algorithm_config": config_snapshot(algorithm_config),
+                    "n_envs": args.n_envs,
+                },
+                reward_info={k: env_cfg.get(k) for k in reward_keys},
+                env_info=config_snapshot(env_cfg),
+                rule_reporting={
+                    "ranking_score_formula": env_cfg["ranking_score_formula"],
+                    "sparsity_width_ratio": env_cfg["sparsity_width_ratio"],
+                    "top_k": env_cfg["top_k_rules_by_score"],
+                    "min_support": env_cfg["min_support"],
+                    "selection_split": "val",
+                    "report_split": "test",
+                    "bounds_space": "unit",
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Could not dump reproducibility artifact: {e}")
         
         trainer.train()
         

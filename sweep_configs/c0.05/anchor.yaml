@@ -1,0 +1,166 @@
+defaults:
+  - _self_
+
+# Task name for Anchor environment
+task: "anchor"
+
+# AnchorEnv parameters
+# These will be passed directly to AnchorEnv.__init__()
+X_unit: null  # Must be provided - normalized feature data [0, 1]
+X_std: null   # Must be provided - standardized feature data
+y: null       # Must be provided - class labels
+feature_names: null  # Must be provided - list of feature names
+classifier: null     # Must be provided - trained PyTorch classifier
+device: "cpu"
+target_class: null   # Optional: single target class
+target_classes: null # Optional: list of target classes (defaults to all unique classes in y)
+
+# Environment configuration dictionary
+env_config:
+  # Paper rerun (Table 1 setting): Pthr = 0.95, Cthr = 0.2.
+  # Cthr is the sweep knob for the paper's Tables 2/1/3 (0.1 / 0.2 / 0.3).
+  # NOTE: shared with the WyoDOT/CDEA pipeline — restore to 0.90 / 0.1 before
+  # running CDEA experiments.
+  precision_target: 0.9
+  coverage_target: 0.05
+  # Class-level rule selection (inference)
+  # Precision floor for class-level filtering/union is lift-aware:
+  #   floor = min(precision_target * 0.8, union_lift_k * class_prior)
+  # so minority-class rules are judged by lift over base rate, not an
+  # absolute threshold a 2%-prior class can never meet.
+  union_lift_k: 3.0
+  # Metric estimation: exact empirical evaluation over all real data rows in the
+  # box, using cached classifier predictions (computed once per env). Deterministic
+  # and matches the definitions used at inference/evaluation.
+  # - "uniform" measured model predictions on synthetic points the data never
+  #   visits (boxes scored well in empty space).
+  # - "adaptive" switched estimators mid-episode (bootstrap <-> uniform), which made
+  #   precision jump without the box changing and produced wrong results.
+  use_perturbation: False
+  perturbation_mode: "bootstrap"  # Only used if use_perturbation is re-enabled. Avoid "adaptive"/"uniform" (see above).
+  n_perturb: 2048
+  step_fracs: [0.005, 0.01, 0.02]
+  min_width: 0.05
+  alpha: 0.7
+  beta: 0.6  # Reduced from 1.0 to prevent over-expansion and reward explosion
+  gamma: 0.1  # Increased from 0.02 to prevent box collapse
+  precision_blend_lambda: 0.5
+  drift_penalty_weight: 0.05  # Increased from 0.01 for more stable boxes
+  min_coverage_floor: 0.005
+  js_penalty_weight: 0.05  # DEPRECATED: JS proxy retired with potential-based reward (was a third movement penalty)
+  # Potential-based reward shaping (reward = Phi(s') - Phi(s), see environment._potential)
+  terminal_bonus: 5.0           # One-time bonus when an episode terminates with targets met
+  # Cooperative analogue of terminal_bonus, paid ONCE per episode per class the
+  # first step that class's UNION of boxes clears both targets (union_precision >=
+  # effective target AND union_coverage >= coverage_target), to every agent of the
+  # class, then latched. Motivation: the local terminal_bonus is unreachable for
+  # minority classes (a high-precision box on a 2%-prior class can't also cover
+  # coverage_target samples), so in c0d31663 agents for classes 0/1/2 never earned
+  # it and had near-zero reward. The class UNION is reachable (multiple boxes cover
+  # more than one) and is exactly what inference extracts. 0.0 = disabled (opt-in).
+  shared_terminal_bonus: 5.0
+  use_class_aware_targets: true # Cap per-class precision target by classifier's own per-class precision
+  # Episode length (kept here so it is passed directly into AnchorEnv.__init__)
+  # Reduced from 500: with the noise-free potential-based reward, box shaping
+  # converges in tens of steps; long episodes only added noise-farming room.
+  max_cycles: 200
+
+  # Minimum steps before target-based termination is allowed (prevents an agent
+  # from terminating straight from the initial box on step 1 and claiming the
+  # terminal bonus without shaping the anchor). Matches single-agent's value of 2.
+  min_steps_before_termination: 2
+
+  # Stabilization-based early termination (per-agent)
+  enable_stability_termination: true
+  stability_window: 20  # Increased from 10 to require more stable steps before early termination
+  stability_min_steps: 50  # Increased from 20 to prevent premature termination during expansion phase
+  stability_precision_tol: 1e-3
+  stability_coverage_tol: 1e-3
+  stability_drift_tol: 1e-3
+
+  initial_window: 0.1
+  max_action_scale: 0.1  # Reduced from 0.15 for more stable, gradual expansion
+  min_absolute_step: 0.001  # Reduced from 0.01 for finer control
+  # Inter-class overlap penalty: potential-style. Each step charges the CHANGE in
+  # the agent's Jaccard-normalized overlap level (weight * sum of inter/union vs
+  # other-class boxes, clipped to [0,1]), so the episode total telescopes to
+  # level_final - level_init instead of accumulating per step (the per-step level
+  # form added up to ~30-60/episode against a positive signal bounded by ~7, and
+  # its inter/own-volume normalization made full-space boxes penalty-free).
+  inter_class_overlap_weight: 0.1
+  # Same-class cooperative reward: agents of class c share
+  #   shared_reward_weight * (Phi_union_c(s') - Phi_union_c(s))
+  # where Phi_union_c = alpha * union_precision(c)
+  #                   + beta * sqrt(union_coverage(c)) * gate(union_precision(c)),
+  # with the same precision gate as the local potential, so the shared term
+  # cannot pay for raw union-coverage expansion at junk precision.
+  # Replaces the old global shared reward, which was identical for ALL agents
+  # (no credit assignment, rewarded other classes' progress) and positive-only
+  # (a farmable income stream that dwarfed the local signal).
+  # Restored to 0.5 (the c13ca693 value). The shared_reward_weight sweep
+  # (0.50 -> 0.25 -> 0.35) was abandoned: it only tunes the smooth shared term,
+  # which the minority classes barely benefit from — agents 0/1/2 NEVER reached
+  # target-based termination in c0d31663 (per-agent episode_reward_max <= 0.5,
+  # never the +5 terminal bonus), so they got essentially no learning signal.
+  # The new lever is shared_terminal_bonus below, which targets exactly that gap.
+  shared_reward_weight: 0.5
+  # DEPRECATED: level-based class-union bonus retired (the same-class shared reward
+  # above now carries the class-union signal as an oscillation-proof potential gain)
+  class_union_cov_weight: 0.0
+  class_union_prec_weight: 0.0
+  # Global coverage: logging only (no longer a reward stream)
+  global_coverage_weight: 0.01
+  global_coverage_threshold: 0.1
+  # DEPRECATED: coverage/target-class bonuses retired with potential-based reward
+  coverage_bonus_weight_met: 0.1
+  coverage_bonus_weight_high_prec: 0.1
+  coverage_bonus_weight_high_prec_progress: 0.07
+  coverage_bonus_weight_high_prec_distance: 0.02
+  coverage_bonus_weight_reasonable_prec: 0.01
+  coverage_bonus_weight_reasonable_prec_progress: 0.02
+  target_class_bonus_weight: 0.02
+  # NashConv threshold for model selection (ε-Nash equilibrium)
+  # Models with NashConv <= this threshold are considered close to Nash equilibrium
+  # Lower values = stricter equilibrium requirement (default: 0.01 = 1% exploitability)
+  nashconv_threshold: 0.01  # ε-Nash threshold for best model selection
+  agents_per_class: 3        # Paper rerun: 3 agents per class (paper Sec. 7.1)
+  # IMPORTANT: This should match the training configuration. If you trained with agents_per_class: 3,
+  # use 3 here to use all individual policies. If you trained with agents_per_class: 1, use 1 here.
+  # The inference code now properly uses individual policies for each agent when agents_per_class > 1.
+  # Use class centroids to initialize the initial window (default: true)
+  # If true: initial window is set around class centroid (mean of class instances)
+  # If false: initial window is full space (0 to 1 for all features)
+  # For instance-based: x_star_unit overrides this (instance centroid is used)
+  use_class_centroids: true
+  # Optional: Precomputed cluster centroids per class (dict of {class: [centroid1, centroid2, ...]})
+  # If provided, a random centroid is sampled for each episode reset
+  # If None, mean centroid is computed from class data
+  cluster_centroids_per_class: null
+  # Optional: Fixed instances per class to use as centroids (dict of {class: [instance1, instance2, ...]})
+  # If provided, a random instance is sampled as centroid for each episode reset
+  # If None, mean centroid is computed from class data
+  fixed_instances_per_class: null
+  # Training initialization: ratio of instance-based vs centroid-based episodes
+  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% centroid-based
+  training_instance_ratio: 0.5  # 10% instance-based (prediction matching), 90% class-based (class correctness)
+  # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
+  use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
+  
+  # Evaluation settings
+  # Set to false to use training data for evaluation (matches baseline behavior)
+  # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
+  eval_on_test_data: false
+
+  # DEPRECATED: termination-reason max counts removed (the disable mechanism made
+  # the MDP non-stationary mid-training; the terminal bonus replaces it)
+
+# Logging verbosity control
+# Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs
+# Controls logging in training, inference, and environment during rollouts
+logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
+
+# Maximum number of steps per episode (source of truth is env_config.max_cycles; kept here for backward compatibility)
+# If your task wrapper reads only the top-level max_cycles, keep both in sync.
+max_cycles: 200
+
+

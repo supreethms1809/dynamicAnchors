@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 benchmarl_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, benchmarl_dir)
 from environment import AnchorEnv
+from utils.metrics import ranking_score
 
 class AnchorTaskClass(TaskClass):
     
@@ -84,7 +85,12 @@ class AnchorTaskClass(TaskClass):
         return False
     
     def max_steps(self, env: EnvBase) -> int:
-        return self.config.get("max_cycles", 100)
+        if self.config.get("max_cycles") is not None:
+            return int(self.config["max_cycles"])
+        nested = self.config.get("env_config") or {}
+        if nested.get("max_cycles") is not None:
+            return int(nested["max_cycles"])
+        raise ValueError("max_cycles must be set in YAML/CLI; refusing the silent 100-step default.")
     
     def group_map(self, env: EnvBase) -> Dict[str, List[str]]:
         return env.group_map
@@ -135,7 +141,7 @@ class AnchorTask(Task):
 # Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01, ranking_score_formula: str = "precision_coverage"):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -164,6 +170,10 @@ class AnchorMetricsCallback(Callback):
         # Track best model
         self.best_eval_score = -float('inf')  # Track best evaluation score (precision + coverage)
         self.best_model_path = None  # Path to best model checkpoint
+        self.ranking_score_formula = ranking_score_formula
+        # One authoritative checkpoint path is used below. The older
+        # equilibrium/per-class saver is retained only for diagnostics.
+        self.enable_legacy_best_model_selection = False
         
         # Track best models per class (for multi-agent equilibrium evaluation)
         self.best_eval_score_per_class = {}  # class -> best score
@@ -184,6 +194,8 @@ class AnchorMetricsCallback(Callback):
         
         # Experiment reference (will be set by BenchMARL)
         self.experiment = None
+        # Optional: extract individual_models_best from in-memory actors on improve.
+        self.extract_best_fn = None
     
     def on_experiment_start(self, experiment):
         """Called when experiment starts. Sets the experiment reference."""
@@ -680,16 +692,22 @@ class AnchorMetricsCallback(Callback):
             q_stack = torch.stack(q_values, dim=0)  # [n_groups, B]
             return q_stack.mean(dim=0)
 
-        def _approx_class_br_random_search(class_id: int, act_by_group: Dict[str, torch.Tensor]) -> float:
+        def _approx_class_br_random_search(class_id: int, act_by_group: Dict[str, torch.Tensor]) -> Optional[float]:
             """Approximate class-level best-response via black-box random search over *joint actions* of the class.
 
             Here a "class" corresponds to the group(s) in `class_to_groups[class_id]`. In the recommended setup,
             there is exactly one group per class (e.g., 'class_0' or 'agent_0'), and its action tensor can still
             contain an internal agent dimension: [B, agents_per_class, act_dim].
+
+            Returns None when no candidate could be evaluated. It must not return 0.0
+            in that case: 0.0 is a valid Q value, so on a class whose current Q is
+            negative it would read as a large *positive* exploitability, and on a
+            class whose Q is positive it would read as a failure — either way an
+            unevaluated search would be reported as a measurement.
             """
             groups_in_class = class_to_groups.get(class_id, [])
             if not groups_in_class:
-                return 0.0
+                return None
 
             # Hyperparams
             num_samples = int(getattr(self, "nashconv_num_samples", 256))
@@ -699,7 +717,7 @@ class AnchorMetricsCallback(Callback):
             # Base actions for this class (by group)
             base_acts = {g: act_by_group[g] for g in groups_in_class if g in act_by_group}
             if not base_acts:
-                return 0.0
+                return None
 
             B = next(iter(base_acts.values())).shape[0]
             best_q = None
@@ -752,12 +770,17 @@ class AnchorMetricsCallback(Callback):
                     q_chunk_best = q_stack.max(dim=0).values  # [B]
                     best_q = q_chunk_best if best_q is None else torch.maximum(best_q, q_chunk_best)
 
-            return best_q.mean().item() if best_q is not None else 0.0
+            return best_q.mean().item() if best_q is not None else None
 
         # -----------------------------
         # Compute class-level exploitabilities
         # -----------------------------
         class_exploitabilities: Dict[int, float] = {}
+        # Diagnostics: how often the gradient best-response had to fall back to
+        # random search, and how often both searches failed outright. A NashConv of
+        # 0 is only meaningful when these are 0.
+        br_fallbacks = 0
+        br_failures = 0
         available_value_keys = _list_value_module_keys()
         
         # Get critic modules for all groups (need at least one per class)
@@ -889,10 +912,57 @@ class AnchorMetricsCallback(Callback):
                             f"NashConv: Class {class_id} Q not differentiable w.r.t. actions. "
                             f"Using random-search BR (num_samples={int(getattr(self, 'nashconv_num_samples', 256))})."
                         )
-                        q_br_mean = _approx_class_br_random_search(class_id, act_batch)
+                        q_br_rs = _approx_class_br_random_search(class_id, act_batch)
+                        if q_br_rs is None:
+                            logger.warning(
+                                f"NashConv: Class {class_id} random-search BR could not evaluate "
+                                f"any candidate; exploitability not measurable this evaluation."
+                            )
+                            br_failures += 1
+                            continue
+                        q_br_mean = q_br_rs
 
-                    delta = max(0.0, q_br_mean - q_cur_mean)
-                    class_exploitabilities[class_id] = float(delta)
+                    # A best response can never be worse than the action it improves
+                    # on, so q_br_mean < q_cur_mean means the *search* failed, not
+                    # that the class is unexploitable. The old code clamped that to
+                    # 0.0, which is indistinguishable in the logs from a perfect
+                    # equilibrium — and since 0.0 <= nashconv_threshold, a failed
+                    # measurement could be read as an eps-Nash hit.
+                    #
+                    # The gradient path (a few Adam steps, clipped and clamped) fails
+                    # this way routinely. The random-search path cannot: it evaluates
+                    # the current action as candidate 0 and takes the max, so it is
+                    # monotone by construction. Use it as the fallback.
+                    if q_br_mean < q_cur_mean:
+                        logger.debug(
+                            f"NashConv: Class {class_id} gradient BR ended below current "
+                            f"({q_br_mean:.6f} < {q_cur_mean:.6f}); retrying with random-search BR."
+                        )
+                        q_br_rs = _approx_class_br_random_search(class_id, act_batch)
+                        if q_br_rs is None:
+                            logger.warning(
+                                f"NashConv: Class {class_id} gradient BR failed and random-search BR "
+                                f"could not evaluate any candidate; exploitability not measurable."
+                            )
+                            br_failures += 1
+                            continue
+                        q_br_mean = q_br_rs
+                        br_fallbacks += 1
+
+                    raw_delta = q_br_mean - q_cur_mean
+                    if raw_delta < -1e-9:
+                        # Both searches failed: record no value rather than a spurious
+                        # zero, so this class is excluded from the sum and the failure
+                        # is visible in the diagnostics below.
+                        logger.warning(
+                            f"NashConv: Class {class_id} best-response search failed "
+                            f"(BR {q_br_mean:.6f} < current {q_cur_mean:.6f}); "
+                            f"exploitability not measurable this evaluation."
+                        )
+                        br_failures += 1
+                        continue
+
+                    class_exploitabilities[class_id] = float(max(0.0, raw_delta))
 
                 except Exception as e:
                     logger.warning(
@@ -914,19 +984,43 @@ class AnchorMetricsCallback(Callback):
         
         if not class_exploitabilities:
             logger.warning(
-                f"NashConv: No class exploitabilities computed. Classes tried: {classes}"
+                f"NashConv: No class exploitabilities computed. Classes tried: {classes}, "
+                f"best-response failures: {br_failures}"
             )
             return {}
-        
+
+        # Only classes with a valid measurement are summed. If some classes were
+        # dropped, the sum understates true exploitability, so it must not be read
+        # as an equilibrium — hence the explicit incomplete flag below.
+        measured = len(class_exploitabilities)
+        incomplete = measured < len(classes)
+
         # Compute metrics
         nashconv_sum = float(sum(class_exploitabilities.values()))
         exploitability_max = float(max(class_exploitabilities.values()))
-        
+
+        if incomplete:
+            logger.warning(
+                f"NashConv: only {measured}/{len(classes)} classes measurable "
+                f"(sum={nashconv_sum:.6f} is a LOWER BOUND, not an equilibrium claim)."
+            )
+        elif nashconv_sum == 0.0:
+            logger.info(
+                f"NashConv: exactly 0 across all {measured} classes "
+                f"(br_fallbacks={br_fallbacks}) — no profitable deviation found by the search."
+            )
+
         metrics: Dict[str, float] = {
             "evaluation/nashconv_sum": nashconv_sum,
             "evaluation/exploitability_max": exploitability_max,
             "evaluation/class_nashconv_sum": nashconv_sum,  # Alias for clarity
             "evaluation/class_exploitability_max": exploitability_max,  # Alias for clarity
+            # Diagnostics: a nashconv_sum of 0 is trustworthy only when both of
+            # these are 0 and nashconv_classes_measured == number of classes.
+            "evaluation/nashconv_br_fallbacks": float(br_fallbacks),
+            "evaluation/nashconv_br_failures": float(br_failures),
+            "evaluation/nashconv_classes_measured": float(measured),
+            "evaluation/nashconv_incomplete": 1.0 if incomplete else 0.0,
         }
         
         # Per-class exploitability
@@ -1182,16 +1276,37 @@ class AnchorMetricsCallback(Callback):
         metrics, robustly across algorithms.
 
         Priority:
-          1. anchor_precision_mean + anchor_coverage_mean  (preferred; the
-             legacy MADDPG path uses these)
-          2. any '*reward*mean*' eval key  (always logged by BenchMARL)
-          3. any '*return*mean*' eval key
+          1. evaluation/box_precision_mean + evaluation/box_coverage_mean
+             (cross-group quality score; the MASAC path injects these so
+             best_model tracks anchor quality, not raw return)
+          2. anchor_precision_mean + anchor_coverage_mean  (legacy MADDPG path)
+          3. any '*reward*mean*' eval key  (always logged by BenchMARL)
+          4. any '*return*mean*' eval key
         Returns None if nothing usable is found.
+
+        Why not raw reward: with the bounded potential-based reward, the highest
+        return belongs to the do-nothing init box (high precision, ~0 coverage,
+        terminates in 1 step for the terminal bonus). Selecting on reward pinned
+        best_model to the untrained init policy. precision+coverage rewards the
+        coverage growth trained policies actually produce.
+
+        The same configured fidelity/coverage ranking formula is used for
+        checkpointing, rule top-k selection, and revision reporting.
         """
+        if "evaluation/box_precision_mean" in aggregated and "evaluation/box_coverage_mean" in aggregated:
+            return ranking_score(
+                float(aggregated["evaluation/box_precision_mean"]),
+                float(aggregated["evaluation/box_coverage_mean"]),
+                self.ranking_score_formula,
+            )
         prec_keys = [k for k in aggregated if "anchor_precision" in k and "mean" in k and "evaluation" in k]
         cov_keys = [k for k in aggregated if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
         if prec_keys and cov_keys:
-            return float(aggregated[prec_keys[0]]) + float(aggregated[cov_keys[0]])
+            return ranking_score(
+                float(aggregated[prec_keys[0]]),
+                float(aggregated[cov_keys[0]]),
+                self.ranking_score_formula,
+            )
         for needle in ("reward", "return", "episode_reward"):
             cands = [k for k in aggregated if needle in k.lower() and "mean" in k.lower()]
             if cands:
@@ -1220,7 +1335,14 @@ class AnchorMetricsCallback(Callback):
             # BenchMARL Experiment has no public .save() — persist the state_dict
             # directly (same format experiment._save_experiment writes, so it can
             # be reloaded later via torch.load + experiment.load_state_dict).
-            torch.save(self.experiment.state_dict(), best_model_path)
+            try:
+                torch.save(self.experiment.state_dict(), best_model_path)
+            except Exception as e:
+                logger.warning(
+                    "Could not serialize full experiment state_dict (%s); "
+                    "actor extract still runs",
+                    e,
+                )
             prev = self._robust_best_score
             self._robust_best_score = score
             self.best_model_path = best_model_path
@@ -1228,6 +1350,15 @@ class AnchorMetricsCallback(Callback):
                 f"  ✓ best_model saved (robust path): eval score {score:.4f} "
                 f"(prev best {prev if prev != -float('inf') else 'none'}) -> {best_model_path}"
             )
+            if self.extract_best_fn is not None:
+                try:
+                    self.extract_best_fn()
+                    logger.info("  ✓ individual_models_best extracted from in-memory actors")
+                except Exception as e:
+                    logger.warning(
+                        "Could not extract individual_models_best at save-best time: %s",
+                        e,
+                    )
 
     # SS: This function is way too messy. We need to fix this. Its not working right now.
     def on_evaluation_end(self, rollouts: List[TensorDictBase]):
@@ -1449,7 +1580,7 @@ class AnchorMetricsCallback(Callback):
                                         episode_data[group]["final_observation"] = final_obs.cpu().numpy().tolist()
                                     else:
                                         episode_data[group]["final_observation"] = np.array(final_obs).tolist()
-            
+
             if self.collect_anchor_data and episode_data:
                 self.evaluation_anchor_data.append(episode_data)
                 logger.info(f"  Collected anchor data for episode {n_episodes}: {list(episode_data.keys())}")
@@ -1463,46 +1594,76 @@ class AnchorMetricsCallback(Callback):
                     aggregated[f"{key}_std"] = np.std(values) if len(values) > 1 else 0.0
                     aggregated[f"{key}_min"] = min(values)
                     aggregated[f"{key}_max"] = max(values)
-        
+
         aggregated["evaluation/n_episodes"] = n_episodes
 
-        # Mean episode reward across the eval rollouts. Unlike the info-derived
-        # anchor_precision/anchor_coverage keys, reward is ALWAYS present in the
-        # rollout tensors — MASAC eval rollouts don't carry anchor metrics in
-        # `info`, so all_metrics comes back empty and aggregated would otherwise
-        # have no scorable key. Injecting this gives _extract_eval_score a
-        # usable fallback so best_model/best_checkpoint.pt is saved for MASAC.
-        # Harmless for MADDPG: _extract_eval_score still prefers precision+coverage.
+        # Per-eval reward AND box precision/coverage, extracted in the SAME proven
+        # loop. MASAC eval rollouts carry no `info`, so the info-gated block above
+        # produces nothing for MASAC; this loop instead reads the group tensors
+        # directly via experiment.group_map (every group, reliably) — the only
+        # extraction path confirmed to work for MASAC.
+        #   - episode_reward_mean: fallback score, but it is maximized by the
+        #     do-nothing 1-step init box, so it pinned best_model to init.
+        #   - box_precision_mean / box_coverage_mean: the QUALITY score
+        #     _extract_eval_score prefers. Precision and coverage are the last two
+        #     entries of each agent's observation. box_* names avoid the
+        #     "anchor_precision" substring so the dormant legacy per-class save
+        #     block stays off.
         try:
             groups_for_reward = (
                 list(self.experiment.group_map.keys())
                 if hasattr(self.experiment, "group_map") and self.experiment.group_map
                 else ["agent"]
             )
-            ep_returns = []
+
+            def _final_obs_vec(obs):
+                # Last timestep of the episode -> 1-D numpy vector
+                t = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs)
+                t = t.detach().cpu()
+                while t.dim() > 1:
+                    t = t[-1]
+                return t.numpy()
+
+            ep_returns, ep_precisions, ep_coverages = [], [], []
             for rollout in rollouts:
                 nxt = rollout.get("next", None) if hasattr(rollout, "get") else None
-                group_returns = []
+                group_returns, group_prec, group_cov = [], [], []
                 for group in groups_for_reward:
-                    rew = None
                     for src in (nxt, rollout):
                         if src is None or not hasattr(src, "keys"):
                             continue
                         try:
-                            if group in src.keys() and "reward" in src[group].keys():
-                                rew = src[group]["reward"]
-                                break
+                            if group not in src.keys():
+                                continue
+                            gd = src[group]
+                            gkeys = gd.keys()
+                            if "reward" in gkeys:
+                                rew = gd["reward"]
+                                rew_t = rew if isinstance(rew, torch.Tensor) else torch.as_tensor(rew)
+                                group_returns.append(float(rew_t.sum()))
+                            if "observation" in gkeys:
+                                fo = _final_obs_vec(gd["observation"])
+                                if fo.shape[0] >= 4:
+                                    nf = (fo.shape[0] - 2) // 2
+                                    if nf > 0:
+                                        group_prec.append(float(fo[2 * nf]))
+                                        group_cov.append(float(fo[2 * nf + 1]))
+                            break  # found this group in src; don't double-read from rollout
                         except Exception:
                             continue
-                    if rew is not None:
-                        rew_t = rew if isinstance(rew, torch.Tensor) else torch.as_tensor(rew)
-                        group_returns.append(float(rew_t.sum()))
                 if group_returns:
                     ep_returns.append(sum(group_returns) / len(group_returns))
+                if group_prec:
+                    ep_precisions.append(sum(group_prec) / len(group_prec))
+                if group_cov:
+                    ep_coverages.append(sum(group_cov) / len(group_cov))
             if ep_returns:
                 aggregated["evaluation/episode_reward_mean"] = sum(ep_returns) / len(ep_returns)
+            if ep_precisions and ep_coverages:
+                aggregated["evaluation/box_precision_mean"] = sum(ep_precisions) / len(ep_precisions)
+                aggregated["evaluation/box_coverage_mean"] = sum(ep_coverages) / len(ep_coverages)
         except Exception as e:
-            logger.debug(f"Could not compute eval episode reward for best-model scoring: {e}")
+            logger.debug(f"Could not compute eval reward/precision/coverage for best-model scoring: {e}")
 
         # Algorithm-agnostic best-model save (Part 1 fix).
         # The legacy save block further down is gated on string-matching
@@ -1570,7 +1731,11 @@ class AnchorMetricsCallback(Callback):
                 )
                 
                 # Multi-agent best model selection: track per-class metrics and evaluate equilibrium
-                if self.save_best_model and self.experiment is not None:
+                if (
+                    self.enable_legacy_best_model_selection
+                    and self.save_best_model
+                    and self.experiment is not None
+                ):
                     # Extract per-class metrics for equilibrium evaluation
                     class_metrics = {}  # class -> list of (precision, coverage, score) from agents
                     class_union_metrics = {}  # class -> (union_precision, union_coverage, score)
@@ -1747,7 +1912,18 @@ class AnchorMetricsCallback(Callback):
                     
                     # Get NashConv from aggregated metrics (if available)
                     nashconv_sum = aggregated.get("evaluation/nashconv_sum", float('inf'))
-                    nashconv_available = nashconv_sum != float('inf')
+                    # An incomplete measurement (some class's best-response search
+                    # failed) yields a sum over the remaining classes only, i.e. a
+                    # lower bound. Treating that as an eps-Nash hit would select a
+                    # checkpoint on the strength of a failed measurement, so such
+                    # evaluations are considered to have no NashConv at all.
+                    nashconv_incomplete = aggregated.get("evaluation/nashconv_incomplete", 0.0) > 0.0
+                    nashconv_available = nashconv_sum != float('inf') and not nashconv_incomplete
+                    if nashconv_incomplete:
+                        logger.debug(
+                            "NashConv incomplete this evaluation; ignoring it for model selection "
+                            "(falling back to score-based criteria)."
+                        )
                     
                     # Strategy 1: Equilibrium-based (all classes meet targets) with NashConv check
                     if self.equilibrium_eval_mode and all_classes_meet_targets:
