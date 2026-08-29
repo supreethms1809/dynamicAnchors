@@ -46,7 +46,7 @@ except ImportError:
 def generate_anchor_for_instance(
     dataset_name: str,
     instance_idx: int,
-    anchor_threshold: float = 0.95,
+    anchor_threshold: float = 0.9,
     seed: int = 42,
     sample_size: Optional[int] = None,
     classifier_model_path: Optional[str] = None,
@@ -59,7 +59,7 @@ def generate_anchor_for_instance(
     Args:
         dataset_name: Name of the dataset (e.g., 'iris', 'breast_cancer')
         instance_idx: Instance index in the full dataset (train+test combined)
-        anchor_threshold: Threshold for anchor explanation (default: 0.95)
+        anchor_threshold: Threshold for anchor explanation (default: 0.9)
         seed: Random seed for reproducibility (default: 42)
         sample_size: Optional sample size for large datasets
         classifier_model_path: Optional path to saved classifier model
@@ -88,7 +88,7 @@ def generate_anchor_for_instance(
         print(f"Dataset: {dataset_name.upper().replace('_', ' ')}")
         print("="*80)
     
-    X, y, feature_names, class_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
+    X, y, feature_names, class_names, categorical_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
     
     # Split data (same split as baseline)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -181,12 +181,11 @@ def generate_anchor_for_instance(
     if not output_json:
         print("\nInitializing anchor explainer...")
     
-    categorical_names = {}
     explainer = anchor_tabular.AnchorTabularExplainer(
         class_names,
         feature_names,
         X_train,  # Use unscaled X_train for anchor explainer
-        categorical_names,
+        categorical_names or {},
     )
     
     # Get predictions for full dataset
@@ -356,8 +355,8 @@ Examples:
     parser.add_argument(
         '--anchor_threshold',
         type=float,
-        default=0.95,
-        help='Threshold for anchor explanation (default: 0.95)'
+        default=0.9,
+        help='Threshold for anchor explanation (default: 0.9)'
     )
     
     parser.add_argument(

@@ -99,6 +99,42 @@ except ImportError:
     from utils.device_utils import get_device_pair
 
 
+def _categorical_names_from_data(
+    feature_names: List[str],
+    label_encoders: Optional[Dict[str, Any]] = None,
+    X: Optional[np.ndarray] = None,
+) -> Dict[int, List[str]]:
+    """Build the dict Anchors expects: {feature_index: [value_name, ...]}."""
+    names: Dict[int, List[str]] = {}
+    for col, encoder in (label_encoders or {}).items():
+        if col in feature_names:
+            idx = int(feature_names.index(col))
+        elif isinstance(col, (int, np.integer)):
+            idx = int(col)
+        else:
+            continue
+        classes = getattr(encoder, "classes_", None)
+        if classes is None:
+            continue
+        names[idx] = [str(v) for v in classes]
+    if names:
+        return names
+    if X is None:
+        return {}
+    arr = np.asarray(X)
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        if not np.isfinite(col).all():
+            continue
+        rounded = np.round(col)
+        if float(np.max(np.abs(col - rounded))) > 1e-6:
+            continue
+        uniques = np.unique(rounded)
+        if 2 <= uniques.size <= 20:
+            names[j] = [str(int(v)) for v in uniques]
+    return names
+
+
 def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
     """
     Load a sklearn dataset (same function as in sklearn_datasets_anchors.py).
@@ -111,8 +147,9 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         seed: Random seed for sampling
         
     Returns:
-        Tuple of (X, y, feature_names, class_names)
+        Tuple of (X, y, feature_names, class_names, categorical_names)
     """
+    label_encoders: Dict[str, Any] = {}
     if dataset_name == "breast_cancer":
         data = load_breast_cancer()
         X = data.data.astype(np.float32)
@@ -424,7 +461,9 @@ def load_dataset(dataset_name: str, sample_size: int = None, seed: int = 42):
         y = y[indices]
         print(f"Sampling {sample_size} instances for faster execution")
     
-    return X, y, feature_names, class_names
+    return X, y, feature_names, class_names, _categorical_names_from_data(
+        feature_names, label_encoders, X
+    )
 
 
 def train_classifier(
@@ -1272,10 +1311,11 @@ def run_static_anchors(
     feature_names: List[str],
     class_names: List[str],
     device: torch.device,
-    anchor_threshold: float = 0.95,
+    anchor_threshold: float = 0.9,
     n_instances_per_class: int = 20,
     disc_perc: List[int] = None,
     seed: int = 42,
+    categorical_names: Optional[Dict[int, List[str]]] = None,
 ) -> Dict[str, Any]:
     """
     Run static anchors using anchor-exp library.
@@ -1318,7 +1358,8 @@ def run_static_anchors(
             preds = classifier(t).argmax(dim=1).cpu().numpy()
         return preds
     
-    categorical_names = {}
+    if categorical_names is None:
+        categorical_names = _categorical_names_from_data(feature_names, X=X_train)
     explainer = anchor_tabular.AnchorTabularExplainer(
         class_names,
         feature_names,
@@ -1914,7 +1955,7 @@ def main(
     print("STEP 1: Loading Dataset")
     print("="*80)
     
-    X, y, feature_names, class_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
+    X, y, feature_names, class_names, categorical_names = load_dataset(dataset_name, sample_size=sample_size, seed=seed)
     
     print(f"Dataset: {dataset_name.upper().replace('_', ' ')}")
     print(f"Shape: {X.shape}")
@@ -2026,19 +2067,19 @@ def main(
         try:
             # Dataset-specific presets
             presets = {
-                "breast_cancer": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "covtype": {"anchor_threshold": 0.95, "disc_perc": [10, 25, 50, 75, 90]},
-                "wine": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "iris": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "housing": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "synthetic": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "moons": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
-                "circles": {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]},
+                "breast_cancer": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "covtype": {"anchor_threshold": 0.9, "disc_perc": [10, 25, 50, 75, 90]},
+                "wine": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "iris": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "housing": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "synthetic": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "moons": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
+                "circles": {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]},
             }
             # For UCI and Folktables datasets, use default presets
             # Check if dataset_name starts with uci_ or folktables_
             if dataset_name.startswith("uci_") or dataset_name.startswith("folktables_"):
-                preset = {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]}
+                preset = {"anchor_threshold": 0.9, "disc_perc": [25, 50, 75]}
             else:
                 preset = presets.get(dataset_name, {"anchor_threshold": 0.95, "disc_perc": [25, 50, 75]})
             
