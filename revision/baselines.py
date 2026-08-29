@@ -32,7 +32,7 @@ from utils.eval_harness import (  # noqa: E402
 )
 from utils.metrics import (  # noqa: E402
     MIN_SUPPORT_DEFAULT,
-    RANKING_SCORE_PRECISION_COVERAGE,
+    RANKING_SCORE_LCB_COVERAGE,
     RankedRule,
     box_mask,
     evaluate_mask,
@@ -132,8 +132,9 @@ def _emit(
     class_union_fid = {}
     for cls, ranked in per_class_ranked.items():
         union = select_topk_union(
-            ranked, y_eval, y_hat_eval, cls, k=k,
+            ranked, y_eval, y_hat_eval, cls, k=len(ranked),
             class_conditional=True, min_support=min_support,
+            enforce_min_support=False,
         )
         if union is None:
             continue
@@ -171,11 +172,12 @@ def _emit(
         queries=queries.to_dict(),
         n_covered_note=(
             f"Baseline {method}; selection on D_val and reporting on D_test; "
-            f"union over top-k={k}; min_support={min_support}."
+            f"union over top-k={k} ranked by {RANKING_SCORE_LCB_COVERAGE}; "
+            f"min_support={min_support}."
         ),
         extra=extra,
         compactness=_compactness_summary(per_class_out),
-        ranking_formula=RANKING_SCORE_PRECISION_COVERAGE,
+        ranking_formula=RANKING_SCORE_LCB_COVERAGE,
         min_support=min_support,
     )
 
@@ -188,7 +190,7 @@ def _compactness_summary(per_class_out: Dict[str, Any]) -> Dict[str, Any]:
     acts = [a for a in acts if a is not None and np.isfinite(a)]
     return {
         "mean_rules_per_class": (
-            float(np.mean([b.get("k", 0) for b in per_class_out.values()]))
+            float(np.mean([b.get("n_selected", b.get("k", 0)) for b in per_class_out.values()]))
             if per_class_out else 0.0
         ),
         "mean_active_features": float(np.mean(acts)) if acts else None,
@@ -247,8 +249,11 @@ def run_cart(
             per_class_ranked[pred_cls].append(RankedRule(
                 rule_id=f"cart:{pred_cls}:{node}",
                 lower=lo, upper=up, mask=mask, metrics=metrics,
-                score=ranking_score(metrics.fidelity, metrics.coverage,
-                                    n_covered=metrics.n_covered),
+                score=ranking_score(
+                    metrics.fidelity, metrics.coverage,
+                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    n_covered=metrics.n_covered,
+                ),
                 display_rule=display,
             ))
             return
@@ -439,8 +444,11 @@ def run_anchors_family(
             per_class_boxes[cls].append(RankedRule(
                 rule_id=f"anchor:{cls}:{int(row_i)}",
                 lower=lo, upper=up, mask=mask_val, metrics=metrics,
-                score=ranking_score(metrics.fidelity, metrics.coverage,
-                                    n_covered=metrics.n_covered),
+                score=ranking_score(
+                    metrics.fidelity, metrics.coverage,
+                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    n_covered=metrics.n_covered,
+                ),
                 display_rule=display,
             ))
         if budget_exhausted:
@@ -614,8 +622,11 @@ def run_random_search(
             per_class_ranked[cls].append(RankedRule(
                 rule_id=f"rs:{cls}:{i}",
                 lower=lo, upper=up, mask=mask_val, metrics=m_val,
-                score=ranking_score(m_val.fidelity, m_val.coverage,
-                                    n_covered=m_val.n_covered),
+                score=ranking_score(
+                    m_val.fidelity, m_val.coverage,
+                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    n_covered=m_val.n_covered,
+                ),
                 display_rule=f"random box {i}",
             ))
     queries.wall_infer_s = time.time() - t0

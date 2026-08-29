@@ -17,6 +17,13 @@ if str(_REPO) not in sys.path:
 from tabular_datasets import TabularDatasetLoader
 from environment import AnchorEnv
 from utils.eval_harness import apply_train_val_slots, resolve_extracted_models_dir
+from utils.inference_extract import (
+    classifier_labels,
+    generation_split_arrays,
+    maddpg_executed_action,
+    persist_box_from_episode,
+    union_precision,
+)
 from benchmarl.models.mlp import MlpConfig
 from benchmarl_wrappers import AnchorTask
 import argparse
@@ -350,14 +357,15 @@ def greedy_set_cover_union(
     y_data: np.ndarray,
     target_class: int,
     precision_floor: float,
+    y_hat: Optional[np.ndarray] = None,
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, Dict[str, Any]]:
     """
     Select class-based anchors for the class union via greedy set cover.
 
     Repeatedly adds the candidate that most increases class-conditional coverage
     (newly covered target-class samples) while keeping the union's precision
-    P(y = target_class | x in union) at or above precision_floor. Ties are broken
-    by the resulting union precision.
+    (fidelity P(f(x)=c | x in union) when y_hat is given, else label purity)
+    at or above precision_floor. Ties are broken by the resulting union precision.
 
     Unlike filter-then-union, this directly optimizes the stated goal — the
     smallest set of general rules that explains the class — and degrades
@@ -410,7 +418,7 @@ def greedy_set_cover_union(
             gain = int((cand_mask & class_mask).sum()) - union_class_count
             if gain <= 0:
                 continue
-            cand_precision = float((y_data[cand_mask] == target_class).mean())
+            cand_precision = union_precision(cand_mask, target_class, y_data, y_hat)
             if cand_precision < precision_floor:
                 continue
             if gain > best_gain or (gain == best_gain and cand_precision > best_precision):
@@ -428,7 +436,7 @@ def greedy_set_cover_union(
         # No candidate meets the floor even alone — return the single best anchor
         # (precision, tie-break class coverage) so the union is never empty.
         def anchor_quality(i):
-            precision = float((y_data[masks[i]] == target_class).mean())
+            precision = union_precision(masks[i], target_class, y_data, y_hat)
             class_cov = int((masks[i] & class_mask).sum())
             return (precision, class_cov)
         best = max(range(len(valid_anchors)), key=anchor_quality)
@@ -701,27 +709,8 @@ def load_policy_model(
 
 
 def _generation_split_arrays(env_data, env_config):
-    """A2: which split seeds candidate boxes (instances and class centroids).
-
-    Seeding is part of *fitting*, so it draws on train by default. Seeding on the
-    same split used to select rules (val) is doubly harmful: val holds ~20% of the
-    data, so a class region with no val representative never gets a candidate box,
-    and a box built around a val point necessarily contains that point, scoring
-    fidelity 1.0 on n=1 when selection then evaluates it on val. Those rules won
-    selection and covered nothing at test.
-
-    Selection stays on validation (revision.evaluate) and reporting on test, so
-    seeding from train introduces no leakage into the reported numbers.
-
-    Set env_config["generation_split"] to "val" to restore the old behaviour for
-    ablation.
-    """
-    split = str(env_config.get("generation_split", "train") or "train").lower()
-    if split == "val" and env_data.get("X_val_unit") is not None:
-        return (env_data["X_val_unit"], env_data["X_val_std"], env_data["y_val"], "validation")
-    if split == "test" and env_data.get("X_test_unit") is not None:
-        return (env_data["X_test_unit"], env_data["X_test_std"], env_data["y_test"], "test")
-    return (env_data["X_unit"], env_data["X_std"], env_data["y"], "train")
+    """A2: which split seeds candidate boxes (instances and class centroids)."""
+    return generation_split_arrays(env_data, env_config)
 
 
 def _should_log_verbose(env_config: Optional[Dict[str, Any]] = None) -> bool:
@@ -799,7 +788,7 @@ def run_rollout_with_policy(
     device: str = "cpu",
     seed: Optional[int] = None,
     exploration_mode: str = "mean",  # "sample", "mean", or "noisy_mean"
-    action_noise_scale: float = 0.05,  # Noise scale for actions (0.0 = no noise)
+    action_noise_scale: float = 0.0,  # 0.0 for reported runs (policy only)
     verbose_logging: bool = False,  # Enable verbose debug logging
 ) -> Dict[str, Any]:
     # Ensure policy is in eval mode
@@ -991,49 +980,22 @@ def run_rollout_with_policy(
                     action = fwd_outputs
                     action_has_noise = False
             else:
-                # Policy outputs action directly
+                # MADDPG: the saved MLP emits TanhDelta params. Training executed
+                # tanh(param) for EVERY param, so map unconditionally. R-1: this was
+                # gated on |param| > 1.1, which left small params executed unsquashed
+                # (tanh(0.5) = 0.462, not 0.5) -- a guard of exactly this shape is what
+                # hid the original action-mapping bug.
                 action = fwd_outputs
                 action_has_noise = False
-                # If values are out of [-1, 1] range, they're likely raw logits that need normalization
                 if isinstance(action, torch.Tensor):
-                    action_vals = action.cpu().numpy().flatten()
-                    if len(action_vals) > 0 and (action_vals.min() < -1.1 or action_vals.max() > 1.1):
-                        # Values are raw logits that are too large
-                        # Use a fixed scaling factor to preserve relative differences between episodes
-                        # Prevents identical actions when raw outputs are proportional
-                        max_abs = np.abs(action_vals).max()
-                        # Use a fixed scaling factor that keeps values in a reasonable range for tanh
-                        # Typical outputs are 20-30M, so divide by 30M to get values around 0.7-1.0
-                        # keeps values in tanh's active range (not saturated) while preserving differences
-                        fixed_scale = 30000000.0
-                        # Define sample_idx for logging (used in multiple places)
-                        # create sample indices based on actual action space size
-                        action_size = len(action_vals)
-                        if step_count == 0 and action_size > 0:
-                            # sample from beginning, middle, and end of action space
-                            sample_idx = [0, 1, 2]
-                            if action_size > 6:
-                                mid = action_size // 2
-                                sample_idx.extend([mid - 1, mid, mid + 1])
-                            if action_size > 10:
-                                sample_idx.append(action_size - 1)
-                            # Ensure all indices are within bounds
-                            sample_idx = [i for i in sample_idx if i < action_size]
-                        else:
-                            sample_idx = []
-                        if max_abs > 10.0:
-                            if verbose_logging and step_count == 0:
-                                logger.info(f"  Scaling large logits by fixed factor {fixed_scale:.2f} (max_abs={max_abs:.2f})")
-                                logger.info(f"  Before scaling (sample): {[action_vals[i] for i in sample_idx]}")
-                            action = action / fixed_scale
-                            if verbose_logging and step_count == 0:
-                                action_scaled_vals = action.cpu().numpy().flatten()
-                                logger.info(f"  After scaling (sample): {[action_scaled_vals[i] for i in sample_idx]}")
-                        # Now apply tanh to get actions in [-1, 1]
-                        action = torch.tanh(action)
-                        if verbose_logging and step_count == 0 and len(sample_idx) > 0:
-                            action_tanh_vals = action.cpu().numpy().flatten()
-                            logger.info(f"  After tanh (sample): {[action_tanh_vals[i] for i in sample_idx]}")
+                    action_vals = action.detach().cpu().numpy().flatten()
+                    action = maddpg_executed_action(action)
+                    if verbose_logging and step_count == 0:
+                        mapped = action.detach().cpu().numpy().flatten()
+                        logger.info(
+                            f"  MADDPG tanh(param) (max_abs_param={np.abs(action_vals).max():.2f}): "
+                            f"min={mapped.min():.4f} max={mapped.max():.4f}"
+                        )
             
             # Ensure action has batch dimension to match TensorDict batch size
             if len(action.shape) == 1:
@@ -1197,11 +1159,7 @@ def run_rollout_with_policy(
         if env.x_star_unit.get(agent_id) is not None:  # Instance-based mode
             target_class = env._get_class_for_agent(agent_id)
             if target_class is not None:
-                # Get the mask and class labels
-                if env.eval_on_test_data:
-                    y_data = env.y_test
-                else:
-                    y_data = env.y
+                _, _, y_data, _ = env._active_data()
                 mask = env._mask_in_box(agent_id)
                 if len(mask) == len(y_data):
                     class_mask = (y_data == target_class)
@@ -1217,31 +1175,15 @@ def run_rollout_with_policy(
         class_coverage = 0.0
         
         if target_class is not None:
-            # Compute class-level union metrics
-            # FIX: When only one agent acts during inference, class-level metrics should only consider that agent's box
-            # This avoids issues where other agents' boxes (initialized but never updated) affect the union
             class_union_metrics = env._compute_class_union_metrics()
             if target_class in class_union_metrics:
                 class_precision = float(class_union_metrics[target_class].get("union_precision", 0.0))
                 class_coverage = float(class_union_metrics[target_class].get("union_coverage", 0.0))
             else:
-                # Debug: log why class-level metrics might be missing
                 if verbose_logging:
                     logger.debug(f"  Class {target_class} not found in class_union_metrics. Available classes: {list(class_union_metrics.keys())}")
                     logger.debug(f"  Agents with boxes: {list(env.lower.keys())}")
                     logger.debug(f"  Active agents: {list(env.agents) if hasattr(env, 'agents') else 'N/A'}")
-            
-            # FIX: If class-level metrics are 0 but instance-level are > 0, it might be because
-            # other agents' boxes (that were never updated) are included in the union.
-            # For single-agent rollouts, class-level metrics should match instance-level.
-            if class_precision == 0.0 and class_coverage == 0.0 and instance_precision > 0.0:
-                # During single-agent inference, class-level should equal instance-level
-                # This happens when only one agent exists or only one agent's box is valid
-                if verbose_logging:
-                    logger.debug(f"  Class-level metrics are 0 but instance-level are > 0. Using instance-level as fallback for single-agent rollout.")
-                # For single-agent rollouts, class-level = instance-level
-                class_precision = instance_precision
-                class_coverage = instance_coverage
         
         # Get final box bounds
         lower = env.lower[agent_id]
@@ -1256,20 +1198,28 @@ def run_rollout_with_policy(
             initial_lower = env.box_history[agent_id][0][0].tolist()
             initial_upper = env.box_history[agent_id][0][1].tolist()
 
-        # Construct final observation (using instance-level metrics)
-        final_obs = np.concatenate([lower, upper, np.array([instance_precision, instance_coverage], dtype=np.float32)])
+        # Policy observation (quantile: 3n+3). Unit bounds live in export_rule_state.
+        try:
+            final_obs = env._get_observation(agent_id, instance_precision, instance_coverage)
+        except Exception:
+            final_obs = np.concatenate([lower, upper, np.array([instance_precision, instance_coverage], dtype=np.float32)])
 
         episode_data = {
             "initial_lower": initial_lower,
             "initial_upper": initial_upper,
             # Instance-level metrics (for this specific agent/instance)
             "instance_precision": float(instance_precision),
-            "instance_coverage": float(instance_coverage),  # Overall coverage P(x in box)
+            "instance_coverage": float(instance_coverage),  # class-conditional P(x in box | y = c)
             "instance_coverage_class_conditional": float(instance_coverage_class_conditional),  # Class-conditional coverage P(x in box | y = target_class)
             # Anchor metrics (same as instance-level for single agent)
             "anchor_precision": float(instance_precision),
             "anchor_coverage": float(instance_coverage),
             "anchor_coverage_class_conditional": float(instance_coverage_class_conditional),
+            # Support: rows of the eval split inside the box. Needed so the top-k
+            # ranking can apply the Wilson lower bound; without it ranking_score
+            # silently falls back to the point estimate and a box covering ONE row
+            # scores fid=1.0 and outranks well-supported rules.
+            "n_covered": int(details.get("n_covered", 0) or 0),
             # Class-level metrics (union of all agents for this class)
             "class_precision": float(class_precision),
             "class_coverage": float(class_coverage),
@@ -1277,12 +1227,19 @@ def run_rollout_with_policy(
             "n_steps": step_count,
             "rollout_time_seconds": float(rollout_duration),
             "final_observation": final_obs.tolist(),
+            # Authoritative box/rule state. In quantile mode the observation holds
+            # QUANTILE positions, so obs[:n] is NOT `lower` and decoding it as such
+            # silently yields garbage rules. Consumers must prefer these keys.
+            **(env.export_rule_state(agent_id) if hasattr(env, "export_rule_state") else {}),
             # Termination diagnostics
             "terminated": float(1.0 if last_termination else 0.0),
             "truncated": float(1.0 if last_truncation else 0.0),
             "termination_reason_str": str(last_info_for_agent.get("termination_reason_str", "")),
             "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
+        orig_pred = getattr(env, "original_predictions", {}).get(agent_id)
+        if orig_pred is not None:
+            episode_data["original_prediction"] = int(orig_pred)
         
         # Debug: Log metrics
         if verbose_logging:
@@ -1333,8 +1290,8 @@ def extract_rules_from_policies(
     seed: int = 42,
     device: str = "cpu",
     exploration_mode: str = "mean",
-    action_noise_scale: float = 0.05,
-    filter_by_prediction: bool = False,  # Default False for fair comparison (can be enabled if needed)
+    action_noise_scale: float = 0.0,
+    filter_by_prediction: bool = True,
     prefer_model: str = "best",  # "best" or "final" — which extracted-models folder to use
 ) -> Dict[str, Any]:
     logger.info("="*80)
@@ -1810,45 +1767,12 @@ def extract_rules_from_policies(
         # The mapping section below will handle individual agent policies correctly
         logger.debug(f"  Skipping old naming convention check (agents_per_class={agents_per_class} > 1)")
     
-    # Set min_coverage_floor to ensure box always covers at least the anchor instance
-    # Use 1/n_samples from the dataset (to ensure at least one point is covered), 
-    # or fall back to config default (0.005) if dataset size unavailable
-    # CRITICAL: When coverage_on_all_data=True, use full dataset size (train+test combined)
-    if coverage_on_all_data:
-        # Use full dataset size (train + test combined)
-        n_train = env_data.get("X_unit", np.array([])).shape[0] if env_data.get("X_unit") is not None else 0
-        n_test = env_data.get("X_test_unit", np.array([])).shape[0] if env_data.get("X_test_unit") is not None else 0
-        n_samples = n_train + n_test
-        if n_samples == 0:
-            n_samples = None
-    elif eval_on_test_data and env_data.get("X_test_unit") is not None:
-        n_samples = env_data["X_test_unit"].shape[0]
-    elif env_data.get("X_val_unit") is not None:
-        n_samples = env_data["X_val_unit"].shape[0]
-    elif env_data.get("X_unit") is not None:
-        n_samples = env_data["X_unit"].shape[0]
-    else:
-        n_samples = None
-    
-    config_default = env_config.get("min_coverage_floor", 0.005)
-    
-    if n_samples is not None and n_samples > 0:
-        # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
-        # For instance-based anchors, initial coverage is typically 0.001-0.002, so we need
-        # a floor that's lower than that to allow expansion
-        min_coverage_floor = 1.0 / n_samples
-        # Use a very small lower bound (1e-6) instead of config_default to avoid blocking expansion
-        # The config_default (0.005) is too high for instance-based anchors
-        min_coverage_floor = max(min_coverage_floor, 1e-6)
-    else:
-        # Fall back to config default if dataset size unavailable
-        min_coverage_floor = config_default
-    
-    # Ensure it's non-zero
-    min_coverage_floor = max(min_coverage_floor, 1e-6)
-    
-    env_config["min_coverage_floor"] = min_coverage_floor
-    logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
+    # Honor YAML / trainer min_coverage_floor. Do not overwrite with 1/n:
+    # coverage_floor_relative already rescales the YAML floor in the env.
+    logger.info(
+        f"  Using min_coverage_floor={env_config.get('min_coverage_floor')} "
+        f"(from config; not overwritten at inference)"
+    )
     
     env_config.update({
         "X_min": env_data["X_min"],
@@ -2169,6 +2093,7 @@ def extract_rules_from_policies(
             "coverage_on_all_data": coverage_on_all_data,
             "n_instances_per_class": n_instances_per_class,
             "steps_per_episode": steps_per_episode,
+            "generation_split": str(env_config.get("generation_split", "train") or "train").lower(),
             "selection_split": "test" if eval_on_test_data else "val",
             "report_split": "test",
             "bounds_space": "unit",
@@ -2562,98 +2487,71 @@ def extract_rules_from_policies(
                 # Skip empty episodes - don't add to anchors_list
                 continue
             
-            # Extract rule from final observation (if available)
+            # Extract rule from export_rule_state (unit bounds), not quantile obs[:n].
             rule = "any values (no tightened features)"
             lower = None
             upper = None
             lower_normalized = None
             upper_normalized = None
-            
-            if episode_data and "final_observation" in episode_data:
-                obs = np.array(episode_data["final_observation"], dtype=np.float32)
-                # >= not ==: the env observation gained an episode_phase entry
-                # (2n+3); older records are 2n+2. Only the first 2n entries
-                # (the box bounds) are read below, so both layouts are valid.
-                if len(obs) >= 2 * n_features + 2:
-                    policy_lower_normalized = obs[:n_features].copy()
-                    policy_upper_normalized = obs[n_features:2*n_features].copy()
-                    from utils.metrics import sparsify_box
-                    lower_normalized, upper_normalized, _ = sparsify_box(
-                        policy_lower_normalized,
-                        policy_upper_normalized,
-                        sparsity_width_ratio=env_config["sparsity_width_ratio"],
-                        max_features=max_features_in_rule,
-                    )
-                    
-                    # Denormalize bounds to original feature space:
-                    # unit [0,1] -> standardized (X_min/X_range) -> raw (scaler_mean/scale)
-                    X_min = env_config.get("X_min")
-                    X_range = env_config.get("X_range")
-                    scaler_mean = env_config.get("scaler_mean")
-                    scaler_scale = env_config.get("scaler_scale")
-                    if X_min is not None and X_range is not None:
-                        lower = (lower_normalized * X_range) + X_min
-                        upper = (upper_normalized * X_range) + X_min
-                        if scaler_mean is not None and scaler_scale is not None:
-                            lower = lower * scaler_scale + scaler_mean
-                            upper = upper * scaler_scale + scaler_mean
-                    else:
-                        # Fallback to normalized if denormalization params not available
-                        lower = lower_normalized
-                        upper = upper_normalized
-                        logger.warning(f"  X_min/X_range not available for denormalization. Using normalized bounds.")
-                    
-                    # Create temporary environment for rule extraction
-                    # Set mode to "inference" so termination counters are reset in reset()
-                    # Ensure normalize_data=False to avoid double normalization
-                    inference_env_config = {**env_config, "mode": "inference", "normalize_data": False}
-                    
-                    # Use test data if eval_on_test_data=True, otherwise use training data
-                    # This ensures the coordinate space matches the rollout environment
-                    if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                        temp_X_unit = env_data["X_test_unit"]
-                        temp_X_std = env_data["X_test_std"]
-                        temp_y = env_data["y_test"]
-                    else:
-                        temp_X_unit = env_data["X_unit"]
-                        temp_X_std = env_data["X_std"]
-                        temp_y = env_data["y"]
-                    
-                    temp_env = AnchorEnv(
-                        X_unit=temp_X_unit,
-                        X_std=temp_X_std,
-                        y=temp_y,
-                        feature_names=feature_names,
-                        classifier=dataset_loader.get_classifier(),
-                        device="cpu",
-                        target_classes=[target_class],
-                        env_config=inference_env_config
-                    )
-                    
-                    # Use the agent name that matches the target_class
-                    temp_agent_name = f"agent_{target_class}"
-                    # Set normalized bounds in temp_env (extract_rule will denormalize internally)
-                    temp_env.lower[temp_agent_name] = lower_normalized
-                    temp_env.upper[temp_agent_name] = upper_normalized
-                    
-                    # Use the true initial box recorded during the rollout. Fall back to
-                    # reconstructing it from x_instance only if the rollout didn't report it.
-                    if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                        initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                        initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                    else:
-                        initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
-                        initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
-                        initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+            policy_lower_normalized = None
+            policy_upper_normalized = None
 
-                    # Extract rule with denormalization enabled and correct initial bounds
-                    rule = temp_env.extract_rule(
-                        temp_agent_name,
-                        max_features_in_rule=max_features_in_rule,
-                        initial_lower=initial_lower_normalized,
-                        initial_upper=initial_upper_normalized,
-                        denormalize=True  # Denormalize to standardized feature space (mean=0, std=1)
-                    )
+            box = persist_box_from_episode(
+                episode_data, env_config, n_features, max_features_in_rule
+            )
+            if box is not None:
+                policy_lower_normalized = box["policy_lower_normalized"]
+                policy_upper_normalized = box["policy_upper_normalized"]
+                lower_normalized = box["lower_normalized"]
+                upper_normalized = box["upper_normalized"]
+                lower = box["lower"]
+                upper = box["upper"]
+
+                inference_env_config = {**env_config, "mode": "inference", "normalize_data": False}
+                if eval_on_test_data and env_data.get("X_test_unit") is not None:
+                    temp_X_unit = env_data["X_test_unit"]
+                    temp_X_std = env_data["X_test_std"]
+                    temp_y = env_data["y_test"]
+                else:
+                    temp_X_unit = env_data["X_unit"]
+                    temp_X_std = env_data["X_std"]
+                    temp_y = env_data["y"]
+
+                temp_env = AnchorEnv(
+                    X_unit=temp_X_unit,
+                    X_std=temp_X_std,
+                    y=temp_y,
+                    feature_names=feature_names,
+                    classifier=dataset_loader.get_classifier(),
+                    device="cpu",
+                    target_classes=[target_class],
+                    env_config=inference_env_config
+                )
+                temp_agent_name = actual_agent_name
+                if temp_agent_name not in getattr(temp_env, "possible_agents", []):
+                    matches = [a for a in temp_env.possible_agents if a.startswith(f"agent_{target_class}")]
+                    temp_agent_name = matches[0] if matches else temp_env.possible_agents[0]
+                temp_env.lower[temp_agent_name] = lower_normalized
+                temp_env.upper[temp_agent_name] = upper_normalized
+                if box["a"] is not None and box["b"] is not None:
+                    temp_env.a[temp_agent_name] = box["a"]
+                    temp_env.b[temp_agent_name] = box["b"]
+
+                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                else:
+                    initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
+                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
+
+                rule = temp_env.extract_rule(
+                    temp_agent_name,
+                    max_features_in_rule=max_features_in_rule,
+                    initial_lower=initial_lower_normalized,
+                    initial_upper=initial_upper_normalized,
+                    denormalize=True
+                )
             
             # Create anchor_data with metrics
             anchor_data = {
@@ -2669,6 +2567,7 @@ def extract_rules_from_policies(
                 "anchor_precision": float(anchor_instance_precision),
                 "anchor_coverage": float(anchor_instance_coverage),
                 "anchor_coverage_class_conditional": float(anchor_instance_coverage_class_conditional),
+                "n_covered": (int(episode_data["n_covered"]) if episode_data and episode_data.get("n_covered") is not None else None),
                 "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
                 "rule": rule,
             }
@@ -2690,6 +2589,9 @@ def extract_rules_from_policies(
                 # Rollout-estimated metrics use perturbation samples (~4096); recomputed metrics
                 # use the actual dataset, matching the single-agent and baseline approaches so
                 # all three methods are directly comparable.
+                orig_pred = episode_data.get("original_prediction")
+                if orig_pred is None:
+                    orig_pred = int(full_predictions_recompute[data_instance_idx])
                 prec_full, cov_full, n_in_box = compute_anchor_metrics_on_full_dataset(
                     lower_bounds_normalized=lower_normalized,
                     upper_bounds_normalized=upper_normalized,
@@ -2697,7 +2599,7 @@ def extract_rules_from_policies(
                     X_full_std=X_data_std,
                     original_instance_unit=x_instance,
                     original_instance_std=x_instance_std,
-                    original_prediction=target_class,
+                    original_prediction=int(orig_pred),
                     full_predictions=full_predictions_recompute,
                     classifier=classifier_for_recompute,
                     device=device,
@@ -2719,12 +2621,14 @@ def extract_rules_from_policies(
                 anchor_data["coverage_recomputed"] = float(cov_full)
                 anchor_data["coverage_class_conditional_recomputed"] = float(cov_class_cond)
                 anchor_data["n_in_box"] = n_in_box
-                # Replace primary metrics with recomputed values
+                # Primary coverage stays class-conditional (same as training τ_C).
+                # Marginal n_in_box/n_total is stored separately.
                 anchor_data["instance_precision"] = float(prec_full)
-                anchor_data["instance_coverage"] = float(cov_full)
+                anchor_data["instance_coverage"] = float(cov_class_cond)
                 anchor_data["instance_coverage_class_conditional"] = float(cov_class_cond)
+                anchor_data["instance_coverage_marginal"] = float(cov_full)
                 anchor_data["anchor_precision"] = float(prec_full)
-                anchor_data["anchor_coverage"] = float(cov_full)
+                anchor_data["anchor_coverage"] = float(cov_class_cond)
                 anchor_data["anchor_coverage_class_conditional"] = float(cov_class_cond)
 
                 # CRITICAL: Check for near-duplicates using quantization and IoU (early stopping)
@@ -2772,17 +2676,11 @@ def extract_rules_from_policies(
                     if verbose_logging:
                         logger.debug(f"    Skipped duplicate anchor (metrics not counted)")
             else:
-                # No bounds available - still add anchor but without deduplication
-                anchors_list.append(anchor_data)
-                rules_list.append(rule)
-                # Append metrics even without bounds (for backward compatibility)
-                instance_precisions.append(float(instance_precision))
-                instance_coverages.append(float(instance_coverage))
-                class_precisions.append(float(class_precision))
-                class_coverages.append(float(class_coverage))
-                precisions.append(float(instance_precision))
-                coverages.append(float(instance_coverage))
-                rollout_times.append(float(episode_data.get("rollout_time_seconds", 0.0)) if episode_data else 0.0)
+                logger.error(
+                    "  Episode has no unit bounds after export_rule_state "
+                    f"(class={target_class}, instance={instance_idx_in_range}). "
+                    "Not adding a boundsless anchor to the pool."
+                )
         
         # CRITICAL: Apply quantization-based deduplication, NMS, and top-K selection
         # Step 1: Quantization-based deduplication (group by canonical key)
@@ -2790,30 +2688,28 @@ def extract_rules_from_policies(
         for anchor in anchors_list:
             canonical_key = anchor.get("canonical_key")
             if canonical_key is None and anchor.get("lower_bounds_normalized") is not None:
-                # Compute canonical key if missing
                 canonical_key = canonicalize_rule_key(
                     np.array(anchor["lower_bounds_normalized"]),
                     np.array(anchor["upper_bounds_normalized"]),
                     min_width=min_width
                 )
                 anchor["canonical_key"] = canonical_key
-            
-            if canonical_key:
-                if canonical_key not in unique_anchors_by_key:
+            if not canonical_key:
+                logger.error("  Dropping anchor with no canonical_key (missing unit bounds)")
+                continue
+            if canonical_key not in unique_anchors_by_key:
+                unique_anchors_by_key[canonical_key] = anchor
+            else:
+                existing = unique_anchors_by_key[canonical_key]
+                existing_prec = existing.get("instance_precision", existing.get("anchor_precision", 0.0))
+                new_prec = anchor.get("instance_precision", anchor.get("anchor_precision", 0.0))
+                if new_prec > existing_prec:
                     unique_anchors_by_key[canonical_key] = anchor
-                else:
-                    # Keep anchor with higher precision (tie-break by coverage)
-                    existing = unique_anchors_by_key[canonical_key]
-                    existing_prec = existing.get("instance_precision", existing.get("anchor_precision", 0.0))
-                    new_prec = anchor.get("instance_precision", anchor.get("anchor_precision", 0.0))
-                    if new_prec > existing_prec:
+                elif new_prec == existing_prec:
+                    existing_cov = existing.get("instance_coverage", existing.get("anchor_coverage", 0.0))
+                    new_cov = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
+                    if new_cov > existing_cov:
                         unique_anchors_by_key[canonical_key] = anchor
-                    elif new_prec == existing_prec:
-                        # Tie-break by coverage
-                        existing_cov = existing.get("instance_coverage", existing.get("anchor_coverage", 0.0))
-                        new_cov = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
-                        if new_cov > existing_cov:
-                            unique_anchors_by_key[canonical_key] = anchor
         
         # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
         nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)  # Default: 0.9
@@ -2835,7 +2731,19 @@ def extract_rules_from_policies(
                 coverage = anchor.get("instance_coverage", anchor.get("anchor_coverage", 0.0))
                 from utils.metrics import ranking_score as _ranking_score
                 formula = env_config.get("ranking_score_formula", "precision_coverage")
-                score = _ranking_score(precision, coverage, formula)
+                # Pass support so lcb_coverage actually applies the Wilson lower
+                # bound. None (key absent) keeps the old point-estimate behaviour
+                # rather than scoring the anchor -inf.
+                _n_cov = anchor.get("n_covered")
+                # No min_support here: the Wilson lower bound already penalises thin
+                # support smoothly (LCB(1.0, n=1) = 0.21). The hard below-support cut
+                # belongs to select_topk_union on the reporting path, not to this
+                # internal ordering, where an -inf for every candidate would make the
+                # top-k order arbitrary.
+                score = _ranking_score(
+                    precision, coverage, formula,
+                    n_covered=None if _n_cov is None else int(_n_cov),
+                )
                 rule_scores.append({
                     "anchor": anchor,
                     "score": float(score)
@@ -3326,80 +3234,62 @@ def extract_rules_from_policies(
                 rollout_time = episode_data.get("rollout_time_seconds", 0.0)
                 class_based_rollout_times.append(float(rollout_time))
             
-            # Extract rule and bounds
+            # Extract rule from export_rule_state (unit bounds), not quantile obs[:n].
             rule = "any values (no tightened features)"
             lower = None
             upper = None
             lower_normalized = None
             upper_normalized = None
-            
-            if episode_data and "final_observation" in episode_data:
-                obs = np.array(episode_data["final_observation"], dtype=np.float32)
-                # >= not ==: the env observation gained an episode_phase entry
-                # (2n+3); older records are 2n+2. Only the first 2n entries
-                # (the box bounds) are read below, so both layouts are valid.
-                if len(obs) >= 2 * n_features + 2:
-                    policy_lower_normalized = obs[:n_features].copy()
-                    policy_upper_normalized = obs[n_features:2*n_features].copy()
-                    from utils.metrics import sparsify_box
-                    lower_normalized, upper_normalized, _ = sparsify_box(
-                        policy_lower_normalized,
-                        policy_upper_normalized,
-                        sparsity_width_ratio=env_config["sparsity_width_ratio"],
-                        max_features=max_features_in_rule,
-                    )
-                    
-                    # Denormalize bounds: unit -> standardized -> raw
-                    X_min = env_config.get("X_min")
-                    X_range = env_config.get("X_range")
-                    scaler_mean = env_config.get("scaler_mean")
-                    scaler_scale = env_config.get("scaler_scale")
-                    if X_min is not None and X_range is not None:
-                        lower = (lower_normalized * X_range) + X_min
-                        upper = (upper_normalized * X_range) + X_min
-                        if scaler_mean is not None and scaler_scale is not None:
-                            lower = lower * scaler_scale + scaler_mean
-                            upper = upper * scaler_scale + scaler_mean
-                    else:
-                        lower = lower_normalized
-                        upper = upper_normalized
-                    
-                    # Extract rule - use the box center as reference for class-based initialization
-                    temp_env = AnchorEnv(
-                        X_unit=anchor_config["X_unit"],
-                        X_std=anchor_config["X_std"],
-                        y=anchor_config["y"],
-                        feature_names=feature_names,
-                        classifier=dataset_loader.get_classifier(),
-                        device="cpu",
-                        target_classes=[target_class],
-                        env_config={**env_config, "mode": "inference", "normalize_data": False}
-                    )
-                    temp_agent_name = f"agent_{target_class}"
-                    temp_env.lower[temp_agent_name] = lower_normalized
-                    temp_env.upper[temp_agent_name] = upper_normalized
-                    
-                    # Use the true initial box recorded during the rollout. For class-based
-                    # rollouts the real initial box comes from _compute_box_from_centroid
-                    # (a nearest-neighbor box), which cannot be reconstructed from the final
-                    # box center — so only fall back to the center approximation if the
-                    # rollout didn't report the initial box.
-                    if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                        initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                        initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                    else:
-                        initial_window = env_config.get("initial_window", 0.1)
-                        box_center = (lower_normalized + upper_normalized) / 2.0
-                        initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
-                        initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+            policy_lower_normalized = None
+            policy_upper_normalized = None
 
-                    rule = temp_env.extract_rule(
-                        temp_agent_name,
-                        max_features_in_rule=max_features_in_rule,
-                        initial_lower=initial_lower_normalized,
-                        initial_upper=initial_upper_normalized,
-                        denormalize=True
-                    )
+            box = persist_box_from_episode(
+                episode_data, env_config, n_features, max_features_in_rule
+            )
+            if box is not None:
+                policy_lower_normalized = box["policy_lower_normalized"]
+                policy_upper_normalized = box["policy_upper_normalized"]
+                lower_normalized = box["lower_normalized"]
+                upper_normalized = box["upper_normalized"]
+                lower = box["lower"]
+                upper = box["upper"]
+
+                temp_env = AnchorEnv(
+                    X_unit=anchor_config["X_unit"],
+                    X_std=anchor_config["X_std"],
+                    y=anchor_config["y"],
+                    feature_names=feature_names,
+                    classifier=dataset_loader.get_classifier(),
+                    device="cpu",
+                    target_classes=[target_class],
+                    env_config={**env_config, "mode": "inference", "normalize_data": False}
+                )
+                temp_agent_name = actual_agent_name
+                if temp_agent_name not in getattr(temp_env, "possible_agents", []):
+                    matches = [a for a in temp_env.possible_agents if a.startswith(f"agent_{target_class}")]
+                    temp_agent_name = matches[0] if matches else temp_env.possible_agents[0]
+                temp_env.lower[temp_agent_name] = lower_normalized
+                temp_env.upper[temp_agent_name] = upper_normalized
+                if box["a"] is not None and box["b"] is not None:
+                    temp_env.a[temp_agent_name] = box["a"]
+                    temp_env.b[temp_agent_name] = box["b"]
+
+                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
+                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
+                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
+                else:
+                    initial_window = env_config.get("initial_window", 0.1)
+                    box_center = (lower_normalized + upper_normalized) / 2.0
+                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
+                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
+
+                rule = temp_env.extract_rule(
+                    temp_agent_name,
+                    max_features_in_rule=max_features_in_rule,
+                    initial_lower=initial_lower_normalized,
+                    initial_upper=initial_upper_normalized,
+                    denormalize=True
+                )
             
             # Store anchor data
             anchor_data = {
@@ -3412,6 +3302,7 @@ def extract_rules_from_policies(
                 "class_coverage": float(class_coverage),
                 "anchor_precision": float(instance_precision),
                 "anchor_coverage": float(instance_coverage),
+                "n_covered": (int(episode_data["n_covered"]) if episode_data and episode_data.get("n_covered") is not None else None),
                 "total_reward": float(episode_data.get("total_reward", 0.0)) if episode_data else 0.0,
                 "rule": rule,
             }
@@ -3466,9 +3357,11 @@ def extract_rules_from_policies(
                     if verbose_logging:
                         logger.debug(f"    Skipped duplicate class-based anchor (metrics not counted)")
             else:
-                # No bounds available - still add anchor but without deduplication
-                class_based_anchors_list.append(anchor_data)
-                class_based_rules_list.append(rule)
+                logger.error(
+                    "  Class-based episode has no unit bounds after export_rule_state "
+                    f"(class={target_class}, agent={agent_name}). "
+                    "Not adding a boundsless anchor to the pool."
+                )
         
         # CRITICAL: Apply quantization-based deduplication, NMS, and top-K selection for class-based anchors
         # Step 1: Quantization-based deduplication (group by canonical key)
@@ -3484,22 +3377,22 @@ def extract_rules_from_policies(
                 )
                 anchor["canonical_key"] = canonical_key
             
-            if canonical_key:
-                if canonical_key not in unique_class_based_anchors_by_key:
+            if not canonical_key:
+                logger.error("  Dropping class-based anchor with no canonical_key (missing unit bounds)")
+                continue
+            if canonical_key not in unique_class_based_anchors_by_key:
+                unique_class_based_anchors_by_key[canonical_key] = anchor
+            else:
+                existing = unique_class_based_anchors_by_key[canonical_key]
+                existing_prec = existing.get("class_precision", existing.get("instance_precision", 0.0))
+                new_prec = anchor.get("class_precision", anchor.get("instance_precision", 0.0))
+                if new_prec > existing_prec:
                     unique_class_based_anchors_by_key[canonical_key] = anchor
-                else:
-                    # Keep anchor with higher precision (tie-break by coverage)
-                    existing = unique_class_based_anchors_by_key[canonical_key]
-                    existing_prec = existing.get("class_precision", existing.get("instance_precision", 0.0))
-                    new_prec = anchor.get("class_precision", anchor.get("instance_precision", 0.0))
-                    if new_prec > existing_prec:
+                elif new_prec == existing_prec:
+                    existing_cov = existing.get("class_coverage", existing.get("instance_coverage", 0.0))
+                    new_cov = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
+                    if new_cov > existing_cov:
                         unique_class_based_anchors_by_key[canonical_key] = anchor
-                    elif new_prec == existing_prec:
-                        # Tie-break by coverage
-                        existing_cov = existing.get("class_coverage", existing.get("instance_coverage", 0.0))
-                        new_cov = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
-                        if new_cov > existing_cov:
-                            unique_class_based_anchors_by_key[canonical_key] = anchor
         
         # Step 2: Apply NMS for near-duplicate suppression (IoU-based)
         nms_iou_threshold = env_config.get("nms_iou_threshold", 0.9)  # Default: 0.9
@@ -3521,7 +3414,19 @@ def extract_rules_from_policies(
                 coverage = anchor.get("class_coverage", anchor.get("instance_coverage", 0.0))
                 from utils.metrics import ranking_score as _ranking_score
                 formula = env_config.get("ranking_score_formula", "precision_coverage")
-                score = _ranking_score(precision, coverage, formula)
+                # Pass support so lcb_coverage actually applies the Wilson lower
+                # bound. None (key absent) keeps the old point-estimate behaviour
+                # rather than scoring the anchor -inf.
+                _n_cov = anchor.get("n_covered")
+                # No min_support here: the Wilson lower bound already penalises thin
+                # support smoothly (LCB(1.0, n=1) = 0.21). The hard below-support cut
+                # belongs to select_topk_union on the reporting path, not to this
+                # internal ordering, where an -inf for every candidate would make the
+                # top-k order arbitrary.
+                score = _ranking_score(
+                    precision, coverage, formula,
+                    n_covered=None if _n_cov is None else int(_n_cov),
+                )
                 rule_scores.append({
                     "anchor": anchor,
                     "score": float(score)
@@ -3701,31 +3606,37 @@ def extract_rules_from_policies(
     logger.info("Recomputing Class Union Metrics (Class-based anchors only)")
     logger.info(f"{'='*80}")
     
-    # CRITICAL FIX: Use same dataset as class-based rollouts for consistency
-    # Respect eval_on_test_data and coverage_on_all_data to match rollout behavior
+    # Candidate-generation split (train by default). coverage_on_all_data /
+    # eval_on_test_data remain explicit CLI overrides.
     if coverage_on_all_data:
         if env_data.get("X_test_unit") is not None:
             X_data_union = np.vstack([env_data["X_unit"], env_data["X_test_unit"]])
+            X_std_union = np.vstack([env_data["X_std"], env_data["X_test_std"]])
             y_data_union = np.concatenate([env_data["y"], env_data["y_test"]])
             logger.info(f"  Using FULL dataset (train + test) for class union metrics (coverage_on_all_data=True)")
             logger.info(f"    Training samples: {len(env_data['X_unit'])}, Test samples: {len(env_data['X_test_unit'])}, Total: {len(y_data_union)}")
         else:
             X_data_union = env_data["X_unit"]
+            X_std_union = env_data["X_std"]
             y_data_union = env_data["y"]
             logger.info(f"  Using TRAINING data only for class union metrics (test data not available, coverage_on_all_data=True)")
     elif eval_on_test_data:
         if env_data.get("X_test_unit") is not None:
             X_data_union = env_data["X_test_unit"]
+            X_std_union = env_data["X_test_std"]
             y_data_union = env_data["y_test"]
             logger.info(f"  Using TEST data only for class union metrics (eval_on_test_data=True)")
             logger.info(f"    Test samples: {len(y_data_union)}")
         else:
             raise ValueError("eval_on_test_data=True requires test data, but X_test_unit is not available")
     else:
-        X_data_union = env_data["X_unit"]
-        y_data_union = env_data["y"]
-        logger.info(f"  Using TRAINING data only for class union metrics (eval_on_test_data=False, coverage_on_all_data=False)")
-        logger.info(f"    Training samples: {len(y_data_union)}")
+        X_data_union, X_std_union, y_data_union, union_split_name = _generation_split_arrays(
+            env_data, env_config
+        )
+        logger.info(f"  Using {union_split_name} split for class union metrics (generation_split)")
+        logger.info(f"    Samples: {len(y_data_union)}")
+
+    y_hat_union = classifier_labels(dataset_loader.get_classifier(), X_std_union, device)
     
     # Recompute union metrics for each class
     for class_key, class_data in results["per_class_results"].items():
@@ -3772,7 +3683,8 @@ def extract_rules_from_policies(
         precision_floor = compute_class_precision_floor(precision_target, class_prior, union_lift_k)
 
         selected_anchors, union_mask, selection_info = greedy_set_cover_union(
-            all_anchors_for_union, X_data_union, y_data_union, target_class, precision_floor
+            all_anchors_for_union, X_data_union, y_data_union, target_class, precision_floor,
+            y_hat=y_hat_union,
         )
 
         class_data["class_prior"] = class_prior
@@ -3792,7 +3704,9 @@ def extract_rules_from_policies(
         mask_cls = (y_data_union == target_class)
         n_class_samples = int(mask_cls.sum())
         if union_mask.any():
-            class_precision_combined = float((y_data_union[union_mask] == target_class).mean())
+            class_precision_combined = union_precision(
+                union_mask, target_class, y_data_union, y_hat_union
+            )
             class_coverage_combined = float((union_mask & mask_cls).sum() / n_class_samples) if n_class_samples > 0 else 0.0
         else:
             class_precision_combined = 0.0
@@ -4116,8 +4030,8 @@ def main():
     parser.add_argument(
         "--action_noise_scale",
         type=float,
-        default=0.05,
-        help="Scale of Gaussian noise to add to actions for exploration (0.0 = no noise, recommended: 0.05-0.1)"
+        default=0.0,
+        help="Gaussian action noise at inference (0.0 = policy only; paper runs use 0.0)",
     )
     
     parser.add_argument(

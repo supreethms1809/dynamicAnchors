@@ -642,7 +642,7 @@ def resolve_extracted_models_dir(experiment_dir: str, prefer_model: str = "best"
 def apply_train_val_slots(env_data: Dict[str, Any], env_config: Dict[str, Any], metric_split: str = "val") -> Dict[str, Any]:
     """Keep constructor X_unit/X_std/y as train. Attach val/test for live metrics.
 
-    min_coverage_floor is 1/n of the *metric* split (val during paper generation).
+    min_coverage_floor is left to the env (min_support / n_class of the metric split).
     """
     cfg = dict(env_config)
     cfg["eval_on_test_data"] = bool(metric_split == "test")
@@ -665,6 +665,6 @@ def apply_train_val_slots(env_data: Dict[str, Any], env_config: Dict[str, Any], 
     else:
         cfg["eval_split"] = "train"
         n = int(len(env_data["y"])) if env_data.get("y") is not None else 0
-    if n > 0:
-        cfg["min_coverage_floor"] = max(1.0 / float(n), 1e-6)
+    if n > 0 and "min_coverage_floor" not in env_config:
+        pass
     return cfg

@@ -41,7 +41,7 @@ from utils.eval_harness import (  # noqa: E402
 from utils.metrics import (
     RANKING_SCORE_LCB_COVERAGE,  # noqa: E402
     MIN_SUPPORT_DEFAULT,
-    RANKING_SCORE_PRECISION_COVERAGE,
+    active_feature_mask,
     collect_success_rate,
     compactness_of_ruleset,
     evaluate_mask,
@@ -96,12 +96,36 @@ def _pool_class_anchors(per_class_results: Dict[str, Any], cls: int) -> List[Dic
     return _dedupe_anchor_boxes(anchors)
 
 
+def _has_scorable_box(anchor: Dict[str, Any]) -> bool:
+    """Admit unit-space or original-space bounds (evaluate scores unit keys).
+
+    D-01: reject the EMPTY rule. A box with no tightened dimension covers every row,
+    so it enters top-k on coverage alone and drags the union's fidelity down to the
+    class prior. This guard lives here as well as in the producers because every
+    method (RLDA, MADA, and the baselines) is scored through this function.
+    """
+    unit = (
+        anchor.get("lower_bounds_normalized") is not None
+        and anchor.get("upper_bounds_normalized") is not None
+    )
+    orig = anchor.get("lower_bounds") is not None and anchor.get("upper_bounds") is not None
+    if not (unit or orig):
+        return False
+    if unit:
+        active = active_feature_mask(
+            np.asarray(anchor["lower_bounds_normalized"], dtype=float),
+            np.asarray(anchor["upper_bounds_normalized"], dtype=float),
+        )
+        return bool(np.any(active))
+    return True
+
+
 def _collect_anchors(class_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Prefer stored box bounds over printed unique_rules strings (C-01 / C-08)."""
     anchors = []
     for key in ("all_anchors", "anchors"):
         for a in class_data.get(key) or []:
-            if a.get("lower_bounds") is not None and a.get("upper_bounds") is not None:
+            if _has_scorable_box(a):
                 anchors.append(a)
     # Class-based nested slot
     cb = class_data.get("class_based_results") or {}
@@ -110,7 +134,7 @@ def _collect_anchors(class_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not isinstance(agent_cb, dict):
                 continue
             for a in agent_cb.get("anchors") or agent_cb.get("all_anchors") or []:
-                if a.get("lower_bounds") is not None and a.get("upper_bounds") is not None:
+                if _has_scorable_box(a):
                     anchors.append(a)
     return anchors
 
@@ -144,7 +168,7 @@ def evaluate_rules_file(
     out_dir: str,
     k: int = 5,
     min_support: int = MIN_SUPPORT_DEFAULT,
-    ranking_formula: str = RANKING_SCORE_PRECISION_COVERAGE,
+    ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
     split: str = "test",
 ) -> str:
     if split != "test":
@@ -298,6 +322,13 @@ def evaluate_rules_file(
             union.union_metrics.coverage, union.union_metrics.n_covered,
         )
 
+    if not per_class_out:
+        raise RuntimeError(
+            f"No scorable boxes in {rules_file} after scoring "
+            f"({len(classes)} classes in the rules file). Inference likely failed "
+            "to persist unit bounds; refusing to write an empty result."
+        )
+
     global_res = evaluate_ruleset_as_classifier(
         class_union_masks, class_union_fid, y_test, y_hat_test
     )
@@ -339,8 +370,8 @@ def evaluate_rules_file(
         n_covered_note=(
             f"Rules selected/ranked on D_val; all reported metrics on "
             f"D_test (n={len(y_test)}). Union over top-k={k} ranked by "
-            f"{ranking_formula} (score = fid * (1 + cov) when formula is "
-            f"precision_coverage); "
+            f"{ranking_formula} (score = Wilson LCB(fid) * (1 + cov) when formula is "
+            f"lcb_coverage); "
             f"best = rank-1 of that same set. Empty boxes -> NaN precision. "
             f"min_support={min_support}. "
             f"Cells with n_covered < min_support are statistically uninformative."

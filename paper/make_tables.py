@@ -23,12 +23,14 @@ sys.path.insert(0, str(REPO))
 from utils.metrics import mean_ci, paired_wilcoxon  # noqa: E402
 
 RANKING_NOTE = (
-    r"Ranking score: $\mathrm{fid}\times(1+\mathrm{cov})$ "
+    r"Ranking score: Wilson LCB$(\mathrm{fid})\times(1+\mathrm{cov})$ "
     r"(C-52). $k$ is the top-$k$ pool shared by best and union (C-01). "
     r"All metrics on $D_{\mathrm{test}}$; selection on $D_{\mathrm{val}}$ (C-10). "
     r"$\dagger$: $n < $ min\_support$=10$ (C-02). "
     r"Single-seed cells show a Wilson 95\% CI on Fid; multi-seed cells show "
-    r"bootstrap mean $\pm$ 95\% CI (C-11)."
+    r"bootstrap mean $\pm$ 95\% CI (C-11). "
+    r"instC is marginal coverage of the best box; Cov$_{\mathrm{best}}$ is "
+    r"class-conditional."
 )
 
 BASELINE_PREFERENCE = ("anchors", "sp_anchors", "greedy_anchors", "cart")

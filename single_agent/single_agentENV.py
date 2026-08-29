@@ -7,6 +7,8 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.device_utils import get_device
 from utils.networks import predict_proba_torch
+from utils.metrics import ranking_score as _ranking_score, active_feature_mask
+from utils import quantile_mdp as qmdp
 import logging
 logger = logging.getLogger(__name__)
 
@@ -30,15 +32,17 @@ class SingleAgentAnchorEnv(Env):
     
     Compatible with Stable-Baselines3 and other single-agent RL libraries.
     
-    Observation Space: Box of shape (2 * n_features + 2,)
-        - First n_features: lower bounds for each feature
-        - Next n_features: upper bounds for each feature
+    Observation Space: Box of shape (3 * n_features + 3,)
+        - First n_features: class-quantile lower a
+        - Next n_features: class-quantile upper b
+        - Next n_features: q* (instance or class-centroid quantile)
         - Next 1: current precision
         - Next 1: current coverage
-    
+        - Next 1: mode bit (0 class, 1 instance)
+
     Action Space: Box of shape (2 * n_features,)
-        - First n_features: delta for lower bounds (clipped to [-1, 1])
-        - Next n_features: delta for upper bounds (clipped to [-1, 1])
+        - First n_features: delta for a (clipped to [-1, 1])
+        - Next n_features: delta for b (clipped to [-1, 1])
     """
     metadata = {
         "render_modes": [],
@@ -92,13 +96,21 @@ class SingleAgentAnchorEnv(Env):
             target_class = unique_classes[0]
         
         self.target_class = target_class
+        self._quantile_cdfs = qmdp.fit_train_cdfs(self.X_unit, self.y, self.target_class)
+        self.a = np.zeros(self.n_features, dtype=np.float64)
+        self.b = np.ones(self.n_features, dtype=np.float64)
+        self.q_star = np.full(self.n_features, 0.5, dtype=np.float64)
+        self._crn_idx = None
+        self._crn_U = None
+        self._precision_at_reset = 0.0
+        self._class_centroid_unit = None
         
         # Initialize observation and action spaces
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            # lower + upper + fidelity + coverage + episode phase
-            shape=(2 * self.n_features + 3,),
+            # a + b + q* + fidelity + coverage + mode
+            shape=(3 * self.n_features + 3,),
             dtype=np.float32
         )
         
@@ -117,6 +129,8 @@ class SingleAgentAnchorEnv(Env):
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
         self.gamma = env_config.get("gamma", 0.1)
+        # SB3 discount for Ng shaping. Must NOT reuse env.gamma (overlap weight).
+        self.discount = float(env_config.get("discount", 0.99))
 
         self.directions = ("shrink_lower", "expand_lower", "shrink_upper", "expand_upper")
         self.precision_target = env_config.get("precision_target", 0.9)
@@ -124,9 +138,29 @@ class SingleAgentAnchorEnv(Env):
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 1.0)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
 
+        self.init_mode = str(env_config.get("init_mode", "full_space")).lower()
+        self.precision_estimator = str(
+            env_config.get(
+                "precision_estimator",
+                "empirical" if self.init_mode == "neighbor_hull" else "conditional",
+            )
+        ).lower()
         self.use_perturbation = env_config.get("use_perturbation", False)
         self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
-        self.n_perturb = env_config.get("n_perturb", 2048)
+        self.n_perturb = int(env_config.get("n_perturb_train", env_config.get("n_perturb", 2048)))
+        self.n_perturb_eval = int(env_config.get("n_perturb_eval", self.n_perturb))
+        self.quantile_eps = float(env_config.get("quantile_eps", 1e-3))
+        self.max_quantile_step = float(env_config.get("max_quantile_step", 0.10))
+        self.min_quantile_width = float(env_config.get("min_quantile_width", 0.02))
+        self.leave_threshold = float(env_config.get("leave_threshold", 0.85))
+        self.max_new_constraints_per_step = int(env_config.get("max_new_constraints_per_step", 1))
+        self.activation_quantile = float(env_config.get("activation_quantile", 0.05))
+        self.reset_diversity_frac = float(env_config.get("reset_diversity_frac", 0.3))
+        self.n_reset_landings = int(env_config.get("n_reset_landings", 2))
+        self.sparsity_terminal_weight = float(env_config.get("sparsity_terminal_weight", 1.0))
+        self.require_precision_gain_to_terminate = bool(
+            env_config.get("require_precision_gain_to_terminate", self.init_mode != "neighbor_hull")
+        )
         self.X_min = env_config.get("X_min", None)
         self.X_range = env_config.get("X_range", None)
         self.scaler_mean = env_config.get("scaler_mean", None)
@@ -147,19 +181,7 @@ class SingleAgentAnchorEnv(Env):
         # the floor as min_support samples makes it bind where it is meaningful.
         self.coverage_floor_relative = bool(env_config.get("coverage_floor_relative", True))
         self.coverage_floor_min_support = int(env_config.get("min_support", 10))
-        if self.coverage_floor_relative:
-            try:
-                _n = int(np.asarray(y).shape[0])
-            except Exception:
-                _n = 0
-            if _n > 0:
-                _rel = float(self.coverage_floor_min_support) / float(_n)
-                if _rel != self.min_coverage_floor:
-                    logger.info(
-                        f"  coverage floor: {self.min_coverage_floor:.6f} -> {_rel:.6f} "
-                        f"({self.coverage_floor_min_support} of {_n} samples; relative floor)"
-                    )
-                self.min_coverage_floor = _rel
+        self._refresh_coverage_floor()
         # B2 fix 1: penalty charged when an action is reverted at the coverage
         # floor. Default 0.0 — the revert already removes the action's effect.
         # Set negative (e.g. -0.05, the old value) to restore the old behaviour.
@@ -358,13 +380,185 @@ class SingleAgentAnchorEnv(Env):
             f"init_min_neighbors={self.init_min_neighbors}",
             f"centroid_snap_threshold={self.centroid_snap_threshold}",
             f"min_steps_before_termination={self.min_steps_before_termination}",
-            f"alpha={self.alpha} beta={self.beta} gamma={self.gamma}",
+            f"alpha={self.alpha} beta={self.beta} gamma={self.gamma} discount={self.discount}",
             f"terminal_bonus={self.terminal_bonus}",
             f"min_coverage_floor={self.min_coverage_floor}",
+            f"init_mode={self.init_mode}",
+            f"precision_estimator={self.precision_estimator}",
+            f"leave_threshold={self.leave_threshold}",
             f"use_class_aware_targets={self.use_class_aware_targets}",
             f"categorical_freeze={self.categorical_freeze}",
         ]
         logger.info("EFFECTIVE ENV CONFIG (honored YAML/CLI): " + " ".join(bits))
+
+    def _uses_quantile_mdp(self) -> bool:
+        return str(getattr(self, "init_mode", "full_space")).lower() != "neighbor_hull"
+
+    def _n_class_active(self) -> int:
+        try:
+            y = self._active_data()[2]
+        except Exception:
+            y = self.y
+        if y is None:
+            return int((np.asarray(self.y) == self.target_class).sum())
+        return int((np.asarray(y) == self.target_class).sum())
+
+    def _refresh_coverage_floor(self) -> None:
+        """In-episode 'do not collapse to nothing' guard, in class-coverage units.
+
+        min_support / n_class is exactly "at least min_support class rows in the
+        box" (coverage = n_class_in_box / n_class). On small classes that is a LARGE
+        coverage demand -- iris n_class=30 gives 0.333, 6.7x the coverage_target of
+        0.05 -- so a box that legitimately meets tau_C was judged below the floor and
+        force-retreated at the terminal step. Worse, _best_box only records boxes
+        already above the floor, so the retreat could only land on loose,
+        low-precision boxes: measured a tight box (P=0.566, C=0.233) replaced by
+        (P=0.521, C=0.733), inverting the precision-first order.
+
+        The floor therefore never exceeds coverage_target. Statistical support is
+        enforced where it belongs -- at ranking/selection time, where
+        ranking_score() returns -inf below min_support.
+        """
+        if not getattr(self, "coverage_floor_relative", True):
+            return
+        n_class = self._n_class_active()
+        if n_class <= 0:
+            n_class = int((np.asarray(self.y) == self.target_class).sum())
+        if n_class > 0:
+            support_floor = float(self.coverage_floor_min_support) / float(n_class)
+            target = float(getattr(self, "coverage_target", support_floor))
+            floor = min(support_floor, target) if target > 0.0 else support_floor
+            self.min_coverage_floor = max(float(floor), 1e-6)
+
+    def _constrained_mask(self) -> np.ndarray:
+        q_active = None
+        if getattr(self, "a", None) is not None and self._uses_quantile_mdp():
+            q_active = qmdp.constrained_mask(self.a, self.b, self.quantile_eps)
+        if self.lower is None or self.upper is None:
+            if q_active is not None:
+                return np.asarray(q_active, dtype=bool)
+            return np.zeros(self.n_features, dtype=bool)
+        return active_feature_mask(
+            self.lower,
+            self.upper,
+            sparsity_width_ratio=self.sparsity_width_ratio,
+            quantile_active=q_active,
+        )
+
+    def n_predicates(self) -> int:
+        return int(self._constrained_mask().sum())
+
+    def _sync_unit_bounds_from_quantiles(self) -> None:
+        self.lower, self.upper = qmdp.quantile_to_unit_bounds(
+            self.a, self.b, self._quantile_cdfs["v_class"], self.quantile_eps
+        )
+
+    def _values_to_q(self, x_unit: np.ndarray) -> np.ndarray:
+        x_unit = np.asarray(x_unit, dtype=np.float64).reshape(-1)
+        q = np.empty(self.n_features, dtype=np.float64)
+        for j in range(self.n_features):
+            q[j] = qmdp.value_to_quantile(self._quantile_cdfs["v_class"][j], float(x_unit[j]))
+        return q
+
+    def _class_centroid_quantiles(self) -> np.ndarray:
+        class_mask = self.y == self.target_class
+        if not class_mask.any():
+            return np.full(self.n_features, 0.5, dtype=np.float64)
+        centroid = np.median(self.X_unit[class_mask], axis=0)
+        self._class_centroid_unit = centroid.astype(np.float32)
+        return self._values_to_q(centroid)
+
+    def _draw_crn(self) -> None:
+        n = int(self.n_perturb if self.mode == "training" else self.n_perturb_eval)
+        n = max(1, n)
+        n_rows = int(self.X_unit.shape[0])
+        self._crn_idx = self.rng.integers(0, n_rows, size=n)
+        self._crn_U = self.rng.random((n, self.n_features))
+
+    def _empty_rule_eligible(self, precision: float, k: Optional[int] = None) -> bool:
+        if k is None:
+            k = self.n_predicates()
+        p_reset = float(getattr(self, "_precision_at_reset", 0.0))
+        return int(k) >= 1 and float(precision) > p_reset + 1e-12
+
+    def set_quantile_box(self, a: np.ndarray, b: np.ndarray, clip_instance: bool = True) -> None:
+        """Privileged setter for V1 / tests. Bypasses leave-corner."""
+        self.a = np.clip(np.asarray(a, dtype=np.float64).reshape(-1), 0.0, 1.0)
+        self.b = np.clip(np.asarray(b, dtype=np.float64).reshape(-1), 0.0, 1.0)
+        active = self._constrained_mask()
+        if clip_instance and self.x_star_unit is not None:
+            self.a, self.b = qmdp.clip_quantiles_around_qstar(
+                self.a, self.b, self.q_star, active, self.quantile_eps
+            )
+        self._pin_constrained_categoricals()
+        self._sync_unit_bounds_from_quantiles()
+
+    def _get_observation(self, precision: float, coverage: float) -> np.ndarray:
+        if self.a is None or self.b is None:
+            self.a = np.zeros(self.n_features, dtype=np.float64)
+            self.b = np.ones(self.n_features, dtype=np.float64)
+        if self.q_star is None:
+            self.q_star = np.full(self.n_features, 0.5, dtype=np.float64)
+        mode = 1.0 if self.x_star_unit is not None else 0.0
+        return np.concatenate([
+            np.asarray(self.a, dtype=np.float32),
+            np.asarray(self.b, dtype=np.float32),
+            np.asarray(self.q_star, dtype=np.float32),
+            np.array([precision, coverage, mode], dtype=np.float32),
+        ]).astype(np.float32)
+
+    def _empirical_class_cond_coverage(self) -> float:
+        mask = self._mask_in_box()
+        _, _, y_data, _ = self._active_data()
+        c, _, _, _ = self._class_conditional_coverage(mask, y_data, self.target_class)
+        return float(c)
+
+    def _pin_constrained_categoricals(self) -> None:
+        if not self.categorical_indices or self.categorical_freeze == "none":
+            return
+        if not self._uses_quantile_mdp():
+            return
+        X_data, _, y_data, _ = self._active_data()
+        active = self._constrained_mask()
+        for j in self.categorical_indices:
+            if not active[j]:
+                self.a[j] = 0.0
+                self.b[j] = 1.0
+                continue
+            if self.x_star_unit is not None and self.categorical_freeze == "instance":
+                v = float(np.asarray(self.x_star_unit).reshape(-1)[j])
+            else:
+                class_rows = X_data[y_data == self.target_class]
+                if class_rows.shape[0] == 0:
+                    continue
+                vals, counts = np.unique(np.round(class_rows[:, j], 6), return_counts=True)
+                v = float(vals[int(np.argmax(counts))])
+            self.a[j], self.b[j] = qmdp.categorical_atom_quantiles(
+                self._quantile_cdfs["v_class"][j], v
+            )
+
+    def _maybe_reset_diversity_landing(self) -> None:
+        if not self._uses_quantile_mdp():
+            return
+        if self.reset_diversity_frac <= 0.0 or self.rng.random() >= self.reset_diversity_frac:
+            return
+        k_land = max(0, int(self.n_reset_landings))
+        if k_land <= 0:
+            return
+        dims = self.rng.choice(self.n_features, size=min(k_land, self.n_features), replace=False)
+        q = float(np.clip(self.activation_quantile, 0.0, 0.49))
+        for j in dims:
+            if self.x_star_unit is not None:
+                qj = float(self.q_star[j])
+                self.a[j] = max(0.0, qj - q)
+                self.b[j] = min(1.0, qj + q)
+            else:
+                self.a[j] = q
+                self.b[j] = 1.0 - q
+        if self.x_star_unit is not None:
+            self.a, self.b = qmdp.clip_quantiles_around_qstar(
+                self.a, self.b, self.q_star, self._constrained_mask(), self.quantile_eps
+            )
 
     # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
@@ -471,8 +665,13 @@ class SingleAgentAnchorEnv(Env):
             clf_class_precision = float((self.y[pred_mask] == self.target_class).mean())
         else:
             clf_class_precision = prior
-        ceiling = max(prior, 0.9 * clf_class_precision)
-        effective = float(np.clip(min(self.precision_target, ceiling), 0.05, self.precision_target))
+        # Majority: keep τ_P. Empty-rule is closed by k≥1, not by lifting τ above 1.
+        # Minority: cap by 0.9× classifier class precision; do not floor at the prior.
+        if prior < 0.5:
+            ceiling = max(0.05, 0.9 * clf_class_precision)
+            effective = float(np.clip(min(self.precision_target, ceiling), 0.05, self.precision_target))
+        else:
+            effective = float(self.precision_target)
         if effective < self.precision_target:
             logger.info(f"SingleAgent: class {self.target_class} effective precision target "
                         f"{effective:.4f} (absolute={self.precision_target}, prior={prior:.4f}, "
@@ -502,15 +701,14 @@ class SingleAgentAnchorEnv(Env):
         margin = max(float(self.gate_margin), 1e-6)
         gate = (precision - (target - margin)) / margin
         gate = float(min(1.0, max(0.0, gate)))
-
-        # NOTE: no dimension-release / sparsity term here. It was tried and removed:
-        # Phi is potential-based shaping, and shaping with Phi(s') - Phi(s) provably
-        # leaves the optimal policy unchanged (Ng et al., 1999). Any term added to Phi
-        # telescopes over an episode and cancels, which is why adding one produced
-        # bit-identical coverage across a 4-dataset x 10-class probe. Incentives that
-        # are meant to change behaviour must live in the NON-potential part of the
-        # reward -- see the partial terminal credit in step().
-        return float(self.alpha * precision + self.beta * np.sqrt(coverage) * gate)
+        p_tilde = min(precision, target)
+        k = int(self.n_predicates()) if self._uses_quantile_mdp() else 1
+        p_reset = float(getattr(self, "_precision_at_reset", 0.0))
+        cov_ok = 1.0 if (k >= 1 and precision > p_reset + 1e-12) else 0.0
+        if not self._uses_quantile_mdp():
+            cov_ok = 1.0
+            p_tilde = precision
+        return float(self.alpha * p_tilde + self.beta * np.sqrt(coverage) * gate * cov_ok)
 
     def _unit_to_std(self, X_unit_samples: np.ndarray) -> np.ndarray:
         if self.X_min is None or self.X_range is None:
@@ -575,13 +773,20 @@ class SingleAgentAnchorEnv(Env):
         return float(n_in / n_class), coverage_marginal, n_in, n_class
 
     def _coverage_improved(self, coverage: float) -> bool:
+        if self._uses_quantile_mdp() and self.require_precision_gain_to_terminate:
+            return True
         if not self.require_coverage_gain_to_terminate:
             return True
         c_reset = float(self._coverage_at_reset)
-        # Already at τ_C at reset: extra gain is not required to terminate.
         if c_reset >= float(self.coverage_target):
             return True
         return float(coverage) > c_reset + float(self._coverage_gain_eps)
+
+    def _precision_improved(self, precision: float) -> bool:
+        if not self.require_precision_gain_to_terminate:
+            return True
+        p_reset = float(getattr(self, "_precision_at_reset", 0.0))
+        return float(precision) > p_reset + 1e-12
 
     def _snap_to_nearest_class_point(self, point: np.ndarray, class_data: np.ndarray) -> np.ndarray:
         """Snap a mean/cluster centroid onto the nearest real class row.
@@ -615,8 +820,15 @@ class SingleAgentAnchorEnv(Env):
     def _freeze_categorical_bounds(self) -> None:
         if not self.categorical_indices or self.categorical_freeze == "none":
             return
+        if self._uses_quantile_mdp():
+            self._pin_constrained_categoricals()
+            self._sync_unit_bounds_from_quantiles()
+            return
         X_data, _, y_data, _ = self._active_data()
         for j in self.categorical_indices:
+            width = float(self.upper[j] - self.lower[j])
+            if width >= float(getattr(self, "sparsity_width_ratio", 0.95)):
+                continue
             if self.x_star_unit is not None and self.categorical_freeze == "instance":
                 v = float(np.asarray(self.x_star_unit).reshape(-1)[j])
             else:
@@ -749,6 +961,76 @@ class SingleAgentAnchorEnv(Env):
         
         return lower.astype(np.float32), upper.astype(np.float32)
 
+    def _conditional_precision_metrics(
+        self,
+        coverage: float,
+        coverage_marginal: float,
+        n_class_in_box: int,
+        n_class_samples: int,
+        data_source: str,
+        covered: np.ndarray,
+    ) -> tuple:
+        if self._crn_idx is None or self._crn_U is None:
+            self._draw_crn()
+        active = self._constrained_mask()
+        class_mode = None
+        if self._class_centroid_unit is None:
+            self._class_centroid_quantiles()
+        if self._class_centroid_unit is not None:
+            class_mode = self._class_centroid_unit
+        z_unit = qmdp.crn_perturb(
+            self.X_unit,
+            self._crn_idx,
+            self._crn_U,
+            self.lower,
+            self.upper,
+            active,
+            self._quantile_cdfs["v_all"],
+            x_star_unit=self.x_star_unit,
+            class_mode_values=class_mode,
+        )
+        z_std = self._unit_to_std(z_unit)
+        if hasattr(self.classifier, "eval"):
+            self.classifier.eval()
+        with torch.no_grad():
+            inputs = torch.from_numpy(z_std.astype(np.float32)).to(self.device)
+            probs = predict_proba_torch(self.classifier, inputs).cpu().numpy()
+        self.n_blackbox_queries += int(z_std.shape[0])
+        preds = probs.argmax(axis=1)
+        is_instance_based = self.x_star_unit is not None
+        if is_instance_based:
+            if self.original_prediction is None:
+                x_star_std = self._unit_to_std(np.asarray(self.x_star_unit, dtype=np.float32).reshape(1, -1))[0]
+                with torch.no_grad():
+                    instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
+                    ip = predict_proba_torch(self.classifier, instance_tensor).cpu().numpy()[0]
+                    self.original_prediction = int(np.argmax(ip))
+            hard_precision = float((preds == int(self.original_prediction)).mean())
+            avg_prob = float(probs[:, int(self.original_prediction)].mean())
+        else:
+            hard_precision = float((preds == self.target_class).mean())
+            avg_prob = float(probs[:, self.target_class].mean())
+        purity = float("nan")
+        precision_proxy = (
+            self.precision_blend_lambda * hard_precision
+            + (1.0 - self.precision_blend_lambda) * avg_prob
+        )
+        return hard_precision, coverage, {
+            "hard_precision": hard_precision,
+            "precision_proxy": precision_proxy,
+            "purity": purity,
+            "avg_prob": avg_prob,
+            "n_points": int(z_std.shape[0]),
+            "n_covered": int(covered.size),
+            "sampler": "conditional_crn",
+            "target_class_fraction": hard_precision,
+            "data_source": data_source,
+            "cov_real": float(coverage),
+            "coverage_marginal": float(coverage_marginal),
+            "n_class_in_box": int(n_class_in_box),
+            "n_class_samples": int(n_class_samples),
+        }
+
     def _current_metrics(self) -> tuple:
         mask = self._mask_in_box()
         covered = np.where(mask)[0]
@@ -814,7 +1096,9 @@ class SingleAgentAnchorEnv(Env):
                 f"Target class: {self.target_class}, Class samples in dataset: {n_class_samples}"
             )
         
-        if covered.size == 0 and not (self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]):
+        if covered.size == 0 and self.precision_estimator != "conditional" and not (
+            self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]
+        ):
             return 0.0, coverage, {
                 "hard_precision": 0.0, 
                 "avg_prob": 0.0, 
@@ -830,6 +1114,11 @@ class SingleAgentAnchorEnv(Env):
         # (empirical/bootstrap paths). Lets us look up cached classifier
         # probabilities instead of re-running the classifier every step.
         eval_row_idx = None
+
+        if self.precision_estimator == "conditional":
+            return self._conditional_precision_metrics(
+                coverage, coverage_marginal, n_class_in_box, n_class_samples, data_source, covered
+            )
 
         if not self.use_perturbation:
             X_eval = X_data_std[covered]
@@ -1113,8 +1402,35 @@ class SingleAgentAnchorEnv(Env):
             self.x_star_unit = x_star_unit_preserved.copy() if isinstance(x_star_unit_preserved, np.ndarray) else x_star_unit_preserved
             logger.debug(f"SingleAgent: Preserved x_star_unit for instance-based mode during {self.mode}")
         
+        self._refresh_coverage_floor()
+        if self._uses_quantile_mdp():
+            self.a = np.zeros(self.n_features, dtype=np.float64)
+            self.b = np.ones(self.n_features, dtype=np.float64)
+            if self.x_star_unit is not None:
+                x_star = np.asarray(self.x_star_unit, dtype=np.float32).reshape(-1)
+                self.q_star = self._values_to_q(x_star)
+                if self.original_prediction is None:
+                    x_star_std = self._unit_to_std(x_star.reshape(1, -1))[0]
+                    if hasattr(self.classifier, "eval"):
+                        self.classifier.eval()
+                    with torch.no_grad():
+                        instance_tensor = torch.from_numpy(x_star_std.astype(np.float32)).unsqueeze(0).to(self.device)
+                        probs = predict_proba_torch(self.classifier, instance_tensor).cpu().numpy()[0]
+                        self.original_prediction = int(np.argmax(probs))
+            else:
+                if self.class_init_point is not None:
+                    pt = np.asarray(self.class_init_point, dtype=np.float32).reshape(-1)
+                    self._class_centroid_unit = pt
+                    self.q_star = self._values_to_q(pt)
+                else:
+                    self.q_star = self._class_centroid_quantiles()
+            if self.mode != "training" or self.reset_diversity_frac > 0.0:
+                self._maybe_reset_diversity_landing()
+            self._pin_constrained_categoricals()
+            self._sync_unit_bounds_from_quantiles()
+            self._draw_crn()
         # Priority 1: If x_star_unit is explicitly set (for instance-based), use it
-        if self.x_star_unit is not None:
+        elif self.x_star_unit is not None:
             if isinstance(self.x_star_unit, np.ndarray):
                 centroid = self.x_star_unit
             else:
@@ -1188,18 +1504,32 @@ class SingleAgentAnchorEnv(Env):
         if n_class <= 0:
             n_class = int((self._active_data()[2] == self.target_class).sum())
         self._coverage_at_reset = float(coverage)
+        self._precision_at_reset = float(precision)
         self._coverage_gain_eps = 1.0 / max(n_class, 1)
+        k0 = self.n_predicates()
+        n_cov = int(initial_details.get("n_covered") or 0)
+        if self._empty_rule_eligible(precision, k0):
+            self._best_box_cov = _ranking_score(
+                precision, coverage, getattr(self, "ranking_score_formula", "lcb_coverage"),
+                n_covered=n_cov, min_support=self.min_support,
+            )
+            self._best_box = (
+                self.lower.copy(),
+                self.upper.copy(),
+                self.a.copy(),
+                self.b.copy(),
+                self._constrained_mask().copy(),
+            )
+        else:
+            self._best_box = None
+            self._best_box_cov = float("-inf")
         
         # Prevent immediate termination: require at least 2 steps before allowing termination
         # This prevents episodes from terminating on the first step due to initial box meeting targets
         self.step_count = 0
         # Read from YAML so RLDA/MADA use the same Markov termination rule.
         
-        observation = np.concatenate([
-            self.lower,
-            self.upper,
-            np.array([precision, coverage, 0.0], dtype=np.float32),
-        ])
+        observation = self._get_observation(precision, coverage)
         
         info = {
             "initial_precision": float(precision),
@@ -1237,7 +1567,9 @@ class SingleAgentAnchorEnv(Env):
 
     def _apply_continuous_action(self, action: np.ndarray):
         action = np.clip(action, -1.0, 1.0)
-        
+        if self._uses_quantile_mdp():
+            self._apply_quantile_action(action)
+            return
         lower_deltas = action[:self.n_features]
         upper_deltas = action[self.n_features:]
         
@@ -1353,7 +1685,34 @@ class SingleAgentAnchorEnv(Env):
                 logger.warning(f"  ⚠ Action did not change box! lower_deltas mean={lower_deltas.mean():.4f}, upper_deltas mean={upper_deltas.mean():.4f}, max_delta={max_delta.max():.6f}")
             self._action_debug_logged = True
         self._freeze_categorical_bounds()
-    
+
+    def _apply_quantile_action(self, action: np.ndarray) -> None:
+        prev_a, prev_b = self.a.copy(), self.b.copy()
+        self.a, self.b = qmdp.apply_leave_corner_action(
+            self.a,
+            self.b,
+            action,
+            eta=self.max_quantile_step,
+            leave_threshold=self.leave_threshold,
+            max_new_constraints=self.max_new_constraints_per_step,
+            min_quantile_width=self.min_quantile_width,
+            eps=self.quantile_eps,
+        )
+        active = self._constrained_mask()
+        if self.x_star_unit is not None:
+            self.a, self.b = qmdp.clip_quantiles_around_qstar(
+                self.a, self.b, self.q_star, active, self.quantile_eps
+            )
+        self._pin_constrained_categoricals()
+        self._sync_unit_bounds_from_quantiles()
+        _req = float(np.abs(action).sum())
+        _app = float(np.abs(self.a - prev_a).sum() + np.abs(self.b - prev_b).sum())
+        self._act_requested = getattr(self, "_act_requested", 0.0) + _req
+        self._act_applied = getattr(self, "_act_applied", 0.0) + _app
+        self._act_absmean = getattr(self, "_act_absmean", 0.0) + float(np.abs(action).mean())
+        self._act_maxdelta = getattr(self, "_act_maxdelta", 0.0) + float(self.max_quantile_step)
+        self._act_steps = getattr(self, "_act_steps", 0) + 1
+
     def step(
         self, 
         action: np.ndarray
@@ -1391,39 +1750,30 @@ class SingleAgentAnchorEnv(Env):
             prev_precision, prev_coverage, _ = self._current_metrics()
         prev_lower = self.lower.copy()
         prev_upper = self.upper.copy()
+        prev_a = self.a.copy()
+        prev_b = self.b.copy()
+        prev_active = self._constrained_mask()
         
         # Apply continuous action (always continuous for single-agent)
         self._apply_continuous_action(action)
         
-        # CRITICAL VALIDATION: Ensure box is valid (lower <= upper in all dimensions)
-        # This prevents coverage from being 0.0 due to invalid boxes
-        for f in range(self.n_features):
-            if self.lower[f] > self.upper[f]:
-                logger.warning(
-                    f"  ⚠ Invalid box detected: lower[{f}]={self.lower[f]:.6f} > upper[{f}]={self.upper[f]:.6f}. "
-                    f"Fixing by centering around x_star_unit if available."
-                )
-                # Fix invalid box
-                if self.x_star_unit is not None:
-                    if isinstance(self.x_star_unit, np.ndarray):
-                        x_star = self.x_star_unit
+        # Hull path only: unit min_width repair. Quantile path never expands unconstrained dims.
+        if not self._uses_quantile_mdp():
+            for f in range(self.n_features):
+                if self.lower[f] > self.upper[f]:
+                    if self.x_star_unit is not None:
+                        mid = float(np.asarray(self.x_star_unit, dtype=np.float32).reshape(-1)[f])
                     else:
-                        x_star = np.array(self.x_star_unit, dtype=np.float32)
-                    # Center around x_star_unit
-                    mid = x_star[f]
-                else:
-                    # No x_star_unit, use midpoint
-                    mid = 0.5 * (self.lower[f] + self.upper[f])
-                
-                self.lower[f] = max(0.0, mid - self.min_width / 2.0)
-                self.upper[f] = min(1.0, mid + self.min_width / 2.0)
-                if self.upper[f] - self.lower[f] < self.min_width:
-                    if self.upper[f] >= 1.0:
-                        self.lower[f] = max(0.0, 1.0 - self.min_width)
-                        self.upper[f] = 1.0
-                    else:
-                        self.lower[f] = 0.0
-                        self.upper[f] = min(1.0, self.min_width)
+                        mid = 0.5 * (self.lower[f] + self.upper[f])
+                    self.lower[f] = max(0.0, mid - self.min_width / 2.0)
+                    self.upper[f] = min(1.0, mid + self.min_width / 2.0)
+                    if self.upper[f] - self.lower[f] < self.min_width:
+                        if self.upper[f] >= 1.0:
+                            self.lower[f] = max(0.0, 1.0 - self.min_width)
+                            self.upper[f] = 1.0
+                        else:
+                            self.lower[f] = 0.0
+                            self.upper[f] = min(1.0, self.min_width)
         
         precision, coverage, details = self._current_metrics()
 
@@ -1468,10 +1818,22 @@ class SingleAgentAnchorEnv(Env):
         # collapsed final box has nothing to retreat to and the episode returns
         # nothing usable.
         if np.isfinite(coverage) and coverage >= self.min_coverage_floor:
-            _score = float(coverage)
-            if _score > getattr(self, "_best_box_cov", -1.0):
-                self._best_box_cov = _score
-                self._best_box = (self.lower.copy(), self.upper.copy())
+            k_now = self.n_predicates()
+            n_cov = int(details.get("n_covered") or 0)
+            if (not self._uses_quantile_mdp()) or self._empty_rule_eligible(precision, k_now):
+                _score = _ranking_score(
+                    precision, coverage, getattr(self, "ranking_score_formula", "lcb_coverage"),
+                    n_covered=n_cov, min_support=self.min_support,
+                )
+                if _score > getattr(self, "_best_box_cov", float("-inf")):
+                    self._best_box_cov = _score
+                    self._best_box = (
+                        self.lower.copy(),
+                        self.upper.copy(),
+                        self.a.copy(),
+                        self.b.copy(),
+                        self._constrained_mask().copy(),
+                    )
 
         precision_gain = precision - prev_precision
         coverage_gain = coverage - prev_coverage
@@ -1489,14 +1851,24 @@ class SingleAgentAnchorEnv(Env):
         # class bonuses existed to manage that scheme and are retired with it.
         phi_prev = self._potential(prev_precision, prev_coverage)
         phi_curr = self._potential(precision, coverage)
-        shaping_gain = phi_curr - phi_prev
         coverage_gain_for_reward = coverage_gain  # raw gain, kept for logging
 
-        widths = self.upper - self.lower
-        overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
-
-        drift = float(np.linalg.norm(self.upper - prev_upper) + np.linalg.norm(self.lower - prev_lower))
+        curr_active = self._constrained_mask()
+        both_active = prev_active & curr_active
+        if self._uses_quantile_mdp():
+            da = np.abs(self.a - prev_a)
+            db = np.abs(self.b - prev_b)
+            drift = float((da[both_active].sum() + db[both_active].sum()) if both_active.any() else 0.0)
+            widths_q = (self.b - self.a)
+            overlap_penalty = self.gamma * float(
+                ((widths_q < (2 * self.min_quantile_width)) & both_active).mean()
+            ) if both_active.any() else 0.0
+        else:
+            widths = self.upper - self.lower
+            overlap_penalty = self.gamma * float((widths < (2 * self.min_width)).mean())
+            drift = float(np.linalg.norm(self.upper - prev_upper) + np.linalg.norm(self.lower - prev_lower))
         drift_penalty = self.drift_penalty_weight * drift
+        shaping_gain = self.discount * phi_curr - phi_prev
 
         anchor_drift_penalty = self._compute_anchor_drift_penalty(prev_lower, prev_upper)
 
@@ -1561,11 +1933,7 @@ class SingleAgentAnchorEnv(Env):
         episode_phase = min(
             1.0, float(self.timestep + 1) / float(self.max_cycles)
         )
-        state = np.concatenate([
-            self.lower,
-            self.upper,
-            np.array([precision, coverage, episode_phase], dtype=np.float32),
-        ])
+        state = self._get_observation(precision, coverage)
         
         ## SS: Target change here:
         # Termination uses the class-aware effective target so minority/overlapping
@@ -1575,7 +1943,17 @@ class SingleAgentAnchorEnv(Env):
         both_targets_met = (
             precision >= precision_target
             and coverage >= self.coverage_target
-            and self._coverage_improved(coverage)
+            and (
+                (
+                    self._uses_quantile_mdp()
+                    and self.n_predicates() >= 1
+                    and self._precision_improved(precision)
+                )
+                or (
+                    (not self._uses_quantile_mdp())
+                    and self._coverage_improved(coverage)
+                )
+            )
         )
         high_precision_with_reasonable_coverage = (
             precision >= 0.95 * precision_target and
@@ -1604,14 +1982,26 @@ class SingleAgentAnchorEnv(Env):
         high_precision_with_reasonable_coverage = high_precision_with_reasonable_coverage and high_precision_enabled
         both_reasonably_close = both_reasonably_close and both_close_enabled
         
-        # Validate rule validity before allowing termination
-        # Check that bounds are valid: lower < upper for all features, bounds in [0, 1], and finite
+        # Validate rule validity before allowing termination:
+        # bounds ordered, inside [0, 1], and finite.
+        #
+        # Zero width is representation-dependent -- see the matching comment in
+        # BenchMARL/environment.py. Under neighbor_hull, lower == upper means the
+        # box collapsed onto its seed point and is degenerate. Under the quantile
+        # MDP it is an EQUALITY predicate "f_j = v" produced by ties in the class
+        # empirical CDF, with real inclusive support, so only an inverted bound
+        # (lower > upper) is actually invalid.
         bounds_valid = True
-        if np.any(self.lower >= self.upper):
+        _degenerate = (
+            self.lower > self.upper
+            if self._uses_quantile_mdp()
+            else self.lower >= self.upper
+        )
+        if np.any(_degenerate):
             bounds_valid = False
-            invalid_features = np.where(self.lower >= self.upper)[0]
+            invalid_features = np.where(_degenerate)[0]
             logger.warning(
-                f"Invalid bounds detected: lower >= upper for features {invalid_features[:5]}. "
+                f"Invalid bounds detected: lower > upper for features {invalid_features[:5]}. "
                 f"Preventing termination until bounds are fixed."
             )
         if np.any(self.lower < 0) or np.any(self.upper > 1):
@@ -1722,6 +2112,7 @@ class SingleAgentAnchorEnv(Env):
             "coverage_floor_penalty": float(coverage_floor_penalty),
             "coverage_at_reset": float(self._coverage_at_reset),
             "coverage_improved": float(1.0 if self._coverage_improved(coverage) else 0.0),
+            "n_predicates": float(self.n_predicates()),
             # Multi-agent features (not applicable, set to 0.0 for consistency)
             "inter_class_overlap_penalty": 0.0,  # Not applicable: single agent per environment
             "same_class_overlap_penalty": 0.0,   # Not applicable: single agent per environment
@@ -1758,6 +2149,23 @@ class SingleAgentAnchorEnv(Env):
         
         max_steps_reached = (self.timestep >= self.max_cycles)
         truncated = max_steps_reached and not done
+
+        if done:
+            # Potential of the absorbing terminal is 0: F = -Φ(s) = (γ·0 - Φ(s)).
+            #
+            # `done` ONLY, never truncation. SB3 excludes time-limit truncations from
+            # `dones` (ReplayBuffer._get_samples returns dones*(1-timeouts), and
+            # DummyVecEnv sets info["TimeLimit.truncated"]), so on truncation it
+            # bootstraps V(s'). Under shaping V_shaped(s') = V(s') - Φ(s'), so the
+            # bootstrap already carries -Φ(s'); applying this correction there too
+            # double-counts it. Measured -0.286 on a truncated breast_cancer episode,
+            # scaling with Φ(s_T) -- i.e. the better the final box, the bigger the
+            # spurious penalty, on the majority of episodes.
+            _corr = -self.discount * float(phi_curr)
+            reward += _corr
+            shaping_gain = float(shaping_gain) + _corr
+            self._rt_shaping = getattr(self, "_rt_shaping", 0.0) + _corr
+            self._rt_total = getattr(self, "_rt_total", 0.0) + _corr
         
         # Log warning if episode terminates immediately (step_count=1 after step)
         if self.step_count == 1 and done:
@@ -1777,15 +2185,19 @@ class SingleAgentAnchorEnv(Env):
             if np.isfinite(_c_end) and _c_end < self.min_coverage_floor:
                 _ref = getattr(self, "_best_box", None)
                 if _ref is not None:
-                    # Retreat to the best feasible box found this episode, not to the
-                    # previous step (which is collapsed too when the box has run down).
                     _discarded = float(
                         np.abs(self.lower - _ref[0]).sum() + np.abs(self.upper - _ref[1]).sum()
                     )
                     _l, _u = _ref[0].copy(), _ref[1].copy()
+                    if len(_ref) >= 5:
+                        self.a = np.asarray(_ref[2], dtype=np.float64).copy()
+                        self.b = np.asarray(_ref[3], dtype=np.float64).copy()
                 else:
                     _l, _u, _discarded = self._project_to_floor_per_dim(prev_lower, prev_upper)
                 self.lower, self.upper = _l, _u
+                if self._uses_quantile_mdp() and (_ref is None or len(_ref) < 5):
+                    # Projection changed unit bounds; keep (a,b) synced if possible.
+                    self._sync_unit_bounds_from_quantiles()
                 self._act_proj_loss = getattr(self, "_act_proj_loss", 0.0) + _discarded
                 self._act_clipped_steps = getattr(self, "_act_clipped_steps", 0) + 1
                 self.coverage_floor_hits += 1
@@ -1794,16 +2206,24 @@ class SingleAgentAnchorEnv(Env):
                     precision = 0.0
                 if not np.isfinite(coverage):
                     coverage = 0.0
+                info["anchor_precision"] = float(precision)
+                info["anchor_coverage"] = float(coverage)
+                info["precision"] = float(precision)
+                info["coverage"] = float(coverage)
+                for key, value in details.items():
+                    if isinstance(value, (int, float, np.number)):
+                        info[key] = float(value)
+                observation = self._get_observation(precision, coverage)
+                self._last_step_metrics = (precision, coverage, details)
 
         if truncated and not done and self.partial_terminal_credit > 0.0:
-            # Same precision gate as the potential: partial credit only accrues to a
-            # box that is still faithful, so this cannot be farmed by expanding into
-            # garbage. Scales linearly with how far the box got toward tau_C.
             _t = max(float(self.precision_target_effective), 1e-6)
             _m = max(float(self.gate_margin), 1e-6)
             _gate = float(min(1.0, max(0.0, (float(precision) - (_t - _m)) / _m)))
-            _frac = float(min(1.0, max(0.0, float(coverage) / max(float(self.coverage_target), 1e-6))))
-            _partial = float(self.terminal_bonus) * self.partial_terminal_credit * _frac * _gate
+            k_end = self.n_predicates() if self._uses_quantile_mdp() else 1
+            _frac = float(max(0.0, min(1.0, float(coverage)))) * (1.0 if k_end >= 1 else 0.0)
+            _sparsity = max(0.0, 1.0 - self.sparsity_terminal_weight * (k_end / max(1, self.n_features)))
+            _partial = float(self.terminal_bonus) * self.partial_terminal_credit * _frac * _gate * max(_sparsity, 0.0)
             if _partial > 0.0:
                 reward += _partial
                 self._rt_terminal = getattr(self, "_rt_terminal", 0.0) + _partial
@@ -1857,7 +2277,7 @@ class SingleAgentAnchorEnv(Env):
 
         remaining = list(changed)
         for _ in range(len(changed)):
-            _p, c_now, _d = self._current_metrics()
+            c_now = self._empirical_class_cond_coverage()
             if np.isfinite(c_now) and c_now >= self.min_coverage_floor:
                 break
             best_j, best_c = None, -np.inf
@@ -1865,7 +2285,7 @@ class SingleAgentAnchorEnv(Env):
             for j in remaining:
                 self.lower, self.upper = cur_lower.copy(), cur_upper.copy()
                 self.lower[j], self.upper[j] = prev_lower[j], prev_upper[j]
-                _p2, c2, _d2 = self._current_metrics()
+                c2 = self._empirical_class_cond_coverage()
                 if np.isfinite(c2) and c2 > best_c:
                     best_c, best_j = c2, j
             self.lower, self.upper = cur_lower, cur_upper
@@ -1916,11 +2336,16 @@ class SingleAgentAnchorEnv(Env):
         """
         from utils.metrics import sparsify_box
 
+        if self._uses_quantile_mdp() and self.n_predicates() < 1:
+            return "any values (no tightened features)", "any_values"
+
+        active_mask = self._constrained_mask() if self._uses_quantile_mdp() else None
         lower, upper, active = sparsify_box(
             self.lower,
             self.upper,
             sparsity_width_ratio=self.sparsity_width_ratio,
             max_features=max_features_in_rule,
+            active_mask=active_mask,
         )
         lower_unit = lower.copy()
         upper_unit = upper.copy()
@@ -1955,6 +2380,19 @@ class SingleAgentAnchorEnv(Env):
         
         rule_str = " and ".join(cond_parts)
         return rule_str, canonical_key
+
+    def export_rule_state(self) -> Dict[str, Any]:
+        active = self._constrained_mask()
+        return {
+            "a": np.asarray(self.a, dtype=float).tolist(),
+            "b": np.asarray(self.b, dtype=float).tolist(),
+            "q_star": np.asarray(self.q_star, dtype=float).tolist(),
+            "active_features": active.astype(int).tolist(),
+            "n_predicates": int(active.sum()),
+            "quantile_knots": qmdp.export_knots(self._quantile_cdfs),
+            "lower_bounds_normalized": np.asarray(self.lower, dtype=float).tolist(),
+            "upper_bounds_normalized": np.asarray(self.upper, dtype=float).tolist(),
+        }
     
     def _canonicalize_rule_key(
         self,
@@ -1983,7 +2421,9 @@ class SingleAgentAnchorEnv(Env):
         
         # Drop near-full-range features (features that haven't been tightened)
         # A feature is near-full-range if: lower <= eps AND upper >= 1 - eps
-        tightened_mask = ~((lower_quantized <= epsilon) & (upper_quantized >= 1.0 - epsilon))
+        tightened_mask = self._constrained_mask() if self._uses_quantile_mdp() else (
+            ~((lower_quantized <= epsilon) & (upper_quantized >= 1.0 - epsilon))
+        )
         tightened_indices = np.where(tightened_mask)[0]
         
         if len(tightened_indices) == 0:

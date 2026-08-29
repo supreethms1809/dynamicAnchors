@@ -234,6 +234,7 @@ def ranking_score(
     coverage: float,
     formula: str = RANKING_SCORE_LCB_COVERAGE,
     n_covered: Optional[int] = None,
+    min_support: Optional[int] = None,
 ) -> float:
     """Configurable rule-ranking score.
 
@@ -258,9 +259,12 @@ def ranking_score(
     fid = float(fidelity)
     cov = 0.0 if coverage is None or (isinstance(coverage, float) and np.isnan(coverage)) else float(coverage)
     if formula == RANKING_SCORE_LCB_COVERAGE:
-        if n_covered is None or int(n_covered) <= 0:
+        if n_covered is None:
             return fid * (1.0 + cov)
         n = int(n_covered)
+        floor = 1 if min_support is None else int(min_support)
+        if n < floor:
+            return float("-inf")
         lo, _ = wilson_interval(int(round(fid * n)), n)
         return float(lo) * (1.0 + cov)
     if formula == RANKING_SCORE_PRECISION_COVERAGE:
@@ -448,12 +452,15 @@ def active_feature_mask(
     sparsity_width_ratio: float = 0.95,
     feature_min: Optional[np.ndarray] = None,
     feature_max: Optional[np.ndarray] = None,
+    quantile_active: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """True where the interval is tighter than `sparsity_width_ratio` of the full range.
+    """True on constrained dimensions.
 
-    This is the drop criterion used by extract_rule / build_canonical_rule_key.
-    Threshold is a hyperparameter (C-08).
+    If `quantile_active` is provided it is the source of truth (quantile MDP).
+    Otherwise fall back to unit-width < sparsity_width_ratio of full range.
     """
+    if quantile_active is not None:
+        return np.asarray(quantile_active, dtype=bool).reshape(-1)
     lower = np.asarray(lower, dtype=np.float64).reshape(-1)
     upper = np.asarray(upper, dtype=np.float64).reshape(-1)
     if feature_min is None:
@@ -473,17 +480,22 @@ def sparsify_box(
     *,
     sparsity_width_ratio: float,
     max_features: Optional[int] = None,
+    active_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Drop inactive unit-space dimensions by restoring their full [0,1] range."""
+    """Drop inactive dimensions by restoring their full [0,1] range."""
     lower = np.asarray(lower, dtype=np.float32).copy()
     upper = np.asarray(upper, dtype=np.float32).copy()
     active = active_feature_mask(
-        lower, upper, sparsity_width_ratio=sparsity_width_ratio
+        lower, upper, sparsity_width_ratio=sparsity_width_ratio,
+        quantile_active=active_mask,
     )
     active_idx = np.flatnonzero(active)
     if max_features not in (None, -1, 0) and len(active_idx) > int(max_features):
         widths = upper[active_idx] - lower[active_idx]
-        keep = active_idx[np.argsort(widths)[:int(max_features)]]
+        if active_mask is not None:
+            keep = active_idx[np.argsort(widths)[::-1][:int(max_features)]]
+        else:
+            keep = active_idx[np.argsort(widths)[:int(max_features)]]
         active[:] = False
         active[keep] = True
     lower[~active] = 0.0
