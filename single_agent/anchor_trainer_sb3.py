@@ -238,9 +238,10 @@ class FidCovEvalCallback(BaseCallback):
             return float(inner[key])
         return None
 
-    def _evaluate(self) -> Tuple[float, float]:
+    def _evaluate(self) -> Tuple[float, float, Optional[int]]:
         precs: List[float] = []
         covs: List[float] = []
+        ns: List[Optional[int]] = []
         for _ in range(self.n_eval_episodes):
             obs = self._reset(self.eval_env)
             done = False
@@ -249,33 +250,66 @@ class FidCovEvalCallback(BaseCallback):
                 action, _ = self.model.predict(obs, deterministic=True)
                 obs, done, info = self._step(self.eval_env, action)
                 last_info = info if isinstance(info, dict) else {}
+            k = int(last_info.get("n_predicates", last_info.get("n_active", 0)) or 0)
+            try:
+                k = int(getattr(self.eval_env, "n_predicates")())
+            except Exception:
+                pass
             p = self._info_metric(last_info, "anchor_precision")
             c = self._info_metric(last_info, "anchor_coverage")
+            n_cov = last_info.get("n_covered")
             if p is None or c is None:
+                continue
+            if k < 1:
                 continue
             precs.append(p)
             covs.append(c)
+            ns.append(int(n_cov) if n_cov is not None else None)
+        ns = [n for n in ns if n is not None]
         if not precs:
-            return float("nan"), float("nan")
-        return float(np.mean(precs)), float(np.mean(covs))
+            return float("nan"), float("nan"), None
+        # MEAN support across eval episodes, not min.
+        #
+        # min() made a SINGLE empty-box episode poison the whole checkpoint score:
+        # ranking_score(..., n_covered=0) is -inf, and since best_score starts at
+        # -inf the `score > best_score` test was then False forever, so
+        # best_model.zip was never written for that class. Measured on
+        # n_covered=[40,25,18,0]: min -> -inf, mean -> 0.69, sum -> 0.83. wine
+        # recorded 0 saves across all 8 evals this way.
+        #
+        # This became reachable only with the conditional D(z|A) estimator: it makes
+        # precision well-defined on an empty box (the point of the fix), so empty
+        # boxes now survive the `p is None` / `k < 1` filters and reach `ns`.
+        #
+        # mean, not sum: sum grows with n_eval_episodes, which would make the score
+        # depend on the eval budget. The mean is the typical support of the boxes
+        # this checkpoint produces, and keeping the zeros in it correctly penalises
+        # a checkpoint that often collapses.
+        mean_n = int(round(float(np.mean(ns)))) if ns else None
+        return float(np.mean(precs)), float(np.mean(covs)), mean_n
 
     def _on_step(self) -> bool:
         if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
             return True
-        mean_p, mean_c = self._evaluate()
+        mean_p, mean_c, mean_n = self._evaluate()
         self.last_mean_precision = mean_p
         self.last_mean_coverage = mean_c
-        score = ranking_score(mean_p, mean_c)
+        score = ranking_score(mean_p, mean_c, n_covered=mean_n)
+        if score is None or not np.isfinite(score):
+            score = float("-inf")
         self.last_score = score
         logger.info(
-            "  FidCov eval @ %s steps: mean P=%.4f C=%.4f score=%.4f (best=%.4f)",
+            "  FidCov eval @ %s steps: mean P=%.4f C=%.4f score=%s (best=%s)",
             self.n_calls,
             mean_p,
             mean_c,
-            score if np.isfinite(score) else float("nan"),
-            self.best_score if np.isfinite(self.best_score) else float("nan"),
+            f"{score:.4f}" if np.isfinite(score) else "-inf",
+            f"{self.best_score:.4f}" if np.isfinite(self.best_score) else "none",
         )
-        if score > self.best_score:
+        # Only checkpoint on a finite ranking_score. Support-starved evals
+        # return -inf; comparing -inf > -inf would never write best_model.zip
+        # and inference then fails with prefer_model='best'.
+        if np.isfinite(score) and score > self.best_score:
             os.makedirs(self.best_model_save_path, exist_ok=True)
             zip_path = os.path.join(self.best_model_save_path, "best_model.zip")
             self.model.save(zip_path)
@@ -481,24 +515,6 @@ class AnchorTrainerSB3:
         # or fall back to config default if dataset size unavailable
         # This prevents the coverage floor from being too high and blocking expansion during training
         n_samples = env_data["X_unit"].shape[0] if env_data.get("X_unit") is not None else None
-        config_default = env_config.get("min_coverage_floor", 0.005)
-        
-        if n_samples is not None and n_samples > 0:
-            # Use 1/n_samples to ensure at least one point is covered (the anchor instance)
-            # For instance-based anchors, initial coverage is typically 0.001-0.002, so we need
-            # a floor that's lower than that to allow expansion
-            min_coverage_floor = 1.0 / n_samples
-            # Use a very small lower bound (1e-6) instead of config_default to avoid blocking expansion
-            # The config_default (0.005) is too high for instance-based anchors
-            min_coverage_floor = max(min_coverage_floor, 1e-6)
-        else:
-            # Fall back to config default if dataset size unavailable
-            min_coverage_floor = config_default
-        
-        # Ensure it's non-zero
-        min_coverage_floor = max(min_coverage_floor, 1e-6)
-        
-        # Create environment configuration with data
         env_config_with_data = {
             **env_config,
             "X_min": env_data["X_min"],
@@ -506,20 +522,20 @@ class AnchorTrainerSB3:
             "scaler_mean": env_data.get("scaler_mean"),
             "scaler_scale": env_data.get("scaler_scale"),
             "max_cycles": max_cycles,
-            "min_coverage_floor": min_coverage_floor,  # Override with dynamic value
             "categorical_indices": env_data.get("categorical_indices") or [],
             "categorical_value_names": env_data.get("categorical_value_names") or {},
             "X_val_unit": env_data.get("X_val_unit"),
             "X_val_std": env_data.get("X_val_std"),
             "y_val": env_data.get("y_val"),
-            "categorical_indices": env_data.get("categorical_indices") or [],
-            "categorical_value_names": env_data.get("categorical_value_names") or {},
             "X_test_unit": env_data.get("X_test_unit"),
             "X_test_std": env_data.get("X_test_std"),
             "y_test": env_data.get("y_test"),
         }
         
-        logger.info(f"  Set min_coverage_floor={min_coverage_floor:.6f} for training (n_samples={n_samples if n_samples is not None else 'unknown'}, ensures box covers at least anchor instance)")
+        logger.info(
+            "  min_coverage_floor left to env (min_support/n_class); "
+            f"n_train={n_samples if n_samples is not None else 'unknown'}"
+        )
         
         if eval_on_test_data is None:
             eval_on_test_data = bool(env_config.get("eval_on_test_data", False))
@@ -1098,6 +1114,31 @@ class AnchorTrainerSB3:
                 logger.info(
                     "  Restored validation-selected best model for class %s",
                     target_class,
+                )
+            else:
+                # Deliberately NO final-weights fallback here.
+                #
+                # Writing final_model into best_model.zip let the job proceed but made
+                # `best_model` mean "final, unselected" for that class, silently and
+                # invisibly to every downstream consumer -- C-10 checkpoint selection
+                # is on the paper's reporting path, so those numbers would be
+                # unattributable. It also hid the real defect (min() over per-episode
+                # support driving every FidCov score to -inf); iris class_1 shipped a
+                # byte-identical copy of final_model this way while the run looked
+                # healthy.
+                #
+                # If this fires now it is a genuine training failure: no evaluation in
+                # the whole run produced a scorable anchor. Fail loudly at the end of
+                # training rather than at inference, where the message is far from the
+                # cause.
+                raise RuntimeError(
+                    f"No validation-selected best_model.zip for class {target_class}: "
+                    f"every FidCov evaluation scored -inf, so no checkpoint was ever "
+                    f"selected. This means no eval episode produced a box with "
+                    f"k >= 1 predicates and non-zero support. Inspect the "
+                    f"'FidCov eval @ ... score=' lines in the training log. Do not "
+                    f"substitute final_model: it is not validation-selected and would "
+                    f"silently corrupt the reported metrics."
                 )
         
         logger.info("\n" + "="*80)

@@ -234,6 +234,11 @@ comparison_results/*
 .DS_Store
 wandb/*
 final_results/*
-tests/*
-!tests/test_revision_metrics.py
+# Test RUN ARTIFACTS only. Test sources under tests/ are tracked -- the previous
+# blanket `tests/*` silently ignored every new test file, so regression guards
+# were written and then never committed.
+tests/output/
+tests/**/__pycache__/
+tests/*_anchor_mlp__*/
+tests/*_anchor_*__*/
 models/*

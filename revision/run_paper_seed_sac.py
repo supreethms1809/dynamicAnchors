@@ -1,14 +1,17 @@
-"""One-seed revision sweep on paper datasets (Iris harness, other data).
+"""One-seed revision sweep on paper datasets — SAC / MASAC variant.
 
-Train RLDA (DDPG) + MADA (MADDPG), infer, evaluate, baselines, regenerate tables.
-Skip-if-exists so a crash can resume. Continues to the next dataset on failure.
+Sibling of run_paper_seed.py. Identical pipeline (train -> infer -> evaluate ->
+baselines -> tables) but:
+  * RLDA uses single-agent SAC     -> output/{ds}_rlda_sac_seed{seed}
+  * MADA uses BenchMARL MASAC      -> output/{ds}_mada_masac_seed{seed}
+  * eval JSONs                     -> revision/results_sac/
+  * per-dataset logs               -> revision/logs/{ds}_sac/
+  * tables / figures               -> paper/tables_sac/ , paper/figures_sac/
 
-  python revision/run_paper_seed.py
-  python revision/run_paper_seed.py --datasets wine breast_cancer
-  python revision/run_paper_seed.py --seed 42 --device cpu
+Nothing the DDPG/MADDPG sweep produced is touched. Skip-if-exists so a crash
+can resume; continues to the next dataset on failure.
 
-Budgets match run_all_experiments.py (timesteps/frames/n_instances).
-Episode length comes from YAML (max_cycles=200), not the old 500.
+  python revision/run_paper_seed_sac.py --datasets wine --seed 42 --device cpu
 """
 from __future__ import annotations
 
@@ -26,18 +29,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from print_leg import summarize  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-# tau_C 0.20 -> 0.10: at 0.20 no episode met both targets on breast_cancer /
-# wine / uci_credit (success_rate = 0.000), so the terminal bonus never paid and
-# training ran on potential differences alone. The earlier sweep that favoured
-# 0.20 predates the A1/A2 selection+seeding fixes and is not a valid basis.
+# Same thresholds as run_paper_seed.py.
 TAU_P, TAU_C, K = 0.90, 0.10, 5
-RESULTS = REPO / "revision" / "results"
+RESULTS = REPO / "revision" / "results_sac"
 LOG_DIR = REPO / "revision" / "logs"
+TABLES_DIR = REPO / "paper" / "tables_sac"
+FIGURES_DIR = REPO / "paper" / "figures_sac"
 FORCE = False
 SKIP_RLDA = set()
 
-# sa_timesteps / ma_frames / n_instances: same table as run_all_experiments.py.
-# Do not pass max_cycles here — current conf/anchor.yaml is 200.
+SA_ALGO = "sac"
+MA_ALGO = "masac"
+SA_SUBDIR = "sac_single_agent"   # training-subdir filter for latest_exp
+MA_SUBDIR = "masac"              # BenchMARL names it masac_anchor_mlp__...
+
+# SAC spends its budget in the high-entropy exploration phase: at the DDPG-equal
+# budget, ent_coef never decayed (iris ~0.9 throughout) and best checkpoints came
+# at or near the final eval (wine class_1 best = step 40k/40k). Bump the budget 3x
+# to see whether the trend breaks before touching target_entropy / ent_coef.
+BUDGET_MULT = 3
+
+# sa_timesteps / ma_frames / n_instances: same table as run_paper_seed.py.
 DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "iris": {
         "sa_timesteps": 90_000,
@@ -77,6 +89,11 @@ DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     },
 }
 
+# Apply the SAC budget multiplier to the training-length knobs only.
+for _cfg in DATASET_CONFIGS.values():
+    _cfg["sa_timesteps"] *= BUDGET_MULT
+    _cfg["ma_frames"] *= BUDGET_MULT
+
 ENV = os.environ.copy()
 ENV.update({
     "WANDB_MODE": "offline",
@@ -106,16 +123,16 @@ def run(cmd, cwd=None, log_file: Optional[Path] = None) -> None:
 
 
 def rlda_out(dataset: str, seed: int) -> Path:
-    return REPO / "output" / f"{dataset}_rlda_ddpg_seed{seed}"
+    return REPO / "output" / f"{dataset}_rlda_{SA_ALGO}_seed{seed}"
 
 
 def mada_out(dataset: str, seed: int) -> Path:
-    return REPO / "output" / f"{dataset}_mada_maddpg_seed{seed}"
+    return REPO / "output" / f"{dataset}_mada_{MA_ALGO}_seed{seed}"
 
 
 def ds_log(dataset: str, name: str) -> Path:
     safe = dataset.replace("/", "_")
-    return LOG_DIR / safe / name
+    return LOG_DIR / f"{safe}_sac" / name
 
 
 def latest_exp(output_dir: Path, must_contain: str | None = None) -> Path | None:
@@ -137,7 +154,7 @@ def latest_exp(output_dir: Path, must_contain: str | None = None) -> Path | None
 
 
 def rlda_rules(dataset: str, seed: int) -> Path | None:
-    exp = latest_exp(rlda_out(dataset, seed), "ddpg_single_agent")
+    exp = latest_exp(rlda_out(dataset, seed), SA_SUBDIR)
     if exp is None:
         return None
     p = exp / "inference" / "extracted_rules_single_agent.json"
@@ -145,7 +162,7 @@ def rlda_rules(dataset: str, seed: int) -> Path | None:
 
 
 def mada_rules(dataset: str, seed: int) -> Path | None:
-    exp = latest_exp(mada_out(dataset, seed), "maddpg")
+    exp = latest_exp(mada_out(dataset, seed), MA_SUBDIR)
     if exp is None:
         return None
     p = exp / "inference" / "extracted_rules.json"
@@ -159,19 +176,17 @@ def result_path(dataset: str, method: str, seed: int) -> Path:
 
 
 def train_rlda(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> None:
-    if not FORCE and latest_exp(rlda_out(dataset, seed), "ddpg_single_agent") is not None:
+    if not FORCE and latest_exp(rlda_out(dataset, seed), SA_SUBDIR) is not None:
         log(f"{dataset} RLDA seed {seed}: training artifacts present, skip train")
         return
     out = rlda_out(dataset, seed)
     out.mkdir(parents=True, exist_ok=True)
     n_cls = int(cfg.get("n_classes", 1))
-    # driver.py divides --total_timesteps by len(target_classes). One class per
-    # shard, so pass the per-class budget (same sequential total as sa_timesteps).
     per_class = cfg["sa_timesteps"] // max(n_cls, 1)
     run(
         [
             sys.executable, str(REPO / "single_agent" / "run_parallel_classes.py"),
-            "--dataset", dataset, "--algorithm", "ddpg", "--seed", str(seed),
+            "--dataset", dataset, "--algorithm", SA_ALGO, "--seed", str(seed),
             "--n_classes", str(n_cls), "--parallel_classes", str(n_cls),
             "--total_timesteps", str(per_class), "--n_envs", "1",
             "--device", device, "--output_dir", str(out) + "/",
@@ -182,7 +197,7 @@ def train_rlda(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Non
 
 
 def train_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> None:
-    if not FORCE and latest_exp(mada_out(dataset, seed), "maddpg") is not None:
+    if not FORCE and latest_exp(mada_out(dataset, seed), MA_SUBDIR) is not None:
         log(f"{dataset} MADA seed {seed}: training artifacts present, skip train")
         return
     out = mada_out(dataset, seed)
@@ -190,7 +205,7 @@ def train_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Non
     run(
         [
             sys.executable, "driver.py",
-            "--dataset", dataset, "--algorithm", "maddpg", "--seed", str(seed),
+            "--dataset", dataset, "--algorithm", MA_ALGO, "--seed", str(seed),
             "--skip_eda", "--max_n_frames", str(cfg["ma_frames"]),
             "--device", device, "--output_dir", str(out) + "/",
         ],
@@ -200,12 +215,11 @@ def train_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Non
 
 
 def ensure_best_models(exp: Path) -> None:
-    """If FidCov never wrote best_model.zip, copy final weights so inference can load prefer_model=best."""
     final_dir = exp / "final_model"
     if not final_dir.is_dir():
         return
     for final in sorted(final_dir.glob("class_*.zip")):
-        cls = final.stem  # class_N
+        cls = final.stem
         dest_dir = exp / "best_model" / cls
         dest = dest_dir / "best_model.zip"
         if dest.exists():
@@ -220,7 +234,7 @@ def infer_rlda(dataset: str, seed: int, cfg: Dict[str, int]) -> Path:
     if not FORCE and existing is not None:
         log(f"{dataset} RLDA seed {seed}: rules exist, skip inference")
         return existing
-    exp = latest_exp(rlda_out(dataset, seed), "ddpg_single_agent")
+    exp = latest_exp(rlda_out(dataset, seed), SA_SUBDIR)
     if exp is None:
         raise SystemExit(f"No RLDA experiment dir for {dataset} seed {seed}")
     ensure_best_models(exp)
@@ -243,7 +257,7 @@ def infer_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Pat
     if not FORCE and existing is not None:
         log(f"{dataset} MADA seed {seed}: rules exist, skip inference")
         return existing
-    exp = latest_exp(mada_out(dataset, seed), "maddpg")
+    exp = latest_exp(mada_out(dataset, seed), MA_SUBDIR)
     if exp is None:
         raise SystemExit(f"No MADA experiment dir for {dataset} seed {seed}")
     run(
@@ -266,7 +280,7 @@ def evaluate(dataset: str, method: str, rules: Path, seed: int) -> None:
     dest = result_path(dataset, method, seed)
     if dest.exists() and not FORCE:
         log(f"{dataset} {method} seed {seed}: result JSON exists, skip evaluate")
-        log("\n" + summarize(dataset, method, seed, str(rules)))
+        log("\n" + summarize(dataset, method, seed, str(rules), results_dir=str(RESULTS)))
         return
     run(
         [
@@ -277,11 +291,11 @@ def evaluate(dataset: str, method: str, rules: Path, seed: int) -> None:
         ],
         log_file=ds_log(dataset, f"eval_{method}_seed{seed}.log"),
     )
-    log("\n" + summarize(dataset, method, seed, str(rules)))
+    log("\n" + summarize(dataset, method, seed, str(rules), results_dir=str(RESULTS)))
 
 
 def baselines(dataset: str, seed: int) -> None:
-    exp = latest_exp(rlda_out(dataset, seed), "ddpg_single_agent")
+    exp = latest_exp(rlda_out(dataset, seed), SA_SUBDIR)
     if exp is None:
         raise SystemExit(f"No RLDA classifier for {dataset} seed {seed}")
     clf = exp / "classifier.pth"
@@ -306,20 +320,22 @@ def baselines(dataset: str, seed: int) -> None:
 
 
 def tables() -> None:
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     run(
         [sys.executable, str(REPO / "paper" / "make_tables.py"),
-         "--results_dir", str(RESULTS), "--out_dir", str(REPO / "paper" / "tables")],
+         "--results_dir", str(RESULTS), "--out_dir", str(TABLES_DIR)],
     )
     run(
         [sys.executable, str(REPO / "paper" / "make_figures.py"),
-         "--results_dir", str(RESULTS), "--out_dir", str(REPO / "paper" / "figures")],
+         "--results_dir", str(RESULTS), "--out_dir", str(FIGURES_DIR)],
     )
 
 
 def run_dataset(dataset: str, seed: int, device: str) -> None:
     cfg = DATASET_CONFIGS[dataset]
     log(
-        f"=== {dataset} seed {seed}  "
+        f"=== {dataset} seed {seed}  [SAC/MASAC]  "
         f"RLDA {cfg['sa_timesteps']} steps / MADA {cfg['ma_frames']} frames / "
         f"{cfg['n_instances']} inst/class ==="
     )
@@ -338,7 +354,7 @@ def run_dataset(dataset: str, seed: int, device: str) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Revision 1-seed sweep on paper datasets")
+    p = argparse.ArgumentParser(description="Revision 1-seed SAC/MASAC sweep on paper datasets")
     p.add_argument(
         "--datasets",
         nargs="+",
@@ -350,13 +366,13 @@ def main() -> None:
     p.add_argument(
         "--force",
         action="store_true",
-        help="Retrain/re-infer/re-eval even if artifacts exist (required after env fixes).",
+        help="Retrain/re-infer/re-eval even if artifacts exist.",
     )
     p.add_argument(
         "--skip-rlda-datasets",
         nargs="*",
         default=[],
-        help="Skip RLDA train/infer/eval for these datasets (resume MADA after a failed MA leg).",
+        help="Skip RLDA train/infer/eval for these datasets.",
     )
     args = p.parse_args()
     global FORCE, SKIP_RLDA
@@ -366,7 +382,7 @@ def main() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
     failed: List[str] = []
-    log(f"Paper-dataset seed {args.seed} sweep {args.datasets} device={args.device} force={FORCE} skip_rlda={sorted(SKIP_RLDA)}")
+    log(f"Paper-dataset seed {args.seed} SAC/MASAC sweep {args.datasets} device={args.device} force={FORCE} skip_rlda={sorted(SKIP_RLDA)}")
     for dataset in args.datasets:
         try:
             run_dataset(dataset, args.seed, args.device)
@@ -377,9 +393,9 @@ def main() -> None:
             continue
     tables()
     if failed:
-        log(f"Done with failures: {failed}. Tables in paper/tables/")
+        log(f"Done with failures: {failed}. Tables in {TABLES_DIR}")
         raise SystemExit(1)
-    log("Done. Tables in paper/tables/, figures in paper/figures/")
+    log(f"Done. Tables in {TABLES_DIR}, figures in {FIGURES_DIR}")
 
 
 if __name__ == "__main__":

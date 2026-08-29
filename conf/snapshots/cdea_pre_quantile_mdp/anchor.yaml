@@ -23,36 +23,6 @@ env_config:
   # running CDEA experiments.
   precision_target: 0.9
   coverage_target: 0.1
-
-  # Quantile-position MDP (Anchors procedure order), now enabled for MADA.
-  # Snapshot of the pre-port config: conf/snapshots/cdea_pre_quantile_mdp/.
-  # Set init_mode back to neighbor_hull to restore the old representation
-  # (that is also the C-15 ablation arm, and what WyoDOT/CDEA should use).
-  init_mode: full_space
-  precision_estimator: conditional
-  n_perturb_train: 512
-  n_perturb_eval: 2048
-  quantile_eps: 0.001
-  max_quantile_step: 0.10
-  min_quantile_width: 0.02
-  leave_threshold: 0.85
-  max_new_constraints_per_step: 1
-  activation_quantile: 0.05
-  reset_diversity_frac: 0.3
-  n_reset_landings: 2
-  discount: 0.99
-  sparsity_terminal_weight: 1.0
-  require_precision_gain_to_terminate: true
-  # Declared explicitly: each of these was ABSENT from this file, so MADA silently
-  # took a code default that differs from RLDA's configured value.
-  gate_margin: 0.1              # was absent -> 0.10 default (equal, now explicit)
-  partial_terminal_credit: 1.0  # was absent -> 0.0: RLDA paid truncation credit, MADA did not
-  # was absent -> "step": per-step revert whenever the floor binds. Measured on the
-  # hull env to bind on 197/200 steps and discard 82% of requested movement.
-  coverage_floor_mode: terminal
-  # Floor as min_support/n_class (capped at coverage_target) instead of a flat
-  # 0.005, matching RLDA -- otherwise the two arms use different collapse guards.
-  coverage_floor_relative: true
   # Class-level rule selection (inference)
   # Precision floor for class-level filtering/union is lift-aware:
   #   floor = min(precision_target * 0.8, union_lift_k * class_prior)
@@ -78,15 +48,7 @@ env_config:
   # driving coverage from 0.014 to the 0.10 target was worth 0.119 against
   # per-episode penalties of 0.3-1.6, so shrinking dominated. At 5.0 the same
   # improvement is worth 0.99, comparable to the penalties it costs.
-  # Reverted 5.0 -> 0.6 to match single_agent/conf/anchor_single.yaml.
-  # The 5.0 was justified by "measured precision was exactly 1.000 in all 10
-  # dataset x class probes, so alpha*P is a constant that cancels" -- that was the
-  # HULL representation. Under the quantile MDP precision starts at the class base
-  # rate and rises, so alpha*P_tilde is a live term and the rationale is void.
-  # At 5.0 a +0.6 coverage gain is worth +2.24 against a precision term capped at
-  # 0.63, i.e. MADA would weight coverage 8.3x more than RLDA and the two arms
-  # would not be optimising the same objective.
-  beta: 0.6
+  beta: 5.0
   gamma: 0.1  # Increased from 0.02 to prevent box collapse
   # Control uses hard Fid (P(f̂=c | x∈B)). The 0.5 softmax blend is logged as
   # precision_proxy only; it made τ_P unreachable on accurate but unconfident DNNs.
@@ -109,10 +71,7 @@ env_config:
   # Episode length (kept here so it is passed directly into AnchorEnv.__init__)
   # Reduced from 500: with the noise-free potential-based reward, box shaping
   # converges in tens of steps; long episodes only added noise-farming room.
-  # Aligned with single_agent/conf/anchor_single.yaml. Under the quantile MDP a
-  # good anchor is a handful of predicates, so 200 steps is mostly noise-farming
-  # room -- and RLDA/MADA must share the episode budget to stay comparable.
-  max_cycles: 50
+  max_cycles: 200
 
   # Minimum steps before target-based termination is allowed (prevents an agent
   # from terminating straight from the initial box on step 1 and claiming the
@@ -180,15 +139,9 @@ env_config:
   coverage_bonus_weight_reasonable_prec: 0.01
   coverage_bonus_weight_reasonable_prec_progress: 0.02
   target_class_bonus_weight: 0.02
-  # NashConv (ε-Nash exploitability) -- OFF.
-  # The gradient best-response reports q_has_action_grad=False on most
-  # evaluations and the random-search fallback then evaluates no candidate, so
-  # entire evaluations log "exploitability not measurable". It is expensive and
-  # unreportable in that state. With it off, best-model selection falls back to
-  # score-based (equilibrium min class score, then aggregate precision+coverage).
-  compute_nashconv: false
-  # Only consulted when compute_nashconv is true.
-  # Models with NashConv <= this threshold are considered close to Nash equilibrium.
+  # NashConv threshold for model selection (ε-Nash equilibrium)
+  # Models with NashConv <= this threshold are considered close to Nash equilibrium
+  # Lower values = stricter equilibrium requirement (default: 0.01 = 1% exploitability)
   nashconv_threshold: 0.01  # ε-Nash threshold for best model selection
   agents_per_class: 3        # Paper rerun: 3 agents per class (paper Sec. 7.1)
   # IMPORTANT: This should match the training configuration. If you trained with agents_per_class: 3,
@@ -252,6 +205,6 @@ logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
 
 # Maximum number of steps per episode (source of truth is env_config.max_cycles; kept here for backward compatibility)
 # If your task wrapper reads only the top-level max_cycles, keep both in sync.
-max_cycles: 50
+max_cycles: 200
 
 

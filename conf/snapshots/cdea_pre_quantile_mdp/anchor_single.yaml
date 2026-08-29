@@ -9,30 +9,7 @@ env_config:
   # NOTE: shared with the WyoDOT/CDEA pipeline — restore to 0.90 / 0.1 before
   # running CDEA experiments.
   precision_target: 0.9
-  # Aligned with BenchMARL/conf/anchor.yaml and revision/run_paper_seed.py
-  # (TAU_C). Was 0.05, set during a probe under the OLD expand-from-a-hull
-  # representation; under the quantile MDP coverage starts at 1.0 and falls,
-  # so that rationale is gone. Training and evaluation must agree or the
-  # success/termination columns score a target the policy never optimised.
-  coverage_target: 0.1
-
-  # Quantile-position MDP (Anchors procedure order). Snapshot of pre-remap
-  # CDEA/WyoDOT knobs: conf/snapshots/cdea_pre_quantile_mdp/
-  init_mode: full_space
-  precision_estimator: conditional
-  n_perturb_train: 512
-  n_perturb_eval: 2048
-  quantile_eps: 0.001
-  max_quantile_step: 0.10
-  min_quantile_width: 0.02
-  leave_threshold: 0.85
-  max_new_constraints_per_step: 1
-  activation_quantile: 0.05
-  reset_diversity_frac: 0.3
-  n_reset_landings: 2
-  discount: 0.99
-  sparsity_terminal_weight: 1.0
-  require_precision_gain_to_terminate: true
+  coverage_target: 0.05
 
   # Class-level rule selection (inference)
   # Precision floor for class-level filtering/union is lift-aware:
@@ -165,7 +142,7 @@ env_config:
   # Episode length (kept here so it is passed directly into SingleAgentAnchorEnv.__init__)
   # Reduced from 500: with the noise-free potential-based reward, box shaping
   # converges in tens of steps; long episodes only added noise-farming room.
-  max_cycles: 50
+  max_cycles: 200
   
   # Termination reason counters: disable overused reasons
   # Strategy: Higher limits for better outcomes, lower limits for easier/less ideal outcomes

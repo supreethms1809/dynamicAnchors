@@ -65,6 +65,14 @@ def test_training():
             experiment_config={
                 "total_timesteps": 200,  # Minimal timesteps for testing
                 "tensorboard_log": False,  # Disable tensorboard for tests
+                # eval_freq defaults to 3000, so a 200-step smoke run would do ZERO
+                # FidCov evaluations and training would (correctly) raise
+                # "No validation-selected best_model.zip". best_model is now a hard
+                # requirement -- the final-weights fallback was removed because it
+                # silently shipped unselected weights as "best". Evaluate often
+                # enough that the smoke run actually selects a checkpoint.
+                "eval_freq": 50,
+                "n_eval_episodes": 2,
             },
             algorithm_config={
                 "learning_rate": 1e-3,

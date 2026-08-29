@@ -25,6 +25,11 @@ sys.path.insert(0, benchmarl_dir)
 from environment import AnchorEnv
 from utils.metrics import ranking_score
 
+
+# Observation layout of the AnchorEnv currently under training, recorded at env
+# construction. None until an env is built; callbacks then skip box decoding.
+_OBS_LAYOUT = None
+
 class AnchorTaskClass(TaskClass):
     
     def get_env_fun(
@@ -60,6 +65,14 @@ class AnchorTaskClass(TaskClass):
         
         def _make_env():
             anchor_env = AnchorEnv(**env_config)
+            # Record the observation layout for the metric callbacks. obs_len alone
+            # cannot separate hull (2n+3) from quantile (3n+3) -- e.g. n=30 hull and
+            # n=20 quantile are both 63 -- so the callbacks must be told, not guess.
+            global _OBS_LAYOUT
+            _OBS_LAYOUT = {
+                "n_features": int(anchor_env.n_features),
+                "quantile": bool(anchor_env._uses_quantile_mdp()),
+            }
             
             return PettingZooWrapper(
                 env=anchor_env,
@@ -1126,9 +1139,18 @@ class AnchorMetricsCallback(Callback):
                         obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
                         if obs_len >= 4:  # At least 2 features + precision + coverage
                             # n_features = (obs_len - 2) / 2
-                            n_features = (obs_len - 2) // 2
+                            # HULL layout only. Under the quantile MDP the obs is
+                            # [a(n), b(n), q*(n), P, C, mode] = 3n+3, so obs[:n] is a
+                            # QUANTILE, not a bound, and this inference of n_features
+                            # is wrong. The two lengths are not distinguishable from
+                            # obs_len alone, so trust the env's layout stamp and skip
+                            # box metrics rather than log mislabelled numbers.
+                            # (Authoritative bounds live in env.export_rule_state().)
+                            _lay = _OBS_LAYOUT or {}
+                            _is_quantile = bool(_lay.get("quantile", False))
+                            n_features = int(_lay.get("n_features", 0)) or (obs_len - 2) // 2
                             
-                            if n_features > 0:
+                            if n_features > 0 and not _is_quantile:
                                 lower_bounds = final_obs[:n_features]
                                 upper_bounds = final_obs[n_features:2*n_features]
                                 
@@ -1515,10 +1537,18 @@ class AnchorMetricsCallback(Callback):
                                 
                                 # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
                                 obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
-                                if obs_len >= 4:  # At least 2 features + precision + coverage
-                                    n_features = (obs_len - 2) // 2
-                                    
-                                    if n_features > 0:
+                                # Hull layout only -- see the note at the other
+                                # box-metric site. obs_len alone cannot separate
+                                # 2n+3 from 3m+3, so require the length to be
+                                # consistent with the hull layout AND not with a
+                                # quantile one; when both fit, skip rather than log
+                                # quantile positions mislabelled as bounds.
+                                _lay = _OBS_LAYOUT or {}
+                                _is_quantile = bool(_lay.get("quantile", False))
+                                n_features = int(_lay.get("n_features", 0)) or (
+                                    (obs_len - 3) // 2 if (obs_len - 3) % 2 == 0 else 0
+                                )
+                                if obs_len >= 5 and n_features > 0 and not _is_quantile:
                                         lower_bounds = final_obs[:n_features]
                                         upper_bounds = final_obs[n_features:2*n_features]
                                         
@@ -1643,11 +1673,12 @@ class AnchorMetricsCallback(Callback):
                                 group_returns.append(float(rew_t.sum()))
                             if "observation" in gkeys:
                                 fo = _final_obs_vec(gd["observation"])
-                                if fo.shape[0] >= 4:
-                                    nf = (fo.shape[0] - 2) // 2
-                                    if nf > 0:
-                                        group_prec.append(float(fo[2 * nf]))
-                                        group_cov.append(float(fo[2 * nf + 1]))
+                                if fo.shape[0] >= 5:
+                                    # P and C are the 3rd/2nd-from-last entries in
+                                    # both the hull (2n+3) and quantile (3n+3)
+                                    # layouts; 2*nf indexing breaks on the latter.
+                                    group_prec.append(float(fo[-3]))
+                                    group_cov.append(float(fo[-2]))
                             break  # found this group in src; don't double-read from rollout
                         except Exception:
                             continue

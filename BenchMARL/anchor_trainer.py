@@ -499,14 +499,28 @@ class AnchorTrainer:
         # Get NashConv threshold from config (default: 0.01)
         nashconv_threshold = env_config.get("nashconv_threshold", 0.01)
 
-        # NashConv is disabled for MASAC: its critic API (twin Q-nets, stochastic
-        # TanhNormal actor) doesn't match the MADDPG-shaped exploitability proxy
-        # this callback implements, so it returns empty metrics anyway. Turning it
-        # off removes the per-eval warning spam and the wasted compute. The
-        # best-model selection below no longer depends on NashConv (see Part 1).
-        compute_nashconv = self.algorithm != "masac"
-        if not compute_nashconv:
+        # NashConv is OFF by default (`compute_nashconv: false` in conf/anchor.yaml).
+        #
+        # Two independent reasons:
+        #   - MASAC: its critic API (twin Q-nets, stochastic TanhNormal actor)
+        #     doesn't match the MADDPG-shaped exploitability proxy this callback
+        #     implements, so it returns empty metrics anyway.
+        #   - MADDPG: the gradient best-response frequently reports
+        #     `q_has_action_grad == False` and the random-search fallback then
+        #     evaluates no candidate, so whole evaluations come back
+        #     "exploitability not measurable" -- a per-eval warning storm and a
+        #     large amount of wasted compute for a number we cannot report.
+        #
+        # Best-model selection does not depend on it: with NashConv unavailable
+        # the callback falls back to pure score-based selection (equilibrium min
+        # class score, then aggregate precision+coverage). Set
+        # `compute_nashconv: true` in the env config to re-enable.
+        compute_nashconv = bool(env_config.get("compute_nashconv", False))
+        if compute_nashconv and self.algorithm == "masac":
+            compute_nashconv = False
             logger.info("  NashConv disabled for MASAC (incompatible critic API; would return empty metrics).")
+        elif not compute_nashconv:
+            logger.info("  NashConv disabled (compute_nashconv=false); model selection is score-based.")
 
         self.callback = AnchorMetricsCallback(
             log_training_metrics=True,
@@ -1108,12 +1122,19 @@ class AnchorTrainer:
                                 # obs_len = 2*n_features + 2 (precision + coverage)
                                 obs_len = len(final_obs_np) if hasattr(final_obs_np, '__len__') else final_obs_np.shape[0] if hasattr(final_obs_np, 'shape') else 0
                                 
-                                if obs_len >= 4:  # At least 2 features + precision + coverage
+                                if obs_len >= 5:  # n>=1 features + precision + coverage + tail
                                     n_features = (obs_len - 2) // 2
                                     if n_features > 0:
-                                        # Extract precision and coverage from last two elements
-                                        precision = float(final_obs_np[-2])
-                                        coverage = float(final_obs_np[-1])
+                                        # Precision and coverage are the 3rd- and
+                                        # 2nd-from-last entries in BOTH layouts:
+                                        #   hull     [lo(n), up(n), P, C, phase]
+                                        #   quantile [a(n), b(n), q*(n), P, C, mode]
+                                        # The old [-2]/[-1] read COVERAGE as precision
+                                        # and EPISODE_PHASE as coverage -- the obs
+                                        # gained a phase entry (2n+2 -> 2n+3) and this
+                                        # was never updated.
+                                        precision = float(final_obs_np[-3])
+                                        coverage = float(final_obs_np[-2])
                                         
                                         # Store data keyed by agent name to distinguish between agents
                                         episode_data[agent_name] = {
@@ -1994,7 +2015,14 @@ class AnchorTrainer:
                 
                 if "final_observation" in episode:
                     obs = np.array(episode["final_observation"], dtype=np.float32)
-                    if len(obs) == 2 * n_features + 2:
+                    # Hull layout only. The old `== 2n+2` never matched the current
+                    # 2n+3 observation, so this branch was dead and every rule fell
+                    # through to "any values". Under the quantile MDP obs[:n] is a
+                    # QUANTILE, not a bound, and unit bounds cannot be recovered from
+                    # the observation without the class CDF knots -- so skip there and
+                    # let the caller use env.export_rule_state().
+                    _is_hull = len(obs) in (2 * n_features + 2, 2 * n_features + 3)
+                    if _is_hull:
                         # Extract lower and upper bounds from observation
                         lower = obs[:n_features].copy()
                         upper = obs[n_features:2*n_features].copy()
