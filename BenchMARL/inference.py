@@ -1293,6 +1293,7 @@ def extract_rules_from_policies(
     action_noise_scale: float = 0.0,
     filter_by_prediction: bool = True,
     prefer_model: str = "best",  # "best" or "final" — which extracted-models folder to use
+    n_class_based_rollouts: int = 5,
 ) -> Dict[str, Any]:
     logger.info("="*80)
     logger.info("ANCHOR RULE EXTRACTION USING SAVED POLICY MODELS")
@@ -3023,20 +3024,13 @@ def extract_rules_from_policies(
     logger.info("Starting CLASS-BASED rollouts (initialized from k-means cluster centroids)")
     logger.info(f"{'='*80}")
     
-    # Determine number of class-based rollouts per agent
-    # Use cluster centroids when available, otherwise limit to a reasonable number
-    n_class_based_rollouts_per_agent = None
-    if env_config.get("cluster_centroids_per_class") is not None:
-        # Use number of cluster centroids as guidance
-        max_centroids = 0
-        for cls in target_classes:
-            if cls in env_config["cluster_centroids_per_class"]:
-                max_centroids = max(max_centroids, len(env_config["cluster_centroids_per_class"][cls]))
-        n_class_based_rollouts_per_agent = max(5, min(max_centroids, 10))  # Between 5 and 10 rollouts
-        logger.info(f"  Using {n_class_based_rollouts_per_agent} class-based rollouts per agent (based on cluster centroids)")
-    else:
-        n_class_based_rollouts_per_agent = 5
-        logger.info(f"  Using {n_class_based_rollouts_per_agent} class-based rollouts per agent (default, no cluster centroids)")
+    # Distinct class-init starts. The policy is deterministic at inference
+    # (exploration_mode=mean); repeats of one centroid are duplicate boxes.
+    n_class_based_rollouts_per_agent = max(1, int(n_class_based_rollouts))
+    logger.info(
+        f"  Using {n_class_based_rollouts_per_agent} class-based rollouts per agent "
+        f"(diversified starts, not repeats)"
+    )
     
     # Run class-based rollouts for each agent/class
     for agent_name, policy in policies.items():
@@ -3962,6 +3956,12 @@ def main():
         default=20,
         help="Number of instances to evaluate per class"
     )
+    parser.add_argument(
+        "--n_class_based_rollouts",
+        type=int,
+        default=5,
+        help="Distinct class-init starts per agent (default: 5). Enough for top-k=5."
+    )
     
     parser.add_argument(
         "--eval_on_train_data",
@@ -4075,6 +4075,7 @@ def main():
         max_features_in_rule=args.max_features_in_rule,
         steps_per_episode=args.steps_per_episode,
         n_instances_per_class=args.n_instances_per_class,
+        n_class_based_rollouts=args.n_class_based_rollouts,
         eval_on_test_data=use_test_data,
         coverage_on_all_data=args.coverage_on_all_data,
         output_dir=args.output_dir,

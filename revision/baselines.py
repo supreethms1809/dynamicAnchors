@@ -45,8 +45,8 @@ logger = logging.getLogger("revision.baselines")
 
 
 def _load(dataset: str, seed: int):
-    from BenchMARL.tabular_datasets import TabularDatasetLoader
-    loader = TabularDatasetLoader(dataset_name=dataset, random_state=seed)
+    from utils.dataset_factory import make_tabular_loader
+    loader = make_tabular_loader(dataset, random_state=seed)
     loader.load_dataset()
     loader.preprocess_data()
     return loader
@@ -59,7 +59,8 @@ def _ensure_classifier(loader, classifier_path: str, device: str = "cpu"):
             "A trained RLDA/MADA classifier checkpoint is required for comparable "
             f"fidelity; not found: {classifier_path!r}"
         )
-    loader.load_classifier(filepath=classifier_path, device=device)
+    # load_classifier returns the model but does not assign loader.classifier.
+    loader.classifier = loader.load_classifier(filepath=classifier_path, device=device)
     return loader.classifier
 
 

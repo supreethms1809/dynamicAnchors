@@ -131,28 +131,61 @@ class WyoDOTDatasetLoader(TabularDatasetLoader):
             y = y[indices]
             logger.info(f"  Sampled {self.sample_size} instances")
 
-        # Train/test split (stratified)
+        # C-10 three-way split, same contract as TabularDatasetLoader:
+        # D_train = black-box + RL; D_val = checkpoint / rule ranking;
+        # D_test = reported metrics. Default 60/20/20 (val_size=0.2, test_size=0.2).
+        # RLDA eval_split=val and MADA's BenchMARL eval env both require X_val/y_val.
         stratify = y if len(np.unique(y)) < 20 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.random_state, stratify=stratify
-        )
+        n = len(X)
+        all_idx = np.arange(n)
+        if self.val_size and self.val_size > 0:
+            if self.test_size + self.val_size >= 1.0:
+                raise ValueError(
+                    f"test_size ({self.test_size}) + val_size ({self.val_size}) must be < 1"
+                )
+            idx_temp, idx_test = train_test_split(
+                all_idx, test_size=self.test_size, random_state=self.random_state, stratify=stratify
+            )
+            stratify_temp = y[idx_temp] if stratify is not None else None
+            val_frac_of_temp = self.val_size / (1.0 - self.test_size)
+            idx_train, idx_val = train_test_split(
+                idx_temp, test_size=val_frac_of_temp, random_state=self.random_state, stratify=stratify_temp
+            )
+            from utils.eval_harness import assert_no_index_overlap
+            assert_no_index_overlap(idx_train, idx_val, idx_test)
+            self.train_idx, self.val_idx, self.test_idx = idx_train, idx_val, idx_test
+            X_train, X_val, X_test = X[idx_train], X[idx_val], X[idx_test]
+            y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
+        else:
+            idx_train, idx_test = train_test_split(
+                all_idx, test_size=self.test_size, random_state=self.random_state, stratify=stratify
+            )
+            self.train_idx, self.val_idx, self.test_idx = idx_train, np.array([], dtype=int), idx_test
+            X_train, X_test = X[idx_train], X[idx_test]
+            y_train, y_test = y[idx_train], y[idx_test]
+            X_val, y_val = None, None
 
-        # Set instance attributes (matches parent contract exactly)
         self.X_train = X_train.astype(np.float32)
         self.X_test = X_test.astype(np.float32)
         self.y_train = y_train.astype(int)
         self.y_test = y_test.astype(int)
+        self.X_val = None if X_val is None else X_val.astype(np.float32)
+        self.y_val = None if y_val is None else y_val.astype(int)
         self.feature_names = feature_names
         self.class_names = class_names
         self.n_features = X_train.shape[1]
         self.n_classes = len(np.unique(y))
 
-        logger.info(f"Dataset loaded:")
+        logger.info("Dataset loaded:")
         logger.info(f"  Training samples: {len(X_train)}")
+        if self.y_val is not None:
+            logger.info(f"  Validation samples: {len(self.y_val)}")
         logger.info(f"  Test samples: {len(X_test)}")
         logger.info(f"  Features: {self.n_features}")
         logger.info(f"  Classes: {self.n_classes}")
         logger.info(f"  Class distribution (train): {np.bincount(y_train)}")
+        if self.y_val is not None:
+            logger.info(f"  Class distribution (val): {np.bincount(self.y_val)}")
         logger.info(f"  Class distribution (test): {np.bincount(y_test)}")
 
         return self.X_train, self.X_test, self.y_train, self.y_test, feature_names, class_names

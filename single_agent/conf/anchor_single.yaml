@@ -19,13 +19,20 @@ env_config:
   # Quantile-position MDP (Anchors procedure order). Snapshot of pre-remap
   # CDEA/WyoDOT knobs: conf/snapshots/cdea_pre_quantile_mdp/
   init_mode: full_space
-  precision_estimator: conditional
+  # Terminate / shape on Track A Fid: P(ŷ=c | x in box) on real rows of the
+  # active split (train in the training env, val in FidCov). Conditional CRN
+  # P(ŷ(z)=c) is Track B / Anchors perturbation precision — a different r.v.
+  precision_estimator: empirical
   n_perturb_train: 512
-  n_perturb_eval: 2048
+  # Serving/inference CRN size (Track B measurement only; not the train done-switch).
+  n_perturb_eval: 256
+  # Do not count P≥τ_P on a 3-row box as success (iris C≥0.1 is 3 class rows).
+  require_min_support_to_terminate: true
   quantile_eps: 0.001
   max_quantile_step: 0.10
   min_quantile_width: 0.02
-  leave_threshold: 0.85
+  # 0.85 made most actions fail to add a predicate (empty-rule / full-space boxes).
+  leave_threshold: 0.5
   max_new_constraints_per_step: 1
   activation_quantile: 0.05
   reset_diversity_frac: 0.3
@@ -76,13 +83,10 @@ env_config:
   # Phi = alpha * precision + beta * sqrt(coverage) * gate(precision); see
   # single_agentENV._potential)
   alpha: 0.7              # Weight of precision in the potential
-  # B2 rebalance: 0.6 -> 5.0. Measured precision was exactly 1.000 in all 10
-  # dataset x class probes, so alpha*P is a constant that cancels in the
-  # potential difference and beta*sqrt(C) is the ENTIRE smooth signal. At 0.6,
-  # driving coverage from 0.014 to the 0.10 target was worth 0.119 against
-  # per-episode penalties of 0.3-1.6, so shrinking dominated. At 5.0 the same
-  # improvement is worth 0.99, comparable to the penalties it costs.
-  beta: 0.6
+  # Quantile MDP starts at C≈1 (full_space). beta=0.6 paid to stay large and
+  # produced overlapping unit cubes (wine conflict=1). Lower so shrinking for
+  # precision is not cancelled by the √C term.
+  beta: 0.25
   gamma: 0.1              # Weight for narrow-width penalty (prevents box collapse)
   precision_blend_lambda: 1.0
   drift_penalty_weight: 0.05  # Single movement penalty (JS proxy retired)

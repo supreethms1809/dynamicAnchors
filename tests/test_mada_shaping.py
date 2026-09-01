@@ -311,9 +311,13 @@ def test_shipped_configs_agree_between_rlda_and_mada():
 def test_beta_is_not_the_hull_era_value():
     """beta=5.0 was justified by precision being pinned at 1.000 under the HULL
     representation. Under the quantile MDP precision is a live term, so that value
-    would make a +0.6 coverage gain (+2.24) outweigh the entire precision term."""
+    would make a +0.6 coverage gain (+2.24) outweigh the entire precision term.
+    0.25 (not 0.6) so shrinking for Fid is not cancelled by the √C term at C≈1.
+    """
     mae = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
-    assert mae["beta"] == pytest.approx(0.6)
+    sae = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
+    assert mae["beta"] == pytest.approx(0.25)
+    assert sae["beta"] == pytest.approx(mae["beta"])
 
 
 def test_quantile_mode_starts_from_the_empty_rule():

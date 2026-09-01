@@ -11,6 +11,14 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 
+# Keep in sync with revision/run_paper_seed.py (TAU_P, TAU_C). Importing from
+# there would be circular (run_paper_seed imports summarize from this module).
+TAU_P, TAU_C = 0.90, 0.10
+
+
+def _tau_tok(x: float) -> str:
+    return f"{x:.2f}".replace(".", "p")
+
 
 def _f(x: Any) -> Optional[float]:
     if x is None:
@@ -112,9 +120,16 @@ def _rollout_stats(rules_file: Optional[Path]) -> str:
     return "\n".join(lines)
 
 
-def summarize(dataset: str, method: str, seed: int, rules_file: Optional[str] = None) -> str:
-    tp, tc = "0p90", "0p20"
-    dest = REPO / "revision" / "results" / f"{dataset}__{method}__seed{seed}__tp{tp}__tc{tc}.json"
+def summarize(
+    dataset: str,
+    method: str,
+    seed: int,
+    rules_file: Optional[str] = None,
+    results_dir: Optional[str] = None,
+) -> str:
+    tp, tc = _tau_tok(TAU_P), _tau_tok(TAU_C)
+    base = Path(results_dir) if results_dir else (REPO / "revision" / "results")
+    dest = base / f"{dataset}__{method}__seed{seed}__tp{tp}__tc{tc}.json"
     if not dest.exists():
         return f"[{dataset} {method.upper()} seed {seed}] no eval JSON at {dest}"
     d = json.loads(dest.read_text())
@@ -126,7 +141,8 @@ def summarize(dataset: str, method: str, seed: int, rules_file: Optional[str] = 
         f"abst={_fmt(g.get('abstention_rate'))} conf={_fmt(g.get('conflict_rate'))} "
         f"cov={_fmt(g.get('coverage'))}",
         f"  success={_fmt(s.get('success_rate'))} "
-        f"({s.get('n_success')}/{s.get('n_episodes')} episodes hit τ_P=0.9 and τ_C=0.2)",
+        f"({s.get('n_success')}/{s.get('n_episodes')} episodes hit "
+        f"τ_P={TAU_P:g} and τ_C={TAU_C:g})",
     ]
     for cls, cd in (d.get("per_class") or {}).items():
         if not isinstance(cd, dict):

@@ -29,13 +29,20 @@ env_config:
   # Set init_mode back to neighbor_hull to restore the old representation
   # (that is also the C-15 ablation arm, and what WyoDOT/CDEA should use).
   init_mode: full_space
-  precision_estimator: conditional
+  # Terminate / shape on Track A Fid: P(ŷ=c | x in box) on real rows of the
+  # active split (train in the training env, val in FidCov). Conditional CRN
+  # P(ŷ(z)=c) is Track B / Anchors perturbation precision — a different r.v.
+  precision_estimator: empirical
   n_perturb_train: 512
-  n_perturb_eval: 2048
+  # Serving/inference CRN size (Track B measurement only; not the train done-switch).
+  n_perturb_eval: 256
+  # Do not count P≥τ_P on a 3-row box as success (iris C≥0.1 is 3 class rows).
+  require_min_support_to_terminate: true
   quantile_eps: 0.001
   max_quantile_step: 0.10
   min_quantile_width: 0.02
-  leave_threshold: 0.85
+  # 0.85 made most actions fail to add a predicate (empty-rule / full-space boxes).
+  leave_threshold: 0.5
   max_new_constraints_per_step: 1
   activation_quantile: 0.05
   reset_diversity_frac: 0.3
@@ -72,21 +79,9 @@ env_config:
   step_fracs: [0.005, 0.01, 0.02]
   min_width: 0.05
   alpha: 0.7
-  # B2 rebalance: 0.6 -> 5.0. Measured precision was exactly 1.000 in all 10
-  # dataset x class probes, so alpha*P is a constant that cancels in the
-  # potential difference and beta*sqrt(C) is the ENTIRE smooth signal. At 0.6,
-  # driving coverage from 0.014 to the 0.10 target was worth 0.119 against
-  # per-episode penalties of 0.3-1.6, so shrinking dominated. At 5.0 the same
-  # improvement is worth 0.99, comparable to the penalties it costs.
-  # Reverted 5.0 -> 0.6 to match single_agent/conf/anchor_single.yaml.
-  # The 5.0 was justified by "measured precision was exactly 1.000 in all 10
-  # dataset x class probes, so alpha*P is a constant that cancels" -- that was the
-  # HULL representation. Under the quantile MDP precision starts at the class base
-  # rate and rises, so alpha*P_tilde is a live term and the rationale is void.
-  # At 5.0 a +0.6 coverage gain is worth +2.24 against a precision term capped at
-  # 0.63, i.e. MADA would weight coverage 8.3x more than RLDA and the two arms
-  # would not be optimising the same objective.
-  beta: 0.6
+  # Match RLDA: quantile MDP starts at C≈1, so a large beta pays to keep the
+  # unit cube. 0.25 lets precision-driven shrinking win.
+  beta: 0.25
   gamma: 0.1  # Increased from 0.02 to prevent box collapse
   # Control uses hard Fid (P(f̂=c | x∈B)). The 0.5 softmax blend is logged as
   # precision_proxy only; it made τ_P unreachable on accurate but unconfident DNNs.
@@ -122,7 +117,7 @@ env_config:
   # Stabilization-based early termination (per-agent)
   enable_stability_termination: true
   stability_window: 20  # Increased from 10 to require more stable steps before early termination
-  stability_min_steps: 50  # Increased from 20 to prevent premature termination during expansion phase
+  stability_min_steps: 15  # Was 50 (= max_cycles), so stability termination never fired.
   stability_precision_tol: 1e-3
   stability_coverage_tol: 1e-3
   stability_drift_tol: 1e-3
@@ -148,7 +143,9 @@ env_config:
   # level_final - level_init instead of accumulating per step (the per-step level
   # form added up to ~30-60/episode against a positive signal bounded by ~7, and
   # its inter/own-volume normalization made full-space boxes penalty-free).
-  inter_class_overlap_weight: 0.1
+  # Potential-style delta is bounded by this weight over the whole episode.
+  # 0.1 was too small to stop full-space class boxes from overlapping.
+  inter_class_overlap_weight: 1.0
   # Same-class cooperative reward: agents of class c share
   #   shared_reward_weight * (Phi_union_c(s') - Phi_union_c(s))
   # where Phi_union_c = alpha * union_precision(c)

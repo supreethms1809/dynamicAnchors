@@ -310,6 +310,9 @@ class AnchorEnv(ParallelEnv):
         self.ranking_score_formula = env_config.get("ranking_score_formula", "precision_coverage")
         self.top_k_rules_by_score = env_config.get("top_k_rules_by_score", 5)
         self.min_support = int(env_config.get("min_support", 10))
+        self.require_min_support_to_terminate = bool(
+            env_config.get("require_min_support_to_terminate", False)
+        )
         # Per-agent metrics from the last reset()/step(), reused as prev metrics by
         # the next step() (halves classifier calls; common-random-number gains).
         self._last_step_metrics: Dict[str, Tuple[float, float, Dict[str, Any]]] = {}
@@ -338,19 +341,16 @@ class AnchorEnv(ParallelEnv):
         self._rt_terminal = defaultdict(float)
         self._rt_total = defaultdict(float)
         
+        # Always keep test arrays when provided. Training mode never reads them
+        # (_active_split returns "train"); eval_split=val / test need them even
+        # when eval_on_test_data is False (C-10 checkpoint selection).
+        self.X_test_unit = env_config.get("X_test_unit", None)
+        self.X_test_std = env_config.get("X_test_std", None)
+        y_test = env_config.get("y_test", None)
+        self.y_test = None if y_test is None else np.asarray(y_test).astype(int)
         if self.eval_on_test_data:
-            X_test_unit = env_config.get("X_test_unit", None)
-            X_test_std = env_config.get("X_test_std", None)
-            y_test = env_config.get("y_test", None)
-            if X_test_unit is None or X_test_std is None or y_test is None:
+            if self.X_test_unit is None or self.X_test_std is None or self.y_test is None:
                 raise ValueError("eval_on_test_data=True requires X_test_unit, X_test_std, and y_test")
-            self.X_test_unit = X_test_unit
-            self.X_test_std = X_test_std
-            self.y_test = y_test.astype(int)
-        else:
-            self.X_test_unit = None
-            self.X_test_std = None
-            self.y_test = None
 
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
@@ -1247,10 +1247,13 @@ class AnchorEnv(ParallelEnv):
         preds = probs.argmax(axis=1)
         positive_idx = (preds == target_class)
         
-        # Precision calculation depends on mode:
-        # - Instance-based: P(prediction matches original instance | anchor conditions hold) - matches original Anchor paper
-        # - Class-based: P(y = target_class | x in box) - measures class correctness
-        if is_instance_based:
+        # Empirical Fid (paper / Track A): P(ŷ=c | x in box) on real rows.
+        # Instance-route P(ŷ=ŷ(x*)) is Track B; not the train done-switch.
+        use_track_a_fid = (
+            str(self.precision_estimator).lower() == "empirical"
+            and not self.use_perturbation
+        )
+        if is_instance_based and not use_track_a_fid:
             # Instance-based mode: Match original Anchor paper definition
             # Precision = fraction of samples where prediction matches original instance's prediction
             if agent in self.original_predictions:
@@ -1269,23 +1272,16 @@ class AnchorEnv(ParallelEnv):
                     hard_precision = float((preds == target_class).mean())
             purity = float((y_eval == (self.original_predictions.get(agent, target_class))).mean()) if y_eval is not None else float("nan")
         else:
-            # C-09: class-based PRIMARY is model fidelity P(f_hat(x) = c | x in B).
-            # Label purity is logged as a secondary diagnostic and is NOT the
-            # optimization target. Training previously used y here, so class-mode
-            # policies must be retrained after this change.
+            # C-09 / Track A: PRIMARY is model fidelity P(ŷ(x) = c | x in B).
             hard_precision = float(positive_idx.mean())
             using_synthetic_samples = y_eval is None
             purity = float((y_eval == target_class).mean()) if y_eval is not None else float("nan")
 
-        # CRITICAL FIX: For instance-based mode, use original prediction probability instead of target_class
-        # This ensures reward signal matches single-agent behavior and original Anchor paper
-        if is_instance_based and agent in self.original_predictions:
+        if is_instance_based and not use_track_a_fid and agent in self.original_predictions:
             original_pred = self.original_predictions[agent]
-            # Use probability of original prediction class, not target_class
             avg_prob = float(probs[:, original_pred].mean())
             logger.debug(f"Agent {agent}: Instance-based precision proxy using original prediction class {original_pred} probability")
         else:
-            # Class-based mode: use target_class probability
             avg_prob = float(probs[:, target_class].mean())
         
         precision_proxy = (
@@ -2056,6 +2052,10 @@ class AnchorEnv(ParallelEnv):
             both_targets_met = (
                 precision >= agent_precision_target
                 and coverage >= self.coverage_target
+                and (
+                    (not self.require_min_support_to_terminate)
+                    or int(details.get("n_class_in_box") or 0) >= int(self.min_support)
+                )
                 and (
                     (self._uses_quantile_mdp()
                      and self.n_predicates(agent) >= 1

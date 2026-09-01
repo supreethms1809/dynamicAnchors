@@ -2,10 +2,10 @@
 """
 WyoDOT Complete Pipeline: Single-Agent vs Multi-Agent Comparison
 
-Runs the full pipeline for WyoDOT datasets:
+Runs the full pipeline for WyoDOT datasets, matching revision/run_rlda_pipeline.py:
 1. Training (single-agent and multi-agent)
-2. Inference (single-agent and multi-agent)
-3. Test extracted rules (single-agent and multi-agent)
+2. C-10 inference: generate on D_train, rank on D_val (no train+test leakage)
+3. revision.evaluate: select top-k on D_val, report Fid/Pur on D_test
 4. Summarize and plot results for comparison
 
 Usage:
@@ -62,6 +62,9 @@ DATASET_TIMESTEPS = {
 
 # Both WyoDOT datasets have 5 classes after label remapping.
 WYODOT_N_CLASSES = 5
+
+# C-10 / revision.evaluate (keep in sync with revision/run_rlda_pipeline.py)
+TAU_P, TAU_C, REVISION_K = 0.90, 0.10, 1
 
 # Defaults per machine. Hand-tuned for the two boxes we actually run on.
 # NOTE: n_envs>1 is currently disabled when parallel_classes>1 due to a
@@ -471,12 +474,17 @@ def _merge_inference_results_by_class(
 
 def _run_single_agent_inference_once(
     experiment_dir: str, dataset: str, prefer_model: str,
-    max_features_in_rule: int, steps_per_episode: int,
+    max_features_in_rule: int, steps_per_episode: Optional[int],
     n_instances_per_class: int, n_rollouts_per_instance: int,
     device: str, **kwargs,
 ) -> Optional[Dict[str, Any]]:
     """Run inference once for a single model-preference. Returns the results dict
-    (not a file path) so the caller can merge multiple runs in memory."""
+    (not a file path) so the caller can merge multiple runs in memory.
+
+    C-10: do not pass eval_on_test_data / coverage_on_all_data /
+    sample_from_full_dataset. Generation uses generation_split (train);
+    ranking uses D_val; reported cells come from revision.evaluate on D_test.
+    """
     from single_agent_inference import extract_rules_single_agent
     return extract_rules_single_agent(
         experiment_dir=experiment_dir,
@@ -485,24 +493,16 @@ def _run_single_agent_inference_once(
         steps_per_episode=steps_per_episode,
         n_instances_per_class=n_instances_per_class,
         n_rollouts_per_instance=n_rollouts_per_instance,
+        n_class_based_rollouts=kwargs.get("n_class_based_rollouts", 5),
         device=device,
-        eval_on_test_data=True,
-        coverage_on_all_data=True,
-        sample_from_full_dataset=True,
-        filter_by_prediction=False,
-        use_prediction_routing=kwargs.get("use_prediction_routing", True),
-        use_weighted_average=False,
-        filter_low_quality_rollouts=True,
-        min_precision_threshold=None,
-        min_coverage_threshold=0.01,
         prefer_model=prefer_model,
     )
 
 
 def run_single_agent_inference(
     experiment_dir: str, dataset: str,
-    max_features_in_rule: int = -1, steps_per_episode: int = 100,
-    n_instances_per_class: int = 5, n_rollouts_per_instance: int = 5,
+    max_features_in_rule: int = -1, steps_per_episode: Optional[int] = None,
+    n_instances_per_class: int = 20, n_rollouts_per_instance: int = 1,
     device: str = "cpu",
     inference_model_source: str = "best",  # "best", "final", or "both"
     **kwargs,
@@ -570,12 +570,17 @@ def run_single_agent_inference(
 
 def _run_multi_agent_inference_once(
     experiment_dir: str, dataset: str, prefer_model: str,
-    max_features_in_rule: int, steps_per_episode: int,
+    max_features_in_rule: int, steps_per_episode: Optional[int],
     n_instances_per_class: int, device: str, output_dir: str,
+    **kwargs,
 ) -> Optional[Dict[str, Any]]:
     """Run multi-agent inference once for a given model preference.
     extract_rules_from_policies writes extracted_rules.json into output_dir;
-    this returns the parsed results dict (or None on failure)."""
+    this returns the parsed results dict (or None on failure).
+
+    C-10: generate on D_train (inference.py defaults). Do not pass
+    eval_on_test_data / coverage_on_all_data.
+    """
     from inference import extract_rules_from_policies
     extract_rules_from_policies(
         experiment_dir=experiment_dir,
@@ -583,12 +588,11 @@ def _run_multi_agent_inference_once(
         max_features_in_rule=max_features_in_rule,
         steps_per_episode=steps_per_episode,
         n_instances_per_class=n_instances_per_class,
+        n_class_based_rollouts=kwargs.get("n_class_based_rollouts", 5),
         device=device,
-        eval_on_test_data=True,
-        coverage_on_all_data=True,
-        filter_by_prediction=False,
         prefer_model=prefer_model,
         output_dir=output_dir,
+        exploration_mode="mean",
     )
     rules_path = Path(output_dir) / "extracted_rules.json"
     if not rules_path.exists():
@@ -600,8 +604,8 @@ def _run_multi_agent_inference_once(
 
 def run_multi_agent_inference(
     experiment_dir: str, dataset: str,
-    max_features_in_rule: int = -1, steps_per_episode: int = 100,
-    n_instances_per_class: int = 5, device: str = "cpu",
+    max_features_in_rule: int = -1, steps_per_episode: Optional[int] = None,
+    n_instances_per_class: int = 20, device: str = "cpu",
     inference_model_source: str = "best",  # "best", "final", or "both"
     **kwargs
 ) -> Optional[str]:
@@ -632,12 +636,14 @@ def run_multi_agent_inference(
                 experiment_dir, dataset, "best",
                 max_features_in_rule, steps_per_episode,
                 n_instances_per_class, device, str(inference_dir / "best"),
+                **kwargs,
             )
             logger.info("  [2/2] MA inference with prefer_model=final")
             final_results = _run_multi_agent_inference_once(
                 experiment_dir, dataset, "final",
                 max_features_in_rule, steps_per_episode,
                 n_instances_per_class, device, str(inference_dir / "final"),
+                **kwargs,
             )
             if best_results is None and final_results is None:
                 logger.error("  MA inference produced no rules for either model source")
@@ -657,6 +663,7 @@ def run_multi_agent_inference(
                 experiment_dir, dataset, inference_model_source,
                 max_features_in_rule, steps_per_episode,
                 n_instances_per_class, device, str(inference_dir),
+                **kwargs,
             )
             if results is None:
                 return None
@@ -677,6 +684,41 @@ def run_multi_agent_inference(
         return None
     finally:
         os.chdir(prev_cwd)
+
+
+def run_revision_evaluate(
+    rules_file: str, dataset: str, method: str, seed: int = 42,
+    out_dir: Optional[str] = None,
+) -> Optional[str]:
+    """Score stored boxes with revision.evaluate (rank on D_val, report D_test).
+
+    Replaces the old test_extracted_rules path, which scored printed strings
+    on train+test (coverage_on_all_data).
+    """
+    logger.info(f"\n{'='*80}")
+    logger.info(f"revision.evaluate: {dataset}  method={method}  k={REVISION_K}")
+    logger.info(f"{'='*80}")
+    if out_dir is None:
+        out_dir = str(Path(rules_file).parent)
+    try:
+        from revision.evaluate import evaluate_rules_file
+        path = evaluate_rules_file(
+            rules_file=rules_file,
+            dataset=dataset,
+            method=method,
+            seed=seed,
+            tau_p=TAU_P,
+            tau_c=TAU_C,
+            k=REVISION_K,
+            out_dir=out_dir,
+        )
+        logger.info(f"OK: revision.evaluate wrote {path}")
+        return path
+    except Exception as e:
+        logger.error(f"FAIL: revision.evaluate: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -977,10 +1019,22 @@ Examples:
     parser.add_argument("--skip_multi_agent", action="store_true", help="Skip multi-agent pipeline")
     parser.add_argument("--max_features_in_rule", type=int, default=-1,
                         help="Max features in extracted rules (-1 for all)")
-    parser.add_argument("--steps_per_episode", type=int, default=500,
-                        help="Steps per episode for inference")
-    parser.add_argument("--n_instances_per_class", type=int, default=5,
-                        help="Instances per class for inference")
+    parser.add_argument(
+        "--steps_per_episode", type=int, default=None,
+        help="Steps per inference rollout (default: env max_cycles from YAML, 50)",
+    )
+    parser.add_argument(
+        "--n_instances_per_class", type=int, default=20,
+        help="Instance-based starts per class (C-10 / revision default: 20)",
+    )
+    parser.add_argument(
+        "--n_rollouts_per_instance", type=int, default=1,
+        help="Greedy rollouts per instance (default: 1; extra repeats are duplicates)",
+    )
+    parser.add_argument(
+        "--n_class_based_rollouts", type=int, default=5,
+        help="Class-init starts per class (default: 5)",
+    )
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory for comparison results")
     parser.add_argument("--single_agent_output_dir", type=str, default=None)
@@ -1012,13 +1066,12 @@ Examples:
         help=f"Number of classes in the dataset (default: {WYODOT_N_CLASSES} for WyoDOT)."
     )
     parser.add_argument(
-        "--inference_model_source", type=str, default="both",
+        "--inference_model_source", type=str, default="best",
         choices=["best", "final", "both"],
-        help="Which saved checkpoint to use for single-agent inference. "
-             "'best' = EvalCallback's best-eval-reward snapshot per class; "
-             "'final' = last-step checkpoint per class; "
-             "'both' = run inference on both and keep the higher-scoring rule set per class "
-             "(precision primary, coverage tiebreaker). Default: both."
+        help="Which saved checkpoint to use for inference. "
+             "'best' = FidCov val-selected snapshot per class (revision default); "
+             "'final' = last-step checkpoint; "
+             "'both' = run both and keep the higher-scoring rule set per class."
     )
 
     args = parser.parse_args()
@@ -1148,6 +1201,8 @@ Examples:
                     max_features_in_rule=args.max_features_in_rule,
                     steps_per_episode=args.steps_per_episode,
                     n_instances_per_class=args.n_instances_per_class,
+                    n_rollouts_per_instance=args.n_rollouts_per_instance,
+                    n_class_based_rollouts=args.n_class_based_rollouts,
                     device=args.device,
                     inference_model_source=args.inference_model_source,
                 )
@@ -1157,11 +1212,12 @@ Examples:
                 sa_rules = str(rf)
                 logger.info(f"Found existing rules: {sa_rules}")
 
-        # Testing (in-process with monkey-patched loader)
+        # C-10 reported metrics: rank on D_val, score on D_test
         if not args.skip_testing and sa_rules:
-            sa_test_results = run_single_agent_test(
+            sa_test_results = run_revision_evaluate(
                 rules_file=sa_rules, dataset=args.dataset,
-                seed=args.seed, use_full_dataset=True,
+                method="rlda", seed=args.seed,
+                out_dir=str(Path(sa_rules).parent),
             )
 
         # Summarize & Plot (subprocess — pass pre-computed test results)
@@ -1228,6 +1284,7 @@ Examples:
                     max_features_in_rule=args.max_features_in_rule,
                     steps_per_episode=args.steps_per_episode,
                     n_instances_per_class=args.n_instances_per_class,
+                    n_class_based_rollouts=args.n_class_based_rollouts,
                     device=args.device,
                     inference_model_source=args.inference_model_source,
                 )
@@ -1237,12 +1294,11 @@ Examples:
                 ma_rules = str(rf)
                 logger.info(f"Found existing rules: {ma_rules}")
 
-        # Testing (in-process with monkey-patched loader)
         if not args.skip_testing and ma_rules:
-            ma_test_results = run_multi_agent_test(
+            ma_test_results = run_revision_evaluate(
                 rules_file=ma_rules, dataset=args.dataset,
-                seed=args.seed, use_full_dataset=True,
-                algorithm=args.algorithm,
+                method="mada", seed=args.seed,
+                out_dir=str(Path(ma_rules).parent),
             )
 
         # Summarize & Plot (subprocess — pass pre-computed test results)

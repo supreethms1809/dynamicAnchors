@@ -155,6 +155,20 @@ def main():
         action="store_true",
         help="Skip classifier training (use existing classifier)"
     )
+
+    parser.add_argument(
+        "--classifier_path",
+        type=str,
+        default=None,
+        help="Load this classifier.pth instead of fitting. Same file RLDA used.",
+    )
+
+    parser.add_argument(
+        "--classifier_device",
+        type=str,
+        default=None,
+        help="Device for loading --classifier_path (default: --device).",
+    )
     
     parser.add_argument(
         "--device",
@@ -251,8 +265,24 @@ def main():
     dataset_loader.preprocess_data()
     
     # Skip classifier training if loading from checkpoint
+    clf_device = args.classifier_device or args.device
     if args.load_checkpoint:
         logger.info("\nSkipping classifier training (will load from checkpoint)")
+    elif args.classifier_path and os.path.exists(args.classifier_path):
+        logger.info(f"\nLoading pre-trained classifier from: {args.classifier_path}")
+        classifier = dataset_loader.load_classifier(
+            filepath=args.classifier_path,
+            classifier_type=args.classifier_type,
+            device=clf_device,
+        )
+        dataset_loader.classifier = classifier
+        classifier_output_dir = f"{args.output_dir}training/"
+        os.makedirs(classifier_output_dir, exist_ok=True)
+        classifier_path = os.path.join(classifier_output_dir, "classifier.pth")
+        if os.path.abspath(classifier_path) != os.path.abspath(args.classifier_path):
+            import shutil as _shutil
+            _shutil.copy2(args.classifier_path, classifier_path)
+        logger.info(f"Classifier ready (loaded, not trained): {classifier_path}")
     elif not args.skip_classifier:
         classifier = dataset_loader.create_classifier(
             classifier_type=args.classifier_type,

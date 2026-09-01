@@ -1356,7 +1356,8 @@ def extract_rules_single_agent(
     max_features_in_rule: int = -1,
     steps_per_episode: Optional[int] = None,  # If None, will read from env_config.max_cycles
     n_instances_per_class: int = 10,  # Number of instances to sample (default: 10)
-    n_rollouts_per_instance: int = 10,  # Number of rollouts per instance (default: 20)
+    n_rollouts_per_instance: int = 1,  # One greedy rollout per instance (deterministic policy)
+    n_class_based_rollouts: int = 5,  # Distinct class starts, not repeats of one centroid
     eval_on_test_data: bool = False,
     coverage_on_all_data: bool = False,  # If True, compute coverage on all data (train+test combined, matches baseline)
     sample_from_full_dataset: bool = False,  # If True, sample instances from full dataset (train+test) instead of just test/train
@@ -1398,7 +1399,9 @@ def extract_rules_single_agent(
         max_features_in_rule: Maximum features to include in rules
         steps_per_episode: Maximum steps per rollout
         n_instances_per_class: Number of instances to sample per class (default: 10)
-        n_rollouts_per_instance: Number of rollouts to run per instance (default: 20)
+        n_rollouts_per_instance: Greedy rollouts per instance (default: 1). Extra
+            repeats of the same x* are duplicates under deterministic=True.
+        n_class_based_rollouts: Distinct class-init starts per class (default: 5).
         eval_on_test_data: Whether to evaluate on test data
         coverage_on_all_data: If True, compute coverage on all data (train+test combined)
         sample_from_full_dataset: If True, sample instances from full dataset (train+test) instead of just test/train
@@ -1760,8 +1763,9 @@ def extract_rules_single_agent(
     # Extract rules for each class
     logger.info(f"\nExtracting rules for classes: {target_classes}")
     logger.info(f"  Instances per class: {n_instances_per_class} (will sample this many instances)")
-    logger.info(f"  Rollouts per instance: {n_rollouts_per_instance} (will run this many rollouts for each instance)")
-    logger.info(f"  Total rollouts per class: {n_instances_per_class * n_rollouts_per_instance}")
+    logger.info(f"  Rollouts per instance: {n_rollouts_per_instance} (deterministic; 1 is enough)")
+    logger.info(f"  Class-based starts per class: {n_class_based_rollouts}")
+    logger.info(f"  Instance rollouts per class: {n_instances_per_class * n_rollouts_per_instance}")
     logger.info(f"  Steps per episode: {steps_per_episode}")
     logger.info(f"  Max features in rule: {max_features_in_rule}")
     
@@ -2691,18 +2695,13 @@ def extract_rules_single_agent(
     logger.info("Starting CLASS-BASED rollouts (initialized from k-means cluster centroids)")
     logger.info(f"{'='*80}")
     
-    # Determine number of class-based rollouts per class
-    n_class_based_rollouts_per_class = None
-    if env_config.get("cluster_centroids_per_class") is not None:
-        max_centroids = 0
-        for cls in target_classes:
-            if cls in env_config["cluster_centroids_per_class"]:
-                max_centroids = max(max_centroids, len(env_config["cluster_centroids_per_class"][cls]))
-        n_class_based_rollouts_per_class = max(20, min(max_centroids, 50))  # Increased from 5-10 to 20-50
-        logger.info(f"  Using {n_class_based_rollouts_per_class} class-based rollouts per class (based on cluster centroids)")
-    else:
-        n_class_based_rollouts_per_class = 20  # Increased from 5 to 20
-        logger.info(f"  Using {n_class_based_rollouts_per_class} class-based rollouts per class (default, no cluster centroids)")
+    # Distinct class-init starts. Repeats of one centroid are wasted: the policy
+    # is deterministic, evaluate keeps top-k=5 unique boxes, and NMS drops copies.
+    n_class_based_rollouts_per_class = max(1, int(n_class_based_rollouts))
+    logger.info(
+        f"  Using {n_class_based_rollouts_per_class} class-based rollouts per class "
+        f"(diversified starts, not repeats)"
+    )
     
     # Run class-based rollouts for each class
     for target_class in target_classes:
@@ -3621,9 +3620,15 @@ def main():
     parser.add_argument(
         "--n_rollouts_per_instance",
         type=int,
-        default=10,
-        help="Number of rollouts to run per instance (default: 20). "
-             "Each instance will be rolled out this many times, and metrics will be averaged across rollouts."
+        default=1,
+        help="Greedy rollouts per sampled instance (default: 1). Extra repeats of "
+             "the same x* are duplicates under deterministic=True."
+    )
+    parser.add_argument(
+        "--n_class_based_rollouts",
+        type=int,
+        default=5,
+        help="Distinct class-init starts per class (default: 5). Enough for top-k=5."
     )
     
     parser.add_argument(
@@ -3772,6 +3777,7 @@ def main():
         steps_per_episode=args.steps_per_episode,
         n_instances_per_class=args.n_instances_per_class,
         n_rollouts_per_instance=args.n_rollouts_per_instance,
+        n_class_based_rollouts=args.n_class_based_rollouts,
         eval_on_test_data=bool(args.eval_on_test_data),
         coverage_on_all_data=args.coverage_on_all_data,
         sample_from_full_dataset=args.sample_from_full_dataset,

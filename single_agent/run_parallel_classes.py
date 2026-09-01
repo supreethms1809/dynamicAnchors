@@ -18,17 +18,66 @@ Examples:
 
 Notes:
     - All shards share one experiment folder (passed via --experiment_folder_override).
-    - All shards use the same --seed so each shard trains an identical classifier
-      from scratch (deterministic). This is redundant work but avoids classifier
-      divergence across shards. Acceptable since classifier training is small vs RL.
+    - One classifier.pth is fit (or loaded) BEFORE shards spawn. Every class worker
+      gets --classifier_path pointing at that file. Do not retrain the black box
+      per class: independent DNN fits are not bit-identical, and shards race on
+      training/classifier.pth, so inference can score a different ŷ than training.
     - Per-shard stdout/stderr is captured into a log file inside the shared folder.
 """
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
+
+
+def peel_classifier_path(extras):
+    """Remove --classifier_path/--classifier-path from extras; return (path, rest)."""
+    extras = list(extras or [])
+    if extras and extras[0] == "--":
+        extras = extras[1:]
+    path = None
+    rest = []
+    i = 0
+    while i < len(extras):
+        tok = extras[i]
+        if tok in ("--classifier_path", "--classifier-path") and i + 1 < len(extras):
+            path = extras[i + 1]
+            i += 2
+            continue
+        rest.append(tok)
+        i += 1
+    return path, rest
+
+
+def _ensure_shared_classifier(args, shared_folder, extras_path):
+    """Return a classifier.pth that every shard will load (never retrain)."""
+    dest = os.path.join(shared_folder, "classifier.pth")
+    parent_dest = os.path.join(args.output_dir, "training", "classifier.pth")
+    os.makedirs(os.path.dirname(parent_dest), exist_ok=True)
+
+    src = extras_path
+    if not src or not os.path.exists(src):
+        repo = Path(__file__).resolve().parent.parent
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from revision.fit_shared_classifier import fit_or_load
+        epochs = args.classifier_epochs if args.classifier_epochs is not None else 500
+        print(f"[launcher] fitting ONE classifier for {args.dataset} -> {dest}", flush=True)
+        fit_or_load(
+            args.dataset, Path(dest), seed=args.seed, device=args.device,
+            classifier_type=args.classifier_type, epochs=epochs,
+        )
+        src = dest
+    if os.path.abspath(src) != os.path.abspath(dest):
+        shutil.copy2(src, dest)
+    if os.path.abspath(src) != os.path.abspath(parent_dest):
+        shutil.copy2(src, parent_dest)
+    print(f"[launcher] shared classifier: {dest}", flush=True)
+    return dest
 
 
 def main():
@@ -67,6 +116,11 @@ def main():
     parser.add_argument("--classifier_epochs", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument(
+        "--classifier_path", default=None,
+        help="Pre-trained classifier.pth shared by every class shard. "
+             "If omitted, one classifier is fit into the experiment folder first.",
+    )
+    parser.add_argument(
         "--eval_on_test_data", action="store_true",
         help="Forward --eval_on_test_data to each shard."
     )
@@ -97,11 +151,16 @@ def main():
     shards = [target_classes[i::K] for i in range(K)]
     shards = [s for s in shards if s]
 
+    extras_path, extras = peel_classifier_path(args.extra_args)
+    clf_src = args.classifier_path or extras_path
+    clf_path = _ensure_shared_classifier(args, shared_folder, clf_src)
+
     print(f"[launcher] dataset={args.dataset} algorithm={args.algorithm}")
     print(f"[launcher] shared experiment folder: {shared_folder}")
     print(f"[launcher] classes: {target_classes}")
     print(f"[launcher] workers: {len(shards)} (each: n_envs={args.n_envs})")
     print(f"[launcher] shards: {shards}")
+    print(f"[launcher] classifier_path (all shards load, none refit): {clf_path}")
 
     driver_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 
@@ -111,13 +170,14 @@ def main():
             sys.executable, driver_path,
             "--dataset", args.dataset,
             "--algorithm", args.algorithm,
-            "--seed", str(args.seed),  # same seed: identical classifier across shards
+            "--seed", str(args.seed),
             "--n_envs", str(args.n_envs),
             "--device", args.device,
             "--target_classes", *[str(c) for c in shard],
             "--output_dir", args.output_dir,
             "--experiment_folder_override", shared_folder,
             "--classifier_type", args.classifier_type,
+            "--classifier_path", clf_path,
         ]
         if args.total_timesteps is not None:
             cmd += ["--total_timesteps", str(args.total_timesteps)]
@@ -129,10 +189,7 @@ def main():
             cmd += ["--classifier_epochs", str(args.classifier_epochs)]
         if args.eval_on_test_data:
             cmd += ["--eval_on_test_data"]
-        if args.extra_args:
-            # argparse.REMAINDER picks up the leading "--" too; drop it.
-            extras = args.extra_args[1:] if args.extra_args and args.extra_args[0] == "--" \
-                else args.extra_args
+        if extras:
             cmd += extras
 
         log_name = f"shard_{shard_idx}_classes_{'_'.join(map(str, shard))}.log"

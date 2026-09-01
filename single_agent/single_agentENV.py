@@ -235,19 +235,16 @@ class SingleAgentAnchorEnv(Env):
         self.X_val_unit = env_config.get("X_val_unit", None)
         self.X_val_std = env_config.get("X_val_std", None)
         self.y_val = None if env_config.get("y_val") is None else np.asarray(env_config["y_val"]).astype(int)
+        # Always keep test arrays when provided. eval_split=val (C-10) must not
+        # depend on eval_on_test_data=True, and a missing-val fallback uses test.
+        # Training mode never reads these (see _active_split).
+        self.X_test_unit = env_config.get("X_test_unit", None)
+        self.X_test_std = env_config.get("X_test_std", None)
+        y_test = env_config.get("y_test", None)
+        self.y_test = None if y_test is None else np.asarray(y_test).astype(int)
         if self.eval_on_test_data:
-            X_test_unit = env_config.get("X_test_unit", None)
-            X_test_std = env_config.get("X_test_std", None)
-            y_test = env_config.get("y_test", None)
-            if X_test_unit is None or X_test_std is None or y_test is None:
+            if self.X_test_unit is None or self.X_test_std is None or self.y_test is None:
                 raise ValueError("eval_on_test_data=True requires X_test_unit, X_test_std, and y_test")
-            self.X_test_unit = X_test_unit
-            self.X_test_std = X_test_std
-            self.y_test = y_test.astype(int)
-        else:
-            self.X_test_unit = None
-            self.X_test_std = None
-            self.y_test = None
 
         self.max_action_scale = env_config.get("max_action_scale", 0.1)
         self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
@@ -346,6 +343,11 @@ class SingleAgentAnchorEnv(Env):
         self.ranking_score_formula = env_config.get("ranking_score_formula", "precision_coverage")
         self.top_k_rules_by_score = env_config.get("top_k_rules_by_score", 5)
         self.min_support = int(env_config.get("min_support", 10))
+        # Paper YAML: true. Default follows estimator so hull/CRN tests that
+        # terminate on 2–3 class rows keep working unless they opt in.
+        self.require_min_support_to_terminate = bool(
+            env_config.get("require_min_support_to_terminate", False)
+        )
 
         # Metrics from the last reset()/step(), reused as prev metrics by the next
         # step(). This halves classifier calls AND makes gains telescope exactly:
@@ -385,6 +387,8 @@ class SingleAgentAnchorEnv(Env):
             f"min_coverage_floor={self.min_coverage_floor}",
             f"init_mode={self.init_mode}",
             f"precision_estimator={self.precision_estimator}",
+            f"min_support={self.min_support}",
+            f"require_min_support_to_terminate={self.require_min_support_to_terminate}",
             f"leave_threshold={self.leave_threshold}",
             f"use_class_aware_targets={self.use_class_aware_targets}",
             f"categorical_freeze={self.categorical_freeze}",
@@ -1232,10 +1236,14 @@ class SingleAgentAnchorEnv(Env):
         preds = probs.argmax(axis=1)
         positive_idx = (preds == self.target_class)
         
-        # Precision calculation depends on mode:
-        # - Instance-based: P(prediction matches original instance | anchor conditions hold) - matches original Anchor paper
-        # - Class-based: P(y = target_class | x in box) - measures class correctness
-        if is_instance_based:
+        # Empirical Fid (paper / Track A): P(ŷ=c | x in box) on real rows.
+        # Instance-route P(ŷ=ŷ(x*)) is the Anchors / Track B r.v.; using it as
+        # the train done-switch mixes class identities when ŷ(x*) ≠ c.
+        use_track_a_fid = (
+            str(self.precision_estimator).lower() == "empirical"
+            and not self.use_perturbation
+        )
+        if is_instance_based and not use_track_a_fid:
             # Instance-based mode: Match original Anchor paper definition
             # Precision = fraction of samples where prediction matches original instance's prediction
             if self.original_prediction is not None:
@@ -1253,16 +1261,15 @@ class SingleAgentAnchorEnv(Env):
                     hard_precision = float((y_eval == self.target_class).mean())
             purity = float((y_eval == (self.original_prediction if self.original_prediction is not None else self.target_class)).mean()) if y_eval is not None else float("nan")
         else:
-            # C-09: class-based PRIMARY is model fidelity P(f_hat = c | x in B).
+            # C-09 / Track A: PRIMARY is model fidelity P(ŷ = c | x in B).
             hard_precision = float(positive_idx.mean())
             purity = float((y_eval == self.target_class).mean()) if y_eval is not None else float("nan")
 
-        # For avg_prob blending, use original_prediction for instance-based, target_class for class-based
-        if is_instance_based and self.original_prediction is not None:
-            # Instance-based: blend with probability of original_prediction class
+        # For avg_prob blending, use original_prediction for CRN instance-based,
+        # target_class for Track A empirical Fid and class-based.
+        if is_instance_based and not use_track_a_fid and self.original_prediction is not None:
             avg_prob = float(probs[:, self.original_prediction].mean())
         else:
-            # Class-based: blend with probability of target_class
             avg_prob = float(probs[:, self.target_class].mean())
         
         precision_proxy = (
@@ -1940,9 +1947,15 @@ class SingleAgentAnchorEnv(Env):
         # classes have reachable conditions (see _compute_effective_precision_target).
         eps = 1e-12
         precision_target = self.precision_target_effective
+        n_class_in_box = int(details.get("n_class_in_box") or 0)
+        support_ok = (
+            (not self.require_min_support_to_terminate)
+            or n_class_in_box >= int(self.min_support)
+        )
         both_targets_met = (
             precision >= precision_target
             and coverage >= self.coverage_target
+            and support_ok
             and (
                 (
                     self._uses_quantile_mdp()

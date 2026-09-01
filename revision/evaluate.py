@@ -29,7 +29,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "BenchMARL"))
 
-from BenchMARL.tabular_datasets import TabularDatasetLoader  # noqa: E402
+from utils.dataset_factory import make_tabular_loader  # noqa: E402
 from utils.eval_harness import (  # noqa: E402
     audit_selected_unit_rules,
     evaluate_ruleset_as_classifier,
@@ -179,7 +179,7 @@ def evaluate_rules_file(
     with open(rules_file) as f:
         rules = json.load(f)
 
-    loader = TabularDatasetLoader(dataset_name=dataset, random_state=seed)
+    loader = make_tabular_loader(dataset, random_state=seed)
     loader.load_dataset()
     loader.preprocess_data()
     loader.classifier = _load_classifier(loader, rules_file, seed, dataset)
