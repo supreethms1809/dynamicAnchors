@@ -206,7 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-#Custom 
+#Custom
 output/housing_*_joint/*
 output/wine_*_joint/*
 output/breast_cancer_*_joint/*
@@ -242,3 +242,19 @@ tests/**/__pycache__/
 tests/*_anchor_mlp__*/
 tests/*_anchor_*__*/
 models/*
+
+# ---- Local experiment artifacts (do not commit) ----
+# Training runs, checkpoints, TensorBoard, inference dumps
+runs/
+wyodot/output/
+wyodot/comparison_results/
+wyodot/backup_*/
+# Folktables / ACS microdata (download on the machine that trains)
+data/
+BenchMARL/data/
+# Generated Track A/B JSON (revision.evaluate / baselines / evaluate_instances)
+revision/results/
+revision/results_*/
+revision/logs/
+# Local Excel copies of WyoDOT tables (CSVs under wyodot/ stay tracked)
+wyodot/*.xlsx
