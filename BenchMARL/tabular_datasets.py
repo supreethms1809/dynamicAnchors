@@ -429,12 +429,18 @@ class TabularDatasetLoader:
         elif self.dataset_name in ("heloc", "fico_heloc"):
             # C-23: FICO HELOC (~10k rows, 23 continuous). OpenML 45578 or sklearn fetch.
             X, y, feature_names, class_names = self._load_heloc()
+        elif self.dataset_name in ("sick", "thyroid_sick"):
+            # Imbalanced medical: thyroid disease, ~3772 x 29, ~6.1% positive.
+            X, y, feature_names, class_names = self._load_openml_named("sick", "Thyroid (sick)")
+        elif self.dataset_name == "mammography":
+            # Severely imbalanced medical: ~11183 x 6, ~2.3% positive.
+            X, y, feature_names, class_names = self._load_openml_named("mammography", "Mammography")
         elif self.dataset_name in ("bank_marketing", "uci_bank"):
             # C-23: UCI Bank Marketing (~45k, mixed types).
             X, y, feature_names, class_names = self._load_bank_marketing()
             
         else:
-            supported = ['breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing', 'heloc', 'bank_marketing']
+            supported = ['breast_cancer', 'wine', 'iris', 'synthetic', 'moons', 'circles', 'covtype', 'housing', 'heloc', 'sick', 'mammography', 'bank_marketing']
             if UCIML_AVAILABLE:
                 supported.append('uci_<id_or_name> (e.g., uci_adult, uci_2)')
             if FOLKTABLES_AVAILABLE:
@@ -561,11 +567,19 @@ class TabularDatasetLoader:
             from sklearn.datasets import fetch_openml
         except ImportError as exc:
             raise ImportError("scikit-learn is required to fetch HELOC") from exc
-        logger.info("Fetching HELOC from OpenML (data_id=45578)...")
-        try:
-            bunch = fetch_openml(data_id=45578, as_frame=True, parser="auto")
-        except Exception:
-            bunch = fetch_openml(name="heloc", as_frame=True, parser="auto")
+        # data_id=45578 is NOT HELOC -- it is "California-Housing-Classification"
+        # (20640 x 8: longitude, latitude, housingMedianAge, ...). Fetching it
+        # succeeded, so the `except` fallback never fired and `--dataset heloc`
+        # silently returned California housing labelled as credit risk.
+        # Verified 2026-09-02. Fetch by NAME, and assert the shape we expect.
+        logger.info("Fetching FICO HELOC from OpenML (name='heloc')...")
+        bunch = fetch_openml(name="heloc", as_frame=True, parser="auto")
+        if bunch.data.shape[1] < 15:
+            raise ValueError(
+                f"OpenML 'heloc' returned {bunch.data.shape} with columns "
+                f"{list(bunch.data.columns)[:5]} -- that is not FICO HELOC "
+                f"(expected ~10000 x 22). Refusing to load the wrong dataset."
+            )
         import pandas as pd
         X_df = bunch.data.copy()
         y_raw = bunch.target
@@ -580,6 +594,49 @@ class TabularDatasetLoader:
         class_names = ["bad", "good"] if len(np.unique(y)) == 2 else [f"class_{i}" for i in range(len(np.unique(y)))]
         logger.info(f"  HELOC: n={len(X)}, d={X.shape[1]}, K={len(np.unique(y))}")
         return X, y, feature_names, class_names
+
+    def _load_openml_named(self, name: str, label: str) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+        """Fetch an OpenML dataset by NAME, label-encoding categoricals.
+
+        Used for the imbalanced medical sets (`sick`, `mammography`). Fetching by
+        name rather than numeric id, because a wrong id fails silently -- that is
+        exactly how `heloc` ended up returning California housing.
+        """
+        from sklearn.datasets import fetch_openml
+        from sklearn.preprocessing import LabelEncoder
+        import pandas as pd
+        logger.info(f"Fetching {label} from OpenML (name={name!r})...")
+        bunch = fetch_openml(name=name, as_frame=True, parser="auto")
+        X_df = bunch.data.copy()
+        label_encoders, categorical_cols = {}, []
+        for col in X_df.columns:
+            if X_df[col].dtype == object or str(X_df[col].dtype) == "category":
+                mode = X_df[col].mode()
+                X_df[col] = X_df[col].fillna(mode.iloc[0] if len(mode) else "missing")
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+                label_encoders[col] = le
+                categorical_cols.append(col)
+            else:
+                X_df[col] = pd.to_numeric(X_df[col], errors="coerce")
+                X_df[col] = X_df[col].fillna(X_df[col].median())
+        # A column that is entirely NaN medians to NaN; drop it rather than ship NaNs.
+        bad = [c for c in X_df.columns if X_df[c].isna().any()]
+        if bad:
+            logger.warning(f"  {label}: dropping all-NaN columns {bad}")
+            X_df = X_df.drop(columns=bad)
+            categorical_cols = [c for c in categorical_cols if c not in bad]
+        self.label_encoders = label_encoders
+        self.categorical_names = list(categorical_cols)
+        self.categorical_indices = [list(X_df.columns).index(c) for c in categorical_cols]
+        X = X_df.values.astype(np.float32)
+        y = LabelEncoder().fit_transform(
+            np.asarray(bunch.target).ravel().astype(str)).astype(int)
+        counts = np.bincount(y)
+        logger.info(f"  {label}: n={len(X)}, d={X.shape[1]}, K={len(counts)}, "
+                    f"class balance={np.round(counts/counts.sum(), 4).tolist()}, "
+                    f"categoricals={len(categorical_cols)}")
+        return X, y, list(X_df.columns), [f"class_{i}" for i in range(len(counts))]
 
     def _load_bank_marketing(self) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
         """C-23: UCI Bank Marketing (~45k, mixed types). Requires ucimlrepo (id=222)."""

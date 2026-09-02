@@ -666,3 +666,26 @@ def test_prediction_cache_cannot_serve_a_different_model():
         assert "_hit[0] is self.classifier" in src, f"{path}: no identity check"
         assert "_PROBS_CACHE[_ck] = (self.classifier," in src, \
             f"{path}: cache must hold a strong ref to keep the id valid"
+
+
+# --------------------------------------------------------------- dataset wiring
+
+def test_heloc_is_not_california_housing():
+    """OpenML data_id=45578 is 'California-Housing-Classification', NOT FICO HELOC.
+
+    Fetching it succeeded, so the `except` fallback never fired and
+    `--dataset heloc` silently returned housing data labelled as credit risk.
+    """
+    src = (REPO / "BenchMARL" / "tabular_datasets.py").read_text()
+    block = src[src.index("def _load_heloc"):]
+    block = block[: block.index("\n    def ")]
+    assert "data_id=45578" not in block, "the wrong OpenML id is back"
+    assert 'fetch_openml(name="heloc"' in block
+    assert "shape[1] < 15" in block, "must assert the shape, not trust the fetch"
+
+
+def test_new_datasets_are_wired_into_both_pipelines():
+    for name in ("heloc", "sick", "mammography"):
+        for p in ("revision/run_mada_pipeline.py", "revision/run_rlda_pipeline.py"):
+            assert f'"{name}"' in (REPO / p).read_text(), f"{name} missing from {p}"
+        assert f'"{name}"' in (REPO / "BenchMARL" / "tabular_datasets.py").read_text()

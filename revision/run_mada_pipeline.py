@@ -43,6 +43,13 @@ DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "folktables_income_CA_2018": {"ma_frames": 1_080_000, "n_instances": 25, "n_classes": 2},
     "housing":       {"ma_frames": 720_000, "n_instances": 20, "n_classes": 4},
     "uci_adult":     {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
+    # C-23 additions, 2026-09-02.
+    # heloc: FICO Explainable ML Challenge credit-risk set (10k x 22, balanced).
+    # sick / mammography: IMBALANCED medical (6.1% and 2.3% positive), chosen to
+    # stress the class-union shared reward on a minority class.
+    "heloc":         {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
+    "sick":          {"ma_frames": 360_000, "n_instances": 20, "n_classes": 2},
+    "mammography":   {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
 }
 for _cfg in DATASET_CONFIGS.values():
     _cfg["ma_frames"] *= BUDGET_MULT

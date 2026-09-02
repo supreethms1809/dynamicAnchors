@@ -46,6 +46,10 @@ DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "housing":       {"sa_timesteps": 120_000, "n_instances": 20, "n_classes": 4},
     "covtype":       {"sa_timesteps": 315_000, "n_instances": 25, "n_classes": 7},
     "uci_adult":     {"sa_timesteps": 360_000, "n_instances": 25, "n_classes": 2},
+    # C-23 additions, 2026-09-02 -- see run_mada_pipeline.py for rationale.
+    "heloc":         {"sa_timesteps": 360_000, "n_instances": 25, "n_classes": 2},
+    "sick":          {"sa_timesteps": 90_000,  "n_instances": 20, "n_classes": 2},
+    "mammography":   {"sa_timesteps": 360_000, "n_instances": 25, "n_classes": 2},
 }
 for _cfg in DATASET_CONFIGS.values():
     _cfg["sa_timesteps"] *= BUDGET_MULT
