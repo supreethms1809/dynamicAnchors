@@ -2834,11 +2834,17 @@ class AnchorEnv(ParallelEnv):
             #
             # Keyed on the classifier identity AND the exact bytes of X, so a
             # different model or different data can never hit a stale entry.
+            # id() alone is NOT a safe model identity: CPython reuses addresses
+            # after garbage collection, so a freed classifier's id could be
+            # rebound to a different model and return its predictions for
+            # matching data. The cache VALUE therefore holds a strong reference
+            # to the classifier, which keeps the object -- and its id -- alive
+            # for as long as the entry exists.
             _ck = (id(self.classifier), key, X.shape,
                    hashlib.sha1(np.ascontiguousarray(X, dtype=np.float32)).hexdigest())
             _hit = _PROBS_CACHE.get(_ck)
-            if _hit is not None:
-                self._cached_probs[key] = _hit
+            if _hit is not None and _hit[0] is self.classifier:
+                self._cached_probs[key] = _hit[1]
                 return self._cached_probs[key]
             if hasattr(self.classifier, 'eval'):
                 self.classifier.eval()
@@ -2847,7 +2853,7 @@ class AnchorEnv(ParallelEnv):
             with torch.no_grad():
                 inputs = torch.from_numpy(X.astype(np.float32)).to(self.device)
                 self._cached_probs[key] = predict_proba_torch(self.classifier, inputs).cpu().numpy()
-            _PROBS_CACHE[_ck] = self._cached_probs[key]
+            _PROBS_CACHE[_ck] = (self.classifier, self._cached_probs[key])
             # Counted ONLY on a real miss: these are the distinct rows the black
             # box actually had to score.
             self.n_blackbox_queries += int(X.shape[0])

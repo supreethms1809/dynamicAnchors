@@ -652,3 +652,17 @@ def test_query_buckets_are_reported_separately():
         for key in ("n_blackbox_queries", "n_training_queries",
                     "n_serving_queries_per_explanation", "n_reporting_queries"):
             assert f'"{key}"' in src, f"{path} missing {key}"
+
+
+def test_prediction_cache_cannot_serve_a_different_model():
+    """id() is reused after GC; the cache must verify model identity.
+
+    Without the strong reference + identity check, a freed classifier's address
+    could be rebound to a different model and return its predictions for
+    data whose sha1 matches.
+    """
+    for path in ("BenchMARL/environment.py", "single_agent/single_agentENV.py"):
+        src = (REPO / path).read_text()
+        assert "_hit[0] is self.classifier" in src, f"{path}: no identity check"
+        assert "_PROBS_CACHE[_ck] = (self.classifier," in src, \
+            f"{path}: cache must hold a strong ref to keep the id valid"
