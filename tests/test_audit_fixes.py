@@ -679,7 +679,9 @@ def test_heloc_is_not_california_housing():
     src = (REPO / "BenchMARL" / "tabular_datasets.py").read_text()
     block = src[src.index("def _load_heloc"):]
     block = block[: block.index("\n    def ")]
-    assert "data_id=45578" not in block, "the wrong OpenML id is back"
+    # the id may appear in the explanatory comment; what matters is that it is
+    # not CALLED
+    assert "fetch_openml(data_id=45578" not in block, "the wrong OpenML id is back"
     assert 'fetch_openml(name="heloc"' in block
     assert "shape[1] < 15" in block, "must assert the shape, not trust the fetch"
 
