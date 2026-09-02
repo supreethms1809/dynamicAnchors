@@ -355,8 +355,22 @@ def select_topk_union(
     class_conditional: bool = True,
     min_support: int = MIN_SUPPORT_DEFAULT,
     enforce_min_support: bool = True,
+    marginal_gain: bool = False,
+    ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
 ) -> Optional[UnionResult]:
     """Rank rules, take top-k (same pool), report `best` = rank-1 of that set, union the k.
+
+    `marginal_gain=True` replaces blind top-k with greedy marginal-gain
+    selection: a rule joins the union only if it strictly improves the UNION's
+    ranking score. Blind top-k ranks rules individually and never asks what a
+    rule contributes to the set, so a rule can score well alone and add nothing
+    but wrong-class rows. Measured on iris MADA class_0: k=5 took the union from
+    18 covered rows to 26 while the target-class rows stayed at 6 -- four rules
+    added eight rows, none of them class 0 -- dropping union fidelity
+    0.333 -> 0.231 for zero coverage gain.
+
+    Use it ONLY on the selection split. On the reporting split the rule set is
+    already fixed, and re-selecting there would be selection on test data.
 
     `enforce_min_support` must be True only when this call is *selecting* rules
     (i.e. on validation). On the reporting split the rule set is already fixed;
@@ -393,14 +407,40 @@ def select_topk_union(
         return (r.score, float(cov))
     scored.sort(key=lambda r: str(r.rule_id))
     scored.sort(key=_tiebreak, reverse=True)
-    if k is None or k < 0:
-        selected = scored
+    cap = len(scored) if (k is None or k < 0) else max(1, int(k))
+    best = scored[0]
+    if not marginal_gain:
+        selected = scored[:cap]
+        union_mask = np.zeros_like(scored[0].mask, dtype=bool)
+        for r in selected:
+            union_mask |= r.mask
     else:
-        selected = scored[: max(1, int(k))]
-    best = selected[0]
-    union_mask = np.zeros_like(selected[0].mask, dtype=bool)
-    for r in selected:
-        union_mask |= r.mask
+        # Greedy marginal gain on the SAME objective used to rank rules, so the
+        # union's score is monotonically non-decreasing by construction and a
+        # rule that only adds wrong-class rows is rejected (it lowers fidelity
+        # without adding coverage, hence lowers the score).
+        selected = [scored[0]]
+        union_mask = np.asarray(scored[0].mask, dtype=bool).copy()
+
+        def _score_of(mask):
+            m = evaluate_mask(
+                y=y, y_hat=y_hat, mask=mask, target_class=target_class,
+                class_conditional=class_conditional, min_support=min_support,
+            )
+            return ranking_score(
+                m.fidelity, m.coverage, ranking_formula, n_covered=m.n_covered,
+            )
+
+        current = _score_of(union_mask)
+        for r in scored[1:]:
+            if len(selected) >= cap:
+                break
+            cand = union_mask | np.asarray(r.mask, dtype=bool)
+            cand_score = _score_of(cand)
+            if np.isfinite(cand_score) and cand_score > current:
+                selected.append(r)
+                union_mask = cand
+                current = cand_score
     union_metrics = evaluate_mask(
         y=y,
         y_hat=y_hat,

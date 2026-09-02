@@ -259,6 +259,10 @@ def evaluate_rules_file(
         selected_val = select_topk_union(
             ranked_val, y_val, y_hat_val, cls, k=k,
             class_conditional=True, min_support=min_support,
+            # Greedy marginal gain, on the SELECTION split only. Blind top-k
+            # admitted rules that added no target-class rows (iris MADA class_0:
+            # +8 covered rows, +0 class rows, fidelity 0.333 -> 0.231).
+            marginal_gain=True, ranking_formula=ranking_formula,
         )
         if selected_val is None:
             continue

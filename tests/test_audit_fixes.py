@@ -471,3 +471,63 @@ def test_rlda_class_start_is_a_real_row():
     pt = env._class_centroid_unit
     rows = env.X_unit[env.y == env.target_class]
     assert np.min(np.linalg.norm(rows - pt[None, :], axis=1)) == pytest.approx(0.0, abs=1e-5)
+
+
+# --------------------------------------------------------------- marginal-gain union
+
+def test_marginal_gain_rejects_a_rule_that_adds_no_class_rows():
+    """A rule that only adds WRONG-class rows must not enter the union.
+
+    Blind top-k took iris MADA class_0 from 18 covered rows to 26 while the
+    target-class rows stayed at 6 -- four rules added eight rows, none of them
+    class 0 -- so union fidelity fell 0.333 -> 0.231 for zero coverage gain.
+    """
+    from utils.metrics import select_topk_union
+    n = 20
+    y = np.array([0] * 10 + [1] * 10)
+    y_hat = y.copy()
+    good = np.zeros(n, dtype=bool); good[:6] = True          # 6 class-0 rows
+    noise = np.zeros(n, dtype=bool); noise[10:18] = True     # 8 class-1 rows only
+    a = _ranked("good", good, sel_cov=0.6, score=0.9, y=y, y_hat=y_hat, cls=0)
+    b = _ranked("noise", noise, sel_cov=0.0, score=0.5, y=y, y_hat=y_hat, cls=0)
+
+    blind = select_topk_union([a, b], y, y_hat, 0, k=2, class_conditional=True,
+                              min_support=1, enforce_min_support=False)
+    greedy = select_topk_union([a, b], y, y_hat, 0, k=2, class_conditional=True,
+                               min_support=1, enforce_min_support=False,
+                               marginal_gain=True)
+    assert blind.n_selected == 2, "blind top-k takes both"
+    assert greedy.n_selected == 1, "marginal gain must reject the noise rule"
+    assert greedy.union_metrics.fidelity > blind.union_metrics.fidelity
+    assert greedy.union_metrics.coverage == pytest.approx(blind.union_metrics.coverage)
+
+
+def test_marginal_gain_keeps_a_rule_that_adds_class_rows():
+    """The complement: a rule that adds target-class rows must be kept."""
+    from utils.metrics import select_topk_union
+    n = 20
+    y = np.array([0] * 10 + [1] * 10)
+    y_hat = y.copy()
+    a_mask = np.zeros(n, dtype=bool); a_mask[:5] = True
+    b_mask = np.zeros(n, dtype=bool); b_mask[5:10] = True    # 5 more class-0 rows
+    a = _ranked("a", a_mask, sel_cov=0.5, score=0.9, y=y, y_hat=y_hat, cls=0)
+    b = _ranked("b", b_mask, sel_cov=0.5, score=0.5, y=y, y_hat=y_hat, cls=0)
+    out = select_topk_union([a, b], y, y_hat, 0, k=2, class_conditional=True,
+                            min_support=1, enforce_min_support=False,
+                            marginal_gain=True)
+    assert out.n_selected == 2
+    assert out.union_metrics.coverage == pytest.approx(1.0)
+    assert out.union_metrics.fidelity == pytest.approx(1.0)
+
+
+def test_marginal_gain_is_off_on_the_reporting_split():
+    """Re-selecting on test would be selection on test data."""
+    import inspect
+    from revision import evaluate as ev
+    src = inspect.getsource(ev.evaluate_rules) if hasattr(ev, "evaluate_rules") else \
+          (REPO / "revision" / "evaluate.py").read_text()
+    # window-based, not paren-based: the call carries comments containing parens
+    val_call = src[src.index("selected_val = select_topk_union"):][:900]
+    assert "marginal_gain=True" in val_call
+    rep_call = src[src.index("union = select_topk_union"):][:600]
+    assert "marginal_gain" not in rep_call, "reporting split must not re-select"
