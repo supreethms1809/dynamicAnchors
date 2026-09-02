@@ -325,9 +325,10 @@ class AnchorEnv(ParallelEnv):
         # Latch: has the one-time shared_terminal_bonus already been paid for this
         # class this episode? Reset in reset() alongside _prev_class_phi.
         self._class_union_bonus_paid: Dict[int, bool] = {}
-        # Per-agent inter-class overlap level from the previous step (the overlap
-        # penalty charges the change in this level; seeded in reset())
+        # Per-agent inter-class / same-class overlap levels from the previous
+        # step (each penalty charges the change in its level; seeded in reset())
         self._prev_inter_overlap: Dict[str, float] = {}
+        self._prev_same_overlap: Dict[str, float] = {}
         
         # Track warnings per agent per episode to reduce log spam
         # Only warn once per episode about adaptive mode switching and precision-coverage mismatch
@@ -363,8 +364,8 @@ class AnchorEnv(ParallelEnv):
         self.shared_reward_weight = env_config.get("shared_reward_weight", 0.5)
         
         # Weights for class-level rewards and within-class diversity.
-        # Defaults are 0.0 so the existing reward structure remains unchanged
-        # unless explicitly enabled via env_config.
+        # same_class_diversity_weight defaults to 0.0 so hull/CDEA runs that
+        # omit the key stay copy-tolerant; paper YAML sets it for quantile MADA.
         self.class_union_cov_weight = env_config.get("class_union_cov_weight", 0.0)
         self.class_union_prec_weight = env_config.get("class_union_prec_weight", 0.0)
         self.same_class_diversity_weight = env_config.get("same_class_diversity_weight", 0.0)
@@ -680,6 +681,120 @@ class AnchorEnv(ParallelEnv):
     def n_predicates(self, agent: str) -> int:
         return int(self._constrained_mask(agent).sum())
 
+    def _is_real_rule(self, agent: str) -> bool:
+        """True iff this agent's box is a rule, not the empty start.
+
+        Quantile: a predicate exists iff the interval left the (0, 1) corner.
+        Hull constrains every dim at reset, so every live box is a rule.
+        """
+        if agent not in self.lower or agent not in self.upper:
+            return False
+        if self._uses_quantile_mdp():
+            return self.n_predicates(agent) >= 1
+        return agent in self.agents
+
+    def _rule_agents(self, cls: Optional[int] = None) -> List[str]:
+        """Agents whose box enters the class union and overlap game.
+
+        Quantile: k >= 1, including agents that already `done` — their box
+        still covers. k = 0 is the empty start, dropped at extraction, and
+        must not drown Φ^∪ or count as a claim.
+
+        Hull: live agents only, so idle init boxes in single-agent inference
+        stay out of the union.
+        """
+        if self._uses_quantile_mdp():
+            pool = [a for a in self.lower.keys() if a in self.upper]
+        else:
+            pool = [a for a in self.agents if a in self.lower and a in self.upper]
+        out = [a for a in pool if self._is_real_rule(a)]
+        if cls is not None:
+            out = [a for a in out if self._get_class_for_agent(a) == cls]
+        return out
+
+    def _claim_mask(self, agent: str) -> np.ndarray:
+        """Rows of D_active this agent's *rule* covers. Empty start → none."""
+        X_eval_unit, _, _, _ = self._active_data()
+        n = 0 if X_eval_unit is None else int(X_eval_unit.shape[0])
+        if n == 0 or not self._is_real_rule(agent):
+            return np.zeros(n, dtype=bool)
+        return self._mask_in_box(agent)
+
+    def _union_claim_mask(self, agents: List[str]) -> np.ndarray:
+        X_eval_unit, _, _, _ = self._active_data()
+        n = 0 if X_eval_unit is None else int(X_eval_unit.shape[0])
+        out = np.zeros(n, dtype=bool)
+        for a in agents:
+            m = self._claim_mask(a)
+            if m.shape[0] == n:
+                out |= m
+        return out
+
+    @staticmethod
+    def _simpson_overlap(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+        """|A ∩ B| / min(|A|, |B|). 0 if either claim is empty.
+
+        This is the quantile-native overlap: it is a statement about which
+        *rows* two rules fire on (the same quantity as eval conflict), not
+        hull-era volume on unit-width-active dims.
+        """
+        if mask_a.size == 0 or mask_b.size == 0:
+            return 0.0
+        n_a = int(np.asarray(mask_a).sum())
+        n_b = int(np.asarray(mask_b).sum())
+        if n_a == 0 or n_b == 0:
+            return 0.0
+        n_inter = int(np.logical_and(mask_a, mask_b).sum())
+        return float(n_inter) / float(min(n_a, n_b))
+
+    def _quantile_overlap_level(self, agent: str, same_class: bool) -> float:
+        """Weighted Simpson of this rule vs the union of the other group's rules."""
+        weight = (
+            self.same_class_diversity_weight if same_class
+            else self.inter_class_overlap_weight
+        )
+        if weight <= 0.0 or not self._is_real_rule(agent):
+            return 0.0
+        cls = self._get_class_for_agent(agent)
+        if cls is None:
+            return 0.0
+        if same_class:
+            others = [a for a in self._rule_agents(cls) if a != agent]
+        else:
+            others = [
+                a for a in self._rule_agents()
+                if self._get_class_for_agent(a) != cls
+            ]
+        if not others:
+            return 0.0
+        sim = self._simpson_overlap(
+            self._claim_mask(agent), self._union_claim_mask(others)
+        )
+        return float(np.clip(weight * sim, 0.0, 1.0))
+
+    def _class_union_potential(self, cls: int, metrics: Dict[str, float]) -> float:
+        """Φ^∪_c from already-computed union Fid/C. State function only."""
+        union_prec = max(0.0, float(metrics.get("union_precision", 0.0)))
+        union_cov = max(0.0, float(metrics.get("union_coverage", 0.0)))
+        cls_target = self._get_effective_precision_target(cls)
+        # P-01: the SAME B2 ramp _potential uses. This used to be the retired
+        # 0.8*target form, which _potential's own comment calls "a licence to
+        # trade fidelity for coverage": at tau_P=0.9 it paid FULL coverage credit
+        # from union fidelity 0.72 while the local term paid nothing below 0.80.
+        # The shared stream is the one carrying the cooperation signal, so the
+        # lenient gate was rewarding class-wide box inflation.
+        gate = self._coverage_gate(union_prec, cls_target)
+        if self._uses_quantile_mdp():
+            k_cls = sum(self.n_predicates(a) for a in self.class_to_agents.get(cls, []))
+            cov_ok = 1.0 if k_cls >= 1 else 0.0
+            return float(
+                self.alpha * min(union_prec, cls_target)
+                + self.beta * np.sqrt(union_cov) * gate * cov_ok
+            )
+        return float(
+            self.alpha * union_prec + self.beta * np.sqrt(union_cov) * gate
+        )
+
     def _sync_unit_bounds_from_quantiles(self, agent: str) -> None:
         lo, up = qmdp.quantile_to_unit_bounds(
             self.a[agent], self.b[agent], self._cdfs(agent)["v_class"], self.quantile_eps
@@ -695,14 +810,41 @@ class AnchorEnv(ParallelEnv):
         )
 
     def _class_centroid_quantiles(self, agent: str) -> np.ndarray:
+        """Class-mode start point, as a real class row, diversified per agent.
+
+        G-07/B-05: this used to return the per-feature class MEDIAN, which is
+        generally not a data point, need not be classified as the class, and can
+        be off-manifold -- while inference passed k-means centroids snapped to
+        class rows via class_init_point. Training and inference therefore drew
+        (mode=class, q*) from different distributions.
+
+        Now both sides start on a real class row, and agents of the same class
+        take DIFFERENT rows (indexed by agent), matching the diversified starts
+        inference uses and giving same-class agents a reason to differ that the
+        same-class diversity term can act on.
+        """
         cls = self._get_class_for_agent(agent)
         mask = self.y == cls if cls is not None else np.ones(len(self.y), dtype=bool)
         if not mask.any():
             return np.full(self.n_features, 0.5, dtype=np.float64)
-        centroid = np.median(self.X_unit[mask], axis=0)
+        class_rows = self.X_unit[mask]
+        centroid = np.median(class_rows, axis=0)
+        # Snap to the nearest real class row (Anchors always anchors on a real x*).
+        centroid = self._snap_to_nearest_class_point(centroid, class_rows)
+        if self.agents_per_class > 1 and len(class_rows) > 1:
+            # Deterministic per-agent offset around the snapped centroid: order
+            # class rows by distance to it and take the agent-th one, cycling.
+            agent_idx = 0
+            parts = agent.split("_")
+            if len(parts) >= 3 and parts[2].isdigit():
+                agent_idx = int(parts[2])
+            if agent_idx > 0:
+                d = np.linalg.norm(class_rows - centroid[None, :], axis=1)
+                order = np.argsort(d)
+                centroid = class_rows[order[agent_idx % len(order)]]
         if cls is not None:
-            self._class_centroid_unit[int(cls)] = centroid.astype(np.float32)
-        return self._values_to_q(agent, centroid)
+            self._class_centroid_unit[int(cls)] = np.asarray(centroid, dtype=np.float32)
+        return self._values_to_q(agent, np.asarray(centroid, dtype=np.float64))
 
     def _draw_crn(self, agent: str) -> None:
         n = max(1, int(self.n_perturb if self.mode == "training" else self.n_perturb_eval))
@@ -789,11 +931,16 @@ class AnchorEnv(ParallelEnv):
                 np.array([precision, coverage, episode_phase], dtype=np.float32),
             ]).astype(np.float32)
         mode_bit = 1.0 if self.x_star_unit.get(agent) is not None else 0.0
+        # G-12: episode_phase (the paper's xi_t) is part of the state. With
+        # max_cycles truncation and per-step costs the value function depends on
+        # t, so without this channel the critic regresses a target that moves
+        # with an unobserved variable. The hull layout always carried it; the
+        # quantile layout dropped it for the mode bit. Now it carries both.
         return np.concatenate([
             np.asarray(self.a[agent], dtype=np.float32),
             np.asarray(self.b[agent], dtype=np.float32),
             np.asarray(self.q_star[agent], dtype=np.float32),
-            np.array([precision, coverage, mode_bit], dtype=np.float32),
+            np.array([precision, coverage, mode_bit, episode_phase], dtype=np.float32),
         ]).astype(np.float32)
 
     def _apply_quantile_action(self, agent: str, action: np.ndarray) -> None:
@@ -1562,22 +1709,24 @@ class AnchorEnv(ParallelEnv):
             # a short dict here drops step keys (coverage_at_reset is in step info).
             infos[agent] = {}
 
-        # Reset the per-class union potential used by the same-class shared reward
-        # so the first step of an episode measures gain from the initial boxes.
-        self._prev_class_phi = {}
-        # Clear the shared-terminal-bonus latch so each episode can pay it once.
+        # Seed union Φ and overlap levels from the reset boxes so the first
+        # step's deltas are the change the first actions cause. Under the
+        # quantile MDP that seed is 0 (no k>=1 rules yet); a first predicate
+        # then earns the full ΔΦ^∪ instead of having it dropped.
         self._class_union_bonus_paid = {}
+        self._prev_class_phi = {}
         self._union_coverage_at_reset = {}
-        if (
-            len(self.agents) > 1
-            and self.shared_terminal_bonus != 0.0
+        if len(self.agents) > 1 and (
+            self.shared_reward_weight != 0.0 or self.shared_terminal_bonus != 0.0
         ):
             for cls, m in self._compute_class_union_metrics().items():
+                self._prev_class_phi[cls] = self._class_union_potential(cls, m)
                 self._union_coverage_at_reset[cls] = float(m.get("union_coverage", 0.0))
-        # Seed inter-class overlap levels from the initial boxes so the first
-        # step charges only the overlap CHANGE the first actions cause.
         self._prev_inter_overlap = {
             agent: self._compute_inter_class_overlap_penalty(agent) for agent in self.agents
+        }
+        self._prev_same_overlap = {
+            agent: self._compute_same_class_overlap_penalty(agent) for agent in self.agents
         }
 
         return observations, infos
@@ -1743,13 +1892,20 @@ class AnchorEnv(ParallelEnv):
         # after ALL termination paths have been resolved (see below).
         phi_curr_by_agent: Dict[str, float] = {}
 
+        # G-09: PettingZoo's ParallelEnv contract requires an entry for every live
+        # agent in each returned dict. The old code silently `continue`d past a
+        # missing action, returning a tuple with that agent absent from
+        # observations/rewards/terminations/truncations -- and first threw away an
+        # expensive _current_metrics call computing a value it discarded.
+        missing = [a for a in self.agents if a not in actions]
+        if missing:
+            raise KeyError(
+                f"step() received no action for live agent(s) {missing}. "
+                f"ParallelEnv requires an action per live agent; got {sorted(actions)}."
+            )
+
         for agent in self.agents:
-            if agent not in actions:
-                # Agent did not act in this step; keep its box unchanged
-                precision, coverage, details = self._current_metrics(agent)
-                # Skip action application for agents without actions
-                continue
-            else:
+            if agent in actions:  # guaranteed by the guard above
                 # Agent has an action; read it and apply it
                 # CRITICAL FIX: Do not compute metrics here - observation will be created with post-action metrics
                 # This avoids wasted compute and prevents stochastic variance from duplicate calls
@@ -1988,11 +2144,8 @@ class AnchorEnv(ParallelEnv):
             drift_penalty = self.drift_penalty_weight * drift
 
             anchor_drift_penalty = self._compute_anchor_drift_penalty(agent, prev_lower, prev_upper)
-            # Inter-class overlap is charged AFTER the agent loop as a potential-style
-            # delta (change in overlap level), not a per-step level: the level form
-            # accumulated 0.15-0.3/step (~30-60 per episode) against a positive
-            # signal bounded by ~7, so penalty avoidance dominated the learned policy.
-            same_class_overlap_penalty = self._compute_same_class_overlap_penalty(agent)
+            # Inter-class and same-class overlap are charged AFTER the agent loop
+            # as potential-style deltas (change in level), not per-step levels.
 
             # Retired terms (keys kept for logging compatibility): the JS proxy was a
             # third movement penalty; the bonuses belonged to the relative-gain scheme.
@@ -2004,22 +2157,20 @@ class AnchorEnv(ParallelEnv):
             coverage_floor_penalty = 0.0
             if coverage_clipped:
                 # Reduce all penalties since action didn't actually take effect
-                # (the inter-class overlap delta needs no reduction: a reverted box
-                # leaves the overlap level unchanged, so its delta is already ~0)
+                # (overlap deltas need no reduction: a reverted box leaves the
+                # overlap level unchanged, so its delta is already ~0)
                 penalty_reduction_factor = 0.1
                 overlap_penalty *= penalty_reduction_factor
                 anchor_drift_penalty *= penalty_reduction_factor
-                same_class_overlap_penalty *= penalty_reduction_factor
                 # Give a small negative reward for attempting invalid action
                 coverage_floor_penalty = -0.05
 
-            # SS: R_local: Local reward component (inter-class overlap delta added post-loop)
+            # SS: R_local. Overlap deltas and union Φ are added post-loop.
             reward_local = (
                 shaping_gain
                 - overlap_penalty
                 - drift_penalty
                 - anchor_drift_penalty
-                - same_class_overlap_penalty
                 + coverage_floor_penalty )
 
             if not np.isfinite(reward_local):
@@ -2221,9 +2372,9 @@ class AnchorEnv(ParallelEnv):
                 "overlap_penalty": float(overlap_penalty),
                 "drift_penalty": float(drift_penalty),
                 "anchor_drift_penalty": float(anchor_drift_penalty),
-                # Placeholder: replaced with the post-loop overlap delta below
+                # Placeholder: replaced with the post-loop overlap deltas below
                 "inter_class_overlap_penalty": 0.0,
-                "same_class_overlap_penalty": float(same_class_overlap_penalty),
+                "same_class_overlap_penalty": 0.0,
                 "coverage_floor_penalty": float(coverage_floor_penalty),
                 "coverage_at_reset": float(self._coverage_at_reset.get(agent, 0.0)),
                 "coverage_improved": float(1.0 if self._coverage_improved(agent, coverage) else 0.0),
@@ -2280,23 +2431,8 @@ class AnchorEnv(ParallelEnv):
             for cls, m in class_union_metrics.items():
                 union_prec = max(0.0, float(m.get("union_precision", 0.0)))
                 union_cov = max(0.0, float(m.get("union_coverage", 0.0)))
-                # Gate the coverage term by union precision, mirroring _potential:
-                # ungated, the shared term paid for raw union-coverage expansion
-                # regardless of precision, rewarding box inflation.
                 cls_target = self._get_effective_precision_target(cls)
-                gate = min(1.0, union_prec / max(cls_target * 0.8, 1e-6))
-                if self._uses_quantile_mdp():
-                    # Same two corrections as the local potential. Without them the
-                    # SHARED term reproduces the degenerate optimum on its own: at
-                    # reset every agent is at the corner, so union coverage is 1.0
-                    # and Phi_c is near maximal -- the class is paid for doing
-                    # nothing, and any predicate a member adds lowers it.
-                    _k_cls = sum(self.n_predicates(a) for a in self.class_to_agents.get(cls, []))
-                    _cov_ok = 1.0 if _k_cls >= 1 else 0.0
-                    phi_class = (self.alpha * min(union_prec, cls_target)
-                                 + self.beta * np.sqrt(union_cov) * gate * _cov_ok)
-                else:
-                    phi_class = self.alpha * union_prec + self.beta * np.sqrt(union_cov) * gate
+                phi_class = self._class_union_potential(cls, m)
                 prev_phi = self._prev_class_phi.get(cls)
                 shared_by_class[cls] = (
                     self.shared_reward_weight * (phi_class - prev_phi) if prev_phi is not None else 0.0
@@ -2324,17 +2460,20 @@ class AnchorEnv(ParallelEnv):
                     union_terminal_bonus_by_class[cls] = float(self.shared_terminal_bonus)
                     self._class_union_bonus_paid[cls] = True
 
-        # Inter-class overlap as a potential-style delta: charge each agent the
-        # CHANGE in its (Jaccard-normalized, weighted) overlap level, computed here
-        # from everyone's post-action boxes so all agents see a consistent state.
-        # Telescoping bounds the episode total by level_final - level_init (|.| <= 1)
-        # instead of growing linearly with episode length.
+        # Overlap as potential-style deltas from everyone's post-action boxes.
+        # Quantile: Simpson of k>=1 claim masks (eval conflict on rows).
+        # Hull: volume Jaccard on unit-width-active dims (CDEA unchanged).
         inter_overlap_delta: Dict[str, float] = {}
+        same_overlap_delta: Dict[str, float] = {}
         for agent in self.agents:
             level = self._compute_inter_class_overlap_penalty(agent)
             prev_level = self._prev_inter_overlap.get(agent, level)
             inter_overlap_delta[agent] = level - prev_level
             self._prev_inter_overlap[agent] = level
+            same_level = self._compute_same_class_overlap_penalty(agent)
+            prev_same = self._prev_same_overlap.get(agent, same_level)
+            same_overlap_delta[agent] = same_level - prev_same
+            self._prev_same_overlap[agent] = same_level
 
         # Global coverage kept for logging only (weight-gated; no longer a reward stream)
         global_coverage = self._compute_global_coverage() if self.global_coverage_weight > 0 else 0.0
@@ -2355,16 +2494,23 @@ class AnchorEnv(ParallelEnv):
                 union_purity = float(m.get("union_purity", 0.0))
 
             overlap_delta = float(inter_overlap_delta.get(agent, 0.0))
+            same_delta = float(same_overlap_delta.get(agent, 0.0))
             # One-time union-target bonus for this class (latched), paid to every
             # agent of the class on the step the union first clears both targets.
             union_bonus = float(union_terminal_bonus_by_class.get(cls, 0.0)) if cls is not None else 0.0
-            final_reward = float(local_r + shared_reward + union_bonus - overlap_delta)
+            final_reward = float(
+                local_r + shared_reward + union_bonus - overlap_delta - same_delta
+            )
             rewards[agent] = final_reward
-            self._rt_total[agent] = float(self._rt_total.get(agent, 0.0) + shared_reward + union_bonus - overlap_delta)
+            self._rt_total[agent] = float(
+                self._rt_total.get(agent, 0.0) + shared_reward + union_bonus
+                - overlap_delta - same_delta
+            )
 
             # Update info to reflect the final reward decomposition
             if agent in infos:
                 infos[agent]["inter_class_overlap_penalty"] = overlap_delta
+                infos[agent]["same_class_overlap_penalty"] = same_delta
                 infos[agent]["shared_reward"] = float(shared_reward)
                 infos[agent]["shared_terminal_bonus"] = float(union_bonus)
                 infos[agent]["class_union_coverage"] = float(union_cov)
@@ -2398,7 +2544,7 @@ class AnchorEnv(ParallelEnv):
                     "drift_penalty": 0.0,
                     "anchor_drift_penalty": 0.0,
                     "inter_class_overlap_penalty": overlap_delta,
-                    "same_class_overlap_penalty": 0.0,
+                    "same_class_overlap_penalty": same_delta,
                     "coverage_floor_penalty": 0.0,
                     "class_union_coverage": float(union_cov),
                     "class_union_precision": float(union_prec),
@@ -2534,13 +2680,18 @@ class AnchorEnv(ParallelEnv):
     def _compute_inter_class_overlap_penalty(self, agent: str) -> float:
         """
         Weighted inter-class overlap LEVEL for this agent's box (clipped to [0, 1]).
-        Jaccard-normalized (inter / union): the old inter / own_volume form punished
-        being contained rather than overlapping, so inflating to a near-full-space
-        box drove the penalty to ~0 — the degenerate minority-class solution.
-        Iterates over all agents with boxes (not just alive ones) so another agent
-        terminating does not discontinuously change this level mid-episode; step()
-        charges the CHANGE in this level, not the level itself.
+
+        Quantile MDP: Simpson overlap of this k>=1 claim with the union of
+        other-class k>=1 claims, on rows of D_active. Empty start claims
+        nothing (it is not a rule). This is eval conflict, not hull volume.
+
+        Hull: Jaccard on unit-width-active dims (CDEA / neighbor_hull).
+        step() charges the CHANGE in this level, not the level itself.
+        Finished agents' boxes stay in the other-class union.
         """
+        if self._uses_quantile_mdp():
+            return self._quantile_overlap_level(agent, same_class=False)
+
         cls_agent = self._get_class_for_agent(agent)
         if cls_agent is None:
             return 0.0
@@ -2589,9 +2740,14 @@ class AnchorEnv(ParallelEnv):
         return float(np.clip(penalty, 0.0, 1.0))
 
     def _compute_same_class_overlap_penalty(self, agent: str) -> float:
+        """Same-class diversity LEVEL. Quantile: Simpson vs teammates' k>=1
+        union. Hull: volume Jaccard among live same-class boxes. step() charges
+        the delta. Weight 0 short-circuits (CDEA)."""
         if self.same_class_diversity_weight <= 0.0:
             return 0.0
-        
+        if self._uses_quantile_mdp():
+            return self._quantile_overlap_level(agent, same_class=True)
+
         cls = self._get_class_for_agent(agent)
         if cls is None:
             return 0.0
@@ -2709,6 +2865,18 @@ class AnchorEnv(ParallelEnv):
         self._effective_precision_targets[target_class] = effective
         return effective
 
+    def _coverage_gate(self, precision: float, target: float) -> float:
+        """B2 coverage gate: 0 below (target - gate_margin), 1 at target.
+
+        ONE definition, used by both the local potential and the class-union
+        potential. They used to disagree (P-01): the union kept the retired
+        min(1, P / (0.8*target)) form, so the two reward streams priced coverage
+        differently and the lenient one was the shared/cooperative term.
+        """
+        target = max(float(target), 1e-6)
+        margin = max(float(getattr(self, "gate_margin", 0.10)), 1e-6)
+        return float(min(1.0, max(0.0, (float(precision) - (target - margin)) / margin)))
+
     def _potential(self, precision: float, coverage: float, target_class: Optional[int],
                    k: Optional[int] = None, p_reset: Optional[float] = None) -> float:
         """
@@ -2727,10 +2895,7 @@ class AnchorEnv(ParallelEnv):
         # precision relative to the target. The old gate saturated at 0.8*target,
         # granting full coverage credit below target; with beta raised so coverage
         # drives the policy, that becomes a licence to trade fidelity for coverage.
-        target = max(float(target), 1e-6)
-        margin = max(float(getattr(self, "gate_margin", 0.10)), 1e-6)
-        gate = (precision - (target - margin)) / margin
-        gate = float(min(1.0, max(0.0, gate)))
+        gate = self._coverage_gate(precision, target)
         if not self._uses_quantile_mdp():
             return float(self.alpha * precision + self.beta * np.sqrt(coverage) * gate)
         # Quantile MDP, mirroring single_agentENV._potential:
@@ -2747,61 +2912,37 @@ class AnchorEnv(ParallelEnv):
         return float(self.alpha * p_tilde + self.beta * np.sqrt(coverage) * gate * cov_ok)
 
     def _compute_class_union_metrics(self) -> Dict[int, Dict[str, float]]:
+        """Fid/C of the union of real rules per class.
+
+        Quantile: only k>=1 boxes, including terminated agents. Empty start
+        covers the whole space and would drown Φ^∪; it is not a rule and is
+        dropped at extraction, so it stays out here. Classes with no real
+        rule report coverage 0 (so the union bonus is reachable from reset).
+
+        Hull: live agents only (idle inference boxes stay out).
+        """
         X_data, _, y_data, _ = self._active_data()
         
         if X_data is None or y_data is None or X_data.shape[0] == 0:
             return {}
         
         n_samples = X_data.shape[0]
-        class_ids = set()
-
-        # Only agents currently in the episode. Idle init boxes of other
-        # agents (single-agent inference rollouts) must not enter the union.
-        agents_with_boxes = [a for a in self.agents if a in self.lower and a in self.upper]
-        for agent in agents_with_boxes:
-            cls = self._get_class_for_agent(agent)
-            if cls is not None:
-                class_ids.add(cls)
-        
         metrics: Dict[int, Dict[str, float]] = {}
-        
-        for cls in sorted(class_ids):
-            agents_c = [a for a in agents_with_boxes if self._get_class_for_agent(a) == cls]
-            if not agents_c:
-                continue
-            
+
+        for cls in sorted(self.class_to_agents.keys()):
+            valid_agents = self._rule_agents(cls)
             union_mask = np.zeros(n_samples, dtype=bool)
-            # FIX: Only include agents that have valid boxes (both lower and upper bounds exist)
-            # and have been updated (not just initialized). During inference with single-agent rollouts,
-            # other agents' boxes might be initialized but never updated, causing incorrect union metrics.
-            valid_agents = []
-            for agent in agents_c:
-                if agent in self.lower and agent in self.upper:
-                    # Check if box is valid (not all zeros or all ones, which might indicate uninitialized state)
-                    lower = self.lower[agent]
-                    upper = self.upper[agent]
-                    # Valid box should have upper > lower for at least some features
-                    if np.any(upper > lower):
-                        valid_agents.append(agent)
-            
-            # If no valid agents, skip this class
-            if not valid_agents:
-                continue
-            
             for agent in valid_agents:
                 mask_agent = self._mask_in_box(agent)
                 if mask_agent.shape[0] == union_mask.shape[0]:
                     union_mask |= mask_agent
-            
-            # Class-conditional coverage: P(x in union | y = cls)
+
             mask_cls = (y_data == cls)
             if mask_cls.sum() > 0:
                 cov_union = float(union_mask[mask_cls].mean())
             else:
                 cov_union = 0.0
-            
-            # C-09: union PRIMARY is model fidelity, matching local rewards and
-            # the revision evaluator. Ground-truth purity remains diagnostic.
+
             if union_mask.any():
                 preds = self._get_cached_probs(self._active_split()).argmax(axis=1)
                 fidelity_union = float((preds[union_mask] == cls).mean())
@@ -2809,14 +2950,14 @@ class AnchorEnv(ParallelEnv):
             else:
                 fidelity_union = 0.0
                 purity_union = 0.0
-            
+
             metrics[cls] = {
                 "union_coverage": cov_union,
                 "union_precision": fidelity_union,
                 "union_fidelity": fidelity_union,
                 "union_purity": purity_union,
             }
-        
+
         return metrics
     
     # Added as part of debugging multiagent after presentation
@@ -2863,11 +3004,32 @@ class AnchorEnv(ParallelEnv):
     # shared reward in step()).
 
     def _compute_group_map(self) -> Dict[str, List[str]]:
-        group_map = {}
-        
-        for agent in self.possible_agents:
-            group_map[agent] = [agent]
-        
+        """One group per class, named "class_{c}" (the CLASS-AS-PLAYER model).
+
+        This map is AUTHORITATIVE: benchmarl_wrappers passes it to
+        PettingZooWrapper explicitly. It used to be dead code -- the wrapper
+        omitted group_map, so torchrl's default parallel grouping (agents named
+        "str_int" grouped by "str") silently decided the grouping instead. That
+        put every class in ONE group when agents_per_class == 1, and combined
+        with share_policy_params it collapsed all agents of a group onto a
+        single parameter set (see docs/BUGS_mada_multiagent_design.md M-01/M-03).
+
+        One group per class is what the rest of the code already expects:
+        _extract_class_from_group_name documents "class_{c}" as the recommended
+        name, and the MADDPG critic is centralised WITHIN a group, so a class
+        group is exactly the scope over which the same-class shared reward and
+        the same-class diversity penalty are defined.
+        """
+        group_map: Dict[str, List[str]] = {}
+
+        for cls in self.target_classes:
+            agents_c = [
+                a for a in self.possible_agents
+                if self.agent_to_class.get(a) == cls
+            ]
+            if agents_c:
+                group_map[f"class_{int(cls)}"] = agents_c
+
         return group_map
     
     @property
@@ -2893,7 +3055,11 @@ class AnchorEnv(ParallelEnv):
             # Quantile MDP: [a(n), b(n), q*(n), precision, coverage, mode_bit].
             # Shape is CONDITIONAL so hull-mode runs (WyoDOT/CDEA, in-flight jobs)
             # keep 2n+3 and their existing checkpoints stay loadable.
-            shape=((3 if self._uses_quantile_mdp() else 2) * self.n_features + 3,),
+            # Quantile MDP: [a(n), b(n), q*(n), P, C, mode_bit, episode_phase] = 3n+4.
+            # Hull: [lower(n), upper(n), P, C, episode_phase] = 2n+3 (unchanged, so
+            # CDEA/WyoDOT checkpoints stay loadable).
+            shape=(3 * self.n_features + 4 if self._uses_quantile_mdp()
+                   else 2 * self.n_features + 3,),
             dtype=np.float32
         )
     
@@ -2905,6 +3071,49 @@ class AnchorEnv(ParallelEnv):
             shape=(2 * self.n_features,),
             dtype=np.float32
         )
+
+    def state(self) -> np.ndarray:
+        """Global state for CTDE critics: every agent's box, in a fixed order.
+
+        G-02: without this, has_state() was False and MADDPG took its
+        no-global-state branch, so a critic saw only its OWN group's
+        observations. A group is one class, so the inter-class overlap term
+        (inter_class_overlap_weight) entered the reward while no other class's
+        box entered any critic input or any actor observation -- an
+        unattributable term on the TD target.
+
+        Ordering is self.possible_agents, which is fixed at construction, so the
+        vector is stable across steps and episodes. Agents that have terminated
+        still contribute their final box: it still occupies space and still
+        conflicts, which is exactly what the overlap term prices.
+        """
+        parts = []
+        for agent in self.possible_agents:
+            if self._uses_quantile_mdp():
+                a = self.a.get(agent)
+                b = self.b.get(agent)
+                if a is None or b is None:
+                    a = np.zeros(self.n_features, dtype=np.float32)
+                    b = np.ones(self.n_features, dtype=np.float32)
+                parts.append(np.asarray(a, dtype=np.float32))
+                parts.append(np.asarray(b, dtype=np.float32))
+            else:
+                lo = self.lower.get(agent)
+                up = self.upper.get(agent)
+                if lo is None or up is None:
+                    lo = np.zeros(self.n_features, dtype=np.float32)
+                    up = np.ones(self.n_features, dtype=np.float32)
+                parts.append(np.asarray(lo, dtype=np.float32))
+                parts.append(np.asarray(up, dtype=np.float32))
+        parts.append(np.array(
+            [min(1.0, float(self.timestep) / float(max(1, self.max_cycles)))],
+            dtype=np.float32,
+        ))
+        return np.concatenate(parts).astype(np.float32)
+
+    @property
+    def state_size(self) -> int:
+        return 2 * self.n_features * len(self.possible_agents) + 1
 
     def export_rule_state(self, agent: str) -> Dict[str, Any]:
         """Authoritative rule state for inference.

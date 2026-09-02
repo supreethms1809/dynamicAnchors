@@ -109,8 +109,8 @@ class SingleAgentAnchorEnv(Env):
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            # a + b + q* + fidelity + coverage + mode
-            shape=(3 * self.n_features + 3,),
+            # a + b + q* + fidelity + coverage + mode + episode_phase (G-12)
+            shape=(3 * self.n_features + 4,),
             dtype=np.float32
         )
         
@@ -465,12 +465,20 @@ class SingleAgentAnchorEnv(Env):
         return q
 
     def _class_centroid_quantiles(self) -> np.ndarray:
+        """Class-mode start, snapped to a real class row (G-07/B-05 parity).
+
+        The per-feature median is generally not a data point and can be
+        off-manifold; Anchors always anchors on a real x*. MADA now snaps too,
+        so both arms start class episodes from the same kind of point.
+        """
         class_mask = self.y == self.target_class
         if not class_mask.any():
             return np.full(self.n_features, 0.5, dtype=np.float64)
-        centroid = np.median(self.X_unit[class_mask], axis=0)
-        self._class_centroid_unit = centroid.astype(np.float32)
-        return self._values_to_q(centroid)
+        class_rows = self.X_unit[class_mask]
+        centroid = np.median(class_rows, axis=0)
+        centroid = self._snap_to_nearest_class_point(centroid, class_rows)
+        self._class_centroid_unit = np.asarray(centroid, dtype=np.float32)
+        return self._values_to_q(np.asarray(centroid, dtype=np.float64))
 
     def _draw_crn(self) -> None:
         n = int(self.n_perturb if self.mode == "training" else self.n_perturb_eval)
@@ -497,18 +505,30 @@ class SingleAgentAnchorEnv(Env):
         self._pin_constrained_categoricals()
         self._sync_unit_bounds_from_quantiles()
 
-    def _get_observation(self, precision: float, coverage: float) -> np.ndarray:
+    def _get_observation(self, precision: float, coverage: float,
+                         episode_phase: float = 0.0) -> np.ndarray:
         if self.a is None or self.b is None:
             self.a = np.zeros(self.n_features, dtype=np.float64)
             self.b = np.ones(self.n_features, dtype=np.float64)
         if self.q_star is None:
             self.q_star = np.full(self.n_features, 0.5, dtype=np.float64)
         mode = 1.0 if self.x_star_unit is not None else 0.0
+        # G-12: episode_phase (the paper's xi_t). Same channel, same position as
+        # the MADA observation -- the arms must share the representation, not
+        # just the reward. Under max_cycles truncation with per-step costs the
+        # return depends on t, so omitting it leaves the critic non-Markov.
+        #
+        # Passed IN, never read off self.timestep: step() increments the counter
+        # AFTER building the observation, so reading it here produced a clock
+        # that was one step behind MADA's (which passes timestep + 1) and never
+        # advanced on the first step. That is the exact cross-arm mismatch this
+        # channel exists to remove.
+        phase = float(np.clip(episode_phase, 0.0, 1.0))
         return np.concatenate([
             np.asarray(self.a, dtype=np.float32),
             np.asarray(self.b, dtype=np.float32),
             np.asarray(self.q_star, dtype=np.float32),
-            np.array([precision, coverage, mode], dtype=np.float32),
+            np.array([precision, coverage, mode, phase], dtype=np.float32),
         ]).astype(np.float32)
 
     def _empirical_class_cond_coverage(self) -> float:
@@ -1940,7 +1960,7 @@ class SingleAgentAnchorEnv(Env):
         episode_phase = min(
             1.0, float(self.timestep + 1) / float(self.max_cycles)
         )
-        state = self._get_observation(precision, coverage)
+        state = self._get_observation(precision, coverage, episode_phase)
         
         ## SS: Target change here:
         # Termination uses the class-aware effective target so minority/overlapping
@@ -2226,7 +2246,7 @@ class SingleAgentAnchorEnv(Env):
                 for key, value in details.items():
                     if isinstance(value, (int, float, np.number)):
                         info[key] = float(value)
-                observation = self._get_observation(precision, coverage)
+                observation = self._get_observation(precision, coverage, episode_phase)
                 self._last_step_metrics = (precision, coverage, details)
 
         if truncated and not done and self.partial_terminal_credit > 0.0:

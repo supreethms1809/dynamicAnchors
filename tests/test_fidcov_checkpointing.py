@@ -110,12 +110,33 @@ def test_support_is_mean_not_sum_so_score_is_eval_budget_invariant(tmp_path):
     assert one._evaluate()[2] == many._evaluate()[2] == 20
 
 
-def test_zero_predicate_episodes_are_excluded(tmp_path):
-    """k < 1 is not an anchor; such episodes must not enter the aggregate."""
+def test_zero_predicate_episodes_score_zero_not_dropped(tmp_path):
+    """P-03: a k < 1 episode produced NO RULE -- score it 0, do not drop it.
+
+    Dropping made the score the quality of whichever episodes happened to work,
+    with no term for how often the policy collapsed, so a checkpoint that
+    collapses 9 times in 10 and lands one excellent box outscored one that
+    reliably produces good boxes. With two episodes, one collapsed and one at
+    P=0.9/n=30, the means must be halved, not equal to the surviving episode.
+    """
     cb = _cb([(1.0, 1.0, 100, 0), (0.9, 0.3, 30, 2)], tmp_path)
-    mean_p, _, mean_n = cb._evaluate()
-    assert mean_p == pytest.approx(0.9)
-    assert mean_n == 30
+    mean_p, mean_c, mean_n = cb._evaluate()
+    assert mean_p == pytest.approx(0.45)      # (0.0 + 0.9) / 2
+    assert mean_c == pytest.approx(0.15)      # (0.0 + 0.3) / 2
+    assert mean_n == 15                       # (0 + 30) / 2
+    assert cb.last_n_collapsed == 1
+
+
+def test_collapse_lowers_the_checkpoint_score(tmp_path):
+    """The whole point of P-03: collapsing must cost score."""
+    clean = _cb([(0.9, 0.3, 30, 2), (0.9, 0.3, 30, 2)], tmp_path / "a")
+    collapsing = _cb([(1.0, 1.0, 100, 0), (0.9, 0.3, 30, 2)], tmp_path / "b")
+    from utils.metrics import ranking_score, RANKING_SCORE_LCB_COVERAGE
+    s_clean = ranking_score(*clean._evaluate()[:2], RANKING_SCORE_LCB_COVERAGE,
+                            n_covered=clean._evaluate()[2])
+    s_coll = ranking_score(*collapsing._evaluate()[:2], RANKING_SCORE_LCB_COVERAGE,
+                           n_covered=collapsing._evaluate()[2])
+    assert s_coll < s_clean
 
 
 def test_no_final_weights_fallback_in_trainer_source():

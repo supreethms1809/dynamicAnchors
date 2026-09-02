@@ -70,6 +70,7 @@ FORCE_TRAIN = False
 SKIP_TRAIN = False
 CLASSIFIER_PATH = None
 CLASSIFIER_DEVICE = None
+MAX_N_FRAMES = None
 
 
 def log(msg: str) -> None:
@@ -261,7 +262,9 @@ def evaluate_instances(dataset: str, method: str, rules: Path, seed: int, device
 
 
 def run_dataset(dataset: str, seed: int, device: str) -> None:
-    cfg = DATASET_CONFIGS[dataset]
+    cfg = dict(DATASET_CONFIGS[dataset])
+    if MAX_N_FRAMES is not None:
+        cfg["ma_frames"] = int(MAX_N_FRAMES)
     log(
         f"=== {dataset} seed {seed}  MADA[{ALGO}]  {cfg['ma_frames']} frames / "
         f"{cfg['n_instances']} inst/class ==="
@@ -302,10 +305,19 @@ def main() -> None:
         help="If set, load this .pth instead of ROOT/classifiers/{ds}_seed{seed}.pth",
     )
     p.add_argument("--classifier_device", default=None)
+    p.add_argument(
+        "--max_n_frames", type=int, default=None,
+        help="Override per-dataset ma_frames. Must be a multiple of "
+             "evaluation_interval (24000) so FidCov eval fires.",
+    )
+    p.add_argument(
+        "--k", type=int, default=None,
+        help="Top-k union at evaluation (default: pipeline K).",
+    )
     args = p.parse_args()
 
     global ALGO, SUBDIR, ROOT, OUT_DIR, RESULTS, LOG_DIR, FORCE, FORCE_TRAIN, SKIP_TRAIN
-    global CLASSIFIER_PATH, CLASSIFIER_DEVICE
+    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, MAX_N_FRAMES, K
     ALGO = args.algo
     SUBDIR = ALGO
     # MUST be absolute: train_mada runs BenchMARL/driver.py with cwd=BenchMARL/,
@@ -319,6 +331,9 @@ def main() -> None:
     SKIP_TRAIN = bool(args.skip_train)
     CLASSIFIER_PATH = args.classifier_path
     CLASSIFIER_DEVICE = args.classifier_device
+    MAX_N_FRAMES = args.max_n_frames
+    if args.k is not None:
+        K = int(args.k)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
@@ -326,7 +341,7 @@ def main() -> None:
 
     failed: List[str] = []
     log(f"MADA-only sweep algo={ALGO} datasets={args.datasets} seed={args.seed} "
-        f"device={args.device} root={ROOT} budget_mult={BUDGET_MULT} "
+        f"device={args.device} root={ROOT} frames={MAX_N_FRAMES or 'per-dataset'} "
         f"force={FORCE} skip_train={SKIP_TRAIN} force_train={FORCE_TRAIN} k={K}")
     for dataset in args.datasets:
         try:

@@ -46,7 +46,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from single_agentENV import SingleAgentAnchorEnv
-from utils.metrics import ranking_score
+from utils.metrics import ranking_score, RANKING_SCORE_LCB_COVERAGE
 
 
 def _build_anchor_env_thunk(env_data, env_config, target_class, device, classifier, seed):
@@ -200,8 +200,11 @@ class FidCovEvalCallback(BaseCallback):
         eval_freq: int,
         n_eval_episodes: int = 4,
         verbose: int = 0,
+        ranking_score_formula: str = RANKING_SCORE_LCB_COVERAGE,
     ):
         super().__init__(verbose)
+        self.ranking_score_formula = ranking_score_formula
+        self.last_n_collapsed = 0
         self.eval_env = eval_env
         self.best_model_save_path = best_model_save_path
         self.eval_freq = int(eval_freq)
@@ -242,6 +245,7 @@ class FidCovEvalCallback(BaseCallback):
         precs: List[float] = []
         covs: List[float] = []
         ns: List[Optional[int]] = []
+        n_collapsed = 0
         for _ in range(self.n_eval_episodes):
             obs = self._reset(self.eval_env)
             done = False
@@ -258,9 +262,16 @@ class FidCovEvalCallback(BaseCallback):
             p = self._info_metric(last_info, "anchor_precision")
             c = self._info_metric(last_info, "anchor_coverage")
             n_cov = last_info.get("n_covered")
-            if p is None or c is None:
-                continue
-            if k < 1:
+            # P-03: an episode that ends with k = 0 produced NO RULE. Dropping it
+            # made the score the quality of the episodes that happened to work,
+            # with no term for how often the policy collapsed -- so a checkpoint
+            # that collapses 9 times in 10 and gets one excellent box outscored
+            # one that reliably produces good boxes. Score it as zero instead.
+            n_collapsed += 1 if (p is None or c is None or k < 1) else 0
+            if p is None or c is None or k < 1:
+                precs.append(0.0)
+                covs.append(0.0)
+                ns.append(0)
                 continue
             precs.append(p)
             covs.append(c)
@@ -283,9 +294,11 @@ class FidCovEvalCallback(BaseCallback):
         #
         # mean, not sum: sum grows with n_eval_episodes, which would make the score
         # depend on the eval budget. The mean is the typical support of the boxes
-        # this checkpoint produces, and keeping the zeros in it correctly penalises
-        # a checkpoint that often collapses.
+        # this checkpoint produces. Since the P-03 fix, k = 0 episodes enter as
+        # (P, C, n) = (0, 0, 0) rather than being dropped, so the mean now really
+        # does penalise a checkpoint that often collapses.
         mean_n = int(round(float(np.mean(ns)))) if ns else None
+        self.last_n_collapsed = int(n_collapsed)
         return float(np.mean(precs)), float(np.mean(covs)), mean_n
 
     def _on_step(self) -> bool:
@@ -294,15 +307,21 @@ class FidCovEvalCallback(BaseCallback):
         mean_p, mean_c, mean_n = self._evaluate()
         self.last_mean_precision = mean_p
         self.last_mean_coverage = mean_c
-        score = ranking_score(mean_p, mean_c, n_covered=mean_n)
+        # P-06: read the configured formula rather than relying on this
+        # function's default happening to match conf/anchor_single.yaml.
+        score = ranking_score(
+            mean_p, mean_c, self.ranking_score_formula, n_covered=mean_n,
+        )
         if score is None or not np.isfinite(score):
             score = float("-inf")
         self.last_score = score
         logger.info(
-            "  FidCov eval @ %s steps: mean P=%.4f C=%.4f score=%s (best=%s)",
+            "  FidCov eval @ %s steps: mean P=%.4f C=%.4f collapsed=%d/%d score=%s (best=%s)",
             self.n_calls,
             mean_p,
             mean_c,
+            self.last_n_collapsed,
+            self.n_eval_episodes,
             f"{score:.4f}" if np.isfinite(score) else "-inf",
             f"{self.best_score:.4f}" if np.isfinite(self.best_score) else "none",
         )
@@ -395,6 +414,7 @@ class AnchorTrainerSB3:
         self.eval_envs: Dict[int, Any] = {}  # class -> eval env
         self.target_classes: List[int] = []
         self.experiment_folder = None
+        self._training_queries_by_class: Dict[int, int] = {}   # G-04
         
         os.makedirs(self.output_dir, exist_ok=True)
     
@@ -964,6 +984,19 @@ class AnchorTrainerSB3:
             logger.info(f"    Observation space: {env.observation_space}")
             logger.info(f"    Action space: {env.action_space}")
     
+    def _write_training_query_count(self) -> None:
+        """training_queries.json, summed over class shards (G-04)."""
+        total = int(sum(self._training_queries_by_class.values()))
+        path = os.path.join(self.experiment_folder, "training_queries.json")
+        with open(path, "w") as f:
+            json.dump({
+                "n_training_queries": total,
+                "per_class": {str(k): int(v) for k, v in self._training_queries_by_class.items()},
+                "counted_from": "single_agentENV.n_blackbox_queries per class shard",
+                "complete": bool(total > 0),
+            }, f, indent=2)
+        logger.info(f"Training black-box queries: {total} -> {path}")
+
     def train(self):
         """Train all models (one per class) with equal timestep allocation."""
         if not self.models:
@@ -1067,6 +1100,9 @@ class AnchorTrainerSB3:
                         ),
                         eval_freq=self.experiment_config["eval_freq"],
                         n_eval_episodes=n_eval_episodes,
+                        ranking_score_formula=self._get_default_env_config().get(
+                            "ranking_score_formula", RANKING_SCORE_LCB_COVERAGE
+                        ),
                     )
                 )
             
@@ -1095,6 +1131,19 @@ class AnchorTrainerSB3:
             )
             
             # Save final model for this class
+            # G-04: record the black-box calls this class shard spent TRAINING.
+            # single_agentENV already counts them; nothing persisted them, so the
+            # break-even figure charged construction as extraction-only.
+            try:
+                _tq = 0
+                for _e in (env, eval_env):
+                    _inner = getattr(_e, "unwrapped", None) or getattr(_e, "env", None) or _e
+                    _tq += int(getattr(_inner, "n_blackbox_queries", 0) or 0)
+                self._training_queries_by_class[target_class] = _tq
+                logger.info(f"  Class {target_class}: {_tq} training black-box queries")
+            except Exception as _e:
+                logger.warning(f"  Could not read training query count: {_e}")
+
             final_model_path = os.path.join(self.experiment_folder, "final_model", f"class_{target_class}")
             os.makedirs(os.path.dirname(final_model_path), exist_ok=True)
             model.save(final_model_path)
@@ -1141,6 +1190,8 @@ class AnchorTrainerSB3:
                     f"silently corrupt the reported metrics."
                 )
         
+        self._write_training_query_count()   # G-04
+
         logger.info("\n" + "="*80)
         logger.info("TRAINING COMPLETE!")
         logger.info("="*80)

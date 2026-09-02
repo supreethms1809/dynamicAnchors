@@ -2,7 +2,15 @@ defaults:
   - masac_config
   - _self_
 
-share_param_critic: True
+# Per-agent critic heads over the group's joint (obs, action).
+# TRUE builds ONE Q per group, shape (1,), expanded to every agent, while the
+# reward stays per-agent shape (n_agents, 1) -- one prediction regressed against
+# n_agents different targets, so the critic fits their mean and no agent gets its
+# own credit. That was harmless while share_policy_params collapsed a class onto
+# one network (identical agents, near-identical rewards); once the agents are
+# genuinely distinct it is the binding constraint on learning.
+# See docs/BUGS_mada_multiagent_design.md (M-04).
+share_param_critic: False
 num_qvalue_nets: 2
 loss_function: "l2"
 delay_qvalue: True

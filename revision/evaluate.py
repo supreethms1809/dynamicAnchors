@@ -288,7 +288,9 @@ def evaluate_rules_file(
             y=y_test, y_hat=y_hat_test, mask=union.best.mask, target_class=cls,
             class_conditional=False, min_support=min_support,
         )
-        per_class_out[f"class_{cls}"] = per_class_block(union, instance_metrics=inst)
+        per_class_out[f"class_{cls}"] = per_class_block(
+            union, instance_metrics=inst, sparsity_width_ratio=sparsity,
+        )
         compactness_rows.append(
             compactness_of_ruleset(union.individual, sparsity_width_ratio=sparsity)
         )

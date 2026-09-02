@@ -524,6 +524,7 @@ def reevaluate_ranked_rules(
 def per_class_block(
     union: UnionResult,
     instance_metrics: Optional[BoxMetrics] = None,
+    sparsity_width_ratio: Optional[float] = None,
 ) -> Dict[str, Any]:
     """One class row for the result JSON / tables.
 
@@ -573,7 +574,15 @@ def per_class_block(
     if instance_metrics is not None:
         block["instance"] = instance_metrics.to_dict()
     if union.individual:
-        sparsity = float((union.best.extra or {}).get("sparsity_width_ratio") or 0.95)
+        # G-13: `sparsity_width_ratio` is never written into `extra` by any
+        # producer, so this always fell back to 0.95 -- while revision/evaluate.py
+        # computed its own compactness row from the artifact's real metadata
+        # value. One JSON could carry two compactness numbers at two thresholds.
+        # The caller now passes the artifact threshold explicitly.
+        sparsity = (
+            float(sparsity_width_ratio) if sparsity_width_ratio is not None
+            else float((union.best.extra or {}).get("sparsity_width_ratio") or 0.95)
+        )
         block["compactness"] = compactness_of_ruleset(
             union.individual, sparsity_width_ratio=sparsity
         )

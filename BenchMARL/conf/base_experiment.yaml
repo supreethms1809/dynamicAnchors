@@ -13,8 +13,14 @@ train_device: "cpu"
 # Use "disk" to store it on disk (in the experiment save_folder)
 buffer_device: "cpu"
 
-# Whether to share the parameters of the policy within agent groups
-share_policy_params: True
+# Whether to share the parameters of the policy within agent groups.
+# FALSE is required for MADA: a group is one CLASS (see AnchorEnv._compute_group_map),
+# so sharing here would give the agents_per_class agents of a class ONE network --
+# identical copies that observe the same reset state and therefore emit the same
+# rule, making same_class_diversity_weight unlearnable. Verified: with True the
+# extracted per-agent actors were byte-identical.
+# See docs/BUGS_mada_multiagent_design.md (M-01, M-02).
+share_policy_params: False
 # If an algorithm and an env support both continuous and discrete actions, what should be preferred
 prefer_continuous_actions: True
 # If False collection is done using a collector (under no grad). If True, collection is done with gradients.

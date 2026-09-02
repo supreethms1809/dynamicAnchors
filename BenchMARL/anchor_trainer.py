@@ -13,7 +13,7 @@ from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models.mlp import MlpConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmarl_wrappers import AnchorTask, AnchorMetricsCallback
+from benchmarl_wrappers import AnchorTask, AnchorMetricsCallback, obs_precision_coverage
 from environment import AnchorEnv
 
 
@@ -33,6 +33,58 @@ def _get_algorithm_configs():
         pass
     
     return algorithm_map
+
+
+def _slice_agent_params(
+    state_dict: Dict[str, Any], agent_idx: int, n_agents: int
+) -> Dict[str, Any]:
+    """Extract one agent's actor parameters from a group state_dict.
+
+    torchrl's MultiAgentMLP stores its parameters in a TensorDict whose
+    batch_size is empty when share_params=True and ``(n_agents,)`` when it is
+    False. In the latter case every tensor carries a leading agent dim, and the
+    serialized dict marks it with a ``<prefix>.__batch_size`` entry:
+
+        share_params=True    params.0.weight  (256, 15)   __batch_size ()
+        share_params=False   params.0.weight  (3, 256, 15) __batch_size (3,)
+
+    We locate each such prefix, index it at ``agent_idx``, and clear the marker,
+    so the result is byte-compatible with the shared layout that
+    ``inference.load_policy_model`` already knows how to read. A state_dict with
+    no agent dim (share_params=True, or a group of one) is returned unchanged.
+    """
+    batched_prefixes = []
+    for key, value in state_dict.items():
+        if not key.endswith("__batch_size"):
+            continue
+        if isinstance(value, torch.Size) and tuple(value) == (n_agents,):
+            batched_prefixes.append(key[: -len("__batch_size")])
+
+    # No marker means share_params=True: no agent dim to strip, pass through so
+    # hull/CDEA checkpoints stay byte-identical. A group of ONE still carries a
+    # leading dim of 1 under share_params=False and must be sliced -- leaving it
+    # would make load_policy_model read in_features off the wrong axis.
+    if not batched_prefixes:
+        return state_dict
+
+    if not 0 <= agent_idx < n_agents:
+        raise ValueError(
+            f"agent_idx {agent_idx} out of range for a group of {n_agents} agents"
+        )
+
+    sliced: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        prefix = next((p for p in batched_prefixes if key.startswith(p)), None)
+        if prefix is None:
+            sliced[key] = value
+        elif key.endswith("__batch_size"):
+            sliced[key] = torch.Size([])
+        elif torch.is_tensor(value) and value.shape[:1] == torch.Size([n_agents]):
+            sliced[key] = value[agent_idx].clone()
+        else:
+            sliced[key] = value
+
+    return sliced
 
 
 class AnchorTrainer:
@@ -1125,16 +1177,12 @@ class AnchorTrainer:
                                 if obs_len >= 5:  # n>=1 features + precision + coverage + tail
                                     n_features = (obs_len - 2) // 2
                                     if n_features > 0:
-                                        # Precision and coverage are the 3rd- and
-                                        # 2nd-from-last entries in BOTH layouts:
-                                        #   hull     [lo(n), up(n), P, C, phase]
-                                        #   quantile [a(n), b(n), q*(n), P, C, mode]
-                                        # The old [-2]/[-1] read COVERAGE as precision
-                                        # and EPISODE_PHASE as coverage -- the obs
-                                        # gained a phase entry (2n+2 -> 2n+3) and this
-                                        # was never updated.
-                                        precision = float(final_obs_np[-3])
-                                        coverage = float(final_obs_np[-2])
+                                        # Layout-aware decode. Hardcoded offsets
+                                        # broke here once already (reading coverage
+                                        # as precision when the hull obs gained
+                                        # `phase`) and would break again now that
+                                        # the quantile obs is 3n+4 (G-12).
+                                        precision, coverage = obs_precision_coverage(final_obs_np)
                                         
                                         # Store data keyed by agent name to distinguish between agents
                                         episode_data[agent_name] = {
@@ -1357,6 +1405,7 @@ class AnchorTrainer:
         results: Dict[str, Dict[str, str]] = {}
 
         # 1. Final state — whatever the experiment currently holds.
+        self.save_training_query_count()   # G-04
         results["final"] = self.extract_and_save_individual_models(
             save_policies=save_policies, save_critics=save_critics,
             models_subdir="individual_models",
@@ -1405,6 +1454,109 @@ class AnchorTrainer:
                     logger.warning(f"Could not restore final experiment state after best extraction: {e}")
 
         return results
+
+    def save_training_query_count(self) -> Optional[str]:
+        """Write training_queries.json: black-box calls spent TRAINING.
+
+        G-04: the break-even figure treated construction cost as extraction
+        only. Policy training issues n_perturb_train classifier calls per env
+        step across the whole frame budget -- the dominant term, and the only
+        reason a break-even point exists. AnchorEnv already counts these in
+        n_blackbox_queries; nothing persisted them.
+
+        The collector holds its own env copies, so the count is read from every
+        reachable env instance and summed.
+        """
+        if self.experiment is None:
+            return None
+        total = 0
+        seen = set()
+
+        def _harvest(obj, depth=0):
+            nonlocal total
+            if obj is None or depth > 6 or id(obj) in seen:
+                return
+            seen.add(id(obj))
+            n = getattr(obj, "n_blackbox_queries", None)
+            if isinstance(n, (int, float)):
+                total += int(n)
+                return
+            for attr in ("env", "_env", "base_env", "_envs", "envs"):
+                inner = getattr(obj, attr, None)
+                if isinstance(inner, (list, tuple)):
+                    for e in inner:
+                        _harvest(e, depth + 1)
+                elif inner is not None:
+                    _harvest(inner, depth + 1)
+
+        for holder in ("env_func", "train_env", "test_env", "collector"):
+            _harvest(getattr(self.experiment, holder, None))
+
+        # Two regimes, and the honest figure differs between them:
+        #
+        #  precision_estimator == "conditional": every agent-step draws
+        #    n_perturb_train perturbations and classifies them, so the cost is
+        #    max_n_frames (the PER-AGENT step budget) x n_agents x n_perturb_train.
+        #    The live counters cannot see this because the collector holds env
+        #    copies in worker processes, so the analytic figure is primary.
+        #
+        #  precision_estimator == "empirical" (the shipped config): precision is
+        #    measured on real rows via cached split predictions, so there is NO
+        #    per-step perturbation cost and the analytic formula would overstate
+        #    by orders of magnitude. The observed counter is the right basis.
+        #
+        # Getting this wrong in either direction misstates the break-even point,
+        # so the regime is recorded alongside the number.
+        env_cfg = self._anchor_env_config or {}
+        if "env_config" in env_cfg:
+            env_cfg = env_cfg["env_config"]
+        n_perturb_train = int(env_cfg.get("n_perturb_train", 0) or 0)
+        n_agents = 0
+        try:
+            n_agents = sum(len(v) for v in self.experiment.group_map.values())
+        except Exception:
+            pass
+        if n_agents <= 0:
+            n_agents = int(env_cfg.get("agents_per_class", 1) or 1)
+        frames = int(getattr(self.experiment_config, "max_n_frames", 0) or 0)
+        estimator = str(env_cfg.get("precision_estimator", "empirical")).lower()
+        perturbation_based = estimator == "conditional"
+        analytic = int(frames * n_agents * n_perturb_train) if perturbation_based else 0
+
+        path = os.path.join(str(self.experiment.folder_name), "training_queries.json")
+        payload = {
+            "n_training_queries": int(analytic if perturbation_based else total),
+            "n_training_queries_observed": int(total),
+            "n_training_queries_analytic": int(analytic),
+            "precision_estimator": estimator,
+            "basis": (
+                "analytic: max_n_frames x n_agents x n_perturb_train "
+                "(perturbation-based estimator)"
+                if perturbation_based else
+                "observed: AnchorEnv.n_blackbox_queries; the empirical estimator "
+                "scores real rows from cached split predictions, so there is no "
+                "per-step perturbation cost"
+            ),
+            "max_n_frames": frames,
+            "n_agents": int(n_agents),
+            "n_perturb_train": n_perturb_train,
+            "complete": bool(analytic > 0 if perturbation_based else total > 0),
+        }
+        if not perturbation_based:
+            payload["note"] = (
+                "LOWER BOUND: the collector holds env copies in worker processes "
+                "that this process cannot read. Under the empirical estimator the "
+                "per-step cost is ~0, so the shortfall is small, but the figure is "
+                "not exact."
+            )
+        import json as _json
+        with open(path, "w") as f:
+            _json.dump(payload, f, indent=2)
+        logger.info(
+            f"Training black-box queries: {payload['n_training_queries']} "
+            f"({payload['basis'].split(':')[0]}, estimator={estimator}) -> {path}"
+        )
+        return path
 
     def extract_and_save_individual_models(
         self,
@@ -1578,11 +1730,25 @@ class AnchorTrainer:
                                 policy_path = os.path.join(output_dir, f"policy_{agent_to_save}.pth")
                                 metadata_path = os.path.join(output_dir, f"policy_{agent_to_save}_metadata.json")
                             
-                            # Save the actor module (same module for all agents in group if shared, or individual if separate)
-                            # Note: In MADDPG, each agent typically has its own policy network
-                            # If policies are shared within a group, this will save the same policy multiple times
-                            # which is fine - they can be loaded separately
-                            torch.save(actor_module.state_dict(), policy_path)
+                            # With share_policy_params: False the group's
+                            # MultiAgentMLP stores a LEADING AGENT DIM on every
+                            # parameter (params.0.weight is [n_agents, out, in]).
+                            # Saving the raw group state_dict would hand every
+                            # agent the whole stack, and load_policy_model --
+                            # which infers in_features from weight.shape[1] --
+                            # would build the wrong MLP and fail to load.
+                            # Slice out this agent's own parameters so each file
+                            # is a standalone single-agent actor.
+                            agent_idx_in_group = (
+                                agents_in_group.index(agent_to_save)
+                                if agent_to_save in agents_in_group else 0
+                            )
+                            agent_state_dict = _slice_agent_params(
+                                actor_module.state_dict(),
+                                agent_idx=agent_idx_in_group,
+                                n_agents=len(agents_in_group),
+                            )
+                            torch.save(agent_state_dict, policy_path)
                             saved_models[f"policy_{agent_to_save}"] = policy_path
                             logger.info(f"   Saved policy model to: {policy_path}")
                             

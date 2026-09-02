@@ -381,7 +381,18 @@ def select_topk_union(
         scored.sort(key=lambda r: int(getattr(r.metrics, "n_covered", 0)), reverse=True)
         best_n = int(getattr(scored[0].metrics, "n_covered", 0))
         scored = [r for r in scored if int(getattr(r.metrics, "n_covered", 0)) == best_n]
-    scored.sort(key=lambda r: (r.score, r.metrics.coverage if np.isfinite(r.metrics.coverage) else -1.0), reverse=True)
+    # P-05: `r.score` is the SELECTION-split score (reevaluate_ranked_rules
+    # preserves it), but `r.metrics` is the reporting split. Breaking ties on
+    # r.metrics.coverage let test data choose which rule is called `best`.
+    # Tie-break on the selection metrics carried in `extra`, then on rule_id so
+    # the order is fully deterministic.
+    def _tiebreak(r):
+        sel = (r.extra or {}).get("selection_metrics") or {}
+        cov = sel.get("coverage", r.metrics.coverage)
+        cov = cov if (cov is not None and np.isfinite(cov)) else -1.0
+        return (r.score, float(cov))
+    scored.sort(key=lambda r: str(r.rule_id))
+    scored.sort(key=_tiebreak, reverse=True)
     if k is None or k < 0:
         selected = scored
     else:
@@ -657,6 +668,21 @@ def collect_success_rate(
             continue
         anchors = _collect_episode_anchors(cd)
         stats = episode_success_rate(anchors, tau_p, tau_c, t_max)
+        # G-03: _collect_episode_anchors walks PERSISTED anchors, so episodes
+        # that ended with the empty rule, errored, or were dropped by the
+        # quality filter never appear -- making the denominator "episodes that
+        # produced a box" rather than "episodes attempted", and inflating the
+        # rate. Producers now record n_episodes_attempted; when present it is
+        # the denominator and the shortfall is reported explicitly.
+        attempted = cd.get("n_episodes_attempted")
+        if attempted is not None and int(attempted) >= int(stats["n_episodes"]):
+            n_missing = int(attempted) - int(stats["n_episodes"])
+            stats["n_episodes_with_box"] = int(stats["n_episodes"])
+            stats["n_episodes_no_box"] = n_missing
+            stats["n_episodes"] = int(attempted)
+            stats["success_rate"] = (
+                float(stats["n_success"]) / float(attempted) if attempted else None
+            )
         per_class[key] = stats
         if str(key).endswith("_class_based"):
             continue

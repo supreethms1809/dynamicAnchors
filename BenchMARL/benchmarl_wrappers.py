@@ -30,6 +30,28 @@ from utils.metrics import ranking_score
 # construction. None until an env is built; callbacks then skip box decoding.
 _OBS_LAYOUT = None
 
+
+def obs_precision_coverage(obs_vec) -> tuple:
+    """(precision, coverage) from a final observation, LAYOUT-AWARE.
+
+    Positions are not the same in the two layouts, and hardcoding them has
+    already gone wrong twice (once reading coverage as precision when the hull
+    obs gained `phase`; again when the quantile obs gained it back as G-12):
+
+        hull     2n+3 = [lo(n), up(n), P, C, phase]              -> P=-3, C=-2
+        quantile 3n+4 = [a(n), b(n), q*(n), P, C, mode, phase]   -> P=-4, C=-3
+
+    obs length alone cannot separate them (2n+3 == 3m+4 has integer solutions),
+    so trust the env's layout stamp set in get_env_fun.
+    """
+    import numpy as _np
+    v = _np.asarray(obs_vec, dtype=_np.float64).reshape(-1)
+    if v.shape[0] < 5:
+        raise ValueError(f"observation too short to carry (P, C): len={v.shape[0]}")
+    quantile = bool((_OBS_LAYOUT or {}).get("quantile", False))
+    pi, ci = (-4, -3) if quantile else (-3, -2)
+    return float(v[pi]), float(v[ci])
+
 class AnchorTaskClass(TaskClass):
     
     def get_env_fun(
@@ -74,13 +96,25 @@ class AnchorTaskClass(TaskClass):
                 "quantile": bool(anchor_env._uses_quantile_mdp()),
             }
             
+            # group_map is EXPLICIT on purpose. Omitting it makes torchrl fall
+            # back to its default parallel grouping -- agents named "str_int"
+            # grouped by "str" -- which silently produced one group for ALL
+            # classes when agents_per_class == 1 (names agent_0/agent_1/...) and
+            # one group per class otherwise. Combined with share_policy_params
+            # that collapsed every agent in a group onto one parameter set.
+            # See docs/BUGS_mada_multiagent_design.md (M-01, M-03).
             return PettingZooWrapper(
                 env=anchor_env,
-                return_state=False,
                 categorical_actions=False,
                 seed=seed,
                 device=device,
                 use_mask=True,
+                group_map=anchor_env.group_map,
+                # G-02: return the global state so MADDPG/MASAC take their
+                # state branch and the critic sees EVERY class's box, not just
+                # its own group's. Without it inter_class_overlap_weight was a
+                # reward term no critic could attribute.
+                return_state=True,
             )
         
         return _make_env
@@ -92,7 +126,8 @@ class AnchorTaskClass(TaskClass):
         return False
     
     def has_state(self) -> bool:
-        return False
+        # G-02: AnchorEnv.state() concatenates all agents' boxes + the clock.
+        return True
     
     def has_render(self, env: EnvBase) -> bool:
         return False
@@ -109,7 +144,17 @@ class AnchorTaskClass(TaskClass):
         return env.group_map
     
     def state_spec(self, env: EnvBase) -> Optional[Composite]:
-        return None
+        """The global state, as ONE leaf named "state" (G-02).
+
+        PettingZooWrapper(return_state=True) exposes it at the root of
+        observation_spec, not on the torchrl `state_spec` attribute (which is
+        the INPUT spec for stateful envs and is empty here). BenchMARL's
+        Algorithm._check_specs requires exactly one leaf, so hand it that key.
+        """
+        obs_spec = env.observation_spec
+        if "state" not in list(obs_spec.keys()):
+            return None
+        return Composite({"state": obs_spec["state"].clone()}).to(obs_spec.device)
     
     def action_mask_spec(self, env: EnvBase) -> Optional[Composite]:
         return None
@@ -121,6 +166,12 @@ class AnchorTaskClass(TaskClass):
             for key in list(group_obs_spec.keys()):
                 if key != "observation":
                     del group_obs_spec[key]
+        # G-02: PettingZooWrapper puts the global state at the ROOT of
+        # observation_spec under "state". It belongs to state_spec (the critic
+        # input), not to the per-agent observations, and BenchMARL requires
+        # exactly one leaf there -- leaving it here would double-count it.
+        if "state" in list(observation_spec.keys()):
+            del observation_spec["state"]
         return observation_spec
     
     def info_spec(self, env: EnvBase) -> Optional[Composite]:
@@ -1315,11 +1366,26 @@ class AnchorMetricsCallback(Callback):
         The same configured fidelity/coverage ranking formula is used for
         checkpointing, rule top-k selection, and revision reporting.
         """
+        # P-02: pass n_covered. Without it `lcb_coverage` silently degrades to the
+        # point estimate fid*(1+cov) (utils/metrics.ranking_score), so
+        # `ranking_score_formula: lcb_coverage` in anchor.yaml was inert and MADA
+        # selected checkpoints support-blind -- a box with fid=1.0 on n=2 scored
+        # 1.0*(1+cov) and won outright, which is the anchor-box collapse we kept
+        # seeing. RLDA passed n_covered all along, so the two arms were selecting
+        # checkpoints on different criteria.
+        support = aggregated.get("evaluation/box_support_mean")
+        n_cov = int(round(float(support))) if support is not None else None
+        if n_cov is None:
+            logger.warning(
+                "Best-model scoring has no box support; %s falls back to the "
+                "point estimate for this evaluation.", self.ranking_score_formula,
+            )
         if "evaluation/box_precision_mean" in aggregated and "evaluation/box_coverage_mean" in aggregated:
             return ranking_score(
                 float(aggregated["evaluation/box_precision_mean"]),
                 float(aggregated["evaluation/box_coverage_mean"]),
                 self.ranking_score_formula,
+                n_covered=n_cov,
             )
         prec_keys = [k for k in aggregated if "anchor_precision" in k and "mean" in k and "evaluation" in k]
         cov_keys = [k for k in aggregated if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
@@ -1328,6 +1394,7 @@ class AnchorMetricsCallback(Callback):
                 float(aggregated[prec_keys[0]]),
                 float(aggregated[cov_keys[0]]),
                 self.ranking_score_formula,
+                n_covered=n_cov,
             )
         for needle in ("reward", "return", "episode_reward"):
             cands = [k for k in aggregated if needle in k.lower() and "mean" in k.lower()]
@@ -1655,9 +1722,11 @@ class AnchorMetricsCallback(Callback):
                 return t.numpy()
 
             ep_returns, ep_precisions, ep_coverages = [], [], []
+
+            ep_supports = []
             for rollout in rollouts:
                 nxt = rollout.get("next", None) if hasattr(rollout, "get") else None
-                group_returns, group_prec, group_cov = [], [], []
+                group_returns, group_prec, group_cov, group_support = [], [], [], []
                 for group in groups_for_reward:
                     for src in (nxt, rollout):
                         if src is None or not hasattr(src, "keys"):
@@ -1674,11 +1743,25 @@ class AnchorMetricsCallback(Callback):
                             if "observation" in gkeys:
                                 fo = _final_obs_vec(gd["observation"])
                                 if fo.shape[0] >= 5:
-                                    # P and C are the 3rd/2nd-from-last entries in
-                                    # both the hull (2n+3) and quantile (3n+3)
-                                    # layouts; 2*nf indexing breaks on the latter.
-                                    group_prec.append(float(fo[-3]))
-                                    group_cov.append(float(fo[-2]))
+                                    # Layout-dependent since G-12 added the clock:
+                                    #   hull     2n+3 = [lo, up, P, C, phase]        -> P=-3, C=-2
+                                    #   quantile 3n+4 = [a, b, q*, P, C, mode, phase] -> P=-4, C=-3
+                                    _p, _c = obs_precision_coverage(fo)
+                                    group_prec.append(_p)
+                                    group_cov.append(_c)
+                            # P-02: support count, so best-model scoring can use
+                            # the Wilson lower bound instead of the point estimate.
+                            if "info" in gkeys:
+                                try:
+                                    _inf = gd["info"]
+                                    for _k in ("n_class_in_box", "n_covered"):
+                                        if _k in _inf.keys():
+                                            _v = _inf[_k]
+                                            _t = _v if isinstance(_v, torch.Tensor) else torch.as_tensor(_v)
+                                            group_support.append(float(_t.float().mean()))
+                                            break
+                                except Exception:
+                                    pass
                             break  # found this group in src; don't double-read from rollout
                         except Exception:
                             continue
@@ -1688,11 +1771,15 @@ class AnchorMetricsCallback(Callback):
                     ep_precisions.append(sum(group_prec) / len(group_prec))
                 if group_cov:
                     ep_coverages.append(sum(group_cov) / len(group_cov))
+                if group_support:
+                    ep_supports.append(sum(group_support) / len(group_support))
             if ep_returns:
                 aggregated["evaluation/episode_reward_mean"] = sum(ep_returns) / len(ep_returns)
             if ep_precisions and ep_coverages:
                 aggregated["evaluation/box_precision_mean"] = sum(ep_precisions) / len(ep_precisions)
                 aggregated["evaluation/box_coverage_mean"] = sum(ep_coverages) / len(ep_coverages)
+            if ep_supports:
+                aggregated["evaluation/box_support_mean"] = sum(ep_supports) / len(ep_supports)
         except Exception as e:
             logger.debug(f"Could not compute eval reward/precision/coverage for best-model scoring: {e}")
 

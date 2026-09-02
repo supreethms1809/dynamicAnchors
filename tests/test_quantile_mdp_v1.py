@@ -82,7 +82,7 @@ def test_empty_reset_is_k0_and_full_space():
     assert env.n_predicates() == 0
     assert np.allclose(env.lower, 0.0)
     assert np.allclose(env.upper, 1.0)
-    assert obs.shape == (3 * env.n_features + 3,)
+    assert obs.shape == (3 * env.n_features + 4,)   # G-12: + episode_phase
     assert float(obs[-1]) in (0.0, 1.0)
 
 

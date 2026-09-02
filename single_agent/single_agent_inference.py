@@ -706,7 +706,9 @@ def _process_instances_for_class(
     n_samples = len(sampled_indices)
     
     # For each sampled instance, run multiple rollouts
+    n_episodes_attempted = 0  # G-03: counted before anything can drop the anchor
     for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
+        n_episodes_attempted += 1
         # Get the actual instance from the dataset
         x_instance = X_data_unit[data_instance_idx]
         x_instance_std = X_data_std[data_instance_idx]
@@ -1106,7 +1108,12 @@ def _process_instances_for_class(
             
             for rollout_data in valid_rollouts:
                 anchor_precision = rollout_data["precision_recomputed"]
-                anchor_coverage = rollout_data["coverage_recomputed"]
+                # G-06: class-conditional, matching the primary `coverage` set 20
+                # lines above and the tau_C the policy was trained against. This
+                # read `coverage_recomputed` (MARGINAL) against a threshold
+                # calibrated for the class-conditional quantity, so on imbalanced
+                # data good rules were discarded.
+                anchor_coverage = rollout_data["coverage_class_conditional_recomputed"]
                 
                 if anchor_precision >= min_precision_threshold and anchor_coverage >= min_coverage_threshold:
                     kept_rollouts.append(rollout_data)
@@ -1347,6 +1354,7 @@ def _process_instances_for_class(
         "instance_coverage_median": instance_coverage_median,
         "instance_coverage_iqr": instance_coverage_iqr,
         "n_blackbox_queries": int(n_blackbox_queries),
+        "n_episodes_attempted": int(n_episodes_attempted),
     }
 
 
@@ -2048,6 +2056,9 @@ def extract_rules_single_agent(
             
             # Extract results for this predicted class
             anchors_list_per_class = process_results["anchors_list"]
+            n_episodes_attempted_per_class = int(
+                process_results.get("n_episodes_attempted") or 0
+            )
             rules_list_per_class = process_results["rules_list"]
             precisions_per_class = process_results["precisions"]
             coverages_per_class = process_results["coverages"]
@@ -2164,6 +2175,13 @@ def extract_rules_single_agent(
                 "precision_std": float(np.std(precisions_per_class)) if len(precisions_per_class) > 1 else 0.0,
                 "coverage_std": float(np.std(coverages_per_class)) if len(coverages_per_class) > 1 else 0.0,
                 "n_episodes": len(anchors_list_per_class),
+                # G-03: attempted, so the success rate is not conditioned on
+                # "produced a rule at all". Episodes that end with k = 0 or fail
+                # extraction never reach anchors_list_per_class.
+                "n_episodes_attempted": int(n_episodes_attempted_per_class),
+                "n_episodes_no_box": int(max(
+                    0, n_episodes_attempted_per_class - len(anchors_list_per_class)
+                )),
                 "rules": rules_list_per_class,
                 "unique_rules": unique_rules_per_class,
                 "unique_rules_count": unique_rules_count_per_class,
@@ -3368,12 +3386,37 @@ def extract_rules_single_agent(
     # Add timing summary to metadata
     results["metadata"]["total_inference_time_seconds"] = float(overall_total_time)
     results["metadata"]["total_rollout_time_seconds"] = float(total_rollout_time_all_classes)
+    # G-04: three separate cost buckets, because they amortise differently.
+    #   training   -- paid once, before any explanation exists (the dominant term)
+    #   extraction -- paid once, to turn the trained policy into a rule set
+    #   serving    -- paid per explanation; ZERO for an amortised method, since
+    #                 applying a fixed box to a new instance queries nothing
+    # n_reporting_queries stays separate: it is what we spend MEASURING the
+    # method, and must never be charged as a per-explanation serving cost.
+    _train_q = 0
+    _train_q_complete = False
+    try:
+        _tq_path = os.path.join(str(experiment_dir), "training_queries.json")
+        if os.path.exists(_tq_path):
+            with open(_tq_path) as _f:
+                _tq = json.load(_f)
+            _train_q = int(_tq.get("n_training_queries") or 0)
+            _train_q_complete = bool(_tq.get("complete", False))
+    except Exception as _e:
+        logger.warning(f"Could not read training_queries.json: {_e}")
     results["queries"] = {
         "n_blackbox_queries": int(total_blackbox_queries),
+        "n_training_queries": int(_train_q),
+        "n_training_queries_complete": bool(_train_q_complete),
+        "n_serving_queries_per_explanation": 0,
         "n_reporting_queries": 0,
         "query_policy": (
-            "Generation and validation-selection classifier calls; "
-            "held-out test reporting occurs in revision.evaluate"
+            "n_training_queries: classifier calls during policy training. "
+            "n_blackbox_queries: generation + validation-selection calls. "
+            "Construction cost = training + generation, paid once. "
+            "Serving an explanation from a fixed box costs 0 queries. "
+            "Held-out test reporting occurs in revision.evaluate and is "
+            "instrumentation, not a cost of producing explanations."
         ),
     }
     

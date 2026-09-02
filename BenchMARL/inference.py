@@ -1509,12 +1509,22 @@ def extract_rules_from_policies(
     for group in sorted(policy_files.keys()):
         metadata_path = metadata_files.get(group)
         if metadata_path is None:
-            logger.warning(f"  Warning: No metadata found for {group}, using defaults")
+            # G-10: this used to warn "using defaults" and then pass "" to
+            # load_policy_model, which does open(metadata_path) -- so the
+            # promised defaults did not exist and the call raised an opaque
+            # FileNotFoundError on an empty path. Fail here, with the cause.
+            raise FileNotFoundError(
+                f"No policy metadata for group/agent {group!r}. "
+                f"Expected a *_metadata.json beside the .pth in the "
+                f"individual_models directory (written by "
+                f"AnchorTrainer.extract_and_save_individual_models). "
+                f"Known metadata: {sorted(metadata_files)}"
+            )
         
         # Load the combined policy
         combined_policy = load_policy_model(
             policy_path=policy_files[group],
-            metadata_path=metadata_path or "",
+            metadata_path=metadata_path,   # non-None: guarded above (G-10)
             mlp_config_path=mlp_config_path,
             device=device
         )
@@ -2153,6 +2163,11 @@ def extract_rules_from_policies(
         
         # Run multiple rollouts
         anchors_list = []
+        # G-03: the success-rate denominator must be episodes ATTEMPTED, not
+        # episodes that produced a persisted box. Anchors are dropped when the
+        # episode ends with k = 0 or fails extraction, so len(anchors_list)
+        # silently conditions the rate on "produced a rule at all".
+        n_episodes_attempted = 0
         rules_list = []
         # Instance-level metrics (per agent/instance)
         instance_precisions = []
@@ -2304,6 +2319,7 @@ def extract_rules_from_policies(
         total_blackbox_queries += int(len(X_data_std))
 
         for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
+            n_episodes_attempted += 1  # G-03: counted before anything can drop it
             # Get the actual instance from the dataset
             x_instance = X_data_unit[data_instance_idx]
             x_instance_std = X_data_std[data_instance_idx]
@@ -2899,6 +2915,8 @@ def extract_rules_from_policies(
             "anchor_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
             "anchor_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
             "n_episodes": len(anchors_list),
+            "n_episodes_attempted": int(n_episodes_attempted),
+            "n_episodes_no_box": int(max(0, n_episodes_attempted - len(anchors_list))),
             "rules": rules_list,
             "unique_rules": unique_rules,
             "unique_rules_count": len(unique_rules),
@@ -2976,6 +2994,13 @@ def extract_rules_from_policies(
             ]))
             aggregated["unique_rules_count"] = len(aggregated["unique_rules"])
             aggregated["n_episodes"] = len(aggregated["all_anchors"])
+            aggregated["n_episodes_attempted"] = int(sum(
+                int((r or {}).get("n_episodes_attempted") or 0)
+                for r in (aggregated.get("per_agent_results") or {}).values()
+            ))
+            aggregated["n_episodes_no_box"] = int(max(
+                0, aggregated["n_episodes_attempted"] - aggregated["n_episodes"]
+            ))
             aggregated["rules"] = aggregated["all_rules"]  # All rules from all agents
             aggregated["anchors"] = aggregated["all_anchors"]  # All anchors from all agents
         
@@ -3834,12 +3859,37 @@ def extract_rules_from_policies(
     # Add timing summary to metadata
     results["metadata"]["total_inference_time_seconds"] = float(overall_total_time)
     results["metadata"]["total_rollout_time_seconds"] = float(total_rollout_time_all_classes)
+    # G-04: three separate cost buckets, because they amortise differently.
+    #   training   -- paid once, before any explanation exists (the dominant term)
+    #   extraction -- paid once, to turn the trained policy into a rule set
+    #   serving    -- paid per explanation; ZERO for an amortised method, since
+    #                 applying a fixed box to a new instance queries nothing
+    # n_reporting_queries stays separate: it is what we spend MEASURING the
+    # method, and must never be charged as a per-explanation serving cost.
+    _train_q = 0
+    _train_q_complete = False
+    try:
+        _tq_path = os.path.join(str(experiment_dir), "training_queries.json")
+        if os.path.exists(_tq_path):
+            with open(_tq_path) as _f:
+                _tq = json.load(_f)
+            _train_q = int(_tq.get("n_training_queries") or 0)
+            _train_q_complete = bool(_tq.get("complete", False))
+    except Exception as _e:
+        logger.warning(f"Could not read training_queries.json: {_e}")
     results["queries"] = {
         "n_blackbox_queries": int(total_blackbox_queries),
+        "n_training_queries": int(_train_q),
+        "n_training_queries_complete": bool(_train_q_complete),
+        "n_serving_queries_per_explanation": 0,
         "n_reporting_queries": 0,
         "query_policy": (
-            "Generation and validation-selection classifier calls; "
-            "held-out test reporting occurs in revision.evaluate"
+            "n_training_queries: classifier calls during policy training. "
+            "n_blackbox_queries: generation + validation-selection calls. "
+            "Construction cost = training + generation, paid once. "
+            "Serving an explanation from a fixed box costs 0 queries. "
+            "Held-out test reporting occurs in revision.evaluate and is "
+            "instrumentation, not a cost of producing explanations."
         ),
     }
     

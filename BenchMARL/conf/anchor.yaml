@@ -137,15 +137,14 @@ env_config:
   require_coverage_gain_to_terminate: true
   max_action_scale: 0.1  # Reduced from 0.15 for more stable, gradual expansion
   min_absolute_step: 0.001  # Reduced from 0.01 for finer control
-  # Inter-class overlap penalty: potential-style. Each step charges the CHANGE in
-  # the agent's Jaccard-normalized overlap level (weight * sum of inter/union vs
-  # other-class boxes, clipped to [0,1]), so the episode total telescopes to
-  # level_final - level_init instead of accumulating per step (the per-step level
-  # form added up to ~30-60/episode against a positive signal bounded by ~7, and
-  # its inter/own-volume normalization made full-space boxes penalty-free).
-  # Potential-style delta is bounded by this weight over the whole episode.
-  # 0.1 was too small to stop full-space class boxes from overlapping.
-  inter_class_overlap_weight: 1.0
+  # Inter-class overlap: potential-style delta of a [0,1] level.
+  # Quantile: Simpson(|A∩B|/min(|A|,|B|)) of this k>=1 claim vs the union
+  # of other-class k>=1 claims, on rows of D_active (eval conflict).
+  # Empty start claims nothing. Hull: volume Jaccard on active dims.
+  # 1.0 made a Simpson dodge (~0.4–1.0) dwarf Φ coverage (~0.02–0.1): Iris
+  # class 2 hid in a 2-row corner; breast still grew through it (conflict 0.22).
+  # 0.25 keeps the term live at the same scale as a coverage Φ step.
+  inter_class_overlap_weight: 0.25
   # Same-class cooperative reward: agents of class c share
   #   shared_reward_weight * (Phi_union_c(s') - Phi_union_c(s))
   # where Phi_union_c = alpha * union_precision(c)
@@ -162,8 +161,12 @@ env_config:
   # never the +5 terminal bonus), so they got essentially no learning signal.
   # The new lever is shared_terminal_bonus below, which targets exactly that gap.
   shared_reward_weight: 0.5
-  # DEPRECATED: level-based class-union bonus retired (the same-class shared reward
-  # above now carries the class-union signal as an oscillation-proof potential gain)
+  # Quantile-native same-class diversity: Simpson of this k>=1 claim vs
+  # teammates' k>=1 union, as a potential delta. Matched to inter-class
+  # so a copy is as costly as sitting on another class, relative to Φ.
+  # Hull/CDEA omit this key (0).
+  same_class_diversity_weight: 0.25
+  # DEPRECATED: level-based class-union bonus (union Φ carries this now)
   class_union_cov_weight: 0.0
   class_union_prec_weight: 0.0
   # Global coverage: logging only (no longer a reward stream)
@@ -187,10 +190,12 @@ env_config:
   # Only consulted when compute_nashconv is true.
   # Models with NashConv <= this threshold are considered close to Nash equilibrium.
   nashconv_threshold: 0.01  # ε-Nash threshold for best model selection
-  agents_per_class: 3        # Paper rerun: 3 agents per class (paper Sec. 7.1)
-  # IMPORTANT: This should match the training configuration. If you trained with agents_per_class: 3,
-  # use 3 here to use all individual policies. If you trained with agents_per_class: 1, use 1 here.
-  # The inference code now properly uses individual policies for each agent when agents_per_class > 1.
+  # Covering probe: 3 agents per class (paper Sec. 7.1). Same-class Simpson
+  # is live. Inter-class Simpson still applies across classes.
+  # M=1 was a short-dataset trial; do not leave it as the default.
+  agents_per_class: 3
+  # IMPORTANT: inference must use the same agents_per_class as training so
+  # individual policies map onto the env agent names.
   # Use class centroids to initialize the initial window (default: true)
   # If true: initial window is set around class centroid (mean of class instances)
   # If false: initial window is full space (0 to 1 for all features)

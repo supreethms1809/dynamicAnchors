@@ -224,9 +224,19 @@ def ensure_best_models(exp: Path) -> None:
         dest = dest_dir / "best_model.zip"
         if dest.exists():
             continue
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(final, dest)
-        log(f"  {cls}: no val-selected best_model.zip; copied {final.name} -> {dest}")
+        # G-05: DO NOT copy final -> best. Inference runs with
+        # prefer_model='best', so this handed it FINAL weights from a file named
+        # best_model.zip, indistinguishable downstream and unrecorded in the
+        # result JSON. It fired exactly when validation selection failed
+        # (P-03), so the two failures chained: selection silently fails, then
+        # the unselected checkpoint is silently promoted.
+        raise SystemExit(
+            f"{cls}: no validation-selected best_model.zip in {dest_dir}. "
+            f"Refusing to promote {final.name} to 'best' -- that would report "
+            f"final weights as validation-selected. Fix training (best-model "
+            f"selection scored -inf for every evaluation) or rerun with "
+            f"prefer_model='final' explicitly."
+        )
 
 
 def infer_rlda(dataset: str, seed: int, cfg: Dict[str, int]) -> Path:

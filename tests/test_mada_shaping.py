@@ -274,6 +274,7 @@ def test_shipped_configs_agree_between_rlda_and_mada():
     # The multi-agent method itself: no single-agent counterpart exists.
     MULTI_AGENT_ONLY = {
         "inter_class_overlap_weight", "shared_reward_weight", "shared_terminal_bonus",
+        "same_class_diversity_weight",
         "class_union_cov_weight", "class_union_prec_weight", "global_coverage_weight",
         "global_coverage_threshold", "nashconv_threshold",
     }
@@ -325,7 +326,8 @@ def test_quantile_mode_starts_from_the_empty_rule():
     obs, _ = env.reset(seed=0)
     agents = list(obs.keys())
     a0 = agents[0]
-    assert obs[a0].shape == (3 * env.n_features + 3,), "obs is [a, b, q*, P, C, mode]"
+    assert obs[a0].shape == (3 * env.n_features + 4,), \
+        "obs is [a, b, q*, P, C, mode, episode_phase] (G-12 added the clock)"
     assert env.action_space(a0).shape == (2 * env.n_features,), "action stays (2d,)"
     for a in agents:
         assert env.n_predicates(a) == 0
@@ -442,3 +444,112 @@ def test_no_retreat_when_nothing_feasible_was_found():
         if term.get(a0) or trunc.get(a0):
             break
     assert np.allclose(env.a[a0], kept_a)
+
+
+def _constrain(env, agent, j, a_lo, b_hi):
+    env.a[agent][:] = 0.0
+    env.b[agent][:] = 1.0
+    env.a[agent][j] = float(a_lo)
+    env.b[agent][j] = float(b_hi)
+    env._sync_unit_bounds_from_quantiles(agent)
+
+
+def test_paper_yaml_enables_quantile_same_class_diversity():
+    mae = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
+    assert mae["same_class_diversity_weight"] == pytest.approx(0.25)
+    assert mae["inter_class_overlap_weight"] == pytest.approx(0.25)
+    assert mae["same_class_diversity_weight"] > 0.0
+
+
+def test_quantile_empty_rule_is_not_a_claim():
+    """k=0 is the start state, not a region. Overlap and union ignore it."""
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=2, same_class_diversity_weight=1.0)
+    env.reset(seed=0)
+    for a in env.possible_agents:
+        assert env.n_predicates(a) == 0
+        assert env._is_real_rule(a) is False
+        assert env._compute_inter_class_overlap_penalty(a) == pytest.approx(0.0)
+        assert env._compute_same_class_overlap_penalty(a) == pytest.approx(0.0)
+    for cls, m in env._compute_class_union_metrics().items():
+        assert m["union_coverage"] == pytest.approx(0.0)
+        assert m["union_precision"] == pytest.approx(0.0)
+
+
+def test_quantile_union_excludes_empty_teammate():
+    """A k=0 teammate must not drown Φ^∪ with the full space."""
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=2)
+    env.reset(seed=0)
+    acting, idle = env.class_to_agents[0]
+    _constrain(env, acting, 0, 0.05, 0.55)
+    assert env.n_predicates(acting) >= 1
+    assert env.n_predicates(idle) == 0
+    union = env._compute_class_union_metrics()[0]
+    acting_c = float(env._mask_in_box(acting)[env.y == 0].mean())
+    assert union["union_coverage"] == pytest.approx(acting_c, abs=1e-9)
+    assert union["union_coverage"] < 0.99
+
+
+def test_quantile_union_keeps_terminated_rule():
+    """A finished agent's k>=1 box still covers for teammates."""
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=2)
+    env.reset(seed=0)
+    done_agent, live = env.class_to_agents[0]
+    _constrain(env, done_agent, 0, 0.05, 0.55)
+    cov_before = env._compute_class_union_metrics()[0]["union_coverage"]
+    env.agents = [a for a in env.agents if a != done_agent]
+    cov_after = env._compute_class_union_metrics()[0]["union_coverage"]
+    assert cov_after == pytest.approx(cov_before, abs=1e-9)
+    assert cov_after > 0.0
+
+
+def test_quantile_interclass_simpson_zero_when_disjoint():
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=1, inter_class_overlap_weight=1.0)
+    env.reset(seed=0)
+    a0 = env.class_to_agents[0][0]
+    a1 = env.class_to_agents[1][0]
+    _constrain(env, a0, 0, 0.01, 0.45)
+    _constrain(env, a1, 0, 0.55, 0.99)
+    # Unit boxes (not class-CDF images) so the test is about claims, not knots.
+    n = env.n_features
+    env.lower[a0], env.upper[a0] = np.zeros(n), np.ones(n)
+    env.lower[a0][0], env.upper[a0][0] = 0.0, 0.5
+    env.lower[a1], env.upper[a1] = np.zeros(n), np.ones(n)
+    env.lower[a1][0], env.upper[a1][0] = 0.5, 1.0
+    assert env._compute_inter_class_overlap_penalty(a0) == pytest.approx(0.0, abs=1e-9)
+    assert env._compute_inter_class_overlap_penalty(a1) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_quantile_interclass_simpson_high_when_same_rows():
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=1, inter_class_overlap_weight=1.0)
+    env.reset(seed=0)
+    a0 = env.class_to_agents[0][0]
+    a1 = env.class_to_agents[1][0]
+    _constrain(env, a0, 0, 0.05, 0.95)
+    _constrain(env, a1, 0, 0.05, 0.95)
+    n = env.n_features
+    for agent in (a0, a1):
+        env.lower[agent] = np.zeros(n)
+        env.upper[agent] = np.ones(n)
+        env.lower[agent][0], env.upper[agent][0] = 0.1, 0.9
+    assert env._compute_inter_class_overlap_penalty(a0) > 0.5
+    assert env._compute_inter_class_overlap_penalty(a1) > 0.5
+
+
+def test_quantile_same_class_diversity_penalizes_copies():
+    env = _env(init_mode="full_space", precision_estimator="empirical",
+               agents_per_class=2, same_class_diversity_weight=1.0,
+               inter_class_overlap_weight=0.0)
+    env.reset(seed=0)
+    a, b = env.class_to_agents[0]
+    _constrain(env, a, 0, 0.05, 0.55)
+    _constrain(env, b, 0, 0.05, 0.55)
+    assert env._compute_same_class_overlap_penalty(a) == pytest.approx(1.0, abs=1e-6)
+    n = env.n_features
+    env.lower[b], env.upper[b] = np.zeros(n), np.ones(n)
+    env.lower[b][0], env.upper[b][0] = 0.6, 1.0
+    assert env._compute_same_class_overlap_penalty(a) == pytest.approx(0.0, abs=1e-9)

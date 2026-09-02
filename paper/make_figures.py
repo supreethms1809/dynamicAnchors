@@ -44,16 +44,38 @@ def _mean(vals) -> Optional[float]:
 
 
 def _fixed_and_marginal(row: Dict[str, Any]) -> Tuple[float, float]:
+    """(fixed construction cost, per-explanation serving cost), in black-box queries.
+
+    G-04: this used to return (extraction queries, reporting queries / n_test),
+    which is wrong in KIND on both terms for the amortised methods:
+
+      * The fixed cost omitted TRAINING. Policy training issues
+        n_perturb_train classifier calls per env step over the whole frame
+        budget -- the dominant term, and the only reason a break-even point
+        exists at all. Counting only extraction made the upfront cost look
+        small enough to amortise almost immediately.
+      * The marginal term was `n_reporting_queries / n_test`. Reporting queries
+        are what we spend MEASURING the method (revision/evaluate.py adds
+        len(train)+len(val)+len(test)); they are not paid per explanation. A
+        trained box applied to a new instance costs ZERO black-box queries --
+        the box is already fixed.
+
+    So the amortised arms are (large fixed, ~0 marginal), not (small fixed,
+    non-zero marginal). Per-instance baselines are unchanged: they pay their
+    whole cost per explanation and have no fixed term.
+    """
     q = row.get("queries") or {}
     n_bb = float(q.get("n_blackbox_queries") or 0.0)
-    n_rep = float(q.get("n_reporting_queries") or 0.0)
+    n_train_q = float(q.get("n_training_queries") or 0.0)
     n_test = float((row.get("classifier_accuracy") or {}).get("n") or 0.0)
     method = str(row.get("method", "")).lower()
     if method in PER_INSTANCE:
         n_explained = n_test if n_test > 0 else 1.0
         return 0.0, n_bb / n_explained
-    per = (n_rep / n_test) if n_test > 0 else 0.0
-    return n_bb, per
+    # Amortised (learned-policy) methods: construction is training + extraction,
+    # serving is free. n_reporting_queries is deliberately excluded -- it is
+    # evaluation instrumentation, not a cost of producing explanations.
+    return n_train_q + n_bb, 0.0
 
 
 def break_even_curves(rows: List[Dict[str, Any]], n_max: int = 400) -> Dict[str, Any]:

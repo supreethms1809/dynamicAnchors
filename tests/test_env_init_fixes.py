@@ -156,7 +156,8 @@ def test_control_precision_is_hard_fid_not_softmax_blend():
     assert proxy < 0.85, proxy
     assert precision == pytest.approx(hard)
     # observation packs hard Fid, not the blend
-    assert float(obs[-3]) == pytest.approx(hard)
+    # quantile layout is [a, b, q*, P, C, mode, phase] since G-12, so P is at -4
+    assert float(obs[-4]) == pytest.approx(hard)
 
 
 def test_pool_class_anchors_keeps_class_based_sibling():

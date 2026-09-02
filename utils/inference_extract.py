@@ -23,8 +23,16 @@ def generation_split_arrays(env_data: Dict[str, Any], env_config: Dict[str, Any]
     split = str(env_config.get("generation_split", "train") or "train").lower()
     if split == "val" and env_data.get("X_val_unit") is not None:
         return (env_data["X_val_unit"], env_data["X_val_std"], env_data["y_val"], "validation")
-    if split == "test" and env_data.get("X_test_unit") is not None:
-        return (env_data["X_test_unit"], env_data["X_test_std"], env_data["y_test"], "test")
+    if split == "test":
+        # G-08: candidate boxes are FITTED on this split. Generating them on test
+        # makes every reported test number selection-contaminated, and no
+        # downstream stage can undo it. Refuse rather than warn -- the reporting
+        # split must never be reachable from generation.
+        raise ValueError(
+            "generation_split='test' is not allowed: candidate boxes are fitted "
+            "on the generation split, so this leaks the reporting split into "
+            "rule construction. Use 'train' (default) or 'val'."
+        )
     return (env_data["X_unit"], env_data["X_std"], env_data["y"], "train")
 
 
@@ -71,8 +79,13 @@ def persist_box_from_episode(
         if obs is None:
             return None
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
-        # Hull-era synthetic final_obs is 2n+2 unit bounds; quantile policy obs is 3n+3.
-        if obs.shape[0] < 2 * n_features:
+        # G-11: obs[:n] is `a` (a QUANTILE) under the quantile MDP, not `lower`.
+        # The old guard was `< 2n`, which the 3n+4 quantile layout passes, so a
+        # quantile observation was sliced as unit bounds and quantile positions
+        # were persisted as a box -- silently wrong rather than absent. Accept
+        # ONLY the hull-era synthetic layout, whose length is exactly 2n+2 or
+        # 2n+3; anything longer is a quantile obs and has no bounds to recover.
+        if obs.shape[0] not in (2 * n_features + 2, 2 * n_features + 3):
             return None
         lo, up = obs[:n_features], obs[n_features:2 * n_features]
     policy_lo = np.asarray(lo, dtype=np.float32).reshape(-1)
