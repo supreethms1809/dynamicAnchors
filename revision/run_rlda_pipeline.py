@@ -72,6 +72,7 @@ FORCE = False                         # re-run infer + Track A + Track B; never 
 FORCE_TRAIN = False                   # also retrain (rare; wipes nothing, starts a new exp)
 SKIP_TRAIN = False                    # never train; fail if no experiment dir
 CLASSIFIER_PATH = None                # if set + exists: shards load it, skip classifier fit
+SA_TIMESTEPS = None                   # --sa_timesteps override (TOTAL across classes)
 CLASSIFIER_DEVICE = None              # device for the (one-time) classifier fit
 
 
@@ -318,7 +319,9 @@ def evaluate_instances(dataset: str, method: str, rules: Path, seed: int) -> Non
 
 
 def run_dataset(dataset: str, seed: int, device: str) -> None:
-    cfg = DATASET_CONFIGS[dataset]
+    cfg = dict(DATASET_CONFIGS[dataset])          # copy: never mutate the table
+    if SA_TIMESTEPS is not None:
+        cfg["sa_timesteps"] = int(SA_TIMESTEPS)
     n_cls = cfg["n_classes"]
     per_class = cfg["sa_timesteps"] // n_cls
     log(
@@ -358,6 +361,12 @@ def main() -> None:
         "--force-train", action="store_true",
         help="Retrain even if an experiment directory already exists.",
     )
+    p.add_argument(
+        "--sa_timesteps", type=int, default=None,
+        help="Override the TOTAL timestep budget for this dataset (split evenly "
+             "across classes, matching DATASET_CONFIGS semantics). MADA has "
+             "--max_n_frames; this is the RLDA counterpart, which was missing.",
+    )
     p.add_argument("--classifier-path", default=None,
                    help="Pre-trained classifier.pth for all shards to load (skips per-shard fit).")
     p.add_argument("--classifier-device", default=None,
@@ -366,8 +375,9 @@ def main() -> None:
     args = p.parse_args()
 
     global ALGO, SUBDIR, ROOT, OUT_DIR, RESULTS, LOG_DIR, FORCE, FORCE_TRAIN, SKIP_TRAIN
-    global CLASSIFIER_PATH, CLASSIFIER_DEVICE
+    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, SA_TIMESTEPS
     ALGO = args.algo
+    SA_TIMESTEPS = args.sa_timesteps
     SUBDIR = f"{ALGO}_single_agent"
     ROOT = Path(args.root).resolve()
     OUT_DIR = ROOT / "output"

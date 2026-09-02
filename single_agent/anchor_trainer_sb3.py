@@ -343,6 +343,101 @@ class FidCovEvalCallback(BaseCallback):
         return True
 
 
+def add_gradient_clipping(model, max_norm: float) -> bool:
+    """Clip actor/critic gradient norms before each optimizer step.
+
+    SB3 exposes no max_grad_norm for DDPG/TD3/SAC (only the on-policy
+    algorithms have it), and subclassing to override train() would fork a large
+    chunk of SB3. Wrapping optimizer.step is equivalent and stays a few lines:
+    SB3 calls loss.backward() then optimizer.step(), so clipping inside the
+    wrapper sees exactly the gradients that step would have applied.
+    """
+    if not max_norm or max_norm <= 0:
+        return False
+    nets = [getattr(model, n, None) for n in ("actor", "critic")]
+    nets = [n for n in nets if n is not None and hasattr(n, "optimizer")]
+    if not nets:
+        logger.warning("  Gradient clipping requested but no actor/critic optimizer found")
+        return False
+    for net in nets:
+        opt = net.optimizer
+        if getattr(opt, "_anchor_clip_wrapped", False):
+            continue
+        params = [p for p in net.parameters() if p.requires_grad]
+        original_step = opt.step
+
+        def step(*args, _params=params, _step=original_step, **kwargs):
+            torch.nn.utils.clip_grad_norm_(_params, max_norm)
+            return _step(*args, **kwargs)
+
+        opt.step = step
+        opt._anchor_clip_wrapped = True
+    logger.info(f"  Gradient clipping enabled: max_grad_norm={max_norm}")
+    return True
+
+
+class CriticDivergenceGuard(BaseCallback):
+    """Halt a shard when the critic has diverged beyond recovery.
+
+    DDPG/TD3 critic blow-up is monotonic once it starts: on breast_cancer
+    class_1 the loss crossed 1e1 at 49k steps and reached 1e11 by 128k, and the
+    policy never recovered in the 95k steps that followed. Continuing past that
+    point cannot improve best_model (already selected on FidCov) and only
+    produces a final_model that is pure noise -- which matters because G-05 made
+    a missing best_model a hard failure rather than a silent fallback.
+    """
+
+    def __init__(self, threshold: float, patience: int = 3, verbose: int = 0):
+        super().__init__(verbose)
+        self.threshold = float(threshold)
+        self.patience = int(patience)
+        self.n_over = 0
+        self.diverged = False
+        self.diverged_at = None
+
+    def _current_critic_loss(self):
+        rec = getattr(self.model, "logger", None)
+        vals = getattr(rec, "name_to_value", None) if rec is not None else None
+        if not vals:
+            return None
+        for key in ("train/critic_loss", "train/qf_loss", "train/value_loss"):
+            if key in vals:
+                try:
+                    return float(vals[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _on_step(self) -> bool:
+        if self.threshold <= 0:
+            return True
+        loss = self._current_critic_loss()
+        if loss is None or not np.isfinite(loss):
+            # A non-finite loss is itself divergence, not missing data.
+            if loss is not None:
+                self.n_over += 1
+            else:
+                return True
+        elif loss > self.threshold:
+            self.n_over += 1
+        else:
+            self.n_over = 0
+            return True
+
+        if self.n_over >= self.patience:
+            self.diverged = True
+            self.diverged_at = int(self.num_timesteps)
+            logger.warning(
+                "  CRITIC DIVERGED: loss %.3g > %.3g for %d consecutive checks at "
+                "%d steps. Stopping this shard; best_model (FidCov-selected) is "
+                "kept. Continuing would only degrade final_model.",
+                loss if loss is not None else float("nan"),
+                self.threshold, self.patience, self.num_timesteps,
+            )
+            return False
+        return True
+
+
 class AnchorTrainerSB3:
     """
     Stable-Baselines3 trainer for single-agent dynamic anchors.
@@ -441,6 +536,23 @@ class AnchorTrainerSB3:
             "train_freq": (1, "step"),
             "gradient_steps": 1,
             "action_noise_sigma": 0.1,
+            # Gradient clipping. NOTE: this does NOT fix the critic divergence
+            # described below -- that was tested and refuted on 2026-09-01.
+            # With max_grad_norm=10 the same shard still diverged (critic_loss
+            # 1.06 @38k -> 60.2 @42k -> 1.13e3 @46.75k). Lowering the learning
+            # rate to 1e-4 was also refuted, and made onset EARLIER (diverged at
+            # 18.9k instead of 46.8k) -- so the failure is not step-size driven
+            # and neither optimisation knob addresses it. Kept as ordinary
+            # hygiene, not as a stability fix. Root cause still open: rewards are
+            # bounded (returns ~4.5), episodes terminate rather than truncate
+            # (30/30 at ~4 steps), so it is not reward scale or time-limit
+            # bootstrapping either.
+            "max_grad_norm": 10.0,          # 0/None disables
+            # Stop a shard once the critic has demonstrably diverged. best_model
+            # is selected on FidCov and is already saved, so the remaining budget
+            # would only be spent making the final policy worse.
+            "critic_divergence_threshold": 1e3,
+            "critic_divergence_patience": 3,
             "policy_kwargs": {
                 "net_arch": [256, 256]
             },
@@ -979,6 +1091,10 @@ class AnchorTrainerSB3:
             
             # Create model for this class
             self.models[target_class] = self.algorithm_class(**model_kwargs)
+            add_gradient_clipping(
+                self.models[target_class],
+                self.algorithm_config.get("max_grad_norm", 10.0),
+            )
             
             logger.info(f"  Model for class {target_class} created")
             logger.info(f"    Observation space: {env.observation_space}")
@@ -1105,6 +1221,11 @@ class AnchorTrainerSB3:
                         ),
                     )
                 )
+            divergence_guard = CriticDivergenceGuard(
+                threshold=self.algorithm_config.get("critic_divergence_threshold", 1e3),
+                patience=self.algorithm_config.get("critic_divergence_patience", 3),
+            )
+            callbacks.append(divergence_guard)
             
             # Learning rate scheduling callback (optional, reduces LR on plateau)
             use_lr_schedule = self.algorithm_config.get("use_lr_schedule", False)
