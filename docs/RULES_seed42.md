@@ -1,6 +1,6 @@
 # Seed-42 Extracted Rules
 
-Generated 2026-09-02 10:43. Branch `ma-training-config-bump`.
+Generated 2026-09-02 11:48. Branch `ma-training-config-bump`.
 
 The actual rule sets behind the numbers in `RESULTS_seed42_comparison.md`.
 Rules are the **validation-selected union**, scored on the **test** split.
@@ -815,51 +815,3 @@ its members.
 
 
 ---
-
-## What to look for
-
-### Rule *form* differs by method, not just quality
-
-On `iris`/DNN the three methods pick visibly different hypotheses for the same
-class:
-
-    MADA  class_2:  petal length ∈ [4.79, 6.90] and petal width ∈ [1.79, 2.50]   Fid 1.000
-    RLDA  class_2:  sepal width  ∈ [2.50, 3.90]                                  Fid 0.429
-    CART  class_2:  petal length > 2.45 and petal width > 1.55                   Fid 1.000
-
-RLDA's class_2 rule is a single **sepal-width** interval covering 28 of 30 test
-rows at 0.429 fidelity — a nearly-vacuous box on the wrong feature. It is why
-RLDA's iris conflict is 0.567: a rule that fires on almost everything collides
-with every other class. MADA and CART both find the petal-based split.
-
-This is worth more than the aggregate numbers: RLDA's high *global* iris fidelity
-(0.967) is carried by classes 0 and 1, while class_2 contributes a rule that is
-not an explanation at all.
-
-### Anchors baselines are precise and narrow, by construction
-
-`greedy_anchors` / `sp_anchors` reach Fid 1.000 repeatedly but at Cov 0.300–0.800
-per class, and abstain on 43–61% of rows overall. They are per-instance methods;
-the low coverage is their nature, not a failure.
-
-### CART's rules are a partition
-
-Every CART rule set is mutually exclusive (`petal length <= 2.45` /
-`> 2.45 and petal width <= 1.55` / `> 2.45 and petal width > 1.55`), which is why
-its conflict is 0.000 everywhere and why conflict is the one axis on which a tree
-cannot be beaten by construction.
-
-### `k=1` is common
-
-The marginal-gain selector frequently keeps a single rule per class. Where k > 1,
-the extra rules earned their place by improving the union's ranking score — see
-the `wine` MADA/RF anomaly in the comparison document for a case where that
-criterion admitted a wide, low-fidelity box.
-
-## Provenance
-
-    runs/sweep_{dnn,rf}/results/{ddpg,maddpg}/<dataset>__<method>__seed42__tp0p90__tc0p10.json
-      -> per_class.<class>.selected_rules[].display_rule
-      -> per_class.<class>.selected_rules[].report_metrics   (test split)
-
-Companion to `docs/RESULTS_seed42_comparison.md`.

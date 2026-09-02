@@ -1,6 +1,6 @@
 # Seed-42 Results: MADA vs RLDA vs Baselines
 
-Generated 2026-09-02 10:42. Branch `ma-training-config-bump`.
+Generated 2026-09-02 11:48. Branch `ma-training-config-bump`.
 
 Tables are grouped **by dataset**, with the DNN and RandomForest black boxes
 adjacent, so the effect of swapping the explained model is read top-to-bottom
@@ -48,8 +48,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.958 | 0.800 | 0.000 | 0.200 | 0.122 (22/180) | 21,330 |
-| RLDA | 0.967 | 1.000 | 0.567 | 0.000 | 0.400 (24/60) | 12,480 |
+| MADA | 0.958 | 0.800 | 0.000 | 0.200 | 0.122 (22/180) | 1,170 |
+| RLDA | 0.967 | 1.000 | 0.567 | 0.000 | 0.400 (24/60) | 5,730 |
 | CART | 0.964 | 0.933 | 0.000 | 0.067 | — | 120 |
 | greedy_anchors | 1.000 | 0.567 | 0.000 | 0.433 | — | 65,614 |
 | sp_anchors | 1.000 | 0.567 | 0.033 | 0.433 | — | 65,614 |
@@ -59,8 +59,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.964 | 0.933 | 0.300 | 0.067 | 0.178 (32/180) | 21,330 |
-| RLDA | 0.960 | 0.833 | 0.100 | 0.167 | 0.350 (21/60) | 12,480 |
+| MADA | 0.964 | 0.933 | 0.300 | 0.067 | 0.178 (32/180) | 1,170 |
+| RLDA | 0.960 | 0.833 | 0.100 | 0.167 | 0.350 (21/60) | 5,730 |
 | CART | 1.000 | 0.933 | 0.000 | 0.067 | — | 120 |
 | greedy_anchors | 0.933 | 0.500 | 0.000 | 0.500 | — | 100,349 |
 | sp_anchors | 0.933 | 0.500 | 0.033 | 0.500 | — | 100,349 |
@@ -76,8 +76,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.962 | 0.722 | 0.306 | 0.278 | 0.150 (27/180) | 25,128 |
-| RLDA | 0.923 | 0.722 | 0.139 | 0.278 | 0.250 (15/60) | 14,688 |
+| MADA | 0.962 | 0.722 | 0.306 | 0.278 | 0.150 (27/180) | 1,384 |
+| RLDA | 0.923 | 0.722 | 0.139 | 0.278 | 0.250 (15/60) | 6,738 |
 | CART | 0.920 | 0.694 | 0.000 | 0.306 | — | 142 |
 | greedy_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
 | sp_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
@@ -87,8 +87,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.657 | 0.972 | 0.333 | 0.028 | 0.128 (23/180) | 25,128 |
-| RLDA | 0.968 | 0.861 | 0.111 | 0.139 | 0.367 (22/60) | 14,688 |
+| MADA | 0.657 | 0.972 | 0.333 | 0.028 | 0.128 (23/180) | 1,384 |
+| RLDA | 0.968 | 0.861 | 0.111 | 0.139 | 0.367 (22/60) | 6,738 |
 | CART | 0.920 | 0.694 | 0.000 | 0.306 | — | 142 |
 | greedy_anchors | 1.000 | 0.556 | 0.000 | 0.444 | — | 481,231 |
 | sp_anchors | 1.000 | 0.556 | 0.000 | 0.444 | — | 481,231 |
@@ -104,8 +104,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.930 | 0.877 | 0.053 | 0.123 | 0.133 (16/120) | 53,880 |
-| RLDA | 0.918 | 0.746 | 0.000 | 0.254 | 0.250 (10/40) | 31,412 |
+| MADA | 0.930 | 0.877 | 0.053 | 0.123 | 0.133 (16/120) | 3,071 |
+| RLDA | 0.918 | 0.746 | 0.000 | 0.254 | 0.250 (10/40) | 14,362 |
 | CART | 0.908 | 0.956 | 0.000 | 0.044 | — | 455 |
 | greedy_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
 | sp_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
@@ -115,8 +115,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.920 | 0.877 | 0.035 | 0.123 | 0.158 (19/120) | 53,880 |
-| RLDA | 0.952 | 0.912 | 0.000 | 0.088 | 0.100 (4/40) | 31,412 |
+| MADA | 0.920 | 0.877 | 0.035 | 0.123 | 0.158 (19/120) | 3,071 |
+| RLDA | 0.952 | 0.912 | 0.000 | 0.088 | 0.100 (4/40) | 14,362 |
 | CART | 0.908 | 0.956 | 0.000 | 0.044 | — | 455 |
 | greedy_anchors | 1.000 | 0.711 | 0.000 | 0.289 | — | 908,911 |
 | sp_anchors | 1.000 | 0.711 | 0.000 | 0.289 | — | 908,911 |
@@ -132,8 +132,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.895 | 0.905 | 0.415 | 0.095 | 0.075 (9/120) | 94,800 |
-| RLDA | 0.907 | 0.645 | 0.050 | 0.355 | 0.250 (10/40) | 55,240 |
+| MADA | 0.895 | 0.905 | 0.415 | 0.095 | 0.075 (9/120) | 5,400 |
+| RLDA | 0.907 | 0.645 | 0.050 | 0.355 | 0.250 (10/40) | 25,240 |
 | CART | 0.705 | 0.950 | 0.000 | 0.050 | — | 800 |
 | greedy_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
 | sp_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
@@ -143,8 +143,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.890 | 0.865 | 0.305 | 0.135 | 0.150 (18/120) | 94,800 |
-| RLDA | 1.000 | 0.475 | 0.000 | 0.525 | 0.525 (21/40) | 55,240 |
+| MADA | 0.890 | 0.865 | 0.305 | 0.135 | 0.150 (18/120) | 5,400 |
+| RLDA | 1.000 | 0.475 | 0.000 | 0.525 | 0.525 (21/40) | 25,240 |
 | CART | 0.716 | 0.950 | 0.000 | 0.050 | — | 800 |
 | greedy_anchors | 0.955 | 0.440 | 0.000 | 0.560 | — | 49,689 |
 | sp_anchors | 0.955 | 0.440 | 0.000 | 0.560 | — | 49,689 |
@@ -160,8 +160,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.569 | 0.740 | 0.080 | 0.260 | 0.004 (1/240) | 3,913,344 |
-| RLDA | 0.515 | 0.646 | 0.100 | 0.354 | 0.037 (3/80) | 2,278,736 |
+| MADA | 0.569 | 0.740 | 0.080 | 0.260 | 0.004 (1/240) | 210,528 |
+| RLDA | 0.515 | 0.646 | 0.100 | 0.354 | 0.037 (3/80) | 1,040,336 |
 | CART | 0.563 | 0.998 | 0.000 | 0.002 | — | 16,512 |
 | greedy_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
 | sp_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
@@ -171,8 +171,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.902 | 0.246 | 0.001 | 0.754 | 0.008 (2/240) | 3,913,344 |
-| RLDA | 0.912 | 0.193 | 0.001 | 0.807 | 0.100 (8/80) | 2,278,736 |
+| MADA | 0.902 | 0.246 | 0.001 | 0.754 | 0.008 (2/240) | 210,528 |
+| RLDA | 0.912 | 0.193 | 0.001 | 0.807 | 0.100 (8/80) | 1,040,336 |
 | CART | 0.578 | 0.888 | 0.000 | 0.112 | — | 16,512 |
 | greedy_anchors | 0.685 | 0.225 | 0.004 | 0.775 | — | 370,950 |
 | sp_anchors | 0.692 | 0.271 | 0.000 | 0.729 | — | 370,950 |
@@ -188,8 +188,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.930 | 0.935 | 0.043 | 0.065 | 0.120 (18/150) | 77,832 |
-| RLDA | 0.926 | 0.884 | 0.000 | 0.116 | 0.060 (3/50) | 46,418 |
+| MADA | 0.930 | 0.935 | 0.043 | 0.065 | 0.120 (18/150) | 3,726 |
+| RLDA | 0.926 | 0.884 | 0.000 | 0.116 | 0.060 (3/50) | 21,578 |
 | CART | 0.905 | 0.993 | 0.000 | 0.007 | — | 552 |
 | greedy_anchors | 0.980 | 0.710 | 0.007 | 0.290 | — | 36,117 |
 | sp_anchors | 0.891 | 0.993 | 0.442 | 0.007 | — | 36,117 |
@@ -199,8 +199,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.935 | 1.000 | 0.000 | 0.000 | 0.113 (17/150) | 77,832 |
-| RLDA | 0.989 | 0.630 | 0.000 | 0.370 | 0.100 (5/50) | 46,418 |
+| MADA | 0.935 | 1.000 | 0.000 | 0.000 | 0.113 (17/150) | 3,726 |
+| RLDA | 0.989 | 0.630 | 0.000 | 0.370 | 0.100 (5/50) | 21,578 |
 | CART | 0.934 | 0.993 | 0.000 | 0.007 | — | 552 |
 | greedy_anchors | 0.934 | 0.993 | 0.457 | 0.007 | — | 63,141 |
 | sp_anchors | 0.934 | 0.993 | 0.457 | 0.007 | — | 63,141 |
@@ -216,8 +216,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.877 | 0.894 | 0.080 | 0.106 | 0.047 (7/150) | 5,509,158 |
-| RLDA | 0.871 | 0.746 | 0.054 | 0.254 | 0.020 (1/50) | 3,282,098 |
+| MADA | 0.877 | 0.894 | 0.080 | 0.106 | 0.047 (7/150) | 263,742 |
+| RLDA | 0.871 | 0.746 | 0.054 | 0.254 | 0.020 (1/50) | 1,523,858 |
 | CART | 0.800 | 1.000 | 0.000 | 0.000 | — | 39,073 |
 | greedy_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
 | sp_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
@@ -227,8 +227,8 @@ quoting any cost number.
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
-| MADA | 0.896 | 1.000 | 0.079 | 0.000 | 0.040 (6/150) | 5,509,158 |
-| RLDA | 0.917 | 0.743 | 0.054 | 0.257 | 0.020 (1/50) | 3,282,098 |
+| MADA | 0.896 | 1.000 | 0.079 | 0.000 | 0.040 (6/150) | 263,742 |
+| RLDA | 0.917 | 0.743 | 0.054 | 0.257 | 0.020 (1/50) | 1,523,858 |
 | CART | 0.844 | 1.000 | 0.000 | 0.000 | — | 39,073 |
 | greedy_anchors | 0.955 | 0.791 | 0.000 | 0.209 | — | 102,564 |
 | sp_anchors | 0.932 | 1.000 | 0.117 | 0.000 | — | 102,564 |
@@ -441,3 +441,37 @@ Fid, Cov, Conflict, Abstain and Success are unaffected — they are computed fro
 the rule sets on the test split and have nothing to do with query accounting.
 Only the cost columns and anything derived from them (`table_queries.tex`,
 `break_even.json`) are implicated.
+
+---
+
+## Update 2026-09-02: extraction queries corrected, but still not trustworthy
+
+Inference was re-run across all 28 cells (`--force --skip-train`, no retraining,
+0 failures) after fixing a prediction-cache defect. `Fid/Cov/Conflict/Abstain`
+are unchanged; only the cost column moved.
+
+**Fixed.** `inference.py` builds a fresh `AnchorEnv` per episode, and each one's
+prediction cache started cold, so the same split was re-classified once per
+episode. iris MADA: 225 envs x 90 train rows = 20,250 of a reported 21,330.
+`_get_cached_probs` now shares a process-wide cache keyed on
+`(id(classifier), split, X.shape, sha1(X))`, and counts only real misses.
+iris MADA fell **21,330 -> 1,170 (18x)**.
+
+**Still unexplained — do not publish these as costs.** Two things do not add up:
+
+1. **RLDA reports ~5x MADA on every dataset** (4.67–5.79), independent of class
+   count. MADA runs *more* episodes (9 agents vs 3), so the ratio should favour
+   MADA if it tracked work done. RLDA runs one process per class, so each shard
+   has its own cache — but that predicts a factor of `n_classes` (2–4), not a
+   flat ~5.
+
+2. **Large datasets remain implausibly high**: `uci_adult` RLDA 1,523,858 and
+   MADA 263,742, against CART's 39,073. For an amortised method whose serving
+   cost is zero, extraction should be a small multiple of the split size, not
+   ~50x it. The per-episode cache should be hitting; evidently it is not on
+   these cells.
+
+So the cache fix removed one over-count but did not make the column correct. The
+cost columns, `table_queries.tex` and `break_even.json` all still need work
+before publication. Fidelity/coverage/conflict/abstention conclusions in this
+document do not depend on any of it.
