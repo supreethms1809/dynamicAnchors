@@ -3,6 +3,7 @@ The outline of the file was created by following the Custom env tutorial in the 
 """
 import functools
 from copy import copy
+import hashlib
 import numpy as np
 import torch
 from typing import Dict, Optional, Tuple, Any, List
@@ -18,6 +19,10 @@ from utils.metrics import active_feature_mask, ranking_score as _ranking_score
 from utils import quantile_mdp as qmdp
 import logging
 logger = logging.getLogger(__name__)
+
+# Shared black-box prediction cache across env instances (see _get_cached_probs).
+_PROBS_CACHE: dict = {}
+
 
 
 class AnchorEnv(ParallelEnv):
@@ -2820,6 +2825,21 @@ class AnchorEnv(ParallelEnv):
                 X = self.X_std
             if X is None:
                 raise ValueError(f"No {key} data available for cached predictions")
+            # PROCESS-WIDE cache, not just per-env. Inference constructs a fresh
+            # env PER EPISODE (inference.py builds temp_env inside the instance
+            # loop), so a per-env cache re-classified the SAME split every time:
+            # measured 2026-09-02 on iris MADA, 225 envs x 90 train rows = 20,250
+            # of a reported 21,330 "extraction queries" -- 90 distinct rows
+            # charged 225 times, and 225x the classifier work actually done.
+            #
+            # Keyed on the classifier identity AND the exact bytes of X, so a
+            # different model or different data can never hit a stale entry.
+            _ck = (id(self.classifier), key, X.shape,
+                   hashlib.sha1(np.ascontiguousarray(X, dtype=np.float32)).hexdigest())
+            _hit = _PROBS_CACHE.get(_ck)
+            if _hit is not None:
+                self._cached_probs[key] = _hit
+                return self._cached_probs[key]
             if hasattr(self.classifier, 'eval'):
                 self.classifier.eval()
             if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
@@ -2827,6 +2847,9 @@ class AnchorEnv(ParallelEnv):
             with torch.no_grad():
                 inputs = torch.from_numpy(X.astype(np.float32)).to(self.device)
                 self._cached_probs[key] = predict_proba_torch(self.classifier, inputs).cpu().numpy()
+            _PROBS_CACHE[_ck] = self._cached_probs[key]
+            # Counted ONLY on a real miss: these are the distinct rows the black
+            # box actually had to score.
             self.n_blackbox_queries += int(X.shape[0])
         return self._cached_probs[key]
 

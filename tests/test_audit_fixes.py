@@ -624,3 +624,31 @@ def test_shaping_discount_equals_mdp_gamma_in_both_arms():
     assert sa["discount"] == pytest.approx(ma["discount"]), "arms disagree on discount"
     src = (REPO / "single_agent" / "anchor_trainer_sb3.py").read_text()
     assert '"gamma": 0.95' in src, "RLDA algorithm gamma must match its env discount"
+
+
+# --------------------------------------------------------------- query accounting
+
+def test_episode_queries_are_a_delta_not_the_running_total():
+    """The env counter is cumulative and never reset between episodes.
+
+    Callers do `total += episode_data["n_blackbox_queries"]`, so reporting the
+    running total summed 1q + 2q + ... + Nq = q*N(N+1)/2 instead of q*N. On iris
+    MADA that inflated extraction cost from ~1,080 to 21,330.
+    """
+    for path, fn in (("BenchMARL/inference.py", "run_rollout_with_policy"),
+                     ("single_agent/single_agent_inference.py", "run_single_agent_rollout")):
+        src = (REPO / path).read_text()
+        body = src[src.index(f"def {fn}("):]
+        body = body[: body.index("\nreturn episode_data") + 40] if "\nreturn episode_data" in body else body[:40000]
+        assert "_bbq_at_entry" in body, f"{path}: no entry snapshot"
+        assert 'int(getattr(env, "n_blackbox_queries", 0)) - _bbq_at_entry' in body, \
+            f"{path}: must report the delta, not the running total"
+
+
+def test_query_buckets_are_reported_separately():
+    """training / extraction / serving are different costs and must not be merged."""
+    for path in ("BenchMARL/inference.py", "single_agent/single_agent_inference.py"):
+        src = (REPO / path).read_text()
+        for key in ("n_blackbox_queries", "n_training_queries",
+                    "n_serving_queries_per_explanation", "n_reporting_queries"):
+            assert f'"{key}"' in src, f"{path} missing {key}"

@@ -792,6 +792,13 @@ def run_rollout_with_policy(
     verbose_logging: bool = False,  # Enable verbose debug logging
 ) -> Dict[str, Any]:
     # Ensure policy is in eval mode
+    # G-04 fix: the env counter is CUMULATIVE and never reset between episodes,
+    # but callers do `total += episode_data["n_blackbox_queries"]`. Reporting the
+    # running total summed 1q + 2q + ... + Nq = q*N(N+1)/2 instead of q*N -- a
+    # triangular over-count growing with the episode count. Measured 2026-09-02,
+    # iris MADA: 21,330 reported, of which only ~1,080 was real per-agent
+    # recompute; 20,250 was this artefact. Snapshot on entry, report the DELTA.
+    _bbq_at_entry = int(getattr(env, "n_blackbox_queries", 0))
     policy.to(device)
     policy.eval()
     
@@ -1271,8 +1278,8 @@ def run_rollout_with_policy(
             "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
     
-    episode_data["n_blackbox_queries"] = int(
-        getattr(env, "n_blackbox_queries", 0)
+    episode_data["n_blackbox_queries"] = max(
+        0, int(getattr(env, "n_blackbox_queries", 0)) - _bbq_at_entry
     )
     return episode_data
 
