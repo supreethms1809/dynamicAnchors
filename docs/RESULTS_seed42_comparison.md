@@ -1,6 +1,10 @@
 # Seed-42 Results: MADA vs RLDA vs Baselines
 
-Generated 2026-09-02 10:21. Branch `ma-training-config-bump`, commit `67c9e9c`.
+Generated 2026-09-02 10:42. Branch `ma-training-config-bump`.
+
+Tables are grouped **by dataset**, with the DNN and RandomForest black boxes
+adjacent, so the effect of swapping the explained model is read top-to-bottom
+within one dataset.
 
 ## What was run
 
@@ -16,8 +20,8 @@ Generated 2026-09-02 10:21. Branch `ma-training-config-bump`, commit `67c9e9c`.
 | Selection | validation split, greedy marginal-gain union (k≤5); reporting on test |
 | τ_P / τ_C | 0.90 / 0.10 |
 
-Both arms of a given (dataset, black box) load the **same classifier file**, so MADA and
-RLDA always explain an identical model.
+Both arms of a given (dataset, black box) load the **same classifier file**, so MADA
+and RLDA always explain an identical model.
 
 ### Metric directions
 
@@ -28,17 +32,19 @@ RLDA always explain an identical model.
 | **Conflict** | fraction of rows covered by rules of >1 class | **lower** |
 | **Abstain** | fraction of rows no rule covers | **lower** |
 | **Success** | episodes reaching τ_P and τ_C / episodes attempted | higher |
-| **Extraction queries** | black-box calls to BUILD the rule set (generation + validation selection) | lower |
-| **Training queries** | black-box calls during POLICY TRAINING — RL arms only | lower |
+| **Extraction queries** | black-box calls to BUILD the rule set — *not* training | lower |
 
-`Cov` and `Abstain` sum to 1 by construction. Success applies only to the RL arms —
-baselines are not episodic and report `null`, not 0.
+`Cov` and `Abstain` sum to 1. Success applies only to the RL arms — baselines are
+not episodic and report `null`, not 0. See **Query accounting** below before
+quoting any cost number.
 
 ---
 
-## DNN black box
+## Per-dataset results
 
 ### iris
+
+**DNN black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -49,77 +55,7 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 1.000 | 0.567 | 0.033 | 0.433 | — | 65,614 |
 | random_search | 0.864 | 0.733 | 0.133 | 0.267 | — | 30 |
 
-### wine
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.962 | 0.722 | 0.306 | 0.278 | 0.150 (27/180) | 25,128 |
-| RLDA | 0.923 | 0.722 | 0.139 | 0.278 | 0.250 (15/60) | 14,688 |
-| CART | 0.920 | 0.694 | 0.000 | 0.306 | — | 142 |
-| greedy_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
-| sp_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
-| random_search | 1.000 | 0.028 | 0.000 | 0.972 | — | 36 |
-
-### breast_cancer
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.930 | 0.877 | 0.053 | 0.123 | 0.133 (16/120) | 53,880 |
-| RLDA | 0.918 | 0.746 | 0.000 | 0.254 | 0.250 (10/40) | 31,412 |
-| CART | 0.908 | 0.956 | 0.000 | 0.044 | — | 455 |
-| greedy_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
-| sp_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
-| random_search | 1.000 | 0.035 | 0.000 | 0.965 | — | 114 |
-
-### synthetic
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.895 | 0.905 | 0.415 | 0.095 | 0.075 (9/120) | 94,800 |
-| RLDA | 0.907 | 0.645 | 0.050 | 0.355 | 0.250 (10/40) | 55,240 |
-| CART | 0.705 | 0.950 | 0.000 | 0.050 | — | 800 |
-| greedy_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
-| sp_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
-| random_search | 1.000 | 0.100 | 0.000 | 0.900 | — | 200 |
-
-### housing
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.569 | 0.740 | 0.080 | 0.260 | 0.004 (1/240) | 3,913,344 |
-| RLDA | 0.515 | 0.646 | 0.100 | 0.354 | 0.037 (3/80) | 2,278,736 |
-| CART | 0.563 | 0.998 | 0.000 | 0.002 | — | 16,512 |
-| greedy_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
-| sp_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
-| random_search | 0.681 | 0.169 | 0.000 | 0.831 | — | 4,128 |
-
-### uci_credit
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.930 | 0.935 | 0.043 | 0.065 | 0.120 (18/150) | 77,832 |
-| RLDA | 0.926 | 0.884 | 0.000 | 0.116 | 0.060 (3/50) | 46,418 |
-| CART | 0.905 | 0.993 | 0.000 | 0.007 | — | 552 |
-| greedy_anchors | 0.980 | 0.710 | 0.007 | 0.290 | — | 36,117 |
-| sp_anchors | 0.891 | 0.993 | 0.442 | 0.007 | — | 36,117 |
-| random_search | — | 0.000 | 0.000 | 1.000 | — | 138 |
-
-### uci_adult
-
-| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
-|---|---|---|---|---|---|---|
-| MADA | 0.877 | 0.894 | 0.080 | 0.106 | 0.047 (7/150) | 5,509,158 |
-| RLDA | 0.871 | 0.746 | 0.054 | 0.254 | 0.020 (1/50) | 3,282,098 |
-| CART | 0.800 | 1.000 | 0.000 | 0.000 | — | 39,073 |
-| greedy_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
-| sp_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
-| random_search | 0.996 | 0.029 | 0.000 | 0.971 | — | 9,769 |
-
----
-
-## RandomForest black box
-
-### iris
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -130,7 +66,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 0.933 | 0.500 | 0.033 | 0.500 | — | 100,349 |
 | random_search | 0.864 | 0.733 | 0.133 | 0.267 | — | 30 |
 
+*DNN → RF:* MADA Fid 0.958→0.964, Cov 0.800→0.933 · RLDA Fid 0.967→0.960, Cov 1.000→0.833
+
+---
+
 ### wine
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.962 | 0.722 | 0.306 | 0.278 | 0.150 (27/180) | 25,128 |
+| RLDA | 0.923 | 0.722 | 0.139 | 0.278 | 0.250 (15/60) | 14,688 |
+| CART | 0.920 | 0.694 | 0.000 | 0.306 | — | 142 |
+| greedy_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
+| sp_anchors | 1.000 | 0.389 | 0.000 | 0.611 | — | 336,401 |
+| random_search | 1.000 | 0.028 | 0.000 | 0.972 | — | 36 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -141,7 +94,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 1.000 | 0.556 | 0.000 | 0.444 | — | 481,231 |
 | random_search | — | 0.000 | 0.000 | 1.000 | — | 36 |
 
+*DNN → RF:* MADA Fid 0.962→0.657, Cov 0.722→0.972 · RLDA Fid 0.923→0.968, Cov 0.722→0.861
+
+---
+
 ### breast_cancer
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.930 | 0.877 | 0.053 | 0.123 | 0.133 (16/120) | 53,880 |
+| RLDA | 0.918 | 0.746 | 0.000 | 0.254 | 0.250 (10/40) | 31,412 |
+| CART | 0.908 | 0.956 | 0.000 | 0.044 | — | 455 |
+| greedy_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
+| sp_anchors | 1.000 | 0.526 | 0.000 | 0.474 | — | 794,676 |
+| random_search | 1.000 | 0.035 | 0.000 | 0.965 | — | 114 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -152,7 +122,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 1.000 | 0.711 | 0.000 | 0.289 | — | 908,911 |
 | random_search | 1.000 | 0.026 | 0.000 | 0.974 | — | 114 |
 
+*DNN → RF:* MADA Fid 0.930→0.920, Cov 0.877→0.877 · RLDA Fid 0.918→0.952, Cov 0.746→0.912
+
+---
+
 ### synthetic
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.895 | 0.905 | 0.415 | 0.095 | 0.075 (9/120) | 94,800 |
+| RLDA | 0.907 | 0.645 | 0.050 | 0.355 | 0.250 (10/40) | 55,240 |
+| CART | 0.705 | 0.950 | 0.000 | 0.050 | — | 800 |
+| greedy_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
+| sp_anchors | 0.914 | 0.465 | 0.000 | 0.535 | — | 95,493 |
+| random_search | 1.000 | 0.100 | 0.000 | 0.900 | — | 200 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -163,7 +150,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 0.955 | 0.440 | 0.000 | 0.560 | — | 49,689 |
 | random_search | 0.810 | 0.105 | 0.015 | 0.895 | — | 200 |
 
+*DNN → RF:* MADA Fid 0.895→0.890, Cov 0.905→0.865 · RLDA Fid 0.907→1.000, Cov 0.645→0.475
+
+---
+
 ### housing
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.569 | 0.740 | 0.080 | 0.260 | 0.004 (1/240) | 3,913,344 |
+| RLDA | 0.515 | 0.646 | 0.100 | 0.354 | 0.037 (3/80) | 2,278,736 |
+| CART | 0.563 | 0.998 | 0.000 | 0.002 | — | 16,512 |
+| greedy_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
+| sp_anchors | 0.681 | 0.238 | 0.000 | 0.762 | — | 482,158 |
+| random_search | 0.681 | 0.169 | 0.000 | 0.831 | — | 4,128 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -174,7 +178,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 0.692 | 0.271 | 0.000 | 0.729 | — | 370,950 |
 | random_search | 0.825 | 0.101 | 0.000 | 0.899 | — | 4,128 |
 
+*DNN → RF:* MADA Fid 0.569→0.902, Cov 0.740→0.246 · RLDA Fid 0.515→0.912, Cov 0.646→0.193
+
+---
+
 ### uci_credit
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.930 | 0.935 | 0.043 | 0.065 | 0.120 (18/150) | 77,832 |
+| RLDA | 0.926 | 0.884 | 0.000 | 0.116 | 0.060 (3/50) | 46,418 |
+| CART | 0.905 | 0.993 | 0.000 | 0.007 | — | 552 |
+| greedy_anchors | 0.980 | 0.710 | 0.007 | 0.290 | — | 36,117 |
+| sp_anchors | 0.891 | 0.993 | 0.442 | 0.007 | — | 36,117 |
+| random_search | — | 0.000 | 0.000 | 1.000 | — | 138 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -185,7 +206,24 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 0.934 | 0.993 | 0.457 | 0.007 | — | 63,141 |
 | random_search | — | 0.000 | 0.000 | 1.000 | — | 138 |
 
+*DNN → RF:* MADA Fid 0.930→0.935, Cov 0.935→1.000 · RLDA Fid 0.926→0.989, Cov 0.884→0.630
+
+---
+
 ### uci_adult
+
+**DNN black box**
+
+| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
+|---|---|---|---|---|---|---|
+| MADA | 0.877 | 0.894 | 0.080 | 0.106 | 0.047 (7/150) | 5,509,158 |
+| RLDA | 0.871 | 0.746 | 0.054 | 0.254 | 0.020 (1/50) | 3,282,098 |
+| CART | 0.800 | 1.000 | 0.000 | 0.000 | — | 39,073 |
+| greedy_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
+| sp_anchors | 0.936 | 0.573 | 0.000 | 0.427 | — | 66,155 |
+| random_search | 0.996 | 0.029 | 0.000 | 0.971 | — | 9,769 |
+
+**RandomForest black box**
 
 | method | Fid | Cov | Conflict | Abstain | Success | extraction queries |
 |---|---|---|---|---|---|---|
@@ -196,11 +234,13 @@ baselines are not episodic and report `null`, not 0.
 | sp_anchors | 0.932 | 1.000 | 0.117 | 0.000 | — | 102,564 |
 | random_search | 0.973 | 0.049 | 0.000 | 0.951 | — | 9,769 |
 
+*DNN → RF:* MADA Fid 0.877→0.896, Cov 0.894→1.000 · RLDA Fid 0.871→0.917, Cov 0.746→0.743
+
 ---
 
 ## Head-to-head: MADA vs RLDA
 
-Counts are wins / losses / ties across the 7 datasets.
+Wins / losses / ties across the 7 datasets.
 
 | Metric | DNN | RF |
 |---|---|---|
@@ -217,20 +257,6 @@ Counts are wins / losses / ties across the 7 datasets.
 | MADA vs CART (RF) | 5W/2L/0T | 3W/3L/1T | 0W/6L/1T | 3W/3L/1T |
 | RLDA vs CART (DNN) | 6W/1L/0T | 2W/5L/0T | 0W/5L/2T | 2W/5L/0T |
 | RLDA vs CART (RF) | 6W/1L/0T | 1W/6L/0T | 0W/4L/3T | 1W/6L/0T |
-
-## Effect of the black box: DNN → RandomForest
-
-Same method, same dataset, different model being explained.
-
-| dataset | MADA Fid | MADA Cov | RLDA Fid | RLDA Cov |
-|---|---|---|---|---|
-| iris | 0.958 → 0.964 | 0.800 → 0.933 | 0.967 → 0.960 | 1.000 → 0.833 |
-| wine | 0.962 → 0.657 | 0.722 → 0.972 | 0.923 → 0.968 | 0.722 → 0.861 |
-| breast_cancer | 0.930 → 0.920 | 0.877 → 0.877 | 0.918 → 0.952 | 0.746 → 0.912 |
-| synthetic | 0.895 → 0.890 | 0.905 → 0.865 | 0.907 → 1.000 | 0.645 → 0.475 |
-| housing | 0.569 → 0.902 | 0.740 → 0.246 | 0.515 → 0.912 | 0.646 → 0.193 |
-| uci_credit | 0.930 → 0.935 | 0.935 → 1.000 | 0.926 → 0.989 | 0.884 → 0.630 |
-| uci_adult | 0.877 → 0.896 | 0.894 → 1.000 | 0.871 → 0.917 | 0.746 → 0.743 |
 
 ---
 
