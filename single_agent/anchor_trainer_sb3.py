@@ -387,13 +387,25 @@ class CriticDivergenceGuard(BaseCallback):
     a missing best_model a hard failure rather than a silent fallback.
     """
 
-    def __init__(self, threshold: float, patience: int = 3, verbose: int = 0):
+    def __init__(self, threshold: float, patience: int = 3, verbose: int = 0,
+                 min_steps: int = 5000):
         super().__init__(verbose)
         self.threshold = float(threshold)
         self.patience = int(patience)
+        self.min_steps = int(min_steps)
         self.n_over = 0
         self.diverged = False
         self.diverged_at = None
+        # ARMING. An absolute threshold alone cannot tell "untrained" from
+        # "diverged": at learning_starts the critic has fit nothing, and the
+        # initial loss is algorithm-dependent -- measured 2026-09-01 on
+        # breast_cancer class_1, DDPG starts at 0.96 but SAC starts at 1.4e3,
+        # so a fixed 1e3 threshold flagged SAC as diverged at 1,004 steps and
+        # (via the G-05 no-best_model guard) killed the run outright.
+        # The guard therefore arms only once the critic has DEMONSTRATED it can
+        # fit -- i.e. the loss has come below the threshold at least once.
+        # Divergence after that is a real regression, not a starting transient.
+        self.armed = False
 
     def _current_critic_loss(self):
         rec = getattr(self.model, "logger", None)
@@ -412,17 +424,19 @@ class CriticDivergenceGuard(BaseCallback):
         if self.threshold <= 0:
             return True
         loss = self._current_critic_loss()
-        if loss is None or not np.isfinite(loss):
-            # A non-finite loss is itself divergence, not missing data.
-            if loss is not None:
-                self.n_over += 1
-            else:
-                return True
-        elif loss > self.threshold:
-            self.n_over += 1
-        else:
+        if loss is None:
+            return True
+        if np.isfinite(loss) and loss <= self.threshold:
+            # The critic can fit. Arm the guard and reset the violation streak.
+            self.armed = True
             self.n_over = 0
             return True
+        if not self.armed or self.num_timesteps < self.min_steps:
+            # Still in the initial transient: a high loss here means untrained,
+            # not diverged.
+            return True
+        # Above threshold (or non-finite) after the critic had already fit.
+        self.n_over += 1
 
         if self.n_over >= self.patience:
             self.diverged = True
@@ -532,7 +546,7 @@ class AnchorTrainerSB3:
             "learning_starts": 1000,
             "batch_size": 512,
             "tau": 0.005,
-            "gamma": 0.99,
+            "gamma": 0.95,   # must equal env_config discount (Ng shaping)
             "train_freq": (1, "step"),
             "gradient_steps": 1,
             "action_noise_sigma": 0.1,
@@ -553,6 +567,9 @@ class AnchorTrainerSB3:
             # would only be spent making the final policy worse.
             "critic_divergence_threshold": 1e3,
             "critic_divergence_patience": 3,
+            # Guard arms only after the critic first fits below threshold, and
+            # never before this many steps -- see CriticDivergenceGuard.
+            "critic_divergence_min_steps": 5000,
             "policy_kwargs": {
                 "net_arch": [256, 256]
             },
@@ -1224,6 +1241,7 @@ class AnchorTrainerSB3:
             divergence_guard = CriticDivergenceGuard(
                 threshold=self.algorithm_config.get("critic_divergence_threshold", 1e3),
                 patience=self.algorithm_config.get("critic_divergence_patience", 3),
+                min_steps=self.algorithm_config.get("critic_divergence_min_steps", 5000),
             )
             callbacks.append(divergence_guard)
             

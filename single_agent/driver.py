@@ -393,7 +393,7 @@ def main():
         "learning_starts": 1000,
         "batch_size": 1024,
         "tau": 0.005,
-        "gamma": 0.99,
+        "gamma": 0.95,   # must equal env_config discount (Ng shaping)
         "train_freq": (1, "step"),
         "gradient_steps": 1,
         "action_noise_sigma": 0.1,

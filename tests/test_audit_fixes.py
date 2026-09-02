@@ -531,3 +531,96 @@ def test_marginal_gain_is_off_on_the_reporting_split():
     assert "marginal_gain=True" in val_call
     rep_call = src[src.index("union = select_topk_union"):][:600]
     assert "marginal_gain" not in rep_call, "reporting split must not re-select"
+
+
+# --------------------------------------------------------------- divergence guard arming
+
+class _FakeLogger:
+    def __init__(self): self.name_to_value = {}
+
+class _FakeModel:
+    def __init__(self): self.logger = _FakeLogger()
+
+def _guard(threshold=1e3, patience=3, min_steps=5000):
+    from anchor_trainer_sb3 import CriticDivergenceGuard
+    g = CriticDivergenceGuard(threshold=threshold, patience=patience, min_steps=min_steps)
+    g.model = _FakeModel()
+    g.num_timesteps = 0
+    return g
+
+def _feed(g, step, loss):
+    g.num_timesteps = step
+    g.model.logger.name_to_value["train/critic_loss"] = loss
+    return g._on_step()
+
+
+def test_guard_does_not_fire_on_the_initial_untrained_transient():
+    """SAC's critic loss STARTS at ~1.4e3 where DDPG's starts at ~0.96.
+
+    A bare absolute threshold flagged SAC as diverged at 1,004 steps and, via
+    the no-best_model hard failure, killed the run before it trained at all.
+    """
+    g = _guard()
+    for step in (200, 400, 600, 800, 1004):
+        assert _feed(g, step, 1.4e3) is True, "must not fire before the critic has ever fit"
+    assert not g.diverged
+
+
+def test_guard_fires_once_the_critic_has_fit_and_then_blows_up():
+    g = _guard()
+    assert _feed(g, 6000, 0.01) is True      # critic demonstrates it can fit -> armed
+    assert g.armed
+    assert _feed(g, 7000, 5e3) is True       # 1 violation
+    assert _feed(g, 8000, 5e4) is True       # 2
+    assert _feed(g, 9000, 5e5) is False      # 3 -> stop
+    assert g.diverged and g.diverged_at == 9000
+
+
+def test_guard_resets_the_streak_on_recovery():
+    g = _guard()
+    _feed(g, 6000, 0.01)
+    _feed(g, 7000, 5e3); _feed(g, 8000, 5e3)
+    assert _feed(g, 9000, 0.5) is True, "recovery must reset"
+    assert g.n_over == 0
+    assert _feed(g, 10000, 5e3) is True and not g.diverged
+
+
+def test_guard_respects_min_steps_even_after_arming():
+    g = _guard(min_steps=20000)
+    _feed(g, 1000, 0.01)                      # armed early
+    for step in (2000, 3000, 4000):
+        assert _feed(g, step, 9e9) is True, "min_steps must still hold it off"
+    assert not g.diverged
+
+
+# --------------------------------------------------------------- discount horizon
+
+def test_discount_matches_episode_horizon_and_is_consistent_everywhere():
+    """gamma=0.99 gives a 100-step horizon on episodes lasting 4-18 steps.
+
+    The critic then bootstraps a chain far longer than any trajectory in the
+    buffer, so approximation error compounds with nothing to correct it:
+    measured mean Q drifted to -8.25 while true returns are +4.5. At 0.95
+    (horizon 20) mean Q held ~3.8 over 40k steps.
+    """
+    ma = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
+    sa = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
+    exp = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "base_experiment.yaml"))
+    assert ma["discount"] == pytest.approx(0.95)
+    assert sa["discount"] == pytest.approx(0.95)
+    assert exp["gamma"] == pytest.approx(0.95)
+    horizon = 1.0 / (1.0 - ma["discount"])
+    assert horizon <= 2 * ma["max_cycles"], "horizon must not dwarf the episode length"
+
+
+def test_shaping_discount_equals_mdp_gamma_in_both_arms():
+    """Ng potential-based shaping is policy-invariant ONLY when the shaping
+    discount equals the MDP discount. These must move together or the reward
+    stops being a valid shaping of the original objective."""
+    ma = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
+    sa = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
+    exp = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "base_experiment.yaml"))
+    assert ma["discount"] == pytest.approx(exp["gamma"]), "MADA: env discount != algorithm gamma"
+    assert sa["discount"] == pytest.approx(ma["discount"]), "arms disagree on discount"
+    src = (REPO / "single_agent" / "anchor_trainer_sb3.py").read_text()
+    assert '"gamma": 0.95' in src, "RLDA algorithm gamma must match its env discount"

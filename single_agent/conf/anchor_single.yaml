@@ -37,7 +37,14 @@ env_config:
   activation_quantile: 0.05
   reset_diversity_frac: 0.3
   n_reset_landings: 2
-  discount: 0.99
+  # 0.95: horizon 1/(1-g)=20 matches the measured ep_len 4-18. At 0.99 the
+  # critic bootstraps a 100-step chain on episodes that never reach 18, so
+  # approximation error compounds uncorrected: mean Q drifted to -8.25 while
+  # true returns are +4.5. At 0.95 mean Q holds ~3.8 over 40k steps. Measured
+  # 2026-09-01, breast_cancer class_1, identical seed/env otherwise.
+  # MUST stay equal to the algorithm gamma: Ng potential-based shaping is only
+  # policy-invariant when the shaping discount equals the MDP discount.
+  discount: 0.95
   sparsity_terminal_weight: 1.0
   require_precision_gain_to_terminate: true
 

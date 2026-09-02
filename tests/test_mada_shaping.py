@@ -77,7 +77,7 @@ def _noop(env, agents):
 def test_discount_is_not_the_overlap_gamma():
     env = _env()
     assert env.gamma == pytest.approx(0.1)          # narrow-width penalty weight
-    assert env.discount == pytest.approx(0.99)      # Ng shaping discount
+    assert env.discount == pytest.approx(0.95)      # Ng shaping discount (horizon 20)
     assert _env(discount=0.5).discount == pytest.approx(0.5)
 
 
