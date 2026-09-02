@@ -1118,9 +1118,21 @@ class AnchorTrainerSB3:
             logger.info(f"    Action space: {env.action_space}")
     
     def _write_training_query_count(self) -> None:
-        """training_queries.json, summed over class shards (G-04)."""
+        """Per-shard training query count (G-04).
+
+        RLDA runs ONE PROCESS PER CLASS (run_parallel_classes.py), and every
+        shard shares one experiment_folder. Writing a single
+        `training_queries.json` therefore had last-writer-wins semantics: the
+        file ended up holding one class's count, not the run's. Measured
+        2026-09-02: wine (3 classes) reported per_class={'1': 248}. The total
+        was undercounted by roughly a factor of n_classes.
+
+        Each shard now writes its OWN file, keyed by the classes it trained.
+        Readers sum `training_queries*.json` across the folder.
+        """
         total = int(sum(self._training_queries_by_class.values()))
-        path = os.path.join(self.experiment_folder, "training_queries.json")
+        tag = "_".join(str(c) for c in sorted(self._training_queries_by_class)) or "all"
+        path = os.path.join(self.experiment_folder, f"training_queries_class{tag}.json")
         with open(path, "w") as f:
             json.dump({
                 "n_training_queries": total,

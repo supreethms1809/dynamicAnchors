@@ -3396,12 +3396,17 @@ def extract_rules_single_agent(
     _train_q = 0
     _train_q_complete = False
     try:
-        _tq_path = os.path.join(str(experiment_dir), "training_queries.json")
-        if os.path.exists(_tq_path):
-            with open(_tq_path) as _f:
-                _tq = json.load(_f)
-            _train_q = int(_tq.get("n_training_queries") or 0)
-            _train_q_complete = bool(_tq.get("complete", False))
+        import glob as _glob
+        _paths = sorted(_glob.glob(os.path.join(str(experiment_dir), "training_queries*.json")))
+        if _paths:
+            # Sum across shards: RLDA writes one file per class-shard process.
+            _train_q = 0
+            _train_q_complete = bool(_paths)
+            for _p in _paths:
+                with open(_p) as _f:
+                    _tq = json.load(_f)
+                _train_q += int(_tq.get("n_training_queries") or 0)
+                _train_q_complete = _train_q_complete and bool(_tq.get("complete", False))
     except Exception as _e:
         logger.warning(f"Could not read training_queries.json: {_e}")
     results["queries"] = {
