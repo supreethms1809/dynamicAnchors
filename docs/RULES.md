@@ -1,6 +1,6 @@
 # Extracted Rules
 
-Generated 2026-09-03 09:12. Branch `ma-training-config-bump`.
+Generated 2026-09-03 16:38. Branch `ma-training-config-bump`.
 
 The actual rule sets behind the numbers in `RESULTS_comparison.md`.
 Rules are the **validation-selected union**, scored on the **test** split.
@@ -218,21 +218,24 @@ its members.
     1. petal width (cm) ∈ [0.100000, 0.400000]  — Fid 1.000, Cov 1.000, n=10
   - seed 43 (k=1)
     1. petal width (cm) ∈ [0.100000, 0.488068]  — Fid 1.000, Cov 0.900, n=9
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. sepal length (cm) ∈ [4.686482, 7.900000] and sepal width (cm) ∈ [3.137640, 4.400000] and petal width (cm) ∈ [0.100000, 0.400000]  — Fid 1.000, Cov 0.500, n=5
 
 - `class_1`
   - seed 42 (k=1)
     1. sepal length (cm) ∈ [5.464249, 7.900000] and petal width (cm) ∈ [0.100000, 1.500000]  — Fid 0.750, Cov 0.500, n=8
   - seed 43 (k=1)
     1. petal length (cm) ∈ [3.147385, 4.800000]  — Fid 1.000, Cov 1.000, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal length (cm) ∈ [3.530310, 6.700000] and petal width (cm) ∈ [0.100000, 1.606667]  — Fid 1.000, Cov 0.900, n=10
 
 - `class_2`
   - seed 42 (k=1)
     1. sepal width (cm) ∈ [2.500000, 3.613333] and petal length (cm) ∈ [4.894028, 6.900000]  — Fid 0.900, Cov 0.900, n=10
   - seed 43 (k=1)
     1. sepal length (cm) ∈ [5.486940, 7.900000] and petal length (cm) ∈ [4.546051, 6.100000] and petal width (cm) ∈ [0.100000, 2.310000]  — Fid 0.375, Cov 0.600, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. sepal length (cm) ∈ [6.117279, 7.900000] and sepal width (cm) ∈ [2.700000, 4.400000]  — Fid 0.875, Cov 0.700, n=8
 
 
 **cart**
@@ -242,21 +245,24 @@ its members.
     1. petal length (cm) <= 2.450000  — Fid 1.000, Cov 0.800, n=8
   - seed 43 (k=1)
     1. petal length (cm) <= 2.450000  — Fid 1.000, Cov 1.000, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) <= 0.800000  — Fid 1.000, Cov 0.900, n=9
 
 - `class_1`
   - seed 42 (k=1)
     1. petal length (cm) > 2.450000 and petal width (cm) <= 1.650000  — Fid 1.000, Cov 0.900, n=10
   - seed 43 (k=1)
     1. petal length (cm) > 2.450000 and petal width (cm) <= 1.550000  — Fid 1.000, Cov 0.800, n=9
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) > 0.800000 and petal width (cm) <= 1.750000  — Fid 1.000, Cov 1.000, n=11
 
 - `class_2`
   - seed 42 (k=1)
     1. petal length (cm) > 2.450000 and petal width (cm) > 1.650000  — Fid 1.000, Cov 0.900, n=10
   - seed 43 (k=1)
     1. petal length (cm) > 2.450000 and petal width (cm) > 1.550000  — Fid 0.600, Cov 0.800, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) > 0.800000 and petal width (cm) > 1.750000  — Fid 1.000, Cov 0.800, n=8
 
 
 **greedy_anchors**
@@ -266,21 +272,24 @@ its members.
     1. petal width (cm) <= 0.30 and sepal length (cm) <= 5.10  — Fid 1.000, Cov 0.400, n=4
   - seed 43 (k=1)
     1. petal width (cm) <= 0.30 and petal length (cm) <= 1.60  — Fid 1.000, Cov 0.700, n=7
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) <= 1.35 and sepal width (cm) > 3.38  — Fid 1.000, Cov 0.300, n=3
 
 - `class_1`
   - seed 42 (k=1)
     1. petal width (cm) <= 1.30 and sepal width (cm) <= 2.73 and petal length (cm) <= 5.10  — Fid 1.000, Cov 0.300, n=3
   - seed 43 (k=1)
     1. 1.60 < petal length (cm) <= 4.40 and petal width (cm) <= 1.87 and sepal length (cm) > 5.75  — Fid 1.000, Cov 0.200, n=2
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. 0.30 < petal width (cm) <= 1.35 and sepal width (cm) <= 3.00  — Fid 0.875, Cov 0.700, n=8
 
 - `class_2`
   - seed 42 (k=1)
     1. petal width (cm) > 1.30 and petal length (cm) > 5.10  — Fid 0.875, Cov 0.800, n=8
   - seed 43 (k=1)
     1. petal width (cm) > 1.87 and petal length (cm) > 4.40  — Fid 1.000, Cov 0.400, n=4
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) > 1.80 and petal length (cm) > 4.45 and sepal width (cm) <= 3.00  — Fid 1.000, Cov 0.700, n=7
 
 
 **sp_anchors**
@@ -290,21 +299,24 @@ its members.
     1. petal width (cm) <= 0.30 and sepal length (cm) <= 5.10  — Fid 1.000, Cov 0.400, n=4
   - seed 43 (k=1)
     1. petal width (cm) <= 0.30 and petal length (cm) <= 1.60  — Fid 1.000, Cov 0.700, n=7
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) <= 1.35 and sepal width (cm) > 3.38  — Fid 1.000, Cov 0.300, n=3
 
 - `class_1`
   - seed 42 (k=1)
     1. petal width (cm) <= 1.80 and sepal width (cm) <= 3.00 and 1.60 < petal length (cm) <= 4.25  — Fid 0.750, Cov 0.300, n=4
   - seed 43 (k=1)
     1. 0.30 < petal width (cm) <= 1.87 and 1.60 < petal length (cm) <= 5.10 and sepal width (cm) <= 3.27  — Fid 0.846, Cov 0.800, n=13
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. 0.30 < petal width (cm) <= 1.35 and sepal width (cm) <= 3.00  — Fid 0.875, Cov 0.700, n=8
 
 - `class_2`
   - seed 42 (k=1)
     1. petal width (cm) > 1.30 and petal length (cm) > 5.10  — Fid 0.875, Cov 0.800, n=8
   - seed 43 (k=1)
     1. petal width (cm) > 1.87 and petal length (cm) > 4.40  — Fid 1.000, Cov 0.400, n=4
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal length (cm) > 5.10 and petal width (cm) > 1.35  — Fid 1.000, Cov 0.800, n=8
 
 
 **random_search**
@@ -314,21 +326,24 @@ its members.
     1. random box 111  — Fid 1.000, Cov 1.000, n=10
   - seed 43 (k=1)
     1. random box 100  — Fid 1.000, Cov 0.900, n=9
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 10  — Fid 1.000, Cov 0.600, n=6
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 57  — Fid 0.714, Cov 0.400, n=7
   - seed 43 (k=1)
     1. random box 133  — Fid 1.000, Cov 0.800, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 116  — Fid 1.000, Cov 0.900, n=9
 
 - `class_2`
   - seed 42 (k=1)
     1. random box 51  — Fid 0.667, Cov 0.500, n=9
   - seed 43 (k=1)
     1. random box 235  — Fid 0.500, Cov 0.800, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 188  — Fid 1.000, Cov 0.400, n=4
 
 
 
@@ -533,21 +548,24 @@ its members.
     1. ash ∈ [2.127401, 2.840000] and magnesium ∈ [93.318634, 115.000000] and flavanoids ∈ [2.406571, 3.740000]  — Fid 1.000, Cov 0.750, n=9
   - seed 43 (k=1)
     1. alcalinity_of_ash ∈ [15.160000, 19.542856] and proanthocyanins ∈ [1.359143, 2.960000]  — Fid 0.583, Cov 0.583, n=12
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. alcohol ∈ [13.067714, 14.830000]  — Fid 0.688, Cov 0.917, n=16
 
 - `class_1`
   - seed 42 (k=1)
     1. alcohol ∈ [11.030000, 12.946000]  — Fid 0.800, Cov 0.857, n=15
   - seed 43 (k=1)
     1. ash ∈ [1.707252, 2.580461] and alcalinity_of_ash ∈ [18.500000, 30.000000] and flavanoids ∈ [1.277151, 3.930000]  — Fid 0.875, Cov 0.571, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. ash ∈ [1.360000, 2.583559] and nonflavanoid_phenols ∈ [0.242459, 0.558984]  — Fid 0.438, Cov 0.500, n=16
 
 - `class_2`
   - seed 42 (k=1)
     1. od280/od315_of_diluted_wines ∈ [1.290000, 2.075003]  — Fid 0.909, Cov 1.000, n=11
   - seed 43 (k=1)
     1. proanthocyanins ∈ [0.698541, 2.960000] and hue ∈ [0.573932, 0.894984]  — Fid 0.545, Cov 0.500, n=11
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. malic_acid ∈ [1.635714, 5.800000] and magnesium ∈ [70.000000, 122.035713] and total_phenols ∈ [1.150000, 2.125000]  — Fid 0.750, Cov 0.900, n=12
 
 
 **cart**
@@ -557,21 +575,24 @@ its members.
     1. color_intensity > 3.820000 and flavanoids > 1.580000  — Fid 0.889, Cov 0.667, n=9
   - seed 43 (k=1)
     1. proline > 875.000000  — Fid 0.909, Cov 0.833, n=11
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. proline > 787.500000  — Fid 0.833, Cov 0.833, n=12
 
 - `class_1`
   - seed 42 (k=1)
     1. color_intensity <= 3.820000  — Fid 0.857, Cov 0.429, n=7
   - seed 43 (k=1)
     1. proline <= 875.000000 and color_intensity <= 3.970000  — Fid 1.000, Cov 0.571, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. proline <= 787.500000 and flavanoids > 1.385000  — Fid 0.875, Cov 0.500, n=8
 
 - `class_2`
   - seed 42 (k=1)
     1. color_intensity > 3.820000 and flavanoids <= 1.580000  — Fid 1.000, Cov 0.900, n=9
   - seed 43 (k=1)
     1. proline <= 875.000000 and color_intensity > 3.970000  — Fid 0.750, Cov 0.800, n=12
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. proline <= 787.500000 and flavanoids <= 1.385000  — Fid 0.667, Cov 0.600, n=9
 
 
 **greedy_anchors**
@@ -581,21 +602,24 @@ its members.
     1. total_phenols > 1.65 and proline > 675.00 and flavanoids > 2.03 and alcohol > 13.01  — Fid 1.000, Cov 0.750, n=9
   - seed 43 (k=1)
     1. proline > 677.50 and flavanoids > 2.84 and alcalinity_of_ash <= 17.00  — Fid 1.000, Cov 0.167, n=2
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. alcohol > 12.37 and proline > 645.00 and flavanoids > 2.23  — Fid 1.000, Cov 0.917, n=11
 
 - `class_1`
   - seed 42 (k=1)
     1. color_intensity <= 4.80 and alcohol <= 12.37  — Fid 1.000, Cov 0.357, n=5
   - seed 43 (k=1)
     1. color_intensity <= 4.55 and proline <= 498.75  — Fid 1.000, Cov 0.357, n=5
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. proline <= 981.25 and color_intensity <= 3.25  — Fid 1.000, Cov 0.429, n=6
 
 - `class_2`
   - seed 42 (k=1)
     1. hue <= 0.96 and flavanoids <= 1.21 and nonflavanoid_phenols > 0.43  — Fid 1.000, Cov 0.600, n=6
   - seed 43 (k=1)
     1. flavanoids <= 2.11 and hue <= 0.80 and od280/od315_of_diluted_wines <= 2.82  — Fid 0.800, Cov 0.800, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. total_phenols <= 2.38 and od280/od315_of_diluted_wines <= 1.89  — Fid 1.000, Cov 0.700, n=7
 
 
 **sp_anchors**
@@ -605,21 +629,24 @@ its members.
     1. total_phenols > 1.65 and proline > 675.00 and flavanoids > 2.03 and alcohol > 13.01  — Fid 1.000, Cov 0.750, n=9
   - seed 43 (k=1)
     1. proline > 677.50 and flavanoids > 2.84 and alcalinity_of_ash <= 17.00  — Fid 1.000, Cov 0.167, n=2
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. alcohol > 12.37 and proline > 645.00 and flavanoids > 2.23  — Fid 1.000, Cov 0.917, n=11
 
 - `class_1`
   - seed 42 (k=1)
     1. color_intensity <= 4.80 and alcohol <= 12.37  — Fid 1.000, Cov 0.357, n=5
   - seed 43 (k=1)
     1. color_intensity <= 4.55 and proline <= 498.75  — Fid 1.000, Cov 0.357, n=5
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. proline <= 981.25 and color_intensity <= 3.25  — Fid 1.000, Cov 0.429, n=6
 
 - `class_2`
   - seed 42 (k=1)
     1. hue <= 0.96 and flavanoids <= 1.21 and nonflavanoid_phenols > 0.43  — Fid 1.000, Cov 0.600, n=6
   - seed 43 (k=1)
     1. flavanoids <= 2.11 and hue <= 0.80 and od280/od315_of_diluted_wines <= 2.82  — Fid 0.800, Cov 0.800, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. total_phenols <= 2.38 and od280/od315_of_diluted_wines <= 1.89  — Fid 1.000, Cov 0.700, n=7
 
 
 **random_search**
@@ -629,21 +656,24 @@ its members.
     1. random box 125  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 111  — Cov 0.000, n=0
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 142  — Fid 1.000, Cov 0.083, n=1
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 134  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 0  — Cov 0.000, n=0
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 128  — Cov 0.000, n=0
 
 - `class_2`
   - seed 42 (k=1)
     1. random box 181  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 0  — Cov 0.000, n=0
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 125  — Cov 0.000, n=0
 
 
 
@@ -805,14 +835,16 @@ its members.
     1. mean radius ∈ [15.262047, 28.110001] and mean texture ∈ [9.710000, 30.635748] and mean area ∈ [540.960022, 2499.000000]  — Fid 0.971, Cov 0.738, n=34
   - seed 43 (k=1)
     1. mean radius ∈ [15.052000, 27.219999] and mean texture ∈ [16.384251, 39.279999]  — Fid 0.962, Cov 0.595, n=26
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. mean radius ∈ [14.796000, 28.110001] and mean texture ∈ [17.091999, 33.810001]  — Fid 1.000, Cov 0.833, n=35
 
 - `class_1`
   - seed 42 (k=1)
     1. mean radius ∈ [6.981000, 14.643740] and mean perimeter ∈ [43.790001, 94.270996]  — Fid 0.943, Cov 0.875, n=70
   - seed 43 (k=1)
     1. mean texture ∈ [12.954393, 39.279999] and mean perimeter ∈ [43.790001, 92.480003]  — Fid 0.897, Cov 0.819, n=68
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. mean radius ∈ [6.981001, 14.530001] and mean concave points ∈ [0.006222, 0.184500] and worst smoothness ∈ [0.085289, 0.140540]  — Fid 1.000, Cov 0.542, n=40
 
 
 **cart**
@@ -822,14 +854,16 @@ its members.
     1. worst concave points > 0.145450  — Fid 0.941, Cov 0.762, n=34
   - seed 43 (k=1)
     1. worst concave points > 0.135950  — Fid 0.946, Cov 0.762, n=37
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. worst perimeter > 114.399998  — Fid 0.968, Cov 0.714, n=31
 
 - `class_1`
   - seed 42 (k=1)
     1. worst concave points <= 0.145450  — Fid 0.893, Cov 0.931, n=75
   - seed 43 (k=1)
     1. worst concave points <= 0.135950  — Fid 0.984, Cov 0.819, n=64
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. worst perimeter <= 114.399998  — Fid 0.944, Cov 0.931, n=71
 
 
 **greedy_anchors**
@@ -839,14 +873,16 @@ its members.
     1. worst area > 985.50 and worst radius > 17.98  — Fid 1.000, Cov 0.738, n=32
   - seed 43 (k=1)
     1. worst area > 489.50 and worst concave points > 0.16  — Fid 1.000, Cov 0.595, n=26
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. mean concavity > 0.03 and worst perimeter > 97.59 and perimeter error > 2.29 and worst texture > 25.48  — Fid 0.885, Cov 0.571, n=26
 
 - `class_1`
   - seed 42 (k=1)
     1. worst area <= 680.60 and worst radius <= 14.85  — Fid 1.000, Cov 0.667, n=49
   - seed 43 (k=1)
     1. worst concave points <= 0.10 and mean concavity <= 0.03  — Fid 1.000, Cov 0.375, n=28
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. worst concave points <= 0.10 and worst concavity <= 0.12  — Fid 1.000, Cov 0.347, n=25
 
 
 **sp_anchors**
@@ -856,14 +892,16 @@ its members.
     1. worst area > 985.50 and worst radius > 17.98  — Fid 1.000, Cov 0.738, n=32
   - seed 43 (k=1)
     1. worst area > 489.50 and worst concave points > 0.16  — Fid 1.000, Cov 0.595, n=26
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. mean concavity > 0.03 and worst perimeter > 97.59 and perimeter error > 2.29 and worst texture > 25.48  — Fid 0.885, Cov 0.571, n=26
 
 - `class_1`
   - seed 42 (k=1)
     1. worst area <= 680.60 and worst radius <= 14.85  — Fid 1.000, Cov 0.667, n=49
   - seed 43 (k=1)
     1. worst concave points <= 0.10 and mean concavity <= 0.03  — Fid 1.000, Cov 0.375, n=28
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. worst concave points <= 0.10 and worst concavity <= 0.12  — Fid 1.000, Cov 0.347, n=25
 
 
 **random_search**
@@ -873,14 +911,16 @@ its members.
     1. random box 187  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 228  — Cov 0.000, n=0
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 146  — Fid 0.000, Cov 0.000, n=1
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 102  — Fid 1.000, Cov 0.042, n=3
   - seed 43 (k=1)
     1. random box 166  — Fid 1.000, Cov 0.111, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 186  — Cov 0.000, n=0
 
 
 
@@ -1043,14 +1083,16 @@ its members.
     1. feature_0 ∈ [-4.661168, 1.503932] and feature_4 ∈ [-0.318891, 6.036793] and feature_5 ∈ [0.199058, 5.608411]  — Fid 1.000, Cov 0.596, n=60
   - seed 43 (k=1)
     1. feature_0 ∈ [-4.417074, 1.563181] and feature_2 ∈ [-2.248454, 3.430854] and feature_3 ∈ [-1.474722, 5.864470] and feature_6 ∈ [-3.060544, 0.157763] and feature_7 ∈ [-0.555029, 3.962004] and feature_8 ∈ [-3.468153, -0.050120] and feature_9 ∈ [-0.636340, 3.438132]  — Fid 1.000, Cov 0.150, n=15
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_0 ∈ [-1.024776, 4.254667] and feature_7 ∈ [-3.526631, -0.318895] and feature_9 ∈ [-0.252362, 5.524426]  — Fid 0.972, Cov 0.320, n=36
 
 - `class_1`
   - seed 42 (k=1)
     1. feature_0 ∈ [-4.661168, 2.774007] and feature_3 ∈ [-1.186223, 4.843362] and feature_4 ∈ [-3.716660, -0.019826] and feature_6 ∈ [-0.992333, 7.456970]  — Fid 1.000, Cov 0.347, n=35
   - seed 43 (k=1)
     1. feature_0 ∈ [0.894977, 5.282501] and feature_3 ∈ [-9.130013, 0.266369] and feature_8 ∈ [-0.089434, 5.184010]  — Fid 0.969, Cov 0.630, n=64
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_0 ∈ [-5.354650, 0.995045] and feature_6 ∈ [-0.486886, 5.589865] and feature_7 ∈ [-0.234976, 5.722162]  — Fid 0.955, Cov 0.610, n=66
 
 
 **cart**
@@ -1060,14 +1102,16 @@ its members.
     1. feature_4 > 0.031331  — Fid 0.667, Cov 0.859, n=132
   - seed 43 (k=1)
     1. feature_2 > 0.610751  — Fid 0.870, Cov 0.380, n=46
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 <= -0.241016  — Fid 0.822, Cov 0.720, n=101
 
 - `class_1`
   - seed 42 (k=1)
     1. feature_4 <= 0.031331  — Fid 0.828, Cov 0.495, n=58
   - seed 43 (k=1)
     1. feature_2 <= 0.610751  — Fid 0.620, Cov 0.900, n=150
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 > -0.241016  — Fid 0.764, Cov 0.660, n=89
 
 
 **greedy_anchors**
@@ -1077,14 +1121,16 @@ its members.
     1. feature_4 > 0.53 and feature_5 > -0.69 and feature_0 <= 1.65  — Fid 0.934, Cov 0.566, n=61
   - seed 43 (k=1)
     1. feature_0 <= -0.46 and feature_2 > -0.52 and feature_4 <= 1.40  — Fid 0.968, Cov 0.310, n=31
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 <= -0.10 and feature_0 > 0.73  — Fid 0.966, Cov 0.250, n=29
 
 - `class_1`
   - seed 42 (k=1)
     1. feature_4 <= -0.61 and feature_3 > 0.29  — Fid 1.000, Cov 0.267, n=27
   - seed 43 (k=1)
     1. feature_8 > -0.56 and feature_2 <= -0.52 and feature_7 <= -0.63  — Fid 0.974, Cov 0.350, n=38
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 > -0.10 and feature_6 > 0.59 and feature_0 <= -0.51  — Fid 1.000, Cov 0.350, n=35
 
 
 **sp_anchors**
@@ -1094,14 +1140,16 @@ its members.
     1. feature_4 > 0.53 and feature_5 > -0.69 and feature_0 <= 1.65  — Fid 0.934, Cov 0.566, n=61
   - seed 43 (k=1)
     1. feature_0 <= -0.46 and feature_2 > -0.52 and feature_4 <= 1.40  — Fid 0.968, Cov 0.310, n=31
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 <= -0.10 and feature_0 > 0.73  — Fid 0.966, Cov 0.250, n=29
 
 - `class_1`
   - seed 42 (k=1)
     1. feature_4 <= -0.61 and feature_3 > 0.29  — Fid 1.000, Cov 0.267, n=27
   - seed 43 (k=1)
     1. feature_8 > -0.56 and feature_2 <= -0.52 and feature_7 <= -0.63  — Fid 0.974, Cov 0.350, n=38
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 > -0.10 and feature_6 > 0.59 and feature_0 <= -0.51  — Fid 1.000, Cov 0.350, n=35
 
 
 **random_search**
@@ -1111,14 +1159,16 @@ its members.
     1. random box 203  — Fid 0.750, Cov 0.081, n=12
   - seed 43 (k=1)
     1. random box 167  — Fid 0.833, Cov 0.050, n=6
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 119  — Fid 0.818, Cov 0.090, n=11
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 97  — Fid 0.750, Cov 0.099, n=12
   - seed 43 (k=1)
     1. random box 235  — Fid 0.900, Cov 0.090, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 7  — Fid 0.556, Cov 0.100, n=18
 
 
 
@@ -1437,28 +1487,32 @@ its members.
     1. MedInc ∈ [0.499900, 2.564511] and AveBedrms ∈ [1.068926, 14.111111] and Latitude ∈ [34.240002, 41.880001] and Longitude ∈ [-121.619995, -114.489990]  — Fid 0.960, Cov 0.140, n=174
   - seed 43 (k=1)
     1. MedInc ∈ [0.499900, 2.814031] and AveRooms ∈ [4.253335, 132.533340] and Latitude ∈ [33.812988, 41.950001]  — Fid 0.858, Cov 0.456, n=696
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc ∈ [0.499900, 2.792080] and AveRooms ∈ [4.237594, 141.909088] and Latitude ∈ [33.770000, 41.950005]  — Fid 0.861, Cov 0.475, n=693
 
 - `class_1`
   - seed 42 (k=1)
     1. MedInc ∈ [3.012578, 15.000100] and AveBedrms ∈ [0.444444, 1.038734] and AveOccup ∈ [4.307551, 502.461578] and Longitude ∈ [-120.469994, -114.489990]  — Fid 0.889, Cov 0.024, n=36
   - seed 43 (k=1)
     1. MedInc ∈ [2.013499, 15.000101] and HouseAge ∈ [16.999998, 52.000000] and AveRooms ∈ [3.294988, 5.484581] and AveOccup ∈ [4.948204, 502.461548] and Longitude ∈ [-121.811623, -114.309998]  — Fid 0.839, Cov 0.017, n=31
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. HouseAge ∈ [23.000000, 51.999996] and AveRooms ∈ [0.846154, 6.121200] and AveBedrms ∈ [1.008751, 25.636364] and AveOccup ∈ [3.524548, 1243.333374] and Latitude ∈ [32.540001, 34.435696] and Longitude ∈ [-122.120003, -114.470001]  — Fid 0.654, Cov 0.130, n=263
 
 - `class_2`
   - seed 42 (k=1)
     1. MedInc ∈ [3.035674, 15.000100] and AveRooms ∈ [0.846154, 5.274409] and AveOccup ∈ [2.560740, 3.393601] and Latitude ∈ [32.549999, 37.958115] and Longitude ∈ [-119.106606, -118.089989]  — Fid 0.854, Cov 0.054, n=103
   - seed 43 (k=1)
     1. MedInc ∈ [4.347200, 6.176807] and HouseAge ∈ [1.000000, 39.000000] and AveRooms ∈ [4.950607, 6.022175] and AveBedrms ∈ [0.908449, 1.180356] and AveOccup ∈ [2.532744, 502.461548]  — Fid 0.683, Cov 0.118, n=221
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc ∈ [0.499900, 5.462598] and HouseAge ∈ [10.000000, 51.999996] and AveRooms ∈ [0.846154, 5.452035] and AveOccup ∈ [2.018638, 3.125831] and Latitude ∈ [34.145229, 34.380001] and Longitude ∈ [-121.680481, -117.860001]  — Fid 0.838, Cov 0.061, n=99
 
 - `class_3`
   - seed 42 (k=1)
     1. MedInc ∈ [5.367700, 15.000100] and HouseAge ∈ [1.000000, 52.000000] and AveRooms ∈ [4.021782, 62.422218] and Population ∈ [3.000000, 3550.383789] and AveOccup ∈ [0.692308, 3.116878]  — Fid 0.903, Cov 0.384, n=487
   - seed 43 (k=1)
     1. MedInc ∈ [5.367352, 15.000101] and HouseAge ∈ [23.000000, 52.000000] and AveBedrms ∈ [0.333333, 1.165973] and AveOccup ∈ [0.692308, 3.002718] and Longitude ∈ [-124.349998, -118.400002]  — Fid 0.977, Cov 0.155, n=177
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc ∈ [5.956371, 15.000101] and AveOccup ∈ [2.136319, 1243.333374] and Latitude ∈ [32.540001, 38.590084]  — Fid 0.949, Cov 0.358, n=434
 
 
 **cart**
@@ -1468,21 +1522,30 @@ its members.
     1. MedInc <= 3.198700  — Fid 0.557, Cov 0.821, n=1771
   - seed 43 (k=1)
     1. MedInc <= 3.133950  — Fid 0.583, Cov 0.782, n=1662
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc <= 3.176250 and Latitude > 34.455000  — Fid 0.787, Cov 0.544, n=892
+
+- `class_1`
+  - seed 42: _not run_
+  - seed 43: _not run_
+  - seed 44 (k=1)
+    1. MedInc <= 3.176250 and Latitude <= 34.455000  — Fid 0.403, Cov 0.299, n=836
 
 - `class_2`
   - seed 42 (k=1)
     1. MedInc > 3.198700 and MedInc <= 5.776350 and AveOccup > 2.395127  — Fid 0.477, Cov 0.515, n=1364
   - seed 43 (k=1)
     1. MedInc > 3.133950 and MedInc <= 5.951500 and AveOccup > 2.418130  — Fid 0.485, Cov 0.553, n=1500
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc > 3.176250 and MedInc <= 5.617250  — Fid 0.423, Cov 0.630, n=1833
 
 - `class_3`
   - seed 42 (k=1)
     1. MedInc > 3.198700 and MedInc > 5.776350  — Fid 0.906, Cov 0.427, n=531
   - seed 43 (k=1)
     1. MedInc > 3.133950 and MedInc > 5.951500  — Fid 0.936, Cov 0.380, n=456
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc > 3.176250 and MedInc > 5.617250  — Fid 0.888, Cov 0.435, n=565
 
 
 **greedy_anchors**
@@ -1492,28 +1555,32 @@ its members.
     1. MedInc <= 2.57 and Latitude > 37.72  — Fid 0.897, Cov 0.210, n=301
   - seed 43 (k=1)
     1. MedInc <= 2.57 and Latitude > 34.24 and Longitude > -121.81  — Fid 0.962, Cov 0.303, n=394
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc <= 2.56 and Latitude > 37.72 and Longitude > -121.79  — Fid 0.978, Cov 0.111, n=139
 
 - `class_1`
   - seed 42 (k=1)
     1. 3.55 < MedInc <= 4.78 and AveOccup > 2.82 and Longitude > -118.02 and 33.93 < Latitude <= 34.27 and HouseAge <= 18.00 and AveRooms <= 6.09 and Population > 1729.25 and AveBedrms <= 1.10  — Fid 0.759, Cov 0.016, n=29
   - seed 43 (k=1)
     1. AveOccup > 3.28 and Longitude > -118.48 and MedInc <= 4.74 and AveBedrms <= 1.10 and 33.93 < Latitude <= 34.24 and AveRooms <= 4.45 and Population > 1166.00  — Fid 0.698, Cov 0.091, n=159
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. Latitude > 37.72 and HouseAge <= 18.00 and 2.56 < MedInc <= 4.74 and AveRooms > 5.22 and AveOccup > 2.82 and AveBedrms <= 1.10 and -121.79 < Longitude <= -118.01 and Population <= 782.75  — Fid 0.600, Cov 0.003, n=5
 
 - `class_2`
   - seed 42 (k=1)
     1. 33.93 < Latitude <= 34.27 and 2.57 < MedInc <= 4.78 and AveRooms <= 6.09 and 2.44 < AveOccup <= 3.28 and 18.00 < HouseAge <= 37.00 and AveBedrms <= 1.10  — Fid 0.494, Cov 0.208, n=526
   - seed 43 (k=1)
     1. -121.81 < Longitude <= -118.00 and 3.54 < MedInc <= 4.74 and 2.82 < AveOccup <= 3.28 and HouseAge > 18.00 and AveBedrms <= 1.10 and Population > 788.00  — Fid 0.409, Cov 0.235, n=767
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. Latitude <= 34.25 and 2.56 < MedInc <= 3.53 and Longitude <= -118.01 and 2.43 < AveOccup <= 3.29 and AveRooms <= 4.44  — Fid 0.600, Cov 0.077, n=200
 
 - `class_3`
   - seed 42 (k=1)
     1. MedInc > 4.78 and Longitude <= -121.80 and AveOccup <= 3.28 and AveRooms > 6.09 and Latitude <= 37.72  — Fid 0.977, Cov 0.080, n=88
   - seed 43 (k=1)
     1. MedInc > 4.74 and AveOccup <= 2.82 and Latitude <= 37.72 and Longitude <= -121.81  — Fid 0.903, Cov 0.078, n=93
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc > 4.74 and AveOccup <= 2.82 and Latitude <= 37.72 and Longitude <= -118.49  — Fid 0.889, Cov 0.128, n=171
 
 
 **sp_anchors**
@@ -1523,28 +1590,32 @@ its members.
     1. MedInc <= 2.57 and Latitude > 37.72  — Fid 0.897, Cov 0.210, n=301
   - seed 43 (k=1)
     1. MedInc <= 2.57 and Latitude > 34.24 and Longitude > -121.81  — Fid 0.962, Cov 0.303, n=394
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. Latitude > 34.25 and MedInc <= 4.74 and -121.79 < Longitude <= -118.49 and AveRooms <= 6.05 and AveOccup > 2.43 and Population <= 1706.25  — Fid 0.669, Cov 0.346, n=643
 
 - `class_1`
   - seed 42 (k=1)
     1. AveOccup > 3.28 and -118.52 < Longitude <= -118.02 and AveRooms <= 5.25 and 2.57 < MedInc <= 3.55 and Latitude <= 34.27 and HouseAge > 29.00 and Population > 786.00  — Fid 0.777, Cov 0.123, n=202
   - seed 43 (k=1)
     1. AveOccup > 3.28 and Longitude > -118.48 and MedInc <= 4.74 and AveBedrms <= 1.10 and 33.93 < Latitude <= 34.24 and AveRooms <= 4.45 and Population > 1166.00  — Fid 0.698, Cov 0.091, n=159
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. AveOccup > 3.29 and Longitude > -118.01 and 3.53 < MedInc <= 4.74 and 1161.00 < Population <= 1706.25 and 33.93 < Latitude <= 34.25 and AveRooms <= 6.05 and 1.01 < AveBedrms <= 1.10 and HouseAge <= 37.00  — Fid 0.507, Cov 0.024, n=71
 
 - `class_2`
   - seed 42 (k=1)
     1. 33.93 < Latitude <= 34.27 and 2.57 < MedInc <= 4.78 and AveRooms <= 6.09 and 2.44 < AveOccup <= 3.28 and 18.00 < HouseAge <= 37.00 and AveBedrms <= 1.10  — Fid 0.494, Cov 0.208, n=526
   - seed 43 (k=1)
     1. Latitude <= 34.24 and MedInc > 2.57 and AveRooms <= 6.04 and 2.43 < AveOccup <= 3.28 and HouseAge <= 37.00 and AveBedrms <= 1.10  — Fid 0.564, Cov 0.211, n=479
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. Latitude <= 34.25 and 2.56 < MedInc <= 3.53 and Longitude <= -118.01 and 2.43 < AveOccup <= 3.29 and AveRooms <= 4.44  — Fid 0.600, Cov 0.077, n=200
 
 - `class_3`
   - seed 42 (k=1)
     1. MedInc > 4.78 and Longitude <= -121.80 and AveOccup <= 3.28 and AveRooms > 6.09 and Latitude <= 37.72  — Fid 0.977, Cov 0.080, n=88
   - seed 43 (k=1)
     1. MedInc > 4.74 and AveOccup <= 2.82 and Latitude <= 37.72 and Longitude <= -121.81  — Fid 0.903, Cov 0.078, n=93
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. MedInc > 4.74 and AveOccup <= 2.82 and Latitude <= 37.72 and Longitude <= -118.49  — Fid 0.889, Cov 0.128, n=171
 
 
 **random_search**
@@ -1554,28 +1625,32 @@ its members.
     1. random box 239  — Fid 0.985, Cov 0.113, n=132
   - seed 43 (k=1)
     1. random box 87  — Fid 0.967, Cov 0.101, n=121
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 71  — Fid 1.000, Cov 0.065, n=72
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 130  — Fid 0.667, Cov 0.004, n=18
   - seed 43 (k=1)
     1. random box 10  — Fid 0.870, Cov 0.014, n=23
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 138  — Fid 0.889, Cov 0.036, n=63
 
 - `class_2`
   - seed 42 (k=1)
     1. random box 0  — Fid 0.678, Cov 0.113, n=202
   - seed 43 (k=1)
     1. random box 235  — Fid 0.678, Cov 0.118, n=211
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 78  — Fid 0.638, Cov 0.099, n=224
 
 - `class_3`
   - seed 42 (k=1)
     1. random box 41  — Fid 1.000, Cov 0.058, n=64
   - seed 43 (k=1)
     1. random box 178  — Fid 0.986, Cov 0.063, n=73
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 255  — Fid 1.000, Cov 0.054, n=61
 
 
 
@@ -1731,14 +1806,16 @@ its members.
     1. A10 = 't' and A9 = 't'  — Fid 1.000, Cov 0.639, n=44
   - seed 43 (k=1)
     1. A15 ∈ [252.499939, 50000.000000] and A13 = 'g' and A9 = 't' and A8 ∈ [0.000000, 5.000000] and A7 = 'o'  — Fid 1.000, Cov 0.279, n=18
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A10 = 't' and A9 = 't'  — Fid 1.000, Cov 0.607, n=41
 
 - `class_1`
   - seed 42 (k=1)
     1. A13 = 'g' and A10 = 'f' and A9 = 'f'  — Fid 0.977, Cov 0.519, n=43
   - seed 43 (k=1)
     1. A15 ∈ [-0.000061, 552.000000]  — Fid 0.627, Cov 0.948, n=110
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A13 = 'g' and A10 = 'f' and A9 = 'f'  — Fid 1.000, Cov 0.481, n=39
 
 
 **cart**
@@ -1748,14 +1825,16 @@ its members.
     1. A9 > 0.500000  — Fid 0.919, Cov 0.869, n=74
   - seed 43 (k=1)
     1. A9 > 0.500000  — Fid 0.900, Cov 0.918, n=70
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 > 0.500000  — Fid 0.730, Cov 0.918, n=74
 
 - `class_1`
   - seed 42 (k=1)
     1. A9 <= 0.500000  — Fid 0.952, Cov 0.714, n=63
   - seed 43 (k=1)
     1. A9 <= 0.500000  — Fid 1.000, Cov 0.792, n=65
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 <= 0.500000  — Fid 1.000, Cov 0.753, n=62
 
 
 **greedy_anchors**
@@ -1765,14 +1844,16 @@ its members.
     1. A9 > 0.00 and A10 > 0.00  — Fid 0.518, Cov 1.000, n=137
   - seed 43 (k=1)
     1. A9 > 0.00 and A11 > 3.00  — Fid 0.929, Cov 0.574, n=42
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 > 0.00 and A11 > 3.00  — Fid 0.964, Cov 0.393, n=28
 
 - `class_1`
   - seed 42 (k=1)
     1. A9 <= 0.00  — Fid 0.952, Cov 0.714, n=63
   - seed 43 (k=1)
     1. A9 <= 0.00  — Fid 1.000, Cov 0.792, n=65
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 <= 0.00  — Fid 1.000, Cov 0.753, n=62
 
 
 **sp_anchors**
@@ -1782,14 +1863,16 @@ its members.
     1. A9 > 0.00 and A10 > 0.00  — Fid 0.518, Cov 1.000, n=137
   - seed 43 (k=1)
     1. A9 > 0.00 and A11 > 3.00  — Fid 0.929, Cov 0.574, n=42
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 > 0.00 and A11 > 3.00  — Fid 0.964, Cov 0.393, n=28
 
 - `class_1`
   - seed 42 (k=1)
     1. A9 <= 0.00  — Fid 0.952, Cov 0.714, n=63
   - seed 43 (k=1)
     1. A9 <= 0.00  — Fid 1.000, Cov 0.792, n=65
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 <= 0.00  — Fid 1.000, Cov 0.753, n=62
 
 
 **random_search**
@@ -1799,14 +1882,16 @@ its members.
     1. random box 147  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 247  — Fid 1.000, Cov 0.033, n=3
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 117  — Cov 0.000, n=0
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 154  — Cov 0.000, n=0
   - seed 43 (k=1)
     1. random box 140  — Fid 1.000, Cov 0.039, n=4
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 159  — Fid 1.000, Cov 0.026, n=2
 
 
 
@@ -1987,14 +2072,16 @@ its members.
     1. workclass = 'Private'  — Fid 0.861, Cov 0.734, n=6959
   - seed 43 (k=1)
     1. age ∈ [16.999998, 58.000000]  — Fid 0.829, Cov 0.905, n=8835
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. fnlwgt ∈ [64686.898438, 1226583.000000] and race = 'White' and capital-gain ∈ [-0.000122, 594.000000]  — Fid 0.860, Cov 0.718, n=6849
 
 - `class_1`
   - seed 42 (k=1)
     1. education = 'Bachelors' and marital-status = 'Married-civ-spouse'  — Fid 0.870, Cov 0.241, n=829
   - seed 43 (k=1)
     1. education = 'Bachelors' and education-num ∈ [1.000000, 13.213348] and marital-status = 'Married-civ-spouse' and relationship = 'Husband' and race = 'White' and hours-per-week ∈ [1.000000, 75.017540]  — Fid 0.901, Cov 0.203, n=686
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education = 'Bachelors' and marital-status = 'Married-civ-spouse'  — Fid 0.885, Cov 0.231, n=832
 
 
 **cart**
@@ -2004,14 +2091,16 @@ its members.
     1. education-num <= 12.500000  — Fid 0.955, Cov 0.824, n=7289
   - seed 43 (k=1)
     1. education-num <= 12.500000  — Fid 0.953, Cov 0.828, n=7298
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education-num <= 12.500000  — Fid 0.950, Cov 0.826, n=7337
 
 - `class_1`
   - seed 42 (k=1)
     1. education-num > 12.500000  — Fid 0.516, Cov 0.500, n=2478
   - seed 43 (k=1)
     1. education-num > 12.500000  — Fid 0.537, Cov 0.512, n=2471
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education-num > 12.500000  — Fid 0.530, Cov 0.487, n=2429
 
 
 **greedy_anchors**
@@ -2021,14 +2110,16 @@ its members.
     1. education-num <= 10.00  — Fid 0.963, Cov 0.754, n=6587
   - seed 43 (k=1)
     1. education-num <= 12.00  — Fid 0.953, Cov 0.828, n=7298
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education-num <= 12.00  — Fid 0.950, Cov 0.826, n=7337
 
 - `class_1`
   - seed 42 (k=1)
     1. education-num > 12.00 and relationship <= 0.00 and hours-per-week > 40.00  — Fid 0.913, Cov 0.361, n=1145
   - seed 43 (k=1)
     1. education-num > 12.00 and relationship <= 0.00 and hours-per-week > 40.00 and age > 37.00  — Fid 0.952, Cov 0.287, n=866
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education-num > 12.00 and relationship <= 0.00 and education > 9.00 and age > 37.00  — Fid 0.936, Cov 0.277, n=870
 
 
 **sp_anchors**
@@ -2038,14 +2129,16 @@ its members.
     1. relationship > 0.00  — Fid 0.836, Cov 1.000, n=9767
   - seed 43 (k=1)
     1. relationship > 0.00  — Fid 0.829, Cov 1.000, n=9769
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. relationship > 0.00  — Fid 0.830, Cov 1.000, n=9766
 
 - `class_1`
   - seed 42 (k=1)
     1. education-num > 12.00 and relationship <= 0.00 and hours-per-week > 40.00  — Fid 0.913, Cov 0.361, n=1145
   - seed 43 (k=1)
     1. education-num > 12.00 and relationship <= 0.00 and hours-per-week > 40.00  — Fid 0.912, Cov 0.371, n=1198
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. education-num > 12.00 and relationship <= 0.00 and education > 9.00 and age > 37.00  — Fid 0.936, Cov 0.277, n=870
 
 
 **random_search**
@@ -2055,14 +2148,16 @@ its members.
     1. random box 73  — Fid 0.963, Cov 0.032, n=320
   - seed 43 (k=1)
     1. random box 57  — Fid 1.000, Cov 0.022, n=215
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 59  — Fid 1.000, Cov 0.013, n=98
 
 - `class_1`
   - seed 42 (k=1)
     1. random box 223  — Fid 0.994, Cov 0.057, n=156
   - seed 43 (k=1)
     1. random box 74  — Fid 0.991, Cov 0.030, n=107
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. random box 40  — Fid 0.962, Cov 0.058, n=182
 
 
 

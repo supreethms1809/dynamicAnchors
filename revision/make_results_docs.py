@@ -210,6 +210,18 @@ def results_doc(data, seeds, stamp, branch):
             if not rows:
                 L += ["| _not run yet_ | 0 | — | — | — | — | — | — |", ""]
                 continue
+
+            # A mean over 2 seeds sitting next to a mean over 3 in the same table
+            # invites a direct comparison that is not like-for-like. Say so here
+            # rather than trusting the reader to check the `seeds` column.
+            arm_n = {m: n_seeds(r, seeds) for m, r in rows if m in RL_METHODS}
+            if len(set(arm_n.values())) > 1:
+                detail = ", ".join(f"{method_label(m)} n={n}" for m, n in sorted(arm_n.items()))
+                L += ["",
+                      f"> ⚠️ **Unequal seeds in this table** ({detail}). The arms are averaged",
+                      "> over different runs, so the MADA-vs-RLDA means here are not",
+                      "> like-for-like. This pair is excluded from the pooled head-to-head.",
+                      ""]
             L += ["",
                   f"_per seed ({' / '.join(str(s) for s in seeds)}):_",
                   "",
