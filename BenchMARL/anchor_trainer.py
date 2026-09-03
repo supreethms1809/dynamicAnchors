@@ -60,10 +60,8 @@ def _slice_agent_params(
         if isinstance(value, torch.Size) and tuple(value) == (n_agents,):
             batched_prefixes.append(key[: -len("__batch_size")])
 
-    # No marker means share_params=True: no agent dim to strip, pass through so
-    # hull/CDEA checkpoints stay byte-identical. A group of ONE still carries a
-    # leading dim of 1 under share_params=False and must be sliced -- leaving it
-    # would make load_policy_model read in_features off the wrong axis.
+    # No marker means share_params=True: no agent dim to strip.
+    # A group of one still carries a leading dim of 1 under share_params=False.
     if not batched_prefixes:
         return state_dict
 
@@ -289,7 +287,7 @@ class AnchorTrainer:
         # CRITICAL: Prevent test data leak into training - multi-agent uses same env for training/eval
         # Unlike single-agent which has separate train/eval envs, multi-agent must force training data during training
         # The eval_on_test_data parameter should only affect evaluation, not training
-        # CRITICAL FIX: Always use training data for training environment (mode="training")
+        # Always use training data for training environment (mode="training")
         # Store eval_on_test_data for later use in evaluation, but force False for training env
         env_mode = env_config.get("mode", "training")
         is_training_mode = (env_mode == "training")
@@ -479,7 +477,7 @@ class AnchorTrainer:
                 
                 logger.info(f"   Class {cls}: {len(class_indices)} training samples available (ratio: {class_ratio:.1%})")
                 
-                # CRITICAL FIX: Filter instances where classifier prediction matches target_class
+                # Filter instances where classifier prediction matches target_class
                 # This ensures original_prediction == target_class, preventing precision calculation issues
                 if len(class_indices) > 0:
                     # Get predictions for all class instances
@@ -730,10 +728,7 @@ class AnchorTrainer:
                     logger.warning(f"   Warning: Could not save callback data: {e}")
         
         return self.experiment
-    ######## This is what we need for traning ########
 
-    # SS: Post training evaluation is optional. wanted confirmation of training. 
-    # Code is nasty and needs to be cleaned up.
     def evaluate(
         self,
         n_eval_episodes: Optional[int] = None,
@@ -749,13 +744,12 @@ class AnchorTrainer:
         logger.info("="*80)
         
         # Get anchor data collected during training evaluations
-        # BenchMARL's periodic evaluations during training DO pass rollouts to callbacks - SS: If we get info from callbacks, we don't need to run manual rollouts
+        # BenchMARL's periodic evaluations during training DO pass rollouts to callbacks
         evaluation_anchor_data = []
         if hasattr(self.callback, 'get_evaluation_anchor_data'):
             evaluation_anchor_data = self.callback.get_evaluation_anchor_data()
             logger.info(f"  Found {len(evaluation_anchor_data)} episodes of anchor data from training evaluations")
         
-        # BenchMARL's standard evaluate() for metrics logging (This is not working right now - SS)
         try:
             self.experiment.evaluate()
         except Exception as e:
@@ -812,13 +806,12 @@ class AnchorTrainer:
                 elif hasattr(env, 'mode'):
                     env.mode = "evaluation"
                 
-                # Debug: Check group_map structure (before episode loop) - SS: REMOVE THIS DEBUG LATER
                 logger.info(f"  Debug: algorithm.group_map = {algorithm.group_map}")
                 logger.info(f"  Debug: group_map keys = {list(algorithm.group_map.keys())}")
                 for group, agents in algorithm.group_map.items():
                     logger.info(f"    Group '{group}' contains agents: {agents}")
                 
-                # Get unwrapped environment to check actual agents - SS: REMOVE THIS DEBUG LATER
+                # Get unwrapped environment to check actual agents
                 unwrapped_env = None
                 if hasattr(env, 'env') or hasattr(env, '_env'):
                     unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
@@ -847,7 +840,6 @@ class AnchorTrainer:
                     # Read max_steps from environment config, not hardcoded default
                     max_steps = self.task.max_steps(env) if hasattr(self.task, 'max_steps') else env.max_cycles
                     
-                    # Debug: Check initial td structure - SS: REMOVE THIS DEBUG LATER
                     if episode == 0:
                         logger.info(f"  Debug: Initial td keys: {list(td.keys()) if hasattr(td, 'keys') else 'N/A'}")
                         if hasattr(td, 'keys'):
@@ -936,12 +928,11 @@ class AnchorTrainer:
                     episode_end_time = time.perf_counter()
                     episode_duration = episode_end_time - episode_start_time
                     
-                    # Collect final metrics from info - SS: REMOVE THIS DEBUG LATER
+                    # Collect final metrics from info
                     unwrapped_env = None
                     if hasattr(env, 'env') or hasattr(env, '_env'):
                         unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
                     
-                    # Debug: Check unwrapped environment state - SS: REMOVE THIS DEBUG LATER
                     if episode == 0 and unwrapped_env is not None:
                         if hasattr(unwrapped_env, 'lower') and hasattr(unwrapped_env, 'upper'):
                             if isinstance(unwrapped_env.lower, dict):
@@ -959,7 +950,7 @@ class AnchorTrainer:
                                         except Exception as e:
                                             logger.info(f"    Could not get metrics: {e}")
                     
-                    # Try multiple ways to access the final state - SS: REMOVE THIS DEBUG LATER
+                    # Try multiple ways to access the final state
                     # After the episode loop, td should contain the final state
                     # Check both td and td["next"] if it exists
                     final_td = td
@@ -1005,7 +996,6 @@ class AnchorTrainer:
                     
                     # Process each agent separately
                     for group, agent_name in agents_to_process:
-                        # Debug: Check unwrapped_env state - SS: REMOVE THIS DEBUG LATER
                         if episode == 0:
                             if unwrapped_env is None:
                                 logger.info(f"  Debug: unwrapped_env is None for {agent_name}")
@@ -1078,7 +1068,6 @@ class AnchorTrainer:
                                             lower_bounds = unwrapped_env.lower
                                             upper_bounds = unwrapped_env.upper
                                         
-                                        # Debug: Check bounds values
                                         if episode == 0:
                                             logger.info(f"  Debug: {agent_name} bounds - lower range: [{lower_bounds.min():.4f}, {lower_bounds.max():.4f}], upper range: [{upper_bounds.min():.4f}, {upper_bounds.max():.4f}]")
                                         
@@ -1107,10 +1096,10 @@ class AnchorTrainer:
                                     if episode == 0:
                                         logger.info(f"  Debug: Could not get metrics from unwrapped env for agent {agent_name}: {e}")
                                         import traceback
-                                        traceback.print_exc()  # SS: REMOVE THIS DEBUG LATER
+                                        traceback.print_exc()
                         
-                        # Fallback: Try to get from TensorDict structure - SS: ONLY THIS PART IS CURRENTLY WORKING
-                        # Try both final_td (which might be next_td) and td directly - SS: ONLY THIS PART IS CURRENTLY WORKING
+                        # Fallback: Try to get from TensorDict structure
+                        # Try both final_td (which might be next_td) and td directly
                         group_data = None
                         
                         # First try final_td (state after last step)
@@ -1152,8 +1141,8 @@ class AnchorTrainer:
                             elif hasattr(group_data, 'get'):
                                 obs = group_data.get("observation", None)
                             
-                            # Extract data from observation if available
-                            # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
+                            # Extract P,C from the 3n+4 observation via obs_precision_coverage.
+                            # Observation structure: [a, b, q*, P, C, mode, phase]
                             if obs is not None:
                                 if hasattr(obs, 'shape') and obs.shape[0] > 0:
                                     final_obs = obs[-1]
@@ -1171,17 +1160,12 @@ class AnchorTrainer:
                                     final_obs_np = np.array(final_obs)
                                 
                                 # Extract precision and coverage from observation
-                                # obs_len = 2*n_features + 2 (precision + coverage)
                                 obs_len = len(final_obs_np) if hasattr(final_obs_np, '__len__') else final_obs_np.shape[0] if hasattr(final_obs_np, 'shape') else 0
                                 
-                                if obs_len >= 5:  # n>=1 features + precision + coverage + tail
-                                    n_features = (obs_len - 2) // 2
+                                if obs_len >= 5:  # n>=1 features + P, C, mode, phase
+                                    n_features = (obs_len - 4) // 3
                                     if n_features > 0:
-                                        # Layout-aware decode. Hardcoded offsets
-                                        # broke here once already (reading coverage
-                                        # as precision when the hull obs gained
-                                        # `phase`) and would break again now that
-                                        # the quantile obs is 3n+4 (G-12).
+                                        # P,C come from obs_precision_coverage (quantile layout).
                                         precision, coverage = obs_precision_coverage(final_obs_np)
                                         
                                         # Store data keyed by agent name to distinguish between agents
@@ -1284,7 +1268,6 @@ class AnchorTrainer:
                                     else:
                                         episode_data[agent_name]["final_observation"] = list(final_obs) if hasattr(final_obs, '__iter__') else [final_obs]
                     
-                    # Debug first episode - SS: REMOVE THIS DEBUG LATER
                     if episode == 0:
                         logger.info(f"  Debug: Episode {episode} completed, step_count={step_count}, done={done}")
                         logger.info(f"  Debug: episode_data keys: {list(episode_data.keys())}")
@@ -1936,8 +1919,6 @@ class AnchorTrainer:
             )
         return self.experiment
     
-    # SS: This is the environment instance that is used to collect anchor data. If we remove evaluate()
-    # then we won't need this method.
     def _create_env_instance(self, device=None):
         if self.experiment is None or self.task is None:
             raise ValueError(
@@ -1990,491 +1971,6 @@ class AnchorTrainer:
         # Call the factory function to create the environment instance
         return env_fun()
     
-    # SS: This another method which is currently very messy. It is used to extract rules from the evaluation data.
-    def extract_rules_from_evaluation(
-        self,
-        evaluation_data: Dict[str, Any],
-        max_features_in_rule: Optional[int] = -1,
-        eval_on_test_data: bool = False
-    ) -> Dict[str, Any]:
-        if self.experiment is None:
-            raise ValueError(
-                "Experiment not set up yet. Call setup_experiment() first."
-            )
-        
-        logger.info("\n" + "="*80)
-        logger.info("EXTRACTING ANCHOR RULES FROM EVALUATION DATA")
-        logger.info("="*80)
-        
-        env_data = self.dataset_loader.get_anchor_env_data()
-        target_classes = list(np.unique(self.dataset_loader.y_train))
-        
-        results = {
-            "per_class_results": {},
-            "metadata": {
-                "dataset": self.dataset_loader.dataset_name,
-                "algorithm": self.algorithm,
-                "target_classes": target_classes,
-                "max_features_in_rule": max_features_in_rule,
-                "eval_on_test_data": eval_on_test_data,
-            },
-            "evaluation_data": evaluation_data
-        }
-        
-        # Get anchor data from evaluation
-        evaluation_anchor_data = evaluation_data.get("evaluation_anchor_data", [])
-        
-        if not evaluation_anchor_data:
-            logger.warning("Warning: No anchor data found in evaluation results.")
-            logger.warning("  This may happen if BenchMARL's evaluation doesn't generate rollouts.")
-            return results
-        
-        # Get agents_per_class from environment to know how to group agents
-        env = self._create_env_instance()
-        # Set mode to "evaluation" so termination counters are reset in reset()
-        unwrapped_env = None
-        if hasattr(env, 'env') or hasattr(env, '_env'):
-            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
-        if unwrapped_env is not None and hasattr(unwrapped_env, 'mode'):
-            unwrapped_env.mode = "evaluation"
-        elif hasattr(env, 'mode'):
-            env.mode = "evaluation"
-        
-        if hasattr(env, 'env') or hasattr(env, '_env'):
-            unwrapped_env = getattr(env, 'env', None) or getattr(env, '_env', None)
-        
-        agents_per_class = 1
-        if unwrapped_env is not None and hasattr(unwrapped_env, 'agents_per_class'):
-            agents_per_class = unwrapped_env.agents_per_class
-        
-        # Group evaluation episodes by class (handling multiple agents per class)
-        for target_class in target_classes:
-            class_key = f"class_{target_class}"
-            
-            logger.info(f"\nExtracting rules for class {target_class}...")
-            
-            # Collect all episodes for all agents of this class
-            # When agents_per_class == 1: look for "agent_0", "agent_1", etc.
-            # When agents_per_class > 1: look for "agent_0_0", "agent_0_1", "agent_1_0", "agent_1_1", etc.
-            agent_episodes = []
-            agents_found = set()
-            
-            for episode_data in evaluation_anchor_data:
-                # Check all possible agent names for this class
-                if agents_per_class == 1:
-                    agent_name = f"agent_{target_class}"
-                    if agent_name in episode_data:
-                        agent_episodes.append(episode_data[agent_name])
-                        agents_found.add(agent_name)
-                else:
-                    # Multiple agents per class: agent_0_0, agent_0_1, etc.
-                    for k in range(agents_per_class):
-                        agent_name = f"agent_{target_class}_{k}"
-                        if agent_name in episode_data:
-                            agent_episodes.append(episode_data[agent_name])
-                            agents_found.add(agent_name)
-            
-            if not agent_episodes:
-                logger.warning(f"  No evaluation data found for class {target_class}")
-                if agents_per_class == 1:
-                    logger.warning(f"    Expected agent: agent_{target_class}")
-                else:
-                    logger.warning(f"    Expected agents: agent_{target_class}_0, agent_{target_class}_1, ...")
-                continue
-            
-            logger.info(f"  Found {len(agent_episodes)} evaluation episodes from {len(agents_found)} agent(s): {sorted(agents_found)}")
-            
-            # Extract rules from evaluation data
-            # Note: We need to reconstruct anchor bounds from observations if available
-            # For now, we'll use the metrics from evaluation
-            rules_list = []
-            anchors_list = []
-            # Instance-level metrics (per agent/instance)
-            instance_precisions = []
-            instance_coverages = []
-            # Class-level metrics (union of all agents for the class)
-            class_precisions = []
-            class_coverages = []
-            # Legacy lists (for backward compatibility)
-            precisions = []
-            coverages = []
-            
-            # Get feature names for rule extraction
-            feature_names = env_data["feature_names"]
-            n_features = len(feature_names)
-            
-            # Create a temporary environment to use its extract_rule method
-            # We'll extract rules from the observation data
-            temp_env_config = self._load_env_config_from_yaml()
-            temp_env_config.update({
-                "X_min": env_data["X_min"],
-                "X_range": env_data["X_range"],
-                "scaler_mean": env_data.get("scaler_mean"),
-                "scaler_scale": env_data.get("scaler_scale"),
-            })
-            
-            temp_anchor_env = AnchorEnv(
-                X_unit=env_data["X_unit"],
-                X_std=env_data["X_std"],
-                y=env_data["y"],
-                feature_names=feature_names,
-                classifier=self.dataset_loader.get_classifier(),
-                device="cpu",
-                target_classes=[target_class],
-                env_config=temp_env_config
-            )
-            
-            # Get the agent name for this class (use first agent from temp environment)
-            # The environment creates agents based on target_classes and agents_per_class
-            if temp_anchor_env.agents and len(temp_anchor_env.agents) > 0:
-                agent = temp_anchor_env.agents[0]
-            elif hasattr(temp_anchor_env, 'possible_agents') and temp_anchor_env.possible_agents:
-                agent = temp_anchor_env.possible_agents[0]
-            else:
-                # Fallback: construct agent name based on agents_per_class
-                if agents_per_class == 1:
-                    agent = f"agent_{target_class}"
-                else:
-                    agent = f"agent_{target_class}_0"
-            
-            for episode_idx, episode in enumerate(agent_episodes):
-                # Instance-level metrics
-                instance_precision = episode.get("anchor_precision", episode.get("instance_precision", 0.0))
-                instance_coverage = episode.get("anchor_coverage", episode.get("instance_coverage", 0.0))
-                # Class-level metrics (may not be in episode data, will compute if needed)
-                class_precision = episode.get("class_precision", 0.0)
-                class_coverage = episode.get("class_coverage", 0.0)
-                
-                instance_precisions.append(float(instance_precision))
-                instance_coverages.append(float(instance_coverage))
-                class_precisions.append(float(class_precision))
-                class_coverages.append(float(class_coverage))
-                
-                # Legacy fields (for backward compatibility)
-                precisions.append(float(instance_precision))
-                coverages.append(float(instance_coverage))
-                
-                precision = float(instance_precision)
-                coverage = float(instance_coverage)
-                
-                # Extract anchor bounds from observation
-                # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
-                lower = None
-                upper = None
-                initial_lower = None
-                initial_upper = None
-                rule = "any values (no tightened features)"
-                
-                if "final_observation" in episode:
-                    obs = np.array(episode["final_observation"], dtype=np.float32)
-                    # Hull layout only. The old `== 2n+2` never matched the current
-                    # 2n+3 observation, so this branch was dead and every rule fell
-                    # through to "any values". Under the quantile MDP obs[:n] is a
-                    # QUANTILE, not a bound, and unit bounds cannot be recovered from
-                    # the observation without the class CDF knots -- so skip there and
-                    # let the caller use env.export_rule_state().
-                    _is_hull = len(obs) in (2 * n_features + 2, 2 * n_features + 3)
-                    if _is_hull:
-                        # Extract lower and upper bounds from observation
-                        lower = obs[:n_features].copy()
-                        upper = obs[n_features:2*n_features].copy()
-                        
-                        # Set anchor bounds in temp environment for rule extraction
-                        # Bounds are in unit space [0,1] from observation
-                        temp_anchor_env.lower[agent] = lower
-                        temp_anchor_env.upper[agent] = upper
-                        
-                        # Extract rule using the environment's method
-                        # Use denormalize=True to convert rules to standardized space
-                        rule = temp_anchor_env.extract_rule(
-                            agent,
-                            max_features_in_rule=max_features_in_rule,
-                            initial_lower=initial_lower,
-                            initial_upper=initial_upper,
-                            denormalize=True  # Convert from unit space [0,1] to standardized space (mean=0, std=1)
-                        )
-                
-                anchor_data = {
-                    "episode_idx": episode_idx,
-                    # Instance-level metrics
-                    "instance_precision": float(instance_precision),
-                    "instance_coverage": float(instance_coverage),
-                    # Class-level metrics
-                    "class_precision": float(class_precision),
-                    "class_coverage": float(class_coverage),
-                    "total_reward": float(episode.get("total_reward", 0.0)),
-                    "rule": rule,
-                }
-                
-                if lower is not None and upper is not None:
-                    anchor_data.update({
-                        "lower_bounds": lower.tolist(),
-                        "upper_bounds": upper.tolist(),
-                        "box_widths": (upper - lower).tolist(),
-                        "box_volume": float(np.prod(np.maximum(upper - lower, 1e-9))),
-                    })
-                    if initial_lower is not None and initial_upper is not None:
-                        anchor_data.update({
-                            "initial_lower_bounds": initial_lower.tolist(),
-                            "initial_upper_bounds": initial_upper.tolist(),
-                        })
-                
-                anchors_list.append(anchor_data)
-                rules_list.append(rule)
-            
-            unique_rules = list(set([r for r in rules_list if r and r != "any values (no tightened features)"]))
-            
-            overlap_info = self._check_class_overlaps(target_class, anchors_list, results["per_class_results"])
-            
-            # Compute instance-level metrics (average across all instances)
-            instance_precision = float(np.mean(instance_precisions)) if instance_precisions else 0.0
-            instance_coverage = float(np.mean(instance_coverages)) if instance_coverages else 0.0
-            
-            # Compute class-level metrics from union of all anchors across all episodes
-            class_precision_union = 0.0
-            class_coverage_union = 0.0
-            
-            # Get the appropriate dataset (test or train) based on eval_on_test_data
-            if eval_on_test_data and env_data.get("X_test_unit") is not None:
-                X_data = env_data["X_test_unit"]
-                y_data = env_data["y_test"]
-            else:
-                X_data = env_data["X_unit"]
-                y_data = env_data["y"]
-            
-            # Compute union of all anchors for this class
-            if X_data is not None and y_data is not None and len(anchors_list) > 0:
-                n_samples = X_data.shape[0]
-                union_mask = np.zeros(n_samples, dtype=bool)
-                
-                # IMPORTANT:
-                # - X_data here is always in unit space [0, 1] (X_unit / X_test_unit)
-                # - During extraction we store BOTH:
-                #     * lower_bounds / upper_bounds           -> in standardized feature space
-                #     * lower_bounds_normalized / upper_bounds_normalized -> in unit space [0, 1]
-                # - If we compare X_unit against standardized bounds, almost no samples will match,
-                #   which collapses the union to all-False and yields class_precision = class_coverage = 0.
-                #
-                # To compute a correct union in the same space as the environment, we MUST use the
-                # normalized bounds when they are available, and only fall back to raw bounds if
-                # normalized ones are missing (for older runs).
-                
-                # Build union mask from all anchors
-                for anchor_data in anchors_list:
-                    # Prefer normalized bounds if available (they live in the same space as X_data)
-                    if (
-                        "lower_bounds_normalized" in anchor_data
-                        and "upper_bounds_normalized" in anchor_data
-                    ):
-                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                    elif "lower_bounds" in anchor_data and "upper_bounds" in anchor_data:
-                        # Backward compatibility: assume these bounds are already in the same space as X_data
-                        lower = np.array(anchor_data["lower_bounds"], dtype=np.float32)
-                        upper = np.array(anchor_data["upper_bounds"], dtype=np.float32)
-                    else:
-                        # No usable bounds for this anchor
-                        continue
-                    
-                    # Check which points fall in this anchor box (inclusive bounds)
-                    if lower.shape[0] != X_data.shape[1] or upper.shape[0] != X_data.shape[1]:
-                        # Dimension mismatch – skip this anchor but log once at debug level
-                        logger.debug(
-                            f"Skipping anchor for class {target_class} due to dimension mismatch: "
-                            f"bounds_dim={lower.shape[0]}, X_dim={X_data.shape[1]}"
-                        )
-                        continue
-                    
-                    in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
-                    union_mask |= in_box
-                
-                # Class-level coverage: fraction of class samples that are in the union
-                mask_cls = (y_data == target_class)
-                if mask_cls.sum() > 0:
-                    class_coverage_union = float(union_mask[mask_cls].mean())
-                else:
-                    class_coverage_union = 0.0
-                
-                # Class-level precision: fraction of points in union that belong to target class
-                if union_mask.any():
-                    y_union = y_data[union_mask]
-                    class_precision_union = float((y_union == target_class).mean())
-                else:
-                    class_precision_union = 0.0
-            
-            # Build agent_id string (list of agents for this class)
-            if agents_per_class == 1:
-                agent_id = f"agent_{target_class}"
-            else:
-                agent_id = f"agent_{target_class}_0..{agents_per_class-1}" if agents_per_class > 1 else f"agent_{target_class}"
-            
-            results["per_class_results"][class_key] = {
-                "class": int(target_class),
-                "agent_id": agent_id,
-                "agents_found": sorted(list(agents_found)) if agents_found else [],
-                "n_agents": len(agents_found),
-                # Instance-level metrics (averaged across all instances)
-                "instance_precision": instance_precision,
-                "instance_coverage": instance_coverage,
-                "instance_precision_std": float(np.std(instance_precisions)) if len(instance_precisions) > 1 else 0.0,
-                "instance_coverage_std": float(np.std(instance_coverages)) if len(instance_coverages) > 1 else 0.0,
-                "instance_precision_min": float(np.min(instance_precisions)) if instance_precisions else 0.0,
-                "instance_precision_max": float(np.max(instance_precisions)) if instance_precisions else 0.0,
-                "instance_coverage_min": float(np.min(instance_coverages)) if instance_coverages else 0.0,
-                "instance_coverage_max": float(np.max(instance_coverages)) if instance_coverages else 0.0,
-                # Class-level metrics (union of all anchors for this class across all episodes)
-                "class_precision": class_precision_union,
-                "class_coverage": class_coverage_union,
-                # Keep averaged class-level metrics for backward compatibility (but note they're averaged, not union)
-                "class_precision_avg": float(np.mean(class_precisions)) if class_precisions else 0.0,
-                "class_coverage_avg": float(np.mean(class_coverages)) if class_coverages else 0.0,
-                "class_precision_std": float(np.std(class_precisions)) if len(class_precisions) > 1 else 0.0,
-                "class_coverage_std": float(np.std(class_coverages)) if len(class_coverages) > 1 else 0.0,
-                "class_precision_min": float(np.min(class_precisions)) if class_precisions else 0.0,
-                "class_precision_max": float(np.max(class_precisions)) if class_precisions else 0.0,
-                "class_coverage_min": float(np.min(class_coverages)) if class_coverages else 0.0,
-                "class_coverage_max": float(np.max(class_coverages)) if class_coverages else 0.0,
-                "anchor_precision_mean": float(np.mean(precisions)) if precisions else 0.0,
-                "anchor_coverage_mean": float(np.mean(coverages)) if coverages else 0.0,
-                "anchor_precision_std": float(np.std(precisions)) if len(precisions) > 1 else 0.0,
-                "anchor_coverage_std": float(np.std(coverages)) if len(coverages) > 1 else 0.0,
-                "anchor_precision_min": float(np.min(precisions)) if precisions else 0.0,
-                "anchor_precision_max": float(np.max(precisions)) if precisions else 0.0,
-                "anchor_coverage_min": float(np.min(coverages)) if coverages else 0.0,
-                "anchor_coverage_max": float(np.max(coverages)) if coverages else 0.0,
-                "n_episodes": len(anchors_list),
-                "rules": rules_list,
-                "unique_rules": unique_rules,
-                "unique_rules_count": len(unique_rules),
-                "anchors": anchors_list,
-                "overlap_info": overlap_info,
-            }
-            
-            logger.info(f"  Processed {len(anchors_list)} episodes")
-            logger.info(f"  Instance-level - Average precision: {instance_precision:.4f}, coverage: {instance_coverage:.4f}")
-            logger.info(f"  Class-level (Union) - Precision: {class_precision_union:.4f}, coverage: {class_coverage_union:.4f}")
-            logger.info(f"  Unique rules: {len(unique_rules)}")
-            if overlap_info["has_overlaps"]:
-                logger.warning(f"  ️  Overlaps detected: {overlap_info['n_overlaps']} anchors overlap with other classes")
-            else:
-                logger.info(f"   No overlaps with other classes")
-        
-        logger.info("="*80)
-        
-        results["training_history"] = self.callback.get_training_history() if hasattr(self, 'callback') else []
-        results["evaluation_history"] = evaluation_data.get("evaluation_history", [])
-        
-        return results
-    
-    def _check_class_overlaps(
-        self, 
-        target_class: int, 
-        anchors_list: List[Dict[str, Any]], 
-        existing_results: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        overlap_info = {
-            "has_overlaps": False,
-            "n_overlaps": 0,
-            "overlapping_anchors": [],
-        }
-        
-        if len(existing_results) == 0:
-            return overlap_info
-        
-        for anchor in anchors_list:
-            lower = np.array(anchor["lower_bounds"])
-            upper = np.array(anchor["upper_bounds"])
-            anchor_vol = float(np.prod(np.maximum(upper - lower, 1e-9)))
-            
-            if anchor_vol <= 1e-12:
-                continue
-            
-            overlaps_with = []
-            
-            for other_class_key, other_class_data in existing_results.items():
-                if "anchors" not in other_class_data:
-                    continue
-                
-                for other_anchor in other_class_data["anchors"]:
-                    other_lower = np.array(other_anchor["lower_bounds"])
-                    other_upper = np.array(other_anchor["upper_bounds"])
-                    
-                    inter_lower = np.maximum(lower, other_lower)
-                    inter_upper = np.minimum(upper, other_upper)
-                    inter_widths = np.maximum(inter_upper - inter_lower, 0.0)
-                    inter_vol = float(np.prod(np.maximum(inter_widths, 0.0)))
-                    
-                    if inter_vol > 1e-12:
-                        overlap_ratio = inter_vol / (anchor_vol + 1e-12)
-                        overlaps_with.append({
-                            "class": other_class_key,
-                            "instance_idx": other_anchor.get("instance_idx", -1),
-                            "overlap_ratio": float(overlap_ratio),
-                            "overlap_volume": float(inter_vol),
-                        })
-            
-            if overlaps_with:
-                overlap_info["has_overlaps"] = True
-                overlap_info["n_overlaps"] += 1
-                overlap_info["overlapping_anchors"].append({
-                    "instance_idx": anchor.get("instance_idx", -1),
-                    "overlaps_with": overlaps_with,
-                })
-        
-        return overlap_info
-    
-    def save_rules(self, results: Dict[str, Any], filepath: Optional[str] = None):
-        import json
-        
-        if filepath is None:
-            if self.output_dir is None:
-                raise ValueError("output_dir must be set to save rules")
-            filepath = os.path.join(
-                self.output_dir,
-                "extracted_rules.json"
-            )
-        
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        
-        serializable_results = self._convert_to_serializable(results)
-        
-        with open(filepath, 'w') as f:
-            json.dump(serializable_results, f, indent=2, ensure_ascii=False)
-        
-        n_anchors_total = sum(
-            len(class_data.get("anchors", []))
-            for class_data in serializable_results.get("per_class_results", {}).values()
-        )
-        n_rules_total = sum(
-            len(class_data.get("rules", []))
-            for class_data in serializable_results.get("per_class_results", {}).values()
-        )
-        
-        logger.info(f"Rules and anchors saved to: {filepath}")
-        logger.info(f"  Total anchors saved: {n_anchors_total}")
-        logger.info(f"  Total rules saved: {n_rules_total}")
-        return filepath
-    
-    def _convert_to_serializable(self, obj: Any) -> Any:
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, (np.integer, np.int_)):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, (float, np.float64, np.float32)):
-            return float(obj)
-        elif isinstance(obj, np.bool_):
-            return bool(obj)
-        elif isinstance(obj, dict):
-            return {k: self._convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [self._convert_to_serializable(item) for item in obj]
-        elif isinstance(obj, (int, float, str, bool)) or obj is None:
-            return obj
-        else:
-            return str(obj)
-    
     def _load_env_config_from_yaml(self) -> Dict[str, Any]:
         # Return cached config if already loaded
         if self._anchor_env_config is not None:
@@ -2494,9 +1990,6 @@ class AnchorTrainer:
                 
                 if yaml_data and "env_config" in yaml_data:
                     env_config = yaml_data["env_config"]
-                    # Convert list to tuple for step_fracs if it's a list (YAML loads lists as lists)
-                    if "step_fracs" in env_config and isinstance(env_config["step_fracs"], list):
-                        env_config["step_fracs"] = tuple(env_config["step_fracs"])
                     # Convert boolean strings to actual booleans if needed
                     for key, value in env_config.items():
                         if isinstance(value, str):

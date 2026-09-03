@@ -52,7 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description="Anchor Training Pipeline")
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "bank_marketing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography", "bank_marketing"]
     
     # Add UCIML datasets if available
     try:
@@ -336,7 +336,7 @@ def main():
         )
     
     logger.info(f"\n{'='*80}")
-    logger.info("SETTING UP BANCHMARL TRAINER")
+    logger.info("SETTING UP BENCHMARL TRAINER")
     logger.info(f"{'='*80}")
 
     trainer = AnchorTrainer(
@@ -487,7 +487,7 @@ def main():
     logger.info(f"  Total frames: {eval_results['total_frames']}")
     
     # Save evaluation anchor data to JSON file
-    # SS: This is nasty workaround for json serialization issues. TODO: Create a function in utils 
+    # Workaround: numpy types are not JSON-serializable. 
     evaluation_anchor_data = eval_results.get("evaluation_anchor_data", [])
     if evaluation_anchor_data:
         # NOTE: no `import numpy as np` here. numpy is already imported at module

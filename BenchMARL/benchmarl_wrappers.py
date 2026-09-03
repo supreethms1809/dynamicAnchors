@@ -26,31 +26,16 @@ from environment import AnchorEnv
 from utils.metrics import ranking_score
 
 
-# Observation layout of the AnchorEnv currently under training, recorded at env
-# construction. None until an env is built; callbacks then skip box decoding.
-_OBS_LAYOUT = None
-
-
 def obs_precision_coverage(obs_vec) -> tuple:
-    """(precision, coverage) from a final observation, LAYOUT-AWARE.
+    """(precision, coverage) from a final observation.
 
-    Positions are not the same in the two layouts, and hardcoding them has
-    already gone wrong twice (once reading coverage as precision when the hull
-    obs gained `phase`; again when the quantile obs gained it back as G-12):
-
-        hull     2n+3 = [lo(n), up(n), P, C, phase]              -> P=-3, C=-2
-        quantile 3n+4 = [a(n), b(n), q*(n), P, C, mode, phase]   -> P=-4, C=-3
-
-    obs length alone cannot separate them (2n+3 == 3m+4 has integer solutions),
-    so trust the env's layout stamp set in get_env_fun.
+    Layout is 3n+4 = [a, b, q*, P, C, mode, phase], so P=-4, C=-3.
     """
     import numpy as _np
     v = _np.asarray(obs_vec, dtype=_np.float64).reshape(-1)
     if v.shape[0] < 5:
         raise ValueError(f"observation too short to carry (P, C): len={v.shape[0]}")
-    quantile = bool((_OBS_LAYOUT or {}).get("quantile", False))
-    pi, ci = (-4, -3) if quantile else (-3, -2)
-    return float(v[pi]), float(v[ci])
+    return float(v[-4]), float(v[-3])
 
 class AnchorTaskClass(TaskClass):
     
@@ -87,13 +72,8 @@ class AnchorTaskClass(TaskClass):
         
         def _make_env():
             anchor_env = AnchorEnv(**env_config)
-            # FidCov / NashConv callbacks read P,C from the observation. The
-            # quantile layout is [a, b, q*, P, C, mode, phase] = 3n+4.
-            global _OBS_LAYOUT
-            _OBS_LAYOUT = {
-                "n_features": int(anchor_env.n_features),
-                "quantile": True,
-            }
+            # FidCov / NashConv callbacks read P,C from the observation.
+            # Layout is [a, b, q*, P, C, mode, phase] = 3n+4.
             
             # group_map is EXPLICIT on purpose. Omitting it makes torchrl fall
             # back to its default parallel grouping -- agents named "str_int"
@@ -199,8 +179,6 @@ class AnchorTask(Task):
     def associated_class():
         return AnchorTaskClass
 
-# SS: This is the callback that is used to collect the metrics and the anchor data.
-# Bug: This is not working right now.
 class AnchorMetricsCallback(Callback):
     
     def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01, ranking_score_formula: str = "precision_coverage"):
@@ -269,9 +247,9 @@ class AnchorMetricsCallback(Callback):
         """Extract class id from a GROUP name.
 
         Supported group naming conventions:
-          - class_0, class_1, ...           (recommended: GROUP == class/player)
-          - agent_0, agent_1, ...           (legacy: GROUP == class/player)
-          - agent_0_0, agent_0_1, ...       (legacy: per-agent groups; first index is class)
+          - class_0, class_1, ...           (current: GROUP == class)
+          - agent_0, agent_1, ...           (agent names, also used as group ids)
+          - agent_0_0, agent_0_1, ...       (agents_per_class > 1; first index is class)
 
         Returns None if format is unrecognized.
         """
@@ -301,10 +279,10 @@ class AnchorMetricsCallback(Callback):
         
         metric_keys = [
             "anchor_precision", "anchor_coverage",
-            "class_union_precision", "class_union_coverage",  # Union metrics for multi-agent per class
-            "drift", "anchor_drift", "js_penalty",
-            "precision_gain", "coverage_gain", "coverage_bonus", "target_class_bonus",
-            "overlap_penalty", "drift_penalty", "anchor_drift_penalty", 
+            "class_union_precision", "class_union_coverage",
+            "drift", "anchor_drift",
+            "precision_gain", "coverage_gain",
+            "overlap_penalty", "drift_penalty", "anchor_drift_penalty",
             "inter_class_overlap_penalty", "shared_reward", "total_reward",
             "coverage_floor_hits", "coverage_clipped"
         ]
@@ -745,8 +723,8 @@ class AnchorMetricsCallback(Callback):
                 )
                 return None
 
-            # If there is exactly one group per class (recommended), this is just that group's Q.
-            # If there are multiple groups (legacy), we average them.
+            # If there is exactly one group per class, this is that group's Q.
+            # If a class has multiple groups, average them.
             q_stack = torch.stack(q_values, dim=0)  # [n_groups, B]
             return q_stack.mean(dim=0)
 
@@ -1102,7 +1080,6 @@ class AnchorMetricsCallback(Callback):
         
         for group in self.experiment.group_map.keys():
             group_key = ("next", group, "info")
-            obs_key = ("next", group, "observation")
             
             # Extract info metrics
             if group_key in batch.keys(include_nested=True):
@@ -1138,80 +1115,6 @@ class AnchorMetricsCallback(Callback):
                     episode_detail["anchor_precision"] = safe_get("anchor_precision", 0.0)
                     episode_detail["anchor_coverage"] = safe_get("anchor_coverage", 0.0)
                     episode_detail["total_reward"] = safe_get("total_reward", 0.0)
-                    
-                    # Extract final observation (contains bounds)
-                    # SS: This is very messy. We need to fix this. (its messy but it works - change later)
-                    obs = None
-                    obs_keys_to_try = [
-                        obs_key,  # ("next", group, "observation")
-                        (group, "observation"),  # (group, "observation")
-                        ("next", group, "observation"),  # Explicit nested
-                    ]
-                    
-                    for key in obs_keys_to_try:
-                        try:
-                            if key in batch.keys(include_nested=True):
-                                obs = batch[key]
-                                break
-                        except (KeyError, TypeError):
-                            # Try accessing directly if nested key check fails
-                            try:
-                                if isinstance(key, tuple) and len(key) == 3:
-                                    # Try accessing as batch["next"][group]["observation"]
-                                    if "next" in batch.keys() and group in batch["next"].keys():
-                                        if "observation" in batch["next"][group].keys():
-                                            obs = batch["next"][group]["observation"]
-                                            break
-                                elif isinstance(key, tuple) and len(key) == 2:
-                                    # Try accessing as batch[group]["observation"]
-                                    if group in batch.keys() and "observation" in batch[group].keys():
-                                        obs = batch[group]["observation"]
-                                        break
-                            except (KeyError, TypeError, AttributeError):
-                                continue
-                    
-                    if obs is not None and hasattr(obs, 'shape') and obs.shape[0] > 0:
-                        final_obs = obs[-1]
-                        
-                        # Convert to numpy if tensor
-                        if isinstance(final_obs, torch.Tensor):
-                            final_obs = final_obs.cpu().numpy()
-                        elif not isinstance(final_obs, np.ndarray):
-                            final_obs = np.array(final_obs)
-                        
-                        # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
-                        # We need to infer n_features from the observation length
-                        obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
-                        if obs_len >= 4:  # At least 2 features + precision + coverage
-                            # n_features = (obs_len - 2) / 2
-                            # HULL layout only. Under the quantile MDP the obs is
-                            # [a(n), b(n), q*(n), P, C, mode] = 3n+3, so obs[:n] is a
-                            # QUANTILE, not a bound, and this inference of n_features
-                            # is wrong. The two lengths are not distinguishable from
-                            # obs_len alone, so trust the env's layout stamp and skip
-                            # box metrics rather than log mislabelled numbers.
-                            # (Authoritative bounds live in env.export_rule_state().)
-                            _lay = _OBS_LAYOUT or {}
-                            _is_quantile = bool(_lay.get("quantile", False))
-                            n_features = int(_lay.get("n_features", 0)) or (obs_len - 2) // 2
-                            
-                            if n_features > 0 and not _is_quantile:
-                                lower_bounds = final_obs[:n_features]
-                                upper_bounds = final_obs[n_features:2*n_features]
-                                
-                                episode_detail["lower_bounds"] = lower_bounds.tolist() if hasattr(lower_bounds, 'tolist') else list(lower_bounds)
-                                episode_detail["upper_bounds"] = upper_bounds.tolist() if hasattr(upper_bounds, 'tolist') else list(upper_bounds)
-                                
-                                # Calculate box metrics
-                                box_widths = upper_bounds - lower_bounds
-                                episode_detail["box_widths"] = box_widths.tolist() if hasattr(box_widths, 'tolist') else list(box_widths)
-                                episode_detail["box_volume"] = float(np.prod(np.maximum(box_widths, 1e-9)))
-                                
-                                # Add bounds summary metrics to aggregated metrics
-                                all_metrics[f"training/{group}/box_volume"] = episode_detail["box_volume"]
-                                all_metrics[f"training/{group}/mean_box_width"] = float(np.mean(box_widths))
-                                all_metrics[f"training/{group}/min_box_width"] = float(np.min(box_widths))
-                                all_metrics[f"training/{group}/max_box_width"] = float(np.max(box_widths))
                     
                     episode_detail["group"] = group
                     episode_detail["step"] = self.experiment.n_iters_performed if hasattr(self.experiment, 'n_iters_performed') else None
@@ -1308,8 +1211,6 @@ class AnchorMetricsCallback(Callback):
                     if values:
                         aggregated[key] = sum(values) / len(values)
                 
-                # Try to log to wandb, but handle case where run is finished
-                # SS: This is not working right now.
                 try:
                     self.experiment.logger.log(
                         aggregated,
@@ -1346,7 +1247,7 @@ class AnchorMetricsCallback(Callback):
           1. evaluation/box_precision_mean + evaluation/box_coverage_mean
              (cross-group quality score; the MASAC path injects these so
              best_model tracks anchor quality, not raw return)
-          2. anchor_precision_mean + anchor_coverage_mean  (legacy MADDPG path)
+          2. anchor_precision_mean + anchor_coverage_mean  (info-dict Fid/Pur fallback)
           3. any '*reward*mean*' eval key  (always logged by BenchMARL)
           4. any '*return*mean*' eval key
         Returns None if nothing usable is found.
@@ -1401,7 +1302,7 @@ class AnchorMetricsCallback(Callback):
 
         Algorithm-agnostic and independent of NashConv / equilibrium logic.
         Tracks its own score in self._robust_best_score so it does not interfere
-        with the legacy per-class tracking further down on_evaluation_end.
+        with the per-class tracking further down on_evaluation_end.
         """
         if not self.save_best_model or self.experiment is None:
             return
@@ -1443,7 +1344,6 @@ class AnchorMetricsCallback(Callback):
                         e,
                     )
 
-    # SS: This function is way too messy. We need to fix this. Its not working right now.
     def on_evaluation_end(self, rollouts: List[TensorDictBase]):
         if not self.log_evaluation_metrics:
             logger.debug("Evaluation metrics logging disabled, skipping on_evaluation_end")
@@ -1471,20 +1371,6 @@ class AnchorMetricsCallback(Callback):
             if not hasattr(self, 'evaluation_anchor_data'):
                 self.evaluation_anchor_data = []
 
-        # SS: REMOVE THIS DEBUG LATER
-        # # Debug: check if rollouts is empty
-        # if not rollouts:
-        #     logger.warning("Warning: on_evaluation_end received empty rollouts list")
-        #     logger.warning(f"  Callback collect_anchor_data={self.collect_anchor_data}")
-        #     logger.warning(f"  Experiment group_map: {getattr(self.experiment, 'group_map', 'N/A')}")
-        #     return
-        
-        # logger.info(f"Debug: on_evaluation_end received {len(rollouts)} rollouts")
-        # if rollouts:
-        #     logger.info(f"  First rollout type: {type(rollouts[0])}")
-        #     if hasattr(rollouts[0], 'keys'):
-        #         logger.info(f"  First rollout keys: {list(rollouts[0].keys())}")
-        
         for rollout in rollouts:
             n_episodes += 1
             episode_data = {}
@@ -1581,58 +1467,6 @@ class AnchorMetricsCallback(Callback):
                                 all_metrics[key] = []
                             all_metrics[key].append(value)
                         
-                        # Extract bounds and box metrics from observation
-                        if group_obs is not None:
-                            try:
-                                # Get final observation (last step of episode)
-                                if hasattr(group_obs, 'shape') and group_obs.shape[0] > 0:
-                                    final_obs = group_obs[-1] if len(group_obs.shape) > 1 else group_obs
-                                else:
-                                    final_obs = group_obs
-                                
-                                # Convert to numpy if tensor
-                                if isinstance(final_obs, torch.Tensor):
-                                    final_obs = final_obs.cpu().numpy()
-                                elif not isinstance(final_obs, np.ndarray):
-                                    final_obs = np.array(final_obs)
-                                
-                                # Observation structure: [lower_bounds (n_features), upper_bounds (n_features), precision, coverage]
-                                obs_len = len(final_obs) if hasattr(final_obs, '__len__') else final_obs.shape[0] if hasattr(final_obs, 'shape') else 0
-                                # Hull layout only -- see the note at the other
-                                # box-metric site. obs_len alone cannot separate
-                                # 2n+3 from 3m+3, so require the length to be
-                                # consistent with the hull layout AND not with a
-                                # quantile one; when both fit, skip rather than log
-                                # quantile positions mislabelled as bounds.
-                                _lay = _OBS_LAYOUT or {}
-                                _is_quantile = bool(_lay.get("quantile", False))
-                                n_features = int(_lay.get("n_features", 0)) or (
-                                    (obs_len - 3) // 2 if (obs_len - 3) % 2 == 0 else 0
-                                )
-                                if obs_len >= 5 and n_features > 0 and not _is_quantile:
-                                        lower_bounds = final_obs[:n_features]
-                                        upper_bounds = final_obs[n_features:2*n_features]
-                                        
-                                        # Calculate box metrics
-                                        box_widths = upper_bounds - lower_bounds
-                                        box_volume = float(np.prod(np.maximum(box_widths, 1e-9)))
-                                        
-                                        # Add box metrics to aggregated metrics for wandb logging
-                                        box_metrics = {
-                                            f"evaluation/{group}/box_volume": box_volume,
-                                            f"evaluation/{group}/mean_box_width": float(np.mean(box_widths)),
-                                            f"evaluation/{group}/min_box_width": float(np.min(box_widths)),
-                                            f"evaluation/{group}/max_box_width": float(np.max(box_widths)),
-                                        }
-                                        
-                                        for key, value in box_metrics.items():
-                                            if key not in all_metrics:
-                                                all_metrics[key] = []
-                                            all_metrics[key].append(value)
-                            except Exception as e:
-                                # If bounds extraction fails, continue without box metrics
-                                pass
-                        
                         # Collect anchor data for rule extraction
                         if self.collect_anchor_data:
                             # Extract metrics from final info
@@ -1662,7 +1496,8 @@ class AnchorMetricsCallback(Callback):
                                 "total_reward": safe_get("total_reward", 0.0),
                             }
                             
-                            # Get anchor bounds from observation
+                            # Store the policy observation (3n+4 quantile layout).
+                            # Unit bounds come from export_rule_state, not obs[:n].
                             if group_obs is not None:
                                 if hasattr(group_obs, 'shape') and group_obs.shape[0] > 0:
                                     # Last observation contains final anchor state
@@ -1696,9 +1531,9 @@ class AnchorMetricsCallback(Callback):
         #   - episode_reward_mean: fallback score, but it is maximized by the
         #     do-nothing 1-step init box, so it pinned best_model to init.
         #   - box_precision_mean / box_coverage_mean: the QUALITY score
-        #     _extract_eval_score prefers. Precision and coverage are the last two
-        #     entries of each agent's observation. box_* names avoid the
-        #     "anchor_precision" substring so the dormant legacy per-class save
+        #     _extract_eval_score prefers. P and C are obs[-4] and obs[-3]
+        #     (layout [a, b, q*, P, C, mode, phase]). box_* names avoid the
+        #     "anchor_precision" substring so the older per-class save
         #     block stays off.
         try:
             groups_for_reward = (
@@ -1737,9 +1572,6 @@ class AnchorMetricsCallback(Callback):
                             if "observation" in gkeys:
                                 fo = _final_obs_vec(gd["observation"])
                                 if fo.shape[0] >= 5:
-                                    # Layout-dependent since G-12 added the clock:
-                                    #   hull     2n+3 = [lo, up, P, C, phase]        -> P=-3, C=-2
-                                    #   quantile 3n+4 = [a, b, q*, P, C, mode, phase] -> P=-4, C=-3
                                     _p, _c = obs_precision_coverage(fo)
                                     group_prec.append(_p)
                                     group_cov.append(_c)
@@ -1778,7 +1610,7 @@ class AnchorMetricsCallback(Callback):
             logger.debug(f"Could not compute eval reward/precision/coverage for best-model scoring: {e}")
 
         # Algorithm-agnostic best-model save (Part 1 fix).
-        # The legacy save block further down is gated on string-matching
+        # The older save block further down is gated on string-matching
         # 'anchor_precision'/'anchor_coverage' eval keys; for MASAC those keys
         # are not produced, so best_model was never saved. This call runs
         # unconditionally on every eval and owns best_model/best_checkpoint.pt.
@@ -1842,15 +1674,8 @@ class AnchorMetricsCallback(Callback):
                     f"(n={n_episodes})"
                 )
                 
-    def get_training_history(self) -> List[Dict[str, Any]]:
-        return self.training_history.copy()
-    
     def get_evaluation_history(self) -> List[Dict[str, Any]]:
         return self.evaluation_history.copy()
-    
-    def get_training_episode_details(self) -> List[Dict[str, Any]]:
-        """Get episode details collected during training (bounds, precision, coverage, etc.)."""
-        return self.training_episode_details.copy()
     
     def get_evaluation_anchor_data(self) -> List[Dict[str, Any]]:
         """Get anchor data collected during evaluation for rule extraction."""

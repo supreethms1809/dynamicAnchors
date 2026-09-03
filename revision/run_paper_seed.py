@@ -36,8 +36,8 @@ LOG_DIR = REPO / "revision" / "logs"
 FORCE = False
 SKIP_RLDA = set()
 
-# sa_timesteps / ma_frames / n_instances: same table as run_all_experiments.py.
-# Do not pass max_cycles here — current conf/anchor.yaml is 200.
+# sa_timesteps / ma_frames / n_instances: per-dataset budgets.
+# Do not pass max_cycles here — YAML is the source of truth.
 DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "iris": {
         "sa_timesteps": 90_000,

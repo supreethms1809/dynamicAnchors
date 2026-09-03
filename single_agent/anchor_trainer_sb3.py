@@ -97,26 +97,6 @@ def _get_algorithm_configs():
     return algorithm_map
 
 
-class ResetTerminationCountersCallback(BaseCallback):
-    """
-    Callback to reset termination reason counters before evaluation.
-    This ensures evaluation isn't affected by counters accumulated during training.
-    """
-    def __init__(self, eval_env, verbose: int = 0):
-        super().__init__(verbose)
-        self.eval_env = eval_env
-    
-    def _on_step(self) -> bool:
-        return True
-    
-    def on_evaluation_start(self) -> None:
-        """Called before EvalCallback runs evaluation."""
-        if hasattr(self.eval_env, '_reset_termination_counters'):
-            self.eval_env._reset_termination_counters()
-            if self.verbose > 0:
-                logger.debug("  Reset termination counters before evaluation")
-
-
 class LearningRateScheduleCallback(BaseCallback):
     """
     Callback to schedule learning rate during training.
@@ -851,7 +831,7 @@ class AnchorTrainerSB3:
                 
                 logger.info(f"   Class {cls}: {n_class_samples} training samples available (ratio: {class_ratio:.1%})")
                 
-                # CRITICAL FIX: Filter instances where classifier prediction matches target_class
+                # Filter instances where classifier prediction matches target_class
                 # This ensures original_prediction == target_class, preventing precision calculation issues
                 if len(class_indices) > 0:
                     # Get predictions for all class instances

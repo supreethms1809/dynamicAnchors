@@ -42,6 +42,7 @@ DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "uci_credit":    {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
     "folktables_income_CA_2018": {"ma_frames": 1_080_000, "n_instances": 25, "n_classes": 2},
     "housing":       {"ma_frames": 720_000, "n_instances": 20, "n_classes": 4},
+    "covtype":       {"ma_frames": 1_080_000, "n_instances": 25, "n_classes": 7},
     "uci_adult":     {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
     # C-23 additions, 2026-09-02.
     # heloc: FICO Explainable ML Challenge credit-risk set (10k x 22, balanced).

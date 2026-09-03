@@ -207,19 +207,11 @@ def test_shipped_configs_agree_between_rlda_and_mada():
     MULTI_AGENT_ONLY = {
         "inter_class_overlap_weight", "shared_reward_weight", "shared_terminal_bonus",
         "same_class_diversity_weight",
-        "class_union_cov_weight", "class_union_prec_weight", "global_coverage_weight",
-        "global_coverage_threshold", "nashconv_threshold",
+        "global_coverage_weight", "global_coverage_threshold", "nashconv_threshold",
     }
-    # Read but never used in either reward (coverage_bonus is hardcoded 0.0).
-    DEAD = {
-        "coverage_bonus_weight_met", "coverage_bonus_weight_high_prec",
-        "coverage_bonus_weight_high_prec_progress",
-        "coverage_bonus_weight_high_prec_distance",
-        "coverage_bonus_weight_reasonable_prec",
-        "coverage_bonus_weight_reasonable_prec_progress",
-        "target_class_bonus_weight", "use_random_sampling", "sparsity_weight",
-        "js_penalty_weight",
-    }
+    # Names that used to be env_config.get()'d. Keep them out of the shared-knob
+    # check if they reappear as unused reads.
+    DEAD = set()
 
     ma_cfg = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))
     sa_cfg = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))
@@ -242,11 +234,7 @@ def test_shipped_configs_agree_between_rlda_and_mada():
 
 
 def test_beta_is_not_the_hull_era_value():
-    """beta=5.0 was justified by precision being pinned at 1.000 under the HULL
-    representation. Under the quantile MDP precision is a live term, so that value
-    would make a +0.6 coverage gain (+2.24) outweigh the entire precision term.
-    0.25 (not 0.6) so shrinking for Fid is not cancelled by the √C term at C≈1.
-    """
+    """beta=5.0 was a hull-era value; quantile MDP uses 0.25 so shrinking for Fid wins."""
     mae = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
     sae = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
     assert mae["beta"] == pytest.approx(0.25)

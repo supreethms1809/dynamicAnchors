@@ -620,6 +620,9 @@ def run_multi_agent_inference(
     logger.info(f"Multi-Agent Inference: {dataset}  (model source: {inference_model_source})")
     logger.info(f"{'='*80}")
 
+    # Resolve before chdir(BenchMARL): a relative experiment_dir would miss
+    # individual_models_best even when it exists on disk.
+    experiment_dir = str(Path(experiment_dir).resolve())
     inference_dir = Path(experiment_dir) / "inference"
     inference_dir.mkdir(parents=True, exist_ok=True)
     rules_file = inference_dir / "extracted_rules.json"
@@ -690,11 +693,7 @@ def run_revision_evaluate(
     rules_file: str, dataset: str, method: str, seed: int = 42,
     out_dir: Optional[str] = None,
 ) -> Optional[str]:
-    """Score stored boxes with revision.evaluate (rank on D_val, report D_test).
-
-    Replaces the old test_extracted_rules path, which scored printed strings
-    on train+test (coverage_on_all_data).
-    """
+    """Score stored boxes with revision.evaluate (rank on D_val, report D_test)."""
     logger.info(f"\n{'='*80}")
     logger.info(f"revision.evaluate: {dataset}  method={method}  k={REVISION_K}")
     logger.info(f"{'='*80}")

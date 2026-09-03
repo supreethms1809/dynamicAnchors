@@ -87,7 +87,7 @@ def _dedupe_anchor_boxes(anchors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _pool_class_anchors(per_class_results: Dict[str, Any], cls: int) -> List[Dict[str, Any]]:
-    """Rank instance-based and class-based boxes together (do not starve the hull)."""
+    """Rank instance-based and class-based boxes together."""
     class_data = per_class_results.get(f"class_{cls}") or {}
     anchors = list(_collect_anchors(class_data))
     cb_key = f"class_{cls}_class_based"

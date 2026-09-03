@@ -2,34 +2,17 @@ defaults:
   - experiment_config
   - _self_
 
-# The device for collection (e.g. cuda)
 sampling_device: "cpu"
-# The device for training (e.g. cuda).
-# Was "mps" — caused NotImplementedError: aten::detach with TESTING_ONLY_GenericMode
-# backend in BenchMARL's _evaluation_loop / PettingZoo to_numpy path on macOS
-# (MPS↔CPU routing inconsistency). CPU is small overhead here (7-feature MLPs).
+# Stay on CPU: MPS detach/to_numpy is unreliable in BenchMARL's eval loop on macOS.
 train_device: "cpu"
-# The device for the replay buffer of off-policy algorithms (e.g. cuda).
-# Use "disk" to store it on disk (in the experiment save_folder)
 buffer_device: "cpu"
 
-# Whether to share the parameters of the policy within agent groups.
-# FALSE is required for MADA: a group is one CLASS (see AnchorEnv._compute_group_map),
-# so sharing here would give the agents_per_class agents of a class ONE network --
-# identical copies that observe the same reset state and therefore emit the same
-# rule, making same_class_diversity_weight unlearnable. Verified: with True the
-# extracted per-agent actors were byte-identical.
-# See docs/BUGS_mada_multiagent_design.md (M-01, M-02).
+# A group is one class. Sharing would collapse agents_per_class onto one network.
 share_policy_params: False
 # If an algorithm and an env support both continuous and discrete actions, what should be preferred
 prefer_continuous_actions: True
 # If False collection is done using a collector (under no grad). If True, collection is done with gradients.
 collect_with_grad: False
-# In case of non-vectorized environments, whether to run collection of multiple processes
-# If this is used, there will be n_envs_per_worker processes, collecting frames_per_batch/n_envs_per_worker frames each.
-# Was False as a safety measure while we hunted the MA spawn-storm. Now safe to
-# turn back on because RF n_jobs=1 (wyodot_dataset_loader) and the run_command
-# thread fences in run_pipeline.py keep classifier.predict() single-process.
 parallel_collection: True
 
 # Discount factor

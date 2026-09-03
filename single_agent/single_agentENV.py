@@ -37,13 +37,14 @@ class SingleAgentAnchorEnv(Env):
     
     Compatible with Stable-Baselines3 and other single-agent RL libraries.
     
-    Observation Space: Box of shape (3 * n_features + 3,)
+    Observation Space: Box of shape (3 * n_features + 4,)
         - First n_features: class-quantile lower a
         - Next n_features: class-quantile upper b
         - Next n_features: q* (instance or class-centroid quantile)
         - Next 1: current precision
         - Next 1: current coverage
         - Next 1: mode bit (0 class, 1 instance)
+        - Next 1: episode phase t / max_cycles
 
     Action Space: Box of shape (2 * n_features,)
         - First n_features: delta for a (clipped to [-1, 1])
@@ -122,14 +123,10 @@ class SingleAgentAnchorEnv(Env):
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(2 * self.n_features,),  # delta for lower + delta for upper
+            shape=(2 * self.n_features,),
             dtype=np.float32
         )
         
-        step_fracs = env_config.get("step_fracs", (0.005, 0.01, 0.02))
-        if step_fracs is None or len(step_fracs) == 0:
-            raise ValueError("step_fracs cannot be empty. Provide at least one step fraction value.")
-        self.step_fracs = step_fracs
         self.min_width = env_config.get("min_width", 0.05)
         self.alpha = env_config.get("alpha", 0.7)
         self.beta = env_config.get("beta", 0.6)
@@ -180,16 +177,9 @@ class SingleAgentAnchorEnv(Env):
         self.coverage_floor_relative = bool(env_config.get("coverage_floor_relative", True))
         self.coverage_floor_min_support = int(env_config.get("min_support", 10))
         self._refresh_coverage_floor()
-        # B2 fix 1: penalty charged when an action is reverted at the coverage
-        # floor. Default 0.0 — the revert already removes the action's effect.
-        # Set negative (e.g. -0.05, the old value) to restore the old behaviour.
         self.coverage_floor_penalty_value = float(env_config.get("coverage_floor_penalty", 0.0))
-        # B2 fix 2: bisection steps used to project an infeasible action back onto
-        # the coverage floor. 0 restores the old hard-revert behaviour.
         self.coverage_floor_projection_steps = int(env_config.get("coverage_floor_projection_steps", 6))
         self.coverage_floor_projection_alpha = 0.0
-        # B2 rebalance: width of the precision ramp below target over which coverage
-        # credit goes 0 -> 1. Smaller = stricter fidelity-first curriculum.
         self.gate_margin = float(env_config.get("gate_margin", 0.10))
         self.initial_window = env_config.get("initial_window", 0.1)
         # Only terminate on both_targets_met (disable excellent/high_prec/close).
@@ -209,9 +199,8 @@ class SingleAgentAnchorEnv(Env):
         self.cluster_centroids_per_class = env_config.get("cluster_centroids_per_class", None)
         self.training_instances_per_class = env_config.get("training_instances_per_class", None)
         self.training_instance_ratio = env_config.get("training_instance_ratio", 0.5)  # Base ratio (fallback)
-        self.training_instance_ratios_per_class = env_config.get("training_instance_ratios_per_class", None)  # Class-specific ratios
-        self.use_random_sampling = env_config.get("use_random_sampling", False)
-        self.use_class_centroids = env_config.get("use_class_centroids", True)  # Default: use centroids for initialization
+        self.training_instance_ratios_per_class = env_config.get("training_instance_ratios_per_class", None)
+        self.use_class_centroids = env_config.get("use_class_centroids", True)
         # Explicit class-based start point (unit space). Set per rollout by inference
         # to cycle through diversified starts (k-means centroids + random class
         # samples) instead of drawing a random centroid every reset.
@@ -233,46 +222,24 @@ class SingleAgentAnchorEnv(Env):
             if self.X_test_unit is None or self.X_test_std is None or self.y_test is None:
                 raise ValueError("eval_on_test_data=True requires X_test_unit, X_test_std, and y_test")
 
-        self.max_action_scale = env_config.get("max_action_scale", 0.1)
-        self.min_absolute_step = env_config.get("min_absolute_step", 0.001)
         self.min_steps_before_termination = int(
             env_config.get("min_steps_before_termination", 2)
         )
         
-        # Coverage bonus weights (read from config, defaults match reduced values)
-        self.coverage_bonus_weight_met = env_config.get("coverage_bonus_weight_met", 0.01)
-        self.coverage_bonus_weight_high_prec = env_config.get("coverage_bonus_weight_high_prec", 0.03)
-        self.coverage_bonus_weight_high_prec_progress = env_config.get("coverage_bonus_weight_high_prec_progress", 0.07)
-        self.coverage_bonus_weight_high_prec_distance = env_config.get("coverage_bonus_weight_high_prec_distance", 0.02)
-        self.coverage_bonus_weight_reasonable_prec = env_config.get("coverage_bonus_weight_reasonable_prec", 0.01)
-        self.coverage_bonus_weight_reasonable_prec_progress = env_config.get("coverage_bonus_weight_reasonable_prec_progress", 0.02)
+        self.mode = env_config.get("mode", "training")
         
-        # Target class bonus weight (read from config, default matches reduced value)
-        self.target_class_bonus_weight = env_config.get("target_class_bonus_weight", 0.02)
+        # Diagnostics only. Max-count termination was removed: it made the MDP
+        # non-stationary under the replay buffer.
+        self._reset_termination_counters()
         
-        # Environment mode: "training", "evaluation", or "inference"
-        # Termination counters are reset in reset() for evaluation/inference modes
-        self.mode = env_config.get("mode", "training")  # Default to training
-        
-        # Termination reason counters (diagnostics only). The old max-count
-        # mechanism that permanently disabled overused reasons mid-training was
-        # removed: it made the MDP non-stationary under the replay buffer. The
-        # terminal bonus now provides the incentive it was approximating.
-        self._reset_termination_counters()  # This will check self.mode and disable lenient conditions in inference mode
-        
-        # Multi-agent config options (kept for API compatibility, but not used in single-agent)
-        # Single-agent environments are independent (one per class), so these don't apply
         self.inter_class_overlap_weight = env_config.get("inter_class_overlap_weight", 0.1)
         self.shared_reward_weight = env_config.get("shared_reward_weight", 0.2)
-        # Optional: class union metrics weights (not used in single-agent, but kept for compatibility)
-        self.class_union_cov_weight = env_config.get("class_union_cov_weight", 0.0)
-        self.class_union_prec_weight = env_config.get("class_union_prec_weight", 0.0)
         self.same_class_diversity_weight = env_config.get("same_class_diversity_weight", 0.0)
         
         x_star_unit_config = env_config.get("x_star_unit", None)
         if x_star_unit_config is not None:
             if isinstance(x_star_unit_config, dict):
-                self.x_star_unit = x_star_unit_config.get("agent_0", x_star_unit_config.get(self.agent_name, None))
+                self.x_star_unit = x_star_unit_config.get("agent_0")
             else:
                 self.x_star_unit = x_star_unit_config
         else:
@@ -324,14 +291,9 @@ class SingleAgentAnchorEnv(Env):
         }
         self.categorical_freeze = env_config.get("categorical_freeze", "instance")
         self.sparsity_width_ratio = float(env_config.get("sparsity_width_ratio", 0.95))
-        # B1: weight on the fraction of dimensions released to (near) full range.
-        # 0.0 disables dimension release and restores the old potential.
-        self.sparsity_weight = float(env_config.get("sparsity_weight", 0.5))
-        self.ranking_score_formula = env_config.get("ranking_score_formula", "precision_coverage")
+        self.ranking_score_formula = env_config.get("ranking_score_formula", "lcb_coverage")
         self.top_k_rules_by_score = env_config.get("top_k_rules_by_score", 5)
         self.min_support = int(env_config.get("min_support", 10))
-        # Paper YAML: true. Default follows estimator so hull/CRN tests that
-        # terminate on 2–3 class rows keep working unless they opt in.
         self.require_min_support_to_terminate = bool(
             env_config.get("require_min_support_to_terminate", False)
         )
@@ -561,7 +523,6 @@ class SingleAgentAnchorEnv(Env):
                 self.a, self.b, self.q_star, self._constrained_mask(), self.quantile_eps
             )
 
-    # SS: This is a helper method to normalize the data. It is used to normalize the data for the perturbation sampling.
     @staticmethod
     def _normalize_data(X_std: np.ndarray, env_config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         X_min = env_config.get("X_min", None)
@@ -577,7 +538,6 @@ class SingleAgentAnchorEnv(Env):
         
         return X_unit, X_min, X_range
 
-    # SS: It is used to mask the data in the box for the perturbation sampling.
     def _mask_in_box(self) -> np.ndarray:
         X_eval_unit, _, _, _ = self._active_data()
         
@@ -714,14 +674,7 @@ class SingleAgentAnchorEnv(Env):
         """
         precision = max(0.0, float(precision))
         coverage = max(0.0, float(coverage))
-        # B2 rebalance: gate coverage credit on precision RELATIVE TO THE TARGET.
-        #
-        # The old gate reached 1.0 at 0.8*tau_P — i.e. full coverage credit while
-        # still below target — which was harmless only because measured precision
-        # was pinned at 1.000 in all 10 dataset x class probes. With beta raised so
-        # coverage actually drives the policy, that leniency becomes a licence to
-        # trade fidelity for coverage. The ramp gives zero credit below
-        # (target - gate_margin) and full credit at the target.
+        # Coverage credit ramps from 0 at (target - gate_margin) to 1 at target.
         target = max(float(self.precision_target_effective), 1e-6)
         margin = max(float(self.gate_margin), 1e-6)
         gate = (precision - (target - margin)) / margin
@@ -842,7 +795,7 @@ class SingleAgentAnchorEnv(Env):
                     centroid_idx = self.rng.integers(0, len(centroids))
                     centroid = np.array(centroids[centroid_idx], dtype=np.float32)
                     
-                    # CRITICAL FIX: For scattered data, centroids might be mean centroids (not actual data points)
+                    # For scattered data, centroids might be mean centroids (not actual data points)
                     # Check if centroid is close to any actual data point. If not, use the nearest data point instead.
                     # CRITICAL: During training, always use training data to prevent test set leakage
                     if self.mode == "training":
@@ -1077,7 +1030,7 @@ class SingleAgentAnchorEnv(Env):
                     up = min(1.0, mid + width / 2.0)
                     U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
                 
-                # CRITICAL FIX: For instance-based anchors, always include the original instance
+                # For instance-based anchors, always include the original instance
                 # This ensures precision calculation includes at least one point (the instance itself)
                 # that matches the original prediction, preventing precision from being incorrectly 0.0
                 if is_instance_based and self.x_star_unit is not None:
@@ -1115,7 +1068,7 @@ class SingleAgentAnchorEnv(Env):
                         up = min(1.0, mid + width / 2.0)
                         U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
                     
-                    # CRITICAL FIX: For instance-based anchors, always include the original instance
+                    # For instance-based anchors, always include the original instance
                     # This ensures precision calculation includes at least one point (the instance itself)
                     # that matches the original prediction, preventing precision from being incorrectly 0.0
                     if is_instance_based and self.x_star_unit is not None:
@@ -1224,10 +1177,7 @@ class SingleAgentAnchorEnv(Env):
             "high_precision_reasonable_coverage": True,
             "both_reasonably_close": True
         }
-        # Lenient reasons (excellent_precision, high_prec, reasonably_close)
-        # paid the +5 bonus on class hulls at step 2 without ever hitting τ_C.
-        # strict_target_termination (default) keeps only both_targets_met in
-        # training and inference.
+        # strict_target_termination keeps only both_targets_met.
         if self.strict_target_termination or self.mode == "inference":
             self.termination_reason_enabled["excellent_precision"] = False
             self.termination_reason_enabled["high_precision_reasonable_coverage"] = False
@@ -1258,7 +1208,6 @@ class SingleAgentAnchorEnv(Env):
         # but accumulate across episodes to track usage and disable overused reasons.
         
         self.timestep = 0
-        # B2-DIAG: zero the per-episode reward-term accumulators
         self._rt_shaping = 0.0
         self._rt_overlap = 0.0
         self._rt_drift = 0.0
@@ -1402,8 +1351,6 @@ class SingleAgentAnchorEnv(Env):
         
         return observation, info
 
-    def _apply_continuous_action(self, action: np.ndarray):
-        self._apply_quantile_action(np.clip(action, -1.0, 1.0))
 
     def _apply_quantile_action(self, action: np.ndarray) -> None:
         prev_a, prev_b = self.a.copy(), self.b.copy()
@@ -1473,8 +1420,7 @@ class SingleAgentAnchorEnv(Env):
         prev_b = self.b.copy()
         prev_active = self._constrained_mask()
         
-        # Apply continuous action (always continuous for single-agent)
-        self._apply_continuous_action(action)
+        self._apply_quantile_action(np.clip(action, -1.0, 1.0))
 
         precision, coverage, details = self._current_metrics()
 
@@ -1571,31 +1517,13 @@ class SingleAgentAnchorEnv(Env):
         # Single agent: no inter-class overlap penalty
         inter_class_overlap_penalty = 0.0
 
-        # Retired: the JS proxy was a third movement penalty (consecutive-box volume
-        # overlap, not a divergence); drift_penalty already covers box movement.
-        js_penalty = 0.0
-        # Retired with the relative-gain scheme; keys kept for logging compatibility.
-        coverage_bonus = 0.0
-        target_class_bonus = 0.0
-
         # When action is reverted (coverage_clipped), reduce penalties significantly
         coverage_floor_penalty = 0.0
         if coverage_clipped:
             penalty_reduction_factor = 0.1  # Reduce penalties by 90%
             overlap_penalty *= penalty_reduction_factor
             anchor_drift_penalty *= penalty_reduction_factor
-            # B2 fix 1: do NOT charge for a reverted action.
-            #
-            # Measured on breast_cancer (d=30): the box was reverted on ~196 of 200
-            # steps, so this -0.05 accounted for 81% of the entire penalty mass and
-            # a median episode return of -9.9, while the shaping term that is meant
-            # to teach the precision/coverage trade-off contributed -0.04. The
-            # revert already removes any benefit of the action; charging for it as
-            # well is double jeopardy for a move the environment refused to apply,
-            # and it drowns out the only informative part of the reward.
-            #
-            # Set env_config["coverage_floor_penalty"] to a negative value to
-            # restore the old behaviour for ablation.
+            # Revert already undoes the action; default coverage_floor_penalty is 0.
             coverage_floor_penalty = self.coverage_floor_penalty_value
 
         reward = (shaping_gain -
@@ -1607,11 +1535,6 @@ class SingleAgentAnchorEnv(Env):
         if not np.isfinite(reward):
             reward = 0.0
 
-        # B2-DIAG: per-episode accumulation of every reward term. The shaping term
-        # telescopes (bounded by the range of Phi), while the penalties are charged
-        # every step and accumulate with episode length and with sqrt(d) via the L2
-        # drift norm. Logging the totals separately shows which term actually
-        # dominates the return instead of inferring it from ep_rew_mean.
         self._rt_shaping = getattr(self, "_rt_shaping", 0.0) + float(shaping_gain)
         self._rt_overlap = getattr(self, "_rt_overlap", 0.0) + float(overlap_penalty)
         self._rt_drift = getattr(self, "_rt_drift", 0.0) + float(drift_penalty)
@@ -1630,8 +1553,7 @@ class SingleAgentAnchorEnv(Env):
             1.0, float(self.timestep + 1) / float(self.max_cycles)
         )
         state = self._get_observation(precision, coverage, episode_phase)
-        
-        ## SS: Target change here:
+
         # Termination uses the class-aware effective target so minority/overlapping
         # classes have reachable conditions (see _compute_effective_precision_target).
         eps = 1e-12
@@ -1739,9 +1661,6 @@ class SingleAgentAnchorEnv(Env):
                 # Terminal bonus: pays once, dwarfs anything farmable from per-step
                 # terms in the remaining steps of the episode.
                 reward += self.terminal_bonus
-                # B2-DIAG: the bonus is added after the reward assembly above, so
-                # fold it into the accumulators or the logged decomposition would
-                # not sum to the true episode return.
                 self._rt_terminal = getattr(self, "_rt_terminal", 0.0) + float(self.terminal_bonus)
                 self._rt_total = getattr(self, "_rt_total", 0.0) + float(self.terminal_bonus)
 
@@ -1779,7 +1698,6 @@ class SingleAgentAnchorEnv(Env):
             "coverage": float(coverage),           # Keep original for backward compatibility
             "drift": float(drift),
             "anchor_drift": float(anchor_drift_penalty),
-            "js_penalty": float(js_penalty),
             "coverage_clipped": float(1.0 if coverage_clipped else 0.0),
             "termination_reason": termination_reason_code,
             "coverage_floor_hits": float(self.coverage_floor_hits),
@@ -1790,8 +1708,6 @@ class SingleAgentAnchorEnv(Env):
             "coverage_gain_scaled": float(coverage_gain_for_reward),
             "precision_gain_component": float(precision_gain_component),
             "coverage_gain_component": float(coverage_gain_component),
-            "coverage_bonus": float(coverage_bonus),
-            "target_class_bonus": float(target_class_bonus),
             "overlap_penalty": float(overlap_penalty),
             "drift_penalty": float(drift_penalty),
             "anchor_drift_penalty": float(anchor_drift_penalty),
@@ -1999,19 +1915,10 @@ class SingleAgentAnchorEnv(Env):
                 excess = anchor_distance - max_allowed_distance
                 anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5
         return anchor_drift_penalty
-    
-    # NOTE: _compute_reward_weights_and_penalties, _compute_coverage_bonus and
-    # _compute_target_class_bonus were removed with the move to potential-based
-    # reward shaping (see _potential and the reward block in step()).
 
-    def get_anchor_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
-        return self.lower.copy(), self.upper.copy()
-    
     def extract_rule(
         self, 
         max_features_in_rule: Optional[int] = 5,
-        initial_lower: Optional[np.ndarray] = None,
-        initial_upper: Optional[np.ndarray] = None,
         denormalize: bool = False
     ) -> Tuple[str, str]:
         """
@@ -2135,9 +2042,7 @@ class SingleAgentAnchorEnv(Env):
     def close(self):
         pass
 
-# main function to test the environment compatibility with PettingZoo. 
-# The AnchorEnv is inherited from the ParallelEnv class in PettingZoo.
-# This is needed for the environment to be compatible with BenchMARL.
+# Smoke test for the Gymnasium single-agent environment.
 def main():
     np.random.seed(42)
     torch.manual_seed(42)

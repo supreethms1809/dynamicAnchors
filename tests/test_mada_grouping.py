@@ -171,8 +171,7 @@ def test_slice_agent_params_yields_distinct_single_agent_actors():
 
 
 def test_slice_agent_params_passes_shared_layout_through():
-    """share_params=True (or a group of one) has no agent dim: leave it alone,
-    so hull/CDEA checkpoints stay byte-identical."""
+    """share_params=True (or a group of one) has no agent dim: leave it alone."""
     sd = _multiagent_actor_state_dict(3, share_params=True)
     assert _slice_agent_params(sd, agent_idx=0, n_agents=3) is sd
     assert _slice_agent_params(sd, agent_idx=2, n_agents=3) is sd

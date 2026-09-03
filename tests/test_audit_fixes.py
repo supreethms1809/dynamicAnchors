@@ -1,8 +1,6 @@
 """Regression guards for the 2026-09-01 audit fixes (P-## and G-##).
 
-Each test pins a specific defect from docs/BUGS_pipeline_review.md and
-docs/BUGS_external_review_verdicts.md. They are cheap and hermetic: no training,
-no checkpoints, no network.
+Cheap and hermetic: no training, no checkpoints, no network.
 """
 from __future__ import annotations
 
@@ -231,11 +229,11 @@ def test_quantile_observation_is_never_parsed_as_bounds():
     assert out is None, "a quantile observation must not yield a box"
 
 
-def test_hull_observation_fallback_still_works():
+def test_unit_bound_observation_fallback_still_works():
     n = 4
-    hull_obs = ([0.1] * n) + ([0.9] * n) + [0.5, 0.5, 0.0]     # 2n+3
+    unit_obs = ([0.1] * n) + ([0.9] * n) + [0.5, 0.5, 0.0]     # 2n+3 unit-bound layout
     out = persist_box_from_episode(
-        {"final_observation": hull_obs}, {"X_min": np.zeros(n), "X_range": np.ones(n)}, n,
+        {"final_observation": unit_obs}, {"X_min": np.zeros(n), "X_range": np.ones(n)}, n,
     )
     assert out is not None
 

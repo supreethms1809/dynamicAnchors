@@ -884,18 +884,8 @@ def _process_instances_for_class(
                     temp_env.a = box["a"]
                     temp_env.b = box["b"]
 
-                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                else:
-                    initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
-                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
-
                 rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
-                    initial_lower=initial_lower_normalized,
-                    initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
             else:
@@ -909,7 +899,7 @@ def _process_instances_for_class(
                 "rollout_idx": rollout_idx,
                 "data_instance_idx": int(data_instance_idx),
                 "rollout_type": "instance_based",
-                # Rollout-estimated metrics (computed during rollout using perturbation samples)
+                # Rollout-estimated metrics (Fid/Pur from the env at episode end)
                 "precision_rollout_estimated": float(precision),
                 "coverage_rollout_estimated": float(coverage),
                 "coverage_class_conditional_rollout_estimated": float(coverage_class_conditional),
@@ -1082,7 +1072,7 @@ def _process_instances_for_class(
                 if abs(prec_full - prec_rollout) > 0.05:
                     logger.debug(
                         f"    Rollout {rollout_data['rollout_idx']}: Precision changed from {prec_rollout:.4f} "
-                        f"(rollout-estimated, using perturbation samples) to {prec_full:.4f} "
+                        f"(rollout-estimated) to {prec_full:.4f} "
                         f"(recomputed on full dataset with actual instances)"
                     )
                 
@@ -1201,7 +1191,7 @@ def _process_instances_for_class(
         
         # Support-weighted means: weight by n_in_box (support count) instead of coverage values
         # This follows the metrics strategy: weight by actual number of samples covered
-        # CRITICAL FIX: Build weights from anchors_list (all anchors across all instances), not just kept_rollouts from last instance
+        # Build weights from anchors_list (all anchors across all instances), not just kept_rollouts from last instance
         if use_weighted_average:
             # Extract n_in_box from anchors_list (support count for each anchor across ALL instances)
             # For instance-based: weight by n_in_box (number of samples covered by each anchor)
@@ -2498,14 +2488,8 @@ def extract_rules_single_agent(
             avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
             total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
             
-            # NOTE: Class-level (class-union) metrics will be computed later using class-based anchors only
-            # We do NOT compute union of instance-based anchors here - that's not one of our three metrics:
-            # 1. Instance-based = average of instance-based rollouts
-            # 2. Class-based = average of class-based rollouts  
-            # 3. Class-union = union of class-based rules (computed later, no new rollouts)
-            class_precision = 0.0  # Will be set later from class-based union
-            class_coverage = 0.0   # Will be set later from class-based union
-            anchors_with_bounds = 0  # Initialize to track anchors used in union computation
+            class_precision = 0.0
+            class_coverage = 0.0
             
             # Get the appropriate dataset (test or train) based on eval_on_test_data
             # IMPORTANT: Must use the same dataset that was used during rollouts for consistency
@@ -2523,97 +2507,10 @@ def extract_rules_single_agent(
                 else:
                     logger.info(f"  Computing class-level metrics on TRAIN data (eval_on_test_data=False)")
             
-            # Compute union of all anchors for this class
-            # SKIPPED: We do NOT compute union of instance-based anchors here.
-            # The union of instance-based anchors is NOT one of our three metrics.
-            # Class-union metrics will be computed later from class-based rules only.
-            if False:  # Disabled - union of instance-based anchors is not one of our metrics
-                n_samples = X_data.shape[0]
-                union_mask = np.zeros(n_samples, dtype=bool)
-                
-                # Count how many anchors have normalized bounds
-                anchors_with_bounds = 0
-                
-                # Debug: Track coverage per anchor
-                anchor_coverages = []
-                
-                # Build union mask from all anchors
-                # TODO: Consider using unique rules instead to match test script results
-                for anchor_idx, anchor_data in enumerate(anchors_list):
-                    if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                        lower_norm = anchor_data["lower_bounds_normalized"]
-                        upper_norm = anchor_data["upper_bounds_normalized"]
-                        
-                        # Skip if bounds are None
-                        if lower_norm is None or upper_norm is None:
-                            logger.warning(f"  Anchor {anchor_idx} has None normalized bounds, skipping")
-                            continue
-                        
-                        lower = np.array(lower_norm, dtype=np.float32)
-                        upper = np.array(upper_norm, dtype=np.float32)
-                        
-                        # Validate bounds shape matches data
-                        if lower.shape[0] != X_data.shape[1] or upper.shape[0] != X_data.shape[1]:
-                            logger.warning(f"  Anchor {anchor_idx} bounds shape mismatch: lower.shape={lower.shape}, upper.shape={upper.shape}, X_data.shape[1]={X_data.shape[1]}, skipping")
-                            continue
-                        
-                        # Validate bounds are in [0, 1] range
-                        if np.any(lower < 0) or np.any(upper > 1):
-                            logger.warning(f"  Anchor {anchor_idx} has bounds outside [0,1]: lower min={lower.min():.4f}, upper max={upper.max():.4f}")
-                        
-                        # Check which points fall in this anchor box
-                        in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
-                        n_in_box = in_box.sum()
-                        anchor_coverages.append(n_in_box)
-                        union_mask |= in_box
-                        anchors_with_bounds += 1
-                    else:
-                        logger.warning(f"  Anchor {anchor_idx} missing normalized bounds keys")
-                
-                logger.debug(f"  Anchor individual coverages: {anchor_coverages[:5]}..." if len(anchor_coverages) > 5 else f"  Anchor individual coverages: {anchor_coverages}")
-                
-                # Class-level (class-union) metrics: union of all anchors for this class
-                # NOTE: "class-level" here refers to "class-union" metrics computed from the union of all anchors.
-                # This is different from "instance-level" metrics which are averaged across individual anchors.
-                # 
-                # IMPORTANT: This computation uses ALL anchors (including duplicates), not
-                # just unique rules. revision.evaluate ranks stored boxes on D_val and
-                # reports Fid/Pur on D_test; those cells are the paper path.
-                mask_cls = (y_data == target_class)
-                n_class_samples = mask_cls.sum()
-                n_total_samples = len(y_data)
-                if n_class_samples > 0:
-                    n_covered_class_samples = union_mask[mask_cls].sum()
-                    n_covered_total_samples = union_mask.sum()
-                    class_coverage = float(n_covered_class_samples / n_class_samples)
-                    logger.info(f"  Class {target_class} class-union coverage on {data_source} data: {n_covered_class_samples}/{n_class_samples} = {class_coverage:.4f}")
-                    logger.info(f"    (using {anchors_with_bounds} anchors with normalized bounds out of {len(anchors_list)} total anchors)")
-                    logger.info(f"    NOTE: This uses ALL anchors. Test script uses unique rules, which may differ slightly.")
-                    logger.info(f"    Total samples in {data_source} data: {n_total_samples}, Class {target_class} samples: {n_class_samples}, Total covered by union: {n_covered_total_samples}")
-                    
-                    # Debug: Check if union covers all samples (which would indicate a problem)
-                    if n_covered_total_samples == n_total_samples:
-                        logger.warning(f"    WARNING: Union covers ALL {n_total_samples} samples in {data_source} data! This might indicate anchors are too wide.")
-                    elif n_covered_class_samples == n_class_samples:
-                        logger.info(f"    Union covers all {n_class_samples} class {target_class} samples (perfect coverage for this class)")
-                else:
-                    class_coverage = 0.0
-                    logger.warning(f"  Class {target_class} has no samples in {data_source} data")
-                
-                # Class-level (class-union) precision: fraction of points in union that belong to target class
-                n_union_samples = union_mask.sum()
-                if n_union_samples > 0:
-                    n_union_class_samples = (y_data[union_mask] == target_class).sum()
-                    class_precision = float(n_union_class_samples / n_union_samples)
-                    logger.info(f"  Class {target_class} class-union precision on {data_source} data: {n_union_class_samples}/{n_union_samples} = {class_precision:.4f}")
-                else:
-                    class_precision = 0.0
-                    logger.warning(f"  Class {target_class} union covers no samples in {data_source} data")
-            else:
-                if X_data is None or y_data is None:
-                    logger.warning(f"  Cannot compute class-level metrics: X_data or y_data is None")
-                if len(anchors_list) == 0:
-                    logger.warning(f"  Cannot compute class-level metrics: no anchors found")
+            if X_data is None or y_data is None:
+                logger.warning(f"  Cannot compute class-level metrics: X_data or y_data is None")
+            if len(anchors_list) == 0:
+                logger.warning(f"  Cannot compute class-level metrics: no anchors found")
             
             results["per_class_results"][class_key] = {
                 "class": int(target_class),
@@ -2751,7 +2648,7 @@ def extract_rules_single_agent(
         for rollout_idx in range(n_class_based_rollouts_per_class):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data flags for class-based rollouts
+            # Respect eval_on_test_data and coverage_on_all_data flags for class-based rollouts
             # This ensures consistent evaluation sets between instance-based and class-based metrics
             # Previously, class-based always used full dataset when test data existed, mixing evaluation sets
             if coverage_on_all_data and env_data.get("X_test_unit") is not None:
@@ -2915,19 +2812,8 @@ def extract_rules_single_agent(
                     temp_env.a = box["a"]
                     temp_env.b = box["b"]
 
-                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                else:
-                    initial_window = env_config.get("initial_window", 0.1)
-                    box_center = (lower_normalized + upper_normalized) / 2.0
-                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
-
                 rule, canonical_key = temp_env.extract_rule(
                     max_features_in_rule=max_features_in_rule,
-                    initial_lower=initial_lower_normalized,
-                    initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
             else:
@@ -2940,7 +2826,7 @@ def extract_rules_single_agent(
             anchor_data = {
                 "rollout_type": "class_based",  # Flag to distinguish from instance-based
                 "rollout_idx": rollout_idx,
-                # Rollout-estimated metrics (computed during rollout using perturbation samples)
+                # Rollout-estimated metrics (Fid/Pur from the env at episode end)
                 "precision_rollout_estimated": float(precision),
                 "coverage_rollout_estimated": float(coverage),
                 "total_reward": float(episode_data.get("total_reward", 0.0)),
@@ -3034,7 +2920,7 @@ def extract_rules_single_agent(
         precision_target = env_config.get("precision_target", 0.95)
         union_lift_k = env_config.get("union_lift_k", 3.0)
 
-        # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data flags for class-based recomputation
+        # Respect eval_on_test_data and coverage_on_all_data flags for class-based recomputation
         # This ensures consistent evaluation sets between instance-based and class-based metrics
         # Previously, class-based always used full dataset, mixing evaluation sets
         if coverage_on_all_data and env_data.get("X_test_unit") is not None:
@@ -3513,7 +3399,7 @@ def compare_with_multiagent(
         sa_data = single_agent_classes.get(class_key, {})
         ma_data = multiagent_classes.get(class_key, {})
         
-        # Use instance-level metrics (explicit fields preferred, fallback to legacy)
+        # Use instance-level metrics (explicit fields preferred)
         sa_precision = sa_data.get("instance_precision", sa_data.get("precision", 0.0))
         sa_coverage = sa_data.get("instance_coverage", sa_data.get("coverage", 0.0))
         sa_class_precision = sa_data.get("class_precision", sa_precision)
@@ -3532,7 +3418,6 @@ def compare_with_multiagent(
             "class_precision": sa_class_precision,
             "class_coverage": sa_class_coverage,
             "unique_rules": sa_unique_rules,
-            # Legacy fields for backward compatibility
             "precision": sa_precision,
             "coverage": sa_coverage,
         }
@@ -3609,7 +3494,7 @@ def main():
     )
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography"]
     
     # Add UCIML datasets if available
     try:

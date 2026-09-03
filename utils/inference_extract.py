@@ -79,12 +79,8 @@ def persist_box_from_episode(
         if obs is None:
             return None
         obs = np.asarray(obs, dtype=np.float32).reshape(-1)
-        # G-11: obs[:n] is `a` (a QUANTILE) under the quantile MDP, not `lower`.
-        # The old guard was `< 2n`, which the 3n+4 quantile layout passes, so a
-        # quantile observation was sliced as unit bounds and quantile positions
-        # were persisted as a box -- silently wrong rather than absent. Accept
-        # ONLY the hull-era synthetic layout, whose length is exactly 2n+2 or
-        # 2n+3; anything longer is a quantile obs and has no bounds to recover.
+        # obs[:n] is a quantile under the current MDP, not a unit bound.
+        # Only a 2n+2 / 2n+3 unit-bound vector can be decoded as bounds; skip otherwise.
         if obs.shape[0] not in (2 * n_features + 2, 2 * n_features + 3):
             return None
         lo, up = obs[:n_features], obs[n_features:2 * n_features]

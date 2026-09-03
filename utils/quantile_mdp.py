@@ -251,21 +251,3 @@ def export_knots(cdfs: Dict[str, np.ndarray]) -> Dict[str, list]:
         "n_train": int(cdfs["n_train"]),
         "n_class": int(cdfs["n_class"]),
     }
-
-
-def decode_obs_layout(obs_len: int, n_features: Optional[int] = None) -> Optional[str]:
-    """Return "hull" (2n+3 / 2n+2), "quantile" (3n+3), or None if undecidable.
-
-    The two layouts are NOT distinguishable from obs_len alone (2n+3 and 3m+3
-    collide), so callers that do not know n_features must treat None as "do not
-    slice" rather than guessing -- decoding a quantile observation as bounds
-    yields quantile positions silently mislabelled as unit bounds.
-    """
-    if n_features is None or int(n_features) <= 0:
-        return None
-    n = int(n_features)
-    if obs_len in (3 * n + 3,):
-        return "quantile"
-    if obs_len in (2 * n + 3, 2 * n + 2):
-        return "hull"
-    return None

@@ -721,15 +721,6 @@ def _should_log_verbose(env_config: Optional[Dict[str, Any]] = None) -> bool:
     return verbosity == "verbose"
 
 
-def _should_log_info(env_config: Optional[Dict[str, Any]] = None) -> bool:
-    """Check if info-level logging should be enabled from env_config."""
-    if env_config is None:
-        return True  # Default to logging info
-    verbosity = env_config.get("logging_verbosity", "normal")
-    # "quiet" = only warnings/errors, "normal" and "verbose" = info level logging
-    return verbosity != "quiet"
-
-
 def _get_logging_level(env_config: Optional[Dict[str, Any]] = None) -> int:
     """Get the appropriate logging level based on verbosity setting."""
     if env_config is None:
@@ -897,8 +888,7 @@ def run_rollout_with_policy(
             logger.warning(f"  Agent '{agent_id}' not in observations at step {step_count}")
             break
         
-        # Get observation for this agent
-        # shape: (2*n_features + 3,) - [lower, upper, precision, coverage, episode_phase]
+        # Get observation for this agent: 3n+4 = [a, b, q*, P, C, mode, phase]
         obs_vec = obs_dict[agent_id]
         
         # Convert to tensor for policy
@@ -1108,7 +1098,6 @@ def run_rollout_with_policy(
             original_action_shape = action.shape if hasattr(action, 'shape') else (action_np.shape[0] if hasattr(action_np, 'shape') else 'unknown')
             raise ValueError(f"Empty action extracted for {agent_id}. Original action shape: {original_action_shape}, agent_num: {agent_num}, expected_action_dim: {expected_action_dim}")
         
-        # Debug: Log action for first step (TODO: Remove this)
         if step_count == 0:
             if verbose_logging:
                 logger.info(f"  Action before step: shape={action_np.shape}, sample values: {action_np[:5]}")
@@ -1131,7 +1120,6 @@ def run_rollout_with_policy(
         # Check if done
         done = terminations_dict.get(agent_id, False) or truncations_dict.get(agent_id, False)
         
-        # Debug: Check if box changed after first action (TODO: Remove this)
         if step_count == 0 and lower_before is not None and upper_before is not None:
             if hasattr(env, 'lower') and hasattr(env, 'upper') and agent_id in env.lower:
                 lower_after = env.lower[agent_id].copy()
@@ -1205,7 +1193,7 @@ def run_rollout_with_policy(
             initial_lower = env.box_history[agent_id][0][0].tolist()
             initial_upper = env.box_history[agent_id][0][1].tolist()
 
-        # Policy observation (quantile: 3n+3). Unit bounds live in export_rule_state.
+        # Policy observation is 3n+4 = [a, b, q*, P, C, mode, phase].
         try:
             final_obs = env._get_observation(agent_id, instance_precision, instance_coverage)
         except Exception:
@@ -1807,27 +1795,11 @@ def extract_rules_from_policies(
     elif env_config.get("logging_verbosity") == "quiet":
         logger.warning("Quiet logging mode enabled - only warnings and errors will be shown")
     
-    # Log perturbation settings to verify they're loaded correctly
-    logger.info(f"\nPerturbation settings loaded from config:")
-    logger.info(f"  use_perturbation: {env_config.get('use_perturbation', 'NOT SET')}")
-    logger.info(f"  perturbation_mode: {env_config.get('perturbation_mode', 'NOT SET')}")
-    logger.info(f"  n_perturb: {env_config.get('n_perturb', 'NOT SET')}")
-    if env_config.get('use_perturbation') and env_config.get('perturbation_mode') == 'adaptive':
-        min_points_threshold = max(1, int(0.1 * env_config.get('n_perturb', 4096)))
-        logger.info(f"  (Adaptive mode will use uniform sampling if covered points < {min_points_threshold})")
-    
-    # Respect the perturbation_mode from config (no longer overriding for inference)
-    # Users can set perturbation_mode in config to control behavior during inference
-    original_perturbation_mode = env_config.get('perturbation_mode')
-    original_use_perturbation = env_config.get('use_perturbation')
-    
-    if original_use_perturbation:
-        logger.info(f"\n✓ Using perturbation mode for inference: {original_perturbation_mode}")
-        if original_perturbation_mode == 'adaptive':
-            min_points_threshold = max(1, int(0.1 * env_config.get('n_perturb', 4096)))
-            logger.info(f"  (Adaptive mode will use uniform sampling if covered points < {min_points_threshold})")
-    else:
-        logger.info(f"\n✓ Perturbation disabled for inference (use_perturbation={original_use_perturbation})")
+    if env_config.get("use_perturbation"):
+        logger.info(
+            f"Inference Fid uses resampled samples "
+            f"(mode={env_config.get('perturbation_mode')})"
+        )
     
     # For class-level inference, compute cluster centroids per class
     logger.info("\nComputing cluster centroids per class for class-level inference...")
@@ -1925,8 +1897,7 @@ def extract_rules_from_policies(
         logger.info(f"Generating candidate rules on {_gen_split.upper()}; selection on validation")
     
     # Create config for direct AnchorEnv creation
-    # Constructor slots stay train. Val/test live only in env_config eval_split
-    # so init hull / class-aware τ_P / min_coverage_floor source stay consistent
+    # Constructor slots stay train. Val/test live only in env_config eval_split.
     # with training. Live P/C during generation use the metric split.
     if coverage_on_all_data:
         # Combine train and test data for coverage calculation (matches baseline)
@@ -2056,7 +2027,7 @@ def extract_rules_from_policies(
     
     # Use agent_policies if extracted, otherwise fall back to group policies
     if agent_policies:
-        # CRITICAL FIX: Remove old naming convention agents (agent_0, agent_1) when agents_per_class > 1
+        # Remove old naming convention agents (agent_0, agent_1) when agents_per_class > 1
         # These are fallback mappings that shouldn't be present when we have individual agent policies
         if agents_per_class > 1:
             old_naming_agents = [f"agent_{cls}" for cls in target_classes]
@@ -2198,7 +2169,7 @@ def extract_rules_from_policies(
         # Track time for this class
         class_start_time = time.perf_counter()
         
-        # CRITICAL FIX: Sample instances from the correct dataset based on eval_on_test_data and coverage_on_all_data
+        # Sample instances from the correct dataset based on eval_on_test_data and coverage_on_all_data
         # This ensures consistency: if env evaluates on combined dataset, sample from combined dataset
         # Optionally add prediction-match filtering to ensure original_pred == target_class
         if coverage_on_all_data:
@@ -2356,7 +2327,7 @@ def extract_rules_from_policies(
             if "agents_per_class" not in single_agent_config["env_config"]:
                 single_agent_config["env_config"]["agents_per_class"] = agents_per_class
             
-            # CRITICAL FIX: Ensure X_min and X_range are set in env_config for proper normalization
+            # Ensure X_min and X_range are set in env_config for proper normalization
             # These are needed for _unit_to_std conversion and must match training normalization
             if "X_min" not in single_agent_config["env_config"]:
                 single_agent_config["env_config"]["X_min"] = env_config.get("X_min")
@@ -2423,7 +2394,7 @@ def extract_rules_from_policies(
                         actual_agent_name = f"agent_{target_class}_0"
                 logger.warning(f"  Could not determine agent name from environment, using {actual_agent_name}")
             
-            # CRITICAL FIX: Set x_star_unit for instance-based rollout (matches training behavior)
+            # Set x_star_unit for instance-based rollout (matches training behavior)
             # This must be set BEFORE reset() is called (which happens inside run_rollout_with_policy)
             # Setting x_star_unit makes the rollout instance-based, using overall coverage P(x in box)
             # instead of class-conditional coverage P(x in box | y = target_class)
@@ -2561,19 +2532,9 @@ def extract_rules_from_policies(
                     temp_env.a[temp_agent_name] = box["a"]
                     temp_env.b[temp_agent_name] = box["b"]
 
-                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                else:
-                    initial_window = max(env_config.get("initial_window", 0.1), env_config.get("min_width", 0.05))
-                    initial_lower_normalized = np.clip(x_instance - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(x_instance + initial_window, 0.0, 1.0)
-
                 rule = temp_env.extract_rule(
                     temp_agent_name,
                     max_features_in_rule=max_features_in_rule,
-                    initial_lower=initial_lower_normalized,
-                    initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
             
@@ -2610,9 +2571,7 @@ def extract_rules_from_policies(
                 })
 
                 # Recompute precision/coverage on the full evaluation dataset.
-                # Rollout-estimated metrics use perturbation samples (~4096); recomputed metrics
-                # use the actual dataset, matching the single-agent and baseline approaches so
-                # all three methods are directly comparable.
+                # Rollout Fid is Track A empirical unless use_perturbation is on.
                 orig_pred = episode_data.get("original_prediction")
                 if orig_pred is None:
                     orig_pred = int(full_predictions_recompute[data_instance_idx])
@@ -2815,84 +2774,9 @@ def extract_rules_from_policies(
         avg_rollout_time = float(np.mean(rollout_times)) if rollout_times else 0.0
         total_rollout_time = float(np.sum(rollout_times)) if rollout_times else 0.0
         
-        # NOTE: Class-level (class-union) metrics will be computed later using class-based anchors only
-        # The three metrics are:
-        # 1. Instance-based = average of instance-based rollouts (computed above)
-        # 2. Class-based = average of class-based rollouts (will be computed later)
-        # 3. Class-union = union of class-based rules (will be computed later, no new rollouts)
-        # 
-        # We do NOT compute union of instance-based anchors here - that's not one of our three metrics.
-        class_precision_union = 0.0  # Will be set later from class-based union
-        class_coverage_union = 0.0   # Will be set later from class-based union
-        n_class_samples = 0  # Store class sample count for weighted averaging
-        
-        # SKIP: We do NOT compute union of instance-based anchors here
-        # The union of instance-based anchors is NOT one of our three metrics.
-        # Class-union metrics will be computed later from class-based rules only.
-        if False:  # Disabled - union of instance-based anchors is not one of our metrics
-            n_samples = X_data.shape[0]
-            union_mask = np.zeros(n_samples, dtype=bool)
-            
-            # Build union mask from all anchors for this agent
-            # Each agent should have different anchors, so the union should be different
-            for anchor_data in anchors_list:
-                if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                    lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                    upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                    
-                    # Check which points fall in this anchor box
-                    in_box = np.all((X_data >= lower) & (X_data <= upper), axis=1)
-                    union_mask |= in_box
-            
-            # Class-level coverage: fraction of class samples that are in the union
-            mask_cls = (y_data == target_class)
-            n_class_samples = int(mask_cls.sum())  # Store for weighted averaging
-            if mask_cls.sum() > 0:
-                class_coverage_union = float(union_mask[mask_cls].mean())
-            else:
-                class_coverage_union = 0.0
-            
-            # Class-level precision: fraction of points in union that belong to target class
-            if union_mask.any():
-                y_union = y_data[union_mask]
-                class_precision_union = float((y_union == target_class).mean())
-            else:
-                class_precision_union = 0.0
-            
-            # Debug: Log anchor diversity and coverage diagnostics for this agent
-            if len(anchors_list) > 1:
-                # Check if anchors are actually different
-                anchor_centers = []
-                anchor_widths = []
-                for anchor_data in anchors_list:
-                    if "lower_bounds_normalized" in anchor_data and "upper_bounds_normalized" in anchor_data:
-                        lower = np.array(anchor_data["lower_bounds_normalized"], dtype=np.float32)
-                        upper = np.array(anchor_data["upper_bounds_normalized"], dtype=np.float32)
-                        center = (lower + upper) / 2
-                        width = upper - lower
-                        anchor_centers.append(center)
-                        anchor_widths.append(width)
-                
-                if anchor_centers:
-                    centers_array = np.array(anchor_centers)
-                    widths_array = np.array(anchor_widths)
-                    center_std = centers_array.std(axis=0).mean()
-                    width_std = widths_array.std(axis=0).mean()
-                    avg_width = widths_array.mean(axis=0).mean()
-                    # Log if anchors are very similar (std < 0.001) which might indicate a problem
-                    if center_std < 0.001 or width_std < 0.001:
-                        logger.warning(f"  Agent {agent_name}: Anchors are very similar! center_std={center_std:.6f}, width_std={width_std:.6f}")
-                    elif verbose_logging:
-                        logger.debug(f"  Agent {agent_name}: {len(anchors_list)} anchors, center_std={center_std:.6f}, width_std={width_std:.6f}")
-                    
-                    # Log coverage diagnostics if coverage is low
-                    if class_coverage_union < 0.05:
-                        logger.warning(
-                            f"  Agent {agent_name}: Low per-agent union coverage ({class_coverage_union:.4f}). "
-                            f"Average box width: {avg_width:.4f}, "
-                            f"Total samples: {n_samples}, Class samples: {n_class_samples}, "
-                            f"Samples in union: {union_mask.sum()}"
-                        )
+        class_precision_union = 0.0
+        class_coverage_union = 0.0
+        n_class_samples = 0
         
         # When agents_per_class > 1, we need to aggregate results from all agents of the same class
         # Store per-agent results first, then aggregate at class level
@@ -3104,7 +2988,7 @@ def extract_rules_from_policies(
         for rollout_idx in range(n_class_based_rollouts_per_agent):
             rollout_seed = seed + 10000 + rollout_idx if seed is not None else None  # Use different seed range
             
-            # CRITICAL FIX: Respect eval_on_test_data and coverage_on_all_data for consistent comparisons
+            # Respect eval_on_test_data and coverage_on_all_data for consistent comparisons
             # Previously always used full dataset, causing inconsistent metrics between instance-based and class-based
             if coverage_on_all_data:
                 # When coverage_on_all_data=True, use combined dataset (matches instance-based behavior)
@@ -3177,7 +3061,7 @@ def extract_rules_from_policies(
             # When using full dataset, set eval_on_test_data=False so metrics are computed on full dataset
             class_based_config["env_config"]["eval_on_test_data"] = False if use_full_dataset else eval_on_test_data
             
-            # CRITICAL FIX: Enforce use_class_centroids=True for class-based rollouts
+            # Enforce use_class_centroids=True for class-based rollouts
             # Class-based rollouts should always use centroids, not full-space initialization
             # This matches single-agent behavior and ensures proper class-based initialization
             class_based_config["env_config"]["use_class_centroids"] = True
@@ -3300,20 +3184,9 @@ def extract_rules_from_policies(
                     temp_env.a[temp_agent_name] = box["a"]
                     temp_env.b[temp_agent_name] = box["b"]
 
-                if episode_data.get("initial_lower") is not None and episode_data.get("initial_upper") is not None:
-                    initial_lower_normalized = np.array(episode_data["initial_lower"], dtype=np.float32)
-                    initial_upper_normalized = np.array(episode_data["initial_upper"], dtype=np.float32)
-                else:
-                    initial_window = env_config.get("initial_window", 0.1)
-                    box_center = (lower_normalized + upper_normalized) / 2.0
-                    initial_lower_normalized = np.clip(box_center - initial_window, 0.0, 1.0)
-                    initial_upper_normalized = np.clip(box_center + initial_window, 0.0, 1.0)
-
                 rule = temp_env.extract_rule(
                     temp_agent_name,
                     max_features_in_rule=max_features_in_rule,
-                    initial_lower=initial_lower_normalized,
-                    initial_upper=initial_upper_normalized,
                     denormalize=True
                 )
             
@@ -3490,7 +3363,7 @@ def extract_rules_from_policies(
         precision_target = env_config.get("precision_target", 0.95)
         union_lift_k = env_config.get("union_lift_k", 3.0)
 
-        # CRITICAL FIX: Use same dataset as class-based rollouts for consistency
+        # Use same dataset as class-based rollouts for consistency
         # Respect eval_on_test_data and coverage_on_all_data to match rollout behavior
         if coverage_on_all_data:
             if env_data.get("X_test_unit") is not None:
@@ -3957,7 +3830,7 @@ def main():
     )
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography"]
     
     # Add UCIML datasets if available
     try:

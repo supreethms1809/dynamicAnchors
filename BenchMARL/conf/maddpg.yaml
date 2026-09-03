@@ -3,14 +3,7 @@ defaults:
   - _self_
 
 
-# Per-agent critic heads over the group's joint (obs, action).
-# TRUE builds ONE Q per group, shape (1,), expanded to every agent, while the
-# reward stays per-agent shape (n_agents, 1) -- one prediction regressed against
-# n_agents different targets, so the critic fits their mean and no agent gets its
-# own credit. That was harmless while share_policy_params collapsed a class onto
-# one network (identical agents, near-identical rewards); once the agents are
-# genuinely distinct it is the binding constraint on learning.
-# See docs/BUGS_mada_multiagent_design.md (M-04).
+# Per-agent critics. A shared group Q would regress one prediction against n distinct rewards.
 share_param_critic: False
 loss_function: "l2"
 delay_value: True
