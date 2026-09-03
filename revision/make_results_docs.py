@@ -67,14 +67,36 @@ def metric(res, name):
     raise KeyError(name)
 
 
+def method_label(method):
+    return {"mada": "MADA", "rlda": "RLDA", "cart": "CART"}.get(method, method)
+
+
 def cell(values, seeds, fmt="{:.3f}", mean=True):
-    """Render per-seed values as `v42 / v43 (mean)`; em dash for missing seeds."""
-    shown = [fmt.format(values[s]) if values.get(s) is not None else "—" for s in seeds]
+    """Headline cell: mean over completed seeds, with the spread when n > 1.
+
+    Seeds that have not finished are excluded from the mean rather than counted
+    as zero, and the seed count is carried alongside so a mean over two seeds is
+    never mistaken for a mean over five.
+    """
     have = [values[s] for s in seeds if values.get(s) is not None]
-    text = " / ".join(shown)
-    if mean and len(have) > 1:
-        text += f" ({fmt.format(sum(have) / len(have))})"
-    return text
+    if not have:
+        return "—"
+    m = sum(have) / len(have)
+    if not mean or len(have) == 1:
+        return fmt.format(m)
+    var = sum((v - m) ** 2 for v in have) / (len(have) - 1)
+    return f"{fmt.format(m)} ±{fmt.format(var ** 0.5)}"
+
+
+def per_seed_cell(values, seeds, fmt="{:.3f}"):
+    """Detail cell: one value per seed, in seed order, em dash where absent."""
+    return " / ".join(
+        fmt.format(values[s]) if values.get(s) is not None else "—" for s in seeds
+    )
+
+
+def n_seeds(results, seeds):
+    return sum(1 for s in seeds if results.get(s) is not None)
 
 
 def success_cell(results, seeds):
@@ -102,9 +124,15 @@ def results_doc(data, seeds, stamp, branch):
         "adjacent, so the effect of swapping the explained model is read top-to-bottom",
         "within one dataset.",
         "",
-        f"Every metric cell reads **{seed_list}**, followed by the mean in parentheses",
-        "once more than one seed is present. An em dash marks a seed that has not been",
-        "run yet — it is excluded from the mean rather than counted as zero.",
+        "Each dataset gets a **mean ±sd** summary table per black box, followed by the",
+        f"raw per-seed values in **{seed_list}** order. An em dash marks a seed that has",
+        "not been run yet — it is excluded from the mean rather than counted as zero,",
+        "and the `seeds` column says how many actually contributed, so a mean over two",
+        "seeds is never mistaken for a mean over five.",
+        "",
+        "The sd is the sample standard deviation across seeds. With three seeds it is a",
+        "crude spread estimate, not a confidence interval, and a difference smaller than",
+        "the sd should not be reported as an effect.",
         "",
         "## What was run",
         "",
@@ -153,32 +181,55 @@ def results_doc(data, seeds, stamp, branch):
     for ds in DATASETS:
         L += [f"### {ds}", ""]
         for backend, _ in ROOTS:
-            L += [f"**{BACKEND_LABEL[backend]} black box**", ""]
+            L += [f"**{BACKEND_LABEL[backend]} black box** — mean ±sd over completed seeds", ""]
             L += [
-                "| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
-                "|---|---|---|---|---|---|---|",
+                "| method | seeds | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
+                "|---|---|---|---|---|---|---|---|",
             ]
-            any_row = False
+            rows = []
             for method in METHODS:
                 res = {s: data.get((backend, ds, method, s)) for s in seeds}
                 if not any(res.values()):
                     continue
-                any_row = True
+                rows.append((method, res))
                 vals = lambda n: {s: metric(res[s], n) for s in seeds}
-                succ = success_cell(res, seeds) if method in RL_METHODS else "—"
+                succ = cell({s: metric(res[s], "success") for s in seeds}, seeds) \
+                    if method in RL_METHODS else "—"
                 L.append(
-                    "| {} | {} | {} | {} | {} | {} | {} |".format(
-                        "MADA" if method == "mada" else "RLDA" if method == "rlda" else method.upper() if method == "cart" else method,
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        method_label(method),
+                        n_seeds(res, seeds),
                         cell(vals("fid"), seeds),
                         cell(vals("cov"), seeds),
                         cell(vals("conflict"), seeds),
                         cell(vals("abstain"), seeds),
                         succ,
-                        cell(vals("queries"), seeds, fmt="{:,.0f}", mean=False),
+                        cell(vals("queries"), seeds, fmt="{:,.0f}"),
                     )
                 )
-            if not any_row:
-                L.append("| _not run yet_ | — | — | — | — | — | — |")
+            if not rows:
+                L += ["| _not run yet_ | 0 | — | — | — | — | — | — |", ""]
+                continue
+            L += ["",
+                  f"_per seed ({' / '.join(str(s) for s in seeds)}):_",
+                  "",
+                  "| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
+                  "|---|---|---|---|---|---|---|"]
+            for method, res in rows:
+                vals = lambda n: {s: metric(res[s], n) for s in seeds}
+                succ = per_seed_cell({s: metric(res[s], "success") for s in seeds}, seeds) \
+                    if method in RL_METHODS else "—"
+                L.append(
+                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                        method_label(method),
+                        per_seed_cell(vals("fid"), seeds),
+                        per_seed_cell(vals("cov"), seeds),
+                        per_seed_cell(vals("conflict"), seeds),
+                        per_seed_cell(vals("abstain"), seeds),
+                        succ,
+                        per_seed_cell(vals("queries"), seeds, fmt="{:,.0f}"),
+                    )
+                )
             L.append("")
         L.append("")
 
@@ -214,6 +265,33 @@ def head_to_head(data, seeds):
          "`L` = RLDA better, `T` = tie to three decimals.", ""]
     specs = [("Fid", "fid", True), ("Cov", "cov", True),
              ("Conflict", "conflict", False), ("Abstain", "abstain", False)]
+
+    L += ["### Pooled over all (dataset, seed) pairs", "",
+          "The row to quote: one count per black box over every dataset-seed pair where",
+          "both arms finished. Less seed-sensitive than the per-seed rows below.", "",
+          "| black box | pairs | " + " | ".join(n for n, _, _ in specs) + " |",
+          "|---|---|" + "---|" * len(specs)]
+    for backend, _ in ROOTS:
+        cells, npairs = [], 0
+        for _, key, higher_better in specs:
+            w = l = t = 0
+            for s in seeds:
+                for ds in DATASETS:
+                    a = metric(data.get((backend, ds, "mada", s)), key)
+                    b = metric(data.get((backend, ds, "rlda", s)), key)
+                    if a is None or b is None:
+                        continue
+                    if round(a, 3) == round(b, 3):
+                        t += 1
+                    elif (a > b) == higher_better:
+                        w += 1
+                    else:
+                        l += 1
+            npairs = max(npairs, w + l + t)
+            cells.append("—" if w + l + t == 0 else f"{w}W/{l}L" + (f"/{t}T" if t else ""))
+        L.append(f"| {BACKEND_LABEL[backend]} | {npairs} | " + " | ".join(cells) + " |")
+
+    L += ["", "### By seed", ""]
     L += ["| black box | seed | " + " | ".join(n for n, _, _ in specs) + " |",
           "|---|---|" + "---|" * len(specs)]
     for backend, _ in ROOTS:
