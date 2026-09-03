@@ -743,9 +743,22 @@ def compactness_of_box(
     lower: np.ndarray,
     upper: np.ndarray,
     sparsity_width_ratio: float = 0.95,
+    feature_min: Optional[np.ndarray] = None,
+    feature_max: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Active features / description length of one unit-space box (C-36)."""
-    active = active_feature_mask(lower, upper, sparsity_width_ratio=sparsity_width_ratio)
+    """Active features / description length of one box (C-36).
+
+    Bounds are assumed to live in unit space unless `feature_min`/`feature_max`
+    are given. The baseline paths (CART, Anchors) build boxes in ORIGINAL
+    feature units, where the unit-space default silently compares a width in
+    centimetres against 0.95 and reports nonsense in both directions -- 0 active
+    features for a real one-sided iris split, 16 for breast_cancer where every
+    feature range is small. Pass the observed per-feature range for those.
+    """
+    active = active_feature_mask(
+        lower, upper, sparsity_width_ratio=sparsity_width_ratio,
+        feature_min=feature_min, feature_max=feature_max,
+    )
     n_feat = int(active.size)
     n_active = int(active.sum())
     return {
@@ -759,12 +772,17 @@ def compactness_of_box(
 def compactness_of_ruleset(
     rules: Sequence[RankedRule],
     sparsity_width_ratio: float = 0.95,
+    feature_min: Optional[np.ndarray] = None,
+    feature_max: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     rows = []
     for r in rules:
         if r.lower is None or r.upper is None:
             continue
-        rows.append(compactness_of_box(r.lower, r.upper, sparsity_width_ratio))
+        rows.append(compactness_of_box(
+            r.lower, r.upper, sparsity_width_ratio,
+            feature_min=feature_min, feature_max=feature_max,
+        ))
     if not rows:
         return {
             "n_rules": 0,

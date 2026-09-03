@@ -525,6 +525,8 @@ def per_class_block(
     union: UnionResult,
     instance_metrics: Optional[BoxMetrics] = None,
     sparsity_width_ratio: Optional[float] = None,
+    feature_min: Optional[np.ndarray] = None,
+    feature_max: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """One class row for the result JSON / tables.
 
@@ -584,7 +586,8 @@ def per_class_block(
             else float((union.best.extra or {}).get("sparsity_width_ratio") or 0.95)
         )
         block["compactness"] = compactness_of_ruleset(
-            union.individual, sparsity_width_ratio=sparsity
+            union.individual, sparsity_width_ratio=sparsity,
+            feature_min=feature_min, feature_max=feature_max,
         )
     return block
 

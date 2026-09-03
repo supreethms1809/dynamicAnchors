@@ -62,6 +62,8 @@ def metric(res, name):
         return sr.get("success_rate") if isinstance(sr, dict) else None
     if name == "queries":
         return (res.get("queries") or {}).get("n_blackbox_queries")
+    if name == "active_features":
+        return (res.get("compactness") or {}).get("mean_active_features")
     if name == "train_queries":
         return (res.get("queries") or {}).get("n_training_queries")
     raise KeyError(name)
@@ -166,11 +168,19 @@ def results_doc(data, seeds, stamp, branch):
         "| **Conflict** | fraction of rows covered by rules of >1 class | **lower** |",
         "| **Abstain** | fraction of rows no rule covers | **lower** |",
         "| **Success** | episodes reaching τ_P and τ_C / episodes attempted | higher |",
+        "| **Active feats** | mean constrained features per rule (rule complexity) | lower |",
         "| **Extraction queries** | black-box calls to BUILD the rule set — *not* training | lower |",
         "",
         "`Cov` and `Abstain` sum to 1. Success applies only to the RL arms — baselines are",
         "not episodic and report `—`, not 0. See **Query accounting** below before",
         "quoting any cost number.",
+        "",
+        "> **Compactness was rescaled.** `Active feats` for CART and the Anchors",
+        "> family was previously measured against a unit-space [0,1] range while",
+        "> those methods build boxes in original feature units — iris CART read 0",
+        "> active features for `petal length <= 2.45`, breast_cancer read all 16 as",
+        "> active. Recomputed against each feature's observed X_train range.",
+        "> `random_search` and both RL arms are unit-space and were never affected.",
         "",
         "---",
         "",
@@ -183,8 +193,8 @@ def results_doc(data, seeds, stamp, branch):
         for backend, _ in ROOTS:
             L += [f"**{BACKEND_LABEL[backend]} black box** — mean ±sd over completed seeds", ""]
             L += [
-                "| method | seeds | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
-                "|---|---|---|---|---|---|---|---|",
+                "| method | seeds | Fid | Cov | Conflict | Abstain | Active feats | Success | extraction queries |",
+                "|---|---|---|---|---|---|---|---|---|",
             ]
             rows = []
             for method in METHODS:
@@ -196,13 +206,14 @@ def results_doc(data, seeds, stamp, branch):
                 succ = cell({s: metric(res[s], "success") for s in seeds}, seeds) \
                     if method in RL_METHODS else "—"
                 L.append(
-                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         method_label(method),
                         n_seeds(res, seeds),
                         cell(vals("fid"), seeds),
                         cell(vals("cov"), seeds),
                         cell(vals("conflict"), seeds),
                         cell(vals("abstain"), seeds),
+                        cell(vals("active_features"), seeds, fmt="{:.2f}"),
                         succ,
                         cell(vals("queries"), seeds, fmt="{:,.0f}"),
                     )
@@ -225,19 +236,20 @@ def results_doc(data, seeds, stamp, branch):
             L += ["",
                   f"_per seed ({' / '.join(str(s) for s in seeds)}):_",
                   "",
-                  "| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
-                  "|---|---|---|---|---|---|---|"]
+                  "| method | Fid | Cov | Conflict | Abstain | Active feats | Success | extraction queries |",
+                  "|---|---|---|---|---|---|---|---|"]
             for method, res in rows:
                 vals = lambda n: {s: metric(res[s], n) for s in seeds}
                 succ = per_seed_cell({s: metric(res[s], "success") for s in seeds}, seeds) \
                     if method in RL_METHODS else "—"
                 L.append(
-                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
                         method_label(method),
                         per_seed_cell(vals("fid"), seeds),
                         per_seed_cell(vals("cov"), seeds),
                         per_seed_cell(vals("conflict"), seeds),
                         per_seed_cell(vals("abstain"), seeds),
+                        per_seed_cell(vals("active_features"), seeds, fmt="{:.2f}"),
                         succ,
                         per_seed_cell(vals("queries"), seeds, fmt="{:,.0f}"),
                     )

@@ -1,6 +1,6 @@
 # Extracted Rules
 
-Generated 2026-09-03 16:38. Branch `ma-training-config-bump`.
+Generated 2026-09-03 17:18. Branch `ma-training-config-bump`.
 
 The actual rule sets behind the numbers in `RESULTS_comparison.md`.
 Rules are the **validation-selected union**, scored on the **test** split.
