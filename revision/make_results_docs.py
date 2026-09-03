@@ -62,19 +62,43 @@ def metric(res, name):
         return sr.get("success_rate") if isinstance(sr, dict) else None
     if name == "queries":
         return (res.get("queries") or {}).get("n_blackbox_queries")
+    if name == "active_features":
+        return (res.get("compactness") or {}).get("mean_active_features")
     if name == "train_queries":
         return (res.get("queries") or {}).get("n_training_queries")
     raise KeyError(name)
 
 
+def method_label(method):
+    return {"mada": "MADA", "rlda": "RLDA", "cart": "CART"}.get(method, method)
+
+
 def cell(values, seeds, fmt="{:.3f}", mean=True):
-    """Render per-seed values as `v42 / v43 (mean)`; em dash for missing seeds."""
-    shown = [fmt.format(values[s]) if values.get(s) is not None else "—" for s in seeds]
+    """Headline cell: mean over completed seeds, with the spread when n > 1.
+
+    Seeds that have not finished are excluded from the mean rather than counted
+    as zero, and the seed count is carried alongside so a mean over two seeds is
+    never mistaken for a mean over five.
+    """
     have = [values[s] for s in seeds if values.get(s) is not None]
-    text = " / ".join(shown)
-    if mean and len(have) > 1:
-        text += f" ({fmt.format(sum(have) / len(have))})"
-    return text
+    if not have:
+        return "—"
+    m = sum(have) / len(have)
+    if not mean or len(have) == 1:
+        return fmt.format(m)
+    var = sum((v - m) ** 2 for v in have) / (len(have) - 1)
+    return f"{fmt.format(m)} ±{fmt.format(var ** 0.5)}"
+
+
+def per_seed_cell(values, seeds, fmt="{:.3f}"):
+    """Detail cell: one value per seed, in seed order, em dash where absent."""
+    return " / ".join(
+        fmt.format(values[s]) if values.get(s) is not None else "—" for s in seeds
+    )
+
+
+def n_seeds(results, seeds):
+    return sum(1 for s in seeds if results.get(s) is not None)
 
 
 def success_cell(results, seeds):
@@ -102,9 +126,15 @@ def results_doc(data, seeds, stamp, branch):
         "adjacent, so the effect of swapping the explained model is read top-to-bottom",
         "within one dataset.",
         "",
-        f"Every metric cell reads **{seed_list}**, followed by the mean in parentheses",
-        "once more than one seed is present. An em dash marks a seed that has not been",
-        "run yet — it is excluded from the mean rather than counted as zero.",
+        "Each dataset gets a **mean ±sd** summary table per black box, followed by the",
+        f"raw per-seed values in **{seed_list}** order. An em dash marks a seed that has",
+        "not been run yet — it is excluded from the mean rather than counted as zero,",
+        "and the `seeds` column says how many actually contributed, so a mean over two",
+        "seeds is never mistaken for a mean over five.",
+        "",
+        "The sd is the sample standard deviation across seeds. With three seeds it is a",
+        "crude spread estimate, not a confidence interval, and a difference smaller than",
+        "the sd should not be reported as an effect.",
         "",
         "## What was run",
         "",
@@ -138,11 +168,19 @@ def results_doc(data, seeds, stamp, branch):
         "| **Conflict** | fraction of rows covered by rules of >1 class | **lower** |",
         "| **Abstain** | fraction of rows no rule covers | **lower** |",
         "| **Success** | episodes reaching τ_P and τ_C / episodes attempted | higher |",
+        "| **Active feats** | mean constrained features per rule (rule complexity) | lower |",
         "| **Extraction queries** | black-box calls to BUILD the rule set — *not* training | lower |",
         "",
         "`Cov` and `Abstain` sum to 1. Success applies only to the RL arms — baselines are",
         "not episodic and report `—`, not 0. See **Query accounting** below before",
         "quoting any cost number.",
+        "",
+        "> **Compactness was rescaled.** `Active feats` for CART and the Anchors",
+        "> family was previously measured against a unit-space [0,1] range while",
+        "> those methods build boxes in original feature units — iris CART read 0",
+        "> active features for `petal length <= 2.45`, breast_cancer read all 16 as",
+        "> active. Recomputed against each feature's observed X_train range.",
+        "> `random_search` and both RL arms are unit-space and were never affected.",
         "",
         "---",
         "",
@@ -153,32 +191,69 @@ def results_doc(data, seeds, stamp, branch):
     for ds in DATASETS:
         L += [f"### {ds}", ""]
         for backend, _ in ROOTS:
-            L += [f"**{BACKEND_LABEL[backend]} black box**", ""]
+            L += [f"**{BACKEND_LABEL[backend]} black box** — mean ±sd over completed seeds", ""]
             L += [
-                "| method | Fid | Cov | Conflict | Abstain | Success | extraction queries |",
-                "|---|---|---|---|---|---|---|",
+                "| method | seeds | Fid | Cov | Conflict | Abstain | Active feats | Success | extraction queries |",
+                "|---|---|---|---|---|---|---|---|---|",
             ]
-            any_row = False
+            rows = []
             for method in METHODS:
                 res = {s: data.get((backend, ds, method, s)) for s in seeds}
                 if not any(res.values()):
                     continue
-                any_row = True
+                rows.append((method, res))
                 vals = lambda n: {s: metric(res[s], n) for s in seeds}
-                succ = success_cell(res, seeds) if method in RL_METHODS else "—"
+                succ = cell({s: metric(res[s], "success") for s in seeds}, seeds) \
+                    if method in RL_METHODS else "—"
                 L.append(
-                    "| {} | {} | {} | {} | {} | {} | {} |".format(
-                        "MADA" if method == "mada" else "RLDA" if method == "rlda" else method.upper() if method == "cart" else method,
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        method_label(method),
+                        n_seeds(res, seeds),
                         cell(vals("fid"), seeds),
                         cell(vals("cov"), seeds),
                         cell(vals("conflict"), seeds),
                         cell(vals("abstain"), seeds),
+                        cell(vals("active_features"), seeds, fmt="{:.2f}"),
                         succ,
-                        cell(vals("queries"), seeds, fmt="{:,.0f}", mean=False),
+                        cell(vals("queries"), seeds, fmt="{:,.0f}"),
                     )
                 )
-            if not any_row:
-                L.append("| _not run yet_ | — | — | — | — | — | — |")
+            if not rows:
+                L += ["| _not run yet_ | 0 | — | — | — | — | — | — |", ""]
+                continue
+
+            # A mean over 2 seeds sitting next to a mean over 3 in the same table
+            # invites a direct comparison that is not like-for-like. Say so here
+            # rather than trusting the reader to check the `seeds` column.
+            arm_n = {m: n_seeds(r, seeds) for m, r in rows if m in RL_METHODS}
+            if len(set(arm_n.values())) > 1:
+                detail = ", ".join(f"{method_label(m)} n={n}" for m, n in sorted(arm_n.items()))
+                L += ["",
+                      f"> ⚠️ **Unequal seeds in this table** ({detail}). The arms are averaged",
+                      "> over different runs, so the MADA-vs-RLDA means here are not",
+                      "> like-for-like. This pair is excluded from the pooled head-to-head.",
+                      ""]
+            L += ["",
+                  f"_per seed ({' / '.join(str(s) for s in seeds)}):_",
+                  "",
+                  "| method | Fid | Cov | Conflict | Abstain | Active feats | Success | extraction queries |",
+                  "|---|---|---|---|---|---|---|---|"]
+            for method, res in rows:
+                vals = lambda n: {s: metric(res[s], n) for s in seeds}
+                succ = per_seed_cell({s: metric(res[s], "success") for s in seeds}, seeds) \
+                    if method in RL_METHODS else "—"
+                L.append(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        method_label(method),
+                        per_seed_cell(vals("fid"), seeds),
+                        per_seed_cell(vals("cov"), seeds),
+                        per_seed_cell(vals("conflict"), seeds),
+                        per_seed_cell(vals("abstain"), seeds),
+                        per_seed_cell(vals("active_features"), seeds, fmt="{:.2f}"),
+                        succ,
+                        per_seed_cell(vals("queries"), seeds, fmt="{:,.0f}"),
+                    )
+                )
             L.append("")
         L.append("")
 
@@ -214,6 +289,33 @@ def head_to_head(data, seeds):
          "`L` = RLDA better, `T` = tie to three decimals.", ""]
     specs = [("Fid", "fid", True), ("Cov", "cov", True),
              ("Conflict", "conflict", False), ("Abstain", "abstain", False)]
+
+    L += ["### Pooled over all (dataset, seed) pairs", "",
+          "The row to quote: one count per black box over every dataset-seed pair where",
+          "both arms finished. Less seed-sensitive than the per-seed rows below.", "",
+          "| black box | pairs | " + " | ".join(n for n, _, _ in specs) + " |",
+          "|---|---|" + "---|" * len(specs)]
+    for backend, _ in ROOTS:
+        cells, npairs = [], 0
+        for _, key, higher_better in specs:
+            w = l = t = 0
+            for s in seeds:
+                for ds in DATASETS:
+                    a = metric(data.get((backend, ds, "mada", s)), key)
+                    b = metric(data.get((backend, ds, "rlda", s)), key)
+                    if a is None or b is None:
+                        continue
+                    if round(a, 3) == round(b, 3):
+                        t += 1
+                    elif (a > b) == higher_better:
+                        w += 1
+                    else:
+                        l += 1
+            npairs = max(npairs, w + l + t)
+            cells.append("—" if w + l + t == 0 else f"{w}W/{l}L" + (f"/{t}T" if t else ""))
+        L.append(f"| {BACKEND_LABEL[backend]} | {npairs} | " + " | ".join(cells) + " |")
+
+    L += ["", "### By seed", ""]
     L += ["| black box | seed | " + " | ".join(n for n, _, _ in specs) + " |",
           "|---|---|" + "---|" * len(specs)]
     for backend, _ in ROOTS:

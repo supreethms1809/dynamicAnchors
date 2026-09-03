@@ -121,8 +121,22 @@ def _emit(
     *,
     dataset, method, seed, tau_p, tau_c, out_dir, k, min_support,
     loader, y_eval, y_hat_eval, per_class_ranked: Dict[int, List[RankedRule]],
-    queries: QueryCounter, extra: Dict[str, Any],
+    queries: QueryCounter, extra: Dict[str, Any], box_space: str = "unit",
 ) -> str:
+    # Compactness compares a box side against the feature's full range. The RL
+    # arms build boxes in unit space, where that range is [0, 1] and the default
+    # holds. CART and the Anchors family build boxes in ORIGINAL feature units
+    # and seed the root at X_train's min/max, so their range is X_train's own
+    # span -- without it, an unconstrained iris dimension (width 3.6 cm) is read
+    # as constrained and a real one-sided split reported 0 active features,
+    # while breast_cancer's small-magnitude features reported all 16 as active.
+    if box_space == "original":
+        feature_min = np.min(loader.X_train, axis=0)
+        feature_max = np.max(loader.X_train, axis=0)
+    elif box_space == "unit":
+        feature_min = feature_max = None
+    else:
+        raise ValueError(f"box_space must be 'original' or 'unit', got {box_space!r}")
     # Artifact accuracy reporting performs one classifier pass per split.
     queries.add_queries(len(loader.X_train), reporting=True)
     if getattr(loader, "X_val_scaled", None) is not None:
@@ -143,7 +157,10 @@ def _emit(
             y=y_eval, y_hat=y_hat_eval, mask=union.best.mask, target_class=cls,
             class_conditional=False, min_support=min_support,
         )
-        per_class_out[f"class_{cls}"] = per_class_block(union, instance_metrics=inst)
+        per_class_out[f"class_{cls}"] = per_class_block(
+            union, instance_metrics=inst,
+            feature_min=feature_min, feature_max=feature_max,
+        )
         umask = np.zeros(len(y_eval), dtype=bool)
         for r in union.individual:
             umask |= r.mask
@@ -282,7 +299,7 @@ def run_cart(
     )
 
     return _emit(
-        dataset=dataset, method="cart", seed=seed, tau_p=tau_p, tau_c=tau_c,
+        dataset=dataset, method="cart", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
         out_dir=out_dir, k=k, min_support=min_support,
         loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
         per_class_ranked=per_class_reported, queries=queries,
@@ -469,7 +486,7 @@ def run_anchors_family(
             min_support=min_support,
         )
         written.append(_emit(
-            dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c,
+            dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
             out_dir=out_dir, k=k, min_support=min_support,
             loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
             per_class_ranked=picked, queries=queries,
@@ -496,7 +513,7 @@ def run_anchors_family(
         )
         # greedy_set_cover returns a subset; wrap as ranked list (already scored)
         written.append(_emit(
-            dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c,
+            dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
             out_dir=out_dir, k=k, min_support=min_support,
             loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
             per_class_ranked=picked, queries=queries,
