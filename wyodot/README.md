@@ -1,6 +1,9 @@
 # WyoDOT Dynamic Anchors
 
-Road surface condition classification (Dry, Wet, Snow, Slush, Ice) using Dynamic Anchors with a Random Forest classifier.
+Road surface condition classification (Dry, Wet, Snow, Slush, Ice) using
+Dynamic Anchors with a Random Forest classifier. The collector is the same
+method as the paper sweep: train → infer → `revision.evaluate`
+(τ_P=0.90, τ_C=0.10).
 
 ## Datasets
 
@@ -39,22 +42,16 @@ All commands run from the `wyodot/` directory.
 ### Multi-Agent Training (BenchMARL)
 
 ```bash
-# MADDPG
 python driver_multi_agent.py --dataset wyodot_kvdw_labeled --algorithm maddpg --seed 42
 python driver_multi_agent.py --dataset wyodot_testbed --algorithm maddpg --seed 42
-
-# MASAC
 python driver_multi_agent.py --dataset wyodot_kvdw_labeled --algorithm masac --seed 42
 ```
 
 ### Single-Agent Training (Stable-Baselines3)
 
 ```bash
-# DDPG
 python driver_single_agent.py --dataset wyodot_kvdw_labeled --algorithm ddpg --seed 42
 python driver_single_agent.py --dataset wyodot_testbed --algorithm ddpg --seed 42
-
-# SAC
 python driver_single_agent.py --dataset wyodot_testbed --algorithm sac --seed 42
 ```
 
@@ -74,13 +71,13 @@ python driver_single_agent.py --dataset wyodot_testbed --algorithm sac --seed 42
 
 ### Full Pipeline (recommended)
 
-Runs training, inference, rule testing, and comparison plots end-to-end:
+Train, infer, then score stored boxes with `revision.evaluate`:
 
 ```bash
 # Full pipeline for both single-agent and multi-agent
 python run_pipeline.py --dataset wyodot_kvdw_labeled --algorithm maddpg --seed 42
 
-# Skip training (reuse existing models), only run inference + testing + plots
+# Skip training (reuse existing models), only run inference + revision.evaluate
 python run_pipeline.py --dataset wyodot_testbed --algorithm maddpg --skip_training
 
 # Only multi-agent pipeline
@@ -96,7 +93,7 @@ python run_pipeline.py --dataset wyodot_kvdw_labeled --algorithm maddpg --skip_m
 |------|-------------|
 | `--skip_training` | Skip training, use existing models |
 | `--skip_inference` | Skip inference, use existing rules |
-| `--skip_testing` | Skip rule testing |
+| `--skip_testing` | Skip `revision.evaluate` |
 | `--skip_single_agent` | Skip single-agent pipeline |
 | `--skip_multi_agent` | Skip multi-agent pipeline |
 | `--force_retrain` | Force retraining even if models exist |
@@ -115,8 +112,7 @@ wyodot/output/
 wyodot/comparison_results/wyodot_results/
     wyodot_kvdw_labeled_maddpg_<timestamp>/
         pipeline_run.log                     # Full pipeline log
-        comparison_summary.json              # Side-by-side metrics
-        single_agent/summary.json            # Single-agent summary + plots
-        multi_agent/summary.json             # Multi-agent summary + plots
-        classifier_rules_analysis/           # Rule analysis
+        comparison_summary.json              # Paths/metrics from revision.evaluate
+        single_agent/                        # RLDA evaluate JSON
+        multi_agent/                         # MADA evaluate JSON
 ```

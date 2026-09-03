@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Dynamic Anchors** is a research project that extracts explainable decision rules ("anchors") from tabular datasets using reinforcement learning — both multi-agent (BenchMARL/MARL) and single-agent (Stable-Baselines3) approaches. The two pipelines are designed for direct comparison under the same reward structure.
+**Dynamic Anchors** extracts explainable decision rules ("anchors") from tabular
+datasets using reinforcement learning — multi-agent (BenchMARL/MADA) and
+single-agent (Stable-Baselines3/RLDA). Both arms share the quantile-position MDP
+and the same reward so results are comparable. Paper numbers come from
+`revision.evaluate` (rank on D_val, Fid/Pur on D_test), not from printed rule strings.
 
 ## Setup
 
@@ -16,62 +20,53 @@ pip install -r BenchMARL/requirements.txt
 
 ## Common Commands
 
-### Multi-Agent Training (BenchMARL)
+### Results pipeline (today's collector)
+
+```bash
+python revision/run_overnight_sweep.py
+python revision/run_paper_seed.py --datasets iris wine --seed 42
+python revision/run_rlda_pipeline.py --algo ddpg --datasets iris --seed 42
+python revision/run_mada_pipeline.py --algo maddpg --datasets iris --seed 42
+python wyodot/run_pipeline.py --dataset wyodot_kvdw_labeled --algorithm maddpg --seed 42
+python -m revision.baselines --dataset iris --seed 42
+python -m revision.evaluate --rules_file <extracted_rules.json> --dataset iris --method rlda --seed 42
+```
+
+### Multi-agent training / inference (BenchMARL)
+
 ```bash
 cd BenchMARL
 python driver.py --dataset breast_cancer --algorithm maddpg --seed 42
 # Algorithms: maddpg, masac
-# Datasets: breast_cancer, wine, iris, synthetic, moons, circles, covtype, housing
-#           + optional UCIML (uci_adult, uci_car, ...) and Folktables datasets
-```
-
-### Multi-Agent Inference & Evaluation
-```bash
-cd BenchMARL
 python inference.py --experiment_dir <path_to_experiment_folder> --dataset breast_cancer
-python test_extracted_rules.py --rules_file <path_to_extracted_rules.json> --dataset breast_cancer
 ```
 
-### Single-Agent Training (SB3)
+### Single-agent training / inference (SB3)
+
 ```bash
 python single_agent/driver.py --dataset breast_cancer --algorithm ddpg --seed 42
 # Algorithms: ddpg, sac
-```
-
-### Single-Agent Inference & Evaluation
-```bash
 python single_agent/single_agent_inference.py --experiment_dir <path> --dataset breast_cancer
-cd single_agent
-python test_extracted_rules_single.py --rules_file <path_to_extracted_rules.json> --dataset breast_cancer
-```
-
-### Batch Experiments
-```bash
-python run_batch_comparisons.py --dataset breast_cancer --algorithm maddpg
-python run_comparison_pipeline.py --dataset wine --algorithm masac
-python BenchMARL/run_production_experiments.py --datasets breast_cancer wine --algorithms maddpg
 ```
 
 ### Tests
+
 ```bash
 cd tests
-python test_multi_agent.py
-python test_single_agent.py
+python -m pytest
 ```
 
 ## Architecture
 
-### Dual Pipeline Design
+Both pipelines share the same reward and dataset handling:
 
-Both pipelines share the same reward structure and dataset handling to ensure fair comparison:
-
-| Component | Multi-Agent (BenchMARL/) | Single-Agent (single_agent/) |
+| Component | Multi-Agent (`BenchMARL/`) | Single-Agent (`single_agent/`) |
 |---|---|---|
 | Entry point | `driver.py` | `driver.py` |
 | Trainer | `anchor_trainer.py` | `anchor_trainer_sb3.py` |
 | Environment | `environment.py` (PettingZoo) | `single_agentENV.py` (Gymnasium) |
 | Inference | `inference.py` | `single_agent_inference.py` |
-| Rule evaluation | `test_extracted_rules.py` | `test_extracted_rules_single.py` |
+| Evaluation | `python -m revision.evaluate` | same |
 | Algorithm | MADDPG / MASAC | DDPG / SAC |
 | Agents per class | Multiple (configurable) | One per class |
 
@@ -85,27 +80,33 @@ Both pipelines share the same reward structure and dataset handling to ensure fa
 
 ### RL Environment Design
 
-Agents learn to expand axis-aligned boxes (anchor rules) in the unit-normalized feature space:
-- **Action space:** δ adjustments to box bounds (continuous, [-1, 1] per feature bound)
-- **Observation space:** lower bounds, upper bounds, current precision, current coverage
-- **Reward:** Weighted sum of precision gain (α), coverage gain (β), overlap penalty (γ), JS-divergence penalty, and progressive coverage bonuses
+Quantile-position MDP. Agents start from the empty rule (`k=0`) and add
+predicates by leave-corner actions on class-conditional quantile bounds.
 
-Multi-agent setting: multiple agents per class compete/cooperate to find diverse, non-overlapping rules. Convergence uses NashConv threshold (0.01).
+- **Action space:** leave-corner adjustments in quantile space
+- **Observation space:** `3n+4` = `a`, `b`, `q*`, precision, coverage, mode, episode phase
+- **Reward:** `shaping_gain - overlap_penalty - drift_penalty - anchor_drift_penalty + coverage_floor_penalty`
+  - `shaping_gain = discount * Phi' - Phi` (`discount: 0.95`, must match algo gamma)
+  - overlap weight is YAML **`gamma: 0.1`** (not MDP discount)
+  - `anchor_drift_penalty` uses **`initial_window: 0.1`**
+
+Multi-agent: multiple agents per class. Checkpoint selection uses FidCov + NashConv.
 
 ### Configuration (YAML)
 
-All key hyperparameters are in YAML configs — do not hardcode them:
-- `BenchMARL/conf/base_experiment.yaml` — training loop parameters (lr, batch size, frames, checkpointing, device)
-- `BenchMARL/conf/anchor.yaml` — environment and reward parameters (`precision_target`, `coverage_target`, `alpha`, `beta`, `gamma`, `agents_per_class`, etc.)
-- `BenchMARL/conf/maddpg.yaml` / `masac.yaml` — algorithm-specific settings
-- `BenchMARL/conf/mlp.yaml` — network architecture
-- `single_agent/conf/anchor_single.yaml` — single-agent equivalent (multi-agent fields set to 0)
+Do not hardcode hyperparameters:
+
+- `BenchMARL/conf/base_experiment.yaml` — training loop (lr, batch, frames, device)
+- `BenchMARL/conf/anchor.yaml` — env/reward (`precision_target`, `coverage_target`, `alpha`, `beta`, `gamma`, `discount`, `initial_window`, `agents_per_class`, `precision_estimator: empirical`)
+- `BenchMARL/conf/maddpg.yaml` / `masac.yaml` — algorithm
+- `BenchMARL/conf/mlp.yaml` — network
+- `single_agent/conf/anchor_single.yaml` — single-agent equivalent (multi-agent fields 0)
 
 ### Shared Utilities (`utils/`)
-- `device_utils.py` — auto-selects CUDA > MPS (Apple Silicon) > CPU
-- `networks.py` — classifier and RL policy network architectures
-- `clusters.py` — clustering utilities for rule analysis
-- `multiagent_networks.py` — multi-agent specific network variants
+
+- `quantile_mdp.py` — CDF knots, leave-corner actions, unit-bound sync
+- `metrics.py`, `eval_harness.py`, `inference_extract.py` — revision scoring
+- `dataset_factory.py`, `networks.py`, `device_utils.py`, `clusters.py`
 
 ### Output Structure
 
@@ -117,16 +118,21 @@ output/single_agent_sb3_{dataset}_{algorithm}/training/
     SB3 checkpoints, classifier.pth, TensorBoard logs
 
 experiment_folder/inference/
-    extracted_rules.json, evaluation_metrics.json, test_results.json
+    extracted_rules.json, evaluation_metrics.json
+
+revision/ / runs/  — evaluate JSON artifacts consumed by paper/make_tables.py
 ```
 
-### Baseline (`baseline/`)
+### Baselines
 
-`establish_baseline.py` implements the traditional Anchor (Ribeiro et al.) baseline for comparison. `generate_anchor_for_instance.py` generates per-instance baseline rules.
+`revision/baselines.py` (`python -m revision.baselines`): Anchors, CART, greedy,
+random search, same schema as `revision.evaluate`.
 
 ## Key Design Decisions
 
 - **Two normalizations:** StandardScaler for the classifier; min-max [0,1] for the RL agent. Don't conflate them.
-- **Fair comparison:** Single-agent pipeline uses identical reward weights to multi-agent so results are directly comparable.
-- **Individual models:** After multi-agent training, `AnchorTrainer` extracts individual per-agent policies from the BenchMARL checkpoint for standalone inference.
-- **Perturbation-based sampling:** Environments use adaptive perturbation (`n_perturb: 4096`) to robustly estimate precision/coverage during training.
+- **Fair comparison:** Identical live reward weights in both YAML files.
+- **Empty-rule start:** `k=0` covers the whole space but is not a rule; union/overlap ignore it until a predicate is added.
+- **Track A vs Track B:** training termination uses empirical Fid; conditional CRN is Track B / instance evaluation.
+- **Individual models:** After multi-agent training, `AnchorTrainer` extracts per-agent policies for standalone inference.
+- **Inference JSON:** keep `lower_bounds_normalized` / `lower_bounds`; `revision.evaluate` reads those keys.

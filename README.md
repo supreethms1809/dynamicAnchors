@@ -1,198 +1,105 @@
-# Dynamic Anchors: BenchMARL (Multi‑Agent) and Single‑Agent Pipelines
+# Dynamic Anchors
 
-## Quick start — run everything
+Research code that extracts explainable decision rules ("anchors") from tabular
+datasets with reinforcement learning. Two pipelines share the same quantile-position
+MDP, reward, and held-out evaluation so results are comparable:
 
-To train fresh models and collect results for all datasets:
+| Arm | Code | Algorithm |
+|---|---|---|
+| RLDA (single-agent) | `single_agent/` | DDPG / SAC |
+| MADA (multi-agent) | `BenchMARL/` | MADDPG / MASAC |
 
-```bash
-python run_all_experiments.py --force_retrain --device cpu --seed 42
-```
+Agents grow axis-aligned boxes in unit-normalized feature space. Training uses
+empirical fidelity (Fid) as the done-switch. Paper cells come from
+`revision.evaluate` (rank on validation, report Fid/Pur on test).
 
-To run on a GPU:
-
-```bash
-python run_all_experiments.py --force_retrain --device cuda --seed 42
-```
-
-To run a subset first (recommended smoke test):
-
-```bash
-python run_all_experiments.py --force_retrain --device cpu --seed 42 \
-    --datasets iris breast_cancer wine circles
-```
-
-`run_all_experiments.py` launches `run_comparison_pipeline.py` for every dataset with
-per-dataset training budgets (see table below), running both single-agent (DDPG) and
-multi-agent (MADDPG) pipelines plus the static-anchor baseline.
-
-### Per-dataset training budget
-
-| Dataset | Single-agent steps | Multi-agent frames | max\_cycles | Instances/class |
-|---|---|---|---|---|
-| iris | 90K | 360K | 500 | 20 |
-| breast\_cancer | 90K | 360K | 500 | 20 |
-| wine | 120K | 360K | 500 | 20 |
-| circles | 90K | 360K | 500 | 20 |
-| housing | 240K | 480K | 500 | 25 |
-| uci\_adult | 360K | 720K | 500 | 25 |
-| uci\_credit | 360K | 720K | 500 | 25 |
-| uci\_default-credit-card-clients | 360K | 720K | 500 | 25 |
-| covtype | 1 440K | 1 440K | 500 | 20 |
-| folktables\_income\_CA\_2018 | 720K | 1 080K | 500 | 25 |
-
-### Result directories
-
-| What | Location |
-|------|----------|
-| Comparison results (JSON, plots, logs) | `comparison_results/all_datasets_0_35_uci_credit/{dataset}_{algorithm}_{timestamp}/` |
-| Multi-agent model checkpoints | `BenchMARL/output/{dataset}_{algorithm}/` |
-| Single-agent model checkpoints | `single_agent/output/single_agent_sb3_{dataset}_{algorithm}/` |
-
-Comparison result folders are always timestamped — re-running never overwrites previous
-results. Model checkpoints are reused across runs unless `--force_retrain` is passed.
-
-### `run_all_experiments.py` flags
-
-| Flag | Effect |
-|------|--------|
-| `--datasets D1 D2 ...` | Run only a subset of datasets |
-| `--algorithm maddpg\|masac` | Multi-agent algorithm (default: maddpg) |
-| `--seed N` | Random seed (default: 42) |
-| `--device cpu\|cuda\|mps` | Device (default: cpu) |
-| `--force_retrain` | Retrain even if checkpoints exist |
-| `--skip_training` | Skip training, run inference on existing models |
-| `--skip_baseline` | Skip static-anchor baseline computation |
-
----
-
-### Conda environment (Python 3.12) and dependencies
+## Setup
 
 ```bash
 conda create -n dynamic-anchors python=3.12
 conda activate dynamic-anchors
-
-# Install core dependencies (covers BenchMARL and single_agent)
 pip install -r BenchMARL/requirements.txt
 ```
 
-### BenchMARL: multi‑agent training
+## Results pipeline (what produces today's numbers)
 
-- **Basic training**
+Overnight sweep and paper-seed runs use the same stack:
 
 ```bash
-cd BenchMARL
+# Full overnight sweep (RLDA + MADA, multiple seeds)
+python revision/run_overnight_sweep.py
 
-# Example: breast_cancer with MADDPG
+# One-seed paper run
+python revision/run_paper_seed.py --datasets iris wine breast_cancer --seed 42
+
+# Individual arms
+python revision/run_rlda_pipeline.py --algo ddpg --datasets iris --seed 42
+python revision/run_mada_pipeline.py --algo maddpg --datasets iris --seed 42
+
+# WyoDOT (same train → infer → revision.evaluate path)
+python wyodot/run_pipeline.py --dataset wyodot_kvdw_labeled --algorithm maddpg --seed 42
+```
+
+`revision.evaluate` is the scorer (τ_P=0.90, τ_C=0.10 by default). Baselines
+(Anchors, CART, greedy, random search) are `python -m revision.baselines`.
+Tables/figures: `paper/make_tables.py`, `paper/make_figures.py`.
+
+Generated writeups: [`docs/RESULTS_comparison.md`](docs/RESULTS_comparison.md),
+[`docs/RULES.md`](docs/RULES.md).
+
+## Direct training / inference
+
+```bash
+# Multi-agent
+cd BenchMARL
 python driver.py --dataset breast_cancer --algorithm maddpg --seed 42
-```
+python inference.py --experiment_dir <experiment_folder> --dataset breast_cancer
+python -m revision.evaluate --rules_file <experiment_folder>/inference/extracted_rules.json --dataset breast_cancer --method mada
 
-- **Supported options (high level)**
-  - **Datasets**: `breast_cancer`, `wine`, `iris`, `synthetic`, `moons`, `circles`, `covtype`, `housing`, plus optional UCIML and Folktables datasets if those packages are installed.
-  - **Algorithms**: `maddpg`, `masac` (continuous‑action MARL).
-  - **Key flags** (see `BenchMARL/driver.py` for full list):
-    - `--experiment_config conf/base_experiment.yaml`
-    - `--algorithm_config conf/<algo>.yaml` (defaults if omitted)
-    - `--mlp_config conf/mlp.yaml`
-    - `--classifier_type {dnn,random_forest,gradient_boosting}`
-
-- **Outputs**
-  - Training runs and classifiers are written under `BenchMARL/output/{dataset}_{algorithm}/training/`.
-  - BenchMARL checkpoints (used for later evaluation/inference) are in the experiment folder printed at the end of training.
-
-### BenchMARL: evaluation / inference and rule extraction
-
-- **Evaluate a trained checkpoint (no further training)**
-
-```bash
-cd BenchMARL
-
-python driver.py \
-  --dataset breast_cancer \
-  --algorithm maddpg \
-  --load_checkpoint <path_to_experiment_folder>
-```
-
-This reloads the experiment, runs evaluation, and (when possible) extracts individual models for standalone use.
-
-- **Rule / anchor extraction**
-
-```bash
-cd BenchMARL
-
-python inference.py \
-  --experiment_dir <path_to_experiment_folder> \
-  --dataset breast_cancer
-```
-
-This uses the saved BenchMARL checkpoint (and classifier) to extract final dynamic anchor rules.
-
-- **Test rule extraction**
-```bash
-cd BenchMARL
-
-python test_extracted_rules.py \
-  --rules_file <path_to_extracted_rules.json> \
-  --dataset breast_cancer
-```
-
-Metrics
-- Precision and Coverage of each rule per class
-- Missed samples
-- Rule overlap analysis
-
-### Single‑agent (Stable‑Baselines3) training
-
-- **Basic training**
-
-```bash
-# From repo root
+# Single-agent
 python single_agent/driver.py --dataset breast_cancer --algorithm ddpg --seed 42
-
-# SAC variant
-python single_agent/driver.py --dataset breast_cancer --algorithm sac --seed 42
+python single_agent/single_agent_inference.py --experiment_dir <path> --dataset breast_cancer
+python -m revision.evaluate --rules_file <path>/inference/extracted_rules.json --dataset breast_cancer --method rlda
 ```
 
-- **Advanced configuration (examples)**
+Algorithms: MADDPG / MASAC (multi), DDPG / SAC (single).
+Datasets: `breast_cancer`, `wine`, `iris`, `synthetic`, `moons`, `circles`,
+`covtype`, `housing`, plus optional UCIML and Folktables names.
+
+## Reward (live)
+
+```
+reward = shaping_gain - overlap_penalty - drift_penalty - anchor_drift_penalty + coverage_floor_penalty
+```
+
+- `shaping_gain` = `discount * Phi' - Phi` (`discount: 0.95`, must match the algo gamma)
+- `overlap_penalty` uses YAML **`gamma: 0.1`** (narrow-width weight, not MDP discount)
+- `drift_penalty` from `drift_penalty_weight: 0.05`
+- `anchor_drift_penalty` from **`initial_window: 0.1`**
+
+Config: `BenchMARL/conf/anchor.yaml`, `single_agent/conf/anchor_single.yaml`.
+
+## Tests
 
 ```bash
-python single_agent/driver.py \
-  --dataset breast_cancer \
-  --algorithm ddpg \
-  --seed 42 \
-  --total_timesteps 3072000 \
-  --learning_rate 5e-5 \
-  --max_cycles 1000 \
-  --device cuda \
-  --eval_on_test_data
+cd tests
+python -m pytest
 ```
 
-- **Outputs**
-  - Results are written under `output/single_agent_sb3_{dataset}_{algorithm}/`.
-  - Inside `training/`, you will find SB3 checkpoints, the best/final models, TensorBoard logs, and `classifier.pth`.
+## Architecture
 
-### Single‑agent evaluation / inference
+| Component | Multi-agent (`BenchMARL/`) | Single-agent (`single_agent/`) |
+|---|---|---|
+| Entry point | `driver.py` | `driver.py` |
+| Trainer | `anchor_trainer.py` | `anchor_trainer_sb3.py` |
+| Environment | `environment.py` (PettingZoo) | `single_agentENV.py` (Gymnasium) |
+| Inference | `inference.py` | `single_agent_inference.py` |
+| Evaluation | `python -m revision.evaluate` | same |
+| Agents per class | Multiple (YAML `agents_per_class`) | One per class |
 
-- **Evaluate or run inference from a saved experiment**
+Observation is `3n+4`: quantile bounds `a`, `b`, instance quantiles `q*`,
+precision, coverage, mode, episode phase. Action is leave-corner quantile
+adjustment. The environment starts from the empty rule (`k=0`).
 
-```bash
-python single_agent/driver.py \
-  --dataset breast_cancer \
-  --algorithm ddpg \
-  --load_checkpoint <path_to_experiment_folder>
-```
-
-This reloads the saved SB3 policy and classifier, runs evaluation over multiple episodes, and logs aggregate performance metrics.
-
-- **Test rule extraction**
-```bash
-cd single_agent
-
-python test_extracted_rules_single.py \
-  --rules_file <path_to_extracted_rules.json> \
-  --dataset breast_cancer
-```
-
-Metrics
-- Precision and Coverage of each rule per class
-- Missed samples
-- Rule overlap analysis
+Data (`BenchMARL/tabular_datasets.py`): train/test split, StandardScaler for the
+classifier, min-max `[0,1]` for the RL box. Do not conflate the two spaces.

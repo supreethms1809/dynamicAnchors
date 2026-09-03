@@ -34,12 +34,6 @@ from utils.metrics import (
     sparsify_box,
 )
 
-LEGACY_RULE_TESTER_WARNING = (
-    "This script unions printed unique_rules strings and is NOT the paper "
-    "reporting path (C-01 / C-10). Use `python -m revision.evaluate` for "
-    "held-out Fid/Pur, n_covered, and top-k unions from stored boxes."
-)
-
 
 # ---------------------------------------------------------------------------
 # C-10 — three-way split helpers

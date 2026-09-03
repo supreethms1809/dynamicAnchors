@@ -50,7 +50,6 @@ def _sa_cfg(n_features, **extra):
         "precision_target": 0.9,
         "coverage_target": 0.2,
         "require_coverage_gain_to_terminate": True,
-        "init_mode": "neighbor_hull",
         "precision_estimator": "empirical",
         "use_perturbation": False,
         "mode": "training",
@@ -144,7 +143,12 @@ def test_coverage_improved_true_when_already_at_tau_c():
         feature_names=[f"f{i}" for i in range(X.shape[1])],
         classifier=ConstClf(X.shape[1]),
         target_class=0,
-        env_config=_sa_cfg(X.shape[1], coverage_target=0.2, require_coverage_gain_to_terminate=True),
+        env_config=_sa_cfg(
+            X.shape[1],
+            coverage_target=0.2,
+            require_coverage_gain_to_terminate=True,
+            require_precision_gain_to_terminate=False,
+        ),
     )
     env._coverage_at_reset = 0.25
     env._coverage_gain_eps = 0.01
@@ -202,15 +206,17 @@ def test_union_metrics_ignore_idle_agent_boxes():
     env.reset()
     acting = env.agents[0]
     idle = env.agents[1]
-    env.lower[acting] = np.full(n_features, 0.24, dtype=np.float32)
-    env.upper[acting] = np.full(n_features, 0.26, dtype=np.float32)
-    env.lower[idle] = np.zeros(n_features, dtype=np.float32)
-    env.upper[idle] = np.ones(n_features, dtype=np.float32)
+    a = np.zeros(n_features, dtype=np.float64)
+    b = np.ones(n_features, dtype=np.float64)
+    a[0], b[0] = 0.3, 0.7
+    env.a[acting] = a
+    env.b[acting] = b
+    env._sync_unit_bounds_from_quantiles(acting)
     env.agents = [acting, idle]
     cov_with_idle = env._compute_class_union_metrics()[0]["union_coverage"]
     env.agents = [acting]
     cov_acting_only = env._compute_class_union_metrics()[0]["union_coverage"]
-    assert cov_with_idle > cov_acting_only + 0.1
+    assert cov_with_idle == pytest.approx(cov_acting_only)
 
 
 def test_mada_overlap_skips_unconstrained_dims():

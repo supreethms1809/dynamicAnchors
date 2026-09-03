@@ -1,9 +1,7 @@
-"""MADA (BenchMARL AnchorEnv) shaping + quantile-MDP port guards.
+"""MADA (BenchMARL AnchorEnv) shaping + quantile-MDP guards.
 
-Paper YAML (`BenchMARL/conf/anchor.yaml`) is `init_mode: full_space`, matching
-RLDA. The constructor default stays `neighbor_hull` so CDEA/WyoDOT checkpoints
-keep the 2d+3 obs layout — that is plumbing, not the paper method. Shared YAML
-knobs are locked by `test_shipped_configs_agree_between_rlda_and_mada`.
+Paper YAML (`BenchMARL/conf/anchor.yaml`) is the quantile-position MDP.
+Shared YAML knobs are locked by `test_shipped_configs_agree_between_rlda_and_mada`.
 """
 from __future__ import annotations
 
@@ -85,8 +83,9 @@ def test_shaping_is_discounted_on_a_nonterminal_step():
     """F = gamma*Phi(s') - Phi(s). On a no-op step Phi is unchanged, so the
     shaping contribution must be exactly (gamma - 1) * Phi, not 0.
 
-    Hull mode: a no-op there is a genuine non-terminal step with non-zero Phi."""
-    env = _env(init_mode="neighbor_hull", precision_estimator="empirical")
+    Empty-rule no-op is a genuine non-terminal step (k=0, cov_ok=0) with
+    non-zero Phi = alpha * p_tilde."""
+    env = _env(precision_estimator="empirical")
     obs, _ = env.reset(seed=0)
     agents = list(obs.keys())
     a0 = agents[0]
@@ -100,38 +99,6 @@ def test_shaping_is_discounted_on_a_nonterminal_step():
     assert abs(phi) > 1e-9
     assert env._rt_shaping[a0] == pytest.approx((env.discount - 1.0) * phi, abs=1e-6)
     assert "shaping_terminal_correction" not in info
-
-
-def test_absorbing_terminal_correction_applied_on_termination():
-    """On the terminating transition the total shaping must be -Phi(s):
-    (gamma*Phi(s') - Phi(s)) + (-gamma*Phi(s')) = -Phi(s).
-
-    Pinned to hull mode: there a no-op episode reaches target-based termination so
-    the assertion actually runs. Under the quantile MDP a no-op sits at k=0 forever
-    (cov_ok=0, no precision gain) and this test would silently skip.
-    """
-    env = _env(init_mode="neighbor_hull", precision_estimator="empirical")
-    obs, _ = env.reset(seed=0)
-    agents = list(obs.keys())
-    a0 = agents[0]
-    zero = _noop(env, agents)
-
-    prev = 0.0
-    for _ in range(env.max_cycles):
-        _, _, term, trunc, infos = env.step(zero)
-        delta = env._rt_shaping[a0] - prev
-        prev = env._rt_shaping[a0]
-        if term.get(a0):
-            info = infos[a0]
-            phi = env._potential(info["anchor_precision"], info["anchor_coverage"],
-                                 env._get_class_for_agent(a0))
-            assert "shaping_terminal_correction" in info
-            assert info["shaping_terminal_correction"] == pytest.approx(
-                -env.discount * phi, abs=1e-6)
-            # (gamma-1)*Phi from the step, then -gamma*Phi from the correction.
-            assert delta == pytest.approx(-phi, abs=1e-6)
-            return
-    pytest.skip("fixture never reached target-based termination")
 
 
 def test_no_terminal_correction_on_truncation():
@@ -210,43 +177,8 @@ def test_stability_termination_also_gets_the_correction():
 
 
 # ---------------------------------------------------------------------------
-# Quantile-position MDP port (opt-in via init_mode: full_space)
+# Quantile-position MDP
 # ---------------------------------------------------------------------------
-
-def test_hull_is_the_CODE_default_so_the_port_is_opt_in():
-    """The quantile MDP must be opt-in at the code level.
-
-    WyoDOT/CDEA share this env and hold 2n+3 checkpoints, so an unset init_mode
-    has to mean "hull". The shipped anchor.yaml may legitimately opt in -- that is
-    a config decision, checked separately below.
-    """
-    env = _env(init_mode=None) if False else None
-    X, y = _data()
-    n = X.shape[1]
-    from BenchMARL.environment import AnchorEnv as _AE
-    bare = _AE(
-        X_unit=X, X_std=X, y=y,
-        feature_names=[f"f{i}" for i in range(n)],
-        classifier=LinearSepClf(n),
-        env_config={
-            "max_cycles": 8, "agents_per_class": 1,
-            "X_min": np.zeros(n, dtype=np.float32),
-            "X_range": np.ones(n, dtype=np.float32),
-        },
-    )
-    assert bare.init_mode == "neighbor_hull"
-    assert bare._uses_quantile_mdp() is False
-    assert bare.observation_space(bare.possible_agents[0]).shape == (2 * n + 3,)
-
-
-def test_hull_mode_still_works_when_selected():
-    env = _env(init_mode="neighbor_hull", precision_estimator="empirical")
-    assert env._uses_quantile_mdp() is False
-    obs, _ = env.reset(seed=0)
-    a0 = list(obs.keys())[0]
-    assert obs[a0].shape == (2 * env.n_features + 3,)
-    assert env.n_predicates(a0) == env.n_features, "hull init constrains every dim"
-
 
 def test_shipped_configs_agree_between_rlda_and_mada():
     """Every shared env knob must match, or the RLDA-vs-MADA comparison is invalid.
@@ -322,7 +254,7 @@ def test_beta_is_not_the_hull_era_value():
 
 
 def test_quantile_mode_starts_from_the_empty_rule():
-    env = _env(init_mode="full_space", precision_estimator="conditional")
+    env = _env(precision_estimator="conditional")
     obs, _ = env.reset(seed=0)
     agents = list(obs.keys())
     a0 = agents[0]
@@ -335,7 +267,7 @@ def test_quantile_mode_starts_from_the_empty_rule():
 
 
 def test_quantile_mode_adds_predicates_and_keeps_bounds_valid():
-    env = _env(init_mode="full_space", precision_estimator="conditional", max_cycles=15)
+    env = _env(precision_estimator="conditional", max_cycles=15)
     obs, _ = env.reset(seed=0)
     agents = list(obs.keys())
     rng = np.random.default_rng(1)
@@ -354,7 +286,7 @@ def test_quantile_mode_adds_predicates_and_keeps_bounds_valid():
 
 def test_export_rule_state_is_authoritative_not_the_observation():
     """obs[:n] is a QUANTILE in this mode, so decoding it as `lower` is wrong."""
-    env = _env(init_mode="full_space", precision_estimator="conditional")
+    env = _env(precision_estimator="conditional")
     obs, _ = env.reset(seed=2)
     a0 = list(obs.keys())[0]
     env.a[a0][1], env.b[a0][1] = 0.25, 0.75
@@ -373,7 +305,7 @@ def test_export_rule_state_is_authoritative_not_the_observation():
 def test_quantile_empty_rule_is_not_potential_maximal():
     """k=0 covers everything at the base rate; on a majority class that clears the
     gate, so an ungated Phi would make DOING NOTHING optimal."""
-    env = _env(init_mode="full_space", precision_estimator="conditional")
+    env = _env(precision_estimator="conditional")
     obs, _ = env.reset(seed=0)
     a0 = list(obs.keys())[0]
     cls = env._get_class_for_agent(a0)
@@ -385,7 +317,7 @@ def test_quantile_empty_rule_is_not_potential_maximal():
 def test_quantile_potential_caps_precision_at_target():
     """Precision above target is worth nothing, else the gate slope makes the
     policy shrink to k = d."""
-    env = _env(init_mode="full_space", precision_estimator="conditional")
+    env = _env(precision_estimator="conditional")
     obs, _ = env.reset(seed=0)
     a0 = list(obs.keys())[0]
     cls = env._get_class_for_agent(a0)
@@ -402,7 +334,7 @@ def test_terminal_floor_retreat_rescues_a_collapsed_episode():
     agent-episodes under a random policy (k=27/30, coverage 0.000); with it, 0%
     (k=3.0, coverage 0.773).
     """
-    env = _env(init_mode="full_space", precision_estimator="conditional", max_cycles=6)
+    env = _env(precision_estimator="conditional", max_cycles=6)
     obs, _ = env.reset(seed=0)
     a0 = list(obs.keys())[0]
     assert env.coverage_floor_mode == "terminal"
@@ -430,7 +362,7 @@ def test_terminal_floor_retreat_rescues_a_collapsed_episode():
 
 def test_no_retreat_when_nothing_feasible_was_found():
     """With no feasible box the final one is kept -- never silently fabricated."""
-    env = _env(init_mode="full_space", precision_estimator="conditional", max_cycles=4)
+    env = _env(precision_estimator="conditional", max_cycles=4)
     obs, _ = env.reset(seed=1)
     a0 = list(obs.keys())[0]
     env._best_box[a0] = None
@@ -463,7 +395,7 @@ def test_paper_yaml_enables_quantile_same_class_diversity():
 
 def test_quantile_empty_rule_is_not_a_claim():
     """k=0 is the start state, not a region. Overlap and union ignore it."""
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=2, same_class_diversity_weight=1.0)
     env.reset(seed=0)
     for a in env.possible_agents:
@@ -478,7 +410,7 @@ def test_quantile_empty_rule_is_not_a_claim():
 
 def test_quantile_union_excludes_empty_teammate():
     """A k=0 teammate must not drown Φ^∪ with the full space."""
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=2)
     env.reset(seed=0)
     acting, idle = env.class_to_agents[0]
@@ -493,7 +425,7 @@ def test_quantile_union_excludes_empty_teammate():
 
 def test_quantile_union_keeps_terminated_rule():
     """A finished agent's k>=1 box still covers for teammates."""
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=2)
     env.reset(seed=0)
     done_agent, live = env.class_to_agents[0]
@@ -506,7 +438,7 @@ def test_quantile_union_keeps_terminated_rule():
 
 
 def test_quantile_interclass_simpson_zero_when_disjoint():
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=1, inter_class_overlap_weight=1.0)
     env.reset(seed=0)
     a0 = env.class_to_agents[0][0]
@@ -524,7 +456,7 @@ def test_quantile_interclass_simpson_zero_when_disjoint():
 
 
 def test_quantile_interclass_simpson_high_when_same_rows():
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=1, inter_class_overlap_weight=1.0)
     env.reset(seed=0)
     a0 = env.class_to_agents[0][0]
@@ -541,7 +473,7 @@ def test_quantile_interclass_simpson_high_when_same_rows():
 
 
 def test_quantile_same_class_diversity_penalizes_copies():
-    env = _env(init_mode="full_space", precision_estimator="empirical",
+    env = _env(precision_estimator="empirical",
                agents_per_class=2, same_class_diversity_weight=1.0,
                inter_class_overlap_weight=0.0)
     env.reset(seed=0)

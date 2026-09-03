@@ -7,8 +7,8 @@ Skip-if-exists so a crash can resume. Continues to the next dataset on failure.
   python revision/run_paper_seed.py --datasets wine breast_cancer
   python revision/run_paper_seed.py --seed 42 --device cpu
 
-Budgets match run_all_experiments.py (timesteps/frames/n_instances).
-Episode length comes from YAML (max_cycles=200), not the old 500.
+Budgets match DATASET_CONFIGS in this file (timesteps/frames/n_instances).
+Episode length comes from YAML (max_cycles).
 """
 from __future__ import annotations
 

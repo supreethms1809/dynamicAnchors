@@ -757,11 +757,11 @@ def _apply_logging_verbosity(env_config: Optional[Dict[str, Any]] = None):
     # Also set for common module loggers (both full names and short names)
     logger_names = [
         'BenchMARL', 'single_agent', 'tabular_datasets', 'anchor_trainer_sb3', 
-        'single_agent_inference', 'test_extracted_rules_single', 'inference',
+        'single_agent_inference', 'inference',
         'environment', 'benchmarl_wrappers', 'anchor_trainer', 'BenchMARL.environment',
         'BenchMARL.benchmarl_wrappers', 'BenchMARL.anchor_trainer', 'BenchMARL.tabular_datasets',
         'single_agent.anchor_trainer_sb3', 'single_agent.single_agent_inference',
-        'single_agent.test_extracted_rules_single'
+        'revision.evaluate'
     ]
     for logger_name in logger_names:
         logger = logging.getLogger(logger_name)

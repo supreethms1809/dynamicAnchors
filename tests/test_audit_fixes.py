@@ -93,7 +93,7 @@ def test_class_union_potential_uses_the_shared_gate():
 
 def test_quantile_observation_carries_the_episode_clock():
     """G-12: xi_t is part of the state under truncation + per-step costs."""
-    env = _env(init_mode="full_space")
+    env = _env()
     obs, _ = env.reset(seed=0)
     a0 = sorted(obs)[0]
     assert obs[a0].shape == (3 * env.n_features + 4,)
@@ -106,11 +106,10 @@ def test_quantile_observation_carries_the_episode_clock():
 
 def test_single_agent_observation_matches_mada_layout():
     """The arms must share the representation, not just the reward."""
-    ma = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
-    sa = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
-    assert ma["init_mode"] == sa["init_mode"] == "full_space"
     src = (REPO / "single_agent" / "single_agentENV.py").read_text()
+    src_ma = (REPO / "BenchMARL" / "environment.py").read_text()
     assert "3 * self.n_features + 4" in src, "SA obs must carry the clock too"
+    assert "3 * self.n_features + 4" in src_ma
 
 
 # --------------------------------------------------------------- G-02
@@ -158,7 +157,7 @@ def test_complete_action_dict_returns_every_agent():
 
 def test_class_start_is_a_real_row_and_differs_per_agent():
     """G-07/B-05: anchor on a real x*, and diversify across same-class agents."""
-    env = _env(agents_per_class=3, n_classes=2, init_mode="full_space")
+    env = _env(agents_per_class=3, n_classes=2)
     env.reset(seed=0)
     cls_rows = env.X_unit[env.y == 0]
     starts = []

@@ -1,4 +1,4 @@
-"""Regression tests for init hull, centroid snap, categorical freeze-on-reset, hard Fid."""
+"""Regression tests for categorical freeze-on-reset, centroid snap, hard Fid."""
 from __future__ import annotations
 
 import sys
@@ -47,16 +47,11 @@ def _make_env(X, y, extra_cfg=None, target_class=0):
         "max_cycles": 20,
         "min_width": 0.05,
         "initial_window": 0.1,
-        "init_min_neighbors": 5,
-        "init_neighbor_frac": 0.1,
-        "init_max_neighbors": 20,
-        "init_coverage_frac_of_target": 0.5,
         "strict_target_termination": True,
         "require_coverage_gain_to_terminate": True,
         "centroid_snap_threshold": 0.0,
         "precision_target": 0.9,
         "coverage_target": 0.2,
-        "init_mode": "neighbor_hull",
         "precision_estimator": "empirical",
         "precision_blend_lambda": 0.5,
         "categorical_freeze": "instance",
@@ -80,29 +75,6 @@ def _make_env(X, y, extra_cfg=None, target_class=0):
     return env
 
 
-def test_instance_init_uses_neighbor_hull_not_singleton():
-    X, y = _clustered_data()
-    x_star = X[0]
-    env = _make_env(X, y, extra_cfg={"mode": "inference"})
-    env.x_star_unit = x_star
-    env.reset()
-    mask = ((X >= env.lower) & (X <= env.upper)).all(axis=1)
-    assert mask[0], "start instance must stay inside the hull"
-    n_class = int((mask & (y == 0)).sum())
-    assert n_class >= 1, n_class
-    # τ_C cap wins over init_min_neighbors=5: 0.5 * 0.2 * 40 = 4
-    assert env._init_n_neighbors(40) == 4
-
-
-def test_init_n_neighbors_tau_cap_wins_over_min_neighbors():
-    X, y = _clustered_data(n_per_class=40)
-    env = _make_env(X, y)
-    # wine-like n=35, τ_C=0.2, frac=0.5 → cap=3, not min_neighbors=5
-    assert env._init_n_neighbors(35) == 3
-    assert env._init_n_neighbors(40) == 4
-    assert env._init_n_neighbors(1) == 1
-
-
 def test_categorical_freeze_on_reset():
     X, y = _clustered_data(n_features=4)
     x_star = X[0].copy()
@@ -111,7 +83,6 @@ def test_categorical_freeze_on_reset():
         extra_cfg={
             "mode": "inference",
             "categorical_indices": [0],
-            "init_mode": "full_space",
             "precision_estimator": "conditional",
             "reset_diversity_frac": 0.0,
             "n_reset_landings": 0,
@@ -188,6 +159,10 @@ def test_instance_coverage_is_class_conditional_not_marginal():
     env = _make_env(X, y, extra_cfg={"mode": "inference"})
     env.x_star_unit = X[0]
     env.reset()
+    a = np.zeros(env.n_features, dtype=np.float64)
+    b = np.ones(env.n_features, dtype=np.float64)
+    a[0], b[0] = 0.0, 0.5
+    env.set_quantile_box(a, b)
     precision, coverage, details = env._current_metrics()
     mask = ((X >= env.lower) & (X <= env.upper)).all(axis=1)
     class_mask = y == 0
@@ -221,12 +196,12 @@ def test_no_terminal_bonus_without_coverage_gain():
         extra_cfg={
             "mode": "training",
             "precision_target": 0.0,
-            "coverage_target": 10.0,  # above any real C so the gain gate still applies
+            "coverage_target": 0.0,
             "min_steps_before_termination": 2,
             "require_coverage_gain_to_terminate": True,
+            "require_precision_gain_to_terminate": False,
             "strict_target_termination": True,
             "terminal_bonus": 5.0,
-            "init_mode": "neighbor_hull",
             "precision_estimator": "empirical",
         },
     )
@@ -234,30 +209,28 @@ def test_no_terminal_bonus_without_coverage_gain():
     env.precision_target_effective = 0.0
     action = np.zeros(env.action_space.shape, dtype=np.float32)
 
-    # Below τ_C, and current C cannot beat C_reset + eps.
-    env._coverage_at_reset = float(env._coverage_at_reset) + 1.0
-    env._coverage_gain_eps = 1e-6
+    # Empty start (k=0) is not a rule, so both_targets_met cannot fire.
     done = False
     reward = 0.0
     info = {}
     for _ in range(2):
         _, reward, done, _, info = env.step(action)
     assert done is False
-    assert info["termination_reason"] == 0.0
-    assert info["coverage_improved"] == 0.0
+    assert info["n_predicates"] == 0.0
     assert reward < 5.0
 
     env.reset()
     env.precision_target_effective = 0.0
     env.coverage_target = 0.0
+    a = np.zeros(env.n_features, dtype=np.float64)
+    b = np.ones(env.n_features, dtype=np.float64)
+    a[0], b[0] = 0.0, 0.5
+    env.set_quantile_box(a, b)
     env._coverage_at_reset = -1.0
     env._coverage_gain_eps = 0.0
     for _ in range(2):
         _, reward, done, _, info = env.step(action)
     assert done is True
     assert info["termination_reason"] == 1.0
-    assert info["coverage_improved"] == 1.0
-    assert done is True
-    assert info["termination_reason"] == 1.0
-    assert info["coverage_improved"] == 1.0
+    assert env.n_predicates() >= 1
     assert reward >= 3.0

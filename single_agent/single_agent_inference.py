@@ -2576,17 +2576,9 @@ def extract_rules_single_agent(
                 # NOTE: "class-level" here refers to "class-union" metrics computed from the union of all anchors.
                 # This is different from "instance-level" metrics which are averaged across individual anchors.
                 # 
-                # IMPORTANT: This computation uses ALL anchors (including duplicates), not just unique rules.
-                # The test script (test_extracted_rules_single.py) uses unique rules after deduplication and denormalization,
-                # which may give slightly different results due to:
-                #   1. Deduplication: Only unique rules are tested (fewer anchors)
-                #   2. Denormalization: Rules are converted to standardized space, which may introduce rounding differences
-                # 
-                # Both metrics are valid but measure different things:
-                #   - Inference (all anchors): Shows coverage of all generated anchors with normalized bounds
-                #   - Test script (unique rules): Shows coverage of deduplicated rules after denormalization
-                # 
-                # For consistency with the test script, consider using unique rules for class-level metrics.
+                # IMPORTANT: This computation uses ALL anchors (including duplicates), not
+                # just unique rules. revision.evaluate ranks stored boxes on D_val and
+                # reports Fid/Pur on D_test; those cells are the paper path.
                 mask_cls = (y_data == target_class)
                 n_class_samples = mask_cls.sum()
                 n_total_samples = len(y_data)

@@ -6,7 +6,7 @@ Runs the full pipeline for WyoDOT datasets, matching revision/run_rlda_pipeline.
 1. Training (single-agent and multi-agent)
 2. C-10 inference: generate on D_train, rank on D_val (no train+test leakage)
 3. revision.evaluate: select top-k on D_val, report Fid/Pur on D_test
-4. Summarize and plot results for comparison
+4. Write a comparison_summary.json of those evaluate artifacts
 
 Usage:
     python run_pipeline.py --dataset wyodot_kvdw_labeled --algorithm maddpg --seed 42
@@ -722,224 +722,7 @@ def run_revision_evaluate(
 
 
 # ---------------------------------------------------------------------------
-# Testing (in-process with monkey-patched loader)
-# ---------------------------------------------------------------------------
-
-def run_single_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs) -> Optional[str]:
-    """Run single-agent rule testing in-process. Returns path to saved test results.
-
-    Also writes a dedicated per-test log file and a human-readable Markdown
-    summary into <experiment_dir>/inference/, so the test report can be
-    reviewed without scrolling through the full pipeline_run.log.
-    """
-    logger.info(f"\n{'='*80}")
-    logger.info(f"Single-Agent Test Rules: {dataset}")
-    logger.info(f"{'='*80}")
-
-    inference_dir = Path(rules_file).parent
-    inference_dir.mkdir(parents=True, exist_ok=True)
-    test_log_path = str(inference_dir / "test_report_single_agent.log")
-    test_md_path = str(inference_dir / "test_report_single_agent.md")
-    test_results_file = str(inference_dir / "test_results_single_agent.json")
-
-    file_handler = None
-    try:
-        from test_extracted_rules_single import (
-            test_rules_from_json as test_sa,
-            add_file_log_handler,
-        )
-
-        # Attach a dedicated FileHandler so the per-rule log output lands in
-        # the experiment folder, not buried in pipeline_run.log.
-        file_handler = add_file_log_handler(test_log_path)
-        logger.info(f"Per-test log file: {test_log_path}")
-
-        results = test_sa(
-            rules_file=rules_file,
-            dataset_name=dataset,
-            seed=seed,
-            use_full_dataset=kwargs.get("use_full_dataset", True),
-            report_md_path=test_md_path,
-        )
-
-        with open(test_results_file, 'w') as f:
-            json.dump(_convert_for_json(results), f, indent=2)
-
-        logger.info(f"OK: Single-agent test completed")
-        logger.info(f"  JSON:     {test_results_file}")
-        logger.info(f"  Markdown: {test_md_path}")
-        logger.info(f"  Log:      {test_log_path}")
-        return test_results_file
-    except Exception as e:
-        logger.error(f"FAIL: Single-agent test: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    finally:
-        # Detach the per-test file handler so the pipeline's root logger
-        # doesn't accumulate handlers across runs.
-        if file_handler is not None:
-            try:
-                logging.getLogger().removeHandler(file_handler)
-                file_handler.close()
-            except Exception:
-                pass
-
-
-def run_multi_agent_test(rules_file: str, dataset: str, seed: int = 42, **kwargs) -> Optional[str]:
-    """Run multi-agent rule testing in-process. Returns path to saved test results.
-
-    Mirrors run_single_agent_test: alongside the JSON results it writes a
-    dedicated per-test log file and a human-readable Markdown summary into
-    <experiment_dir>/inference/, so the MA test report has the same artifacts
-    as the SA one (previously only the JSON was saved for MA).
-    """
-    logger.info(f"\n{'='*80}")
-    logger.info(f"Multi-Agent Test Rules: {dataset}")
-    logger.info(f"{'='*80}")
-
-    inference_dir = Path(rules_file).parent
-    inference_dir.mkdir(parents=True, exist_ok=True)
-    test_log_path = str(inference_dir / "test_report_multi_agent.log")
-    test_md_path = str(inference_dir / "test_report_multi_agent.md")
-    test_results_file = str(inference_dir / "test_results_multi_agent.json")
-
-    file_handler = None
-    try:
-        from test_extracted_rules import test_rules_from_json as test_ma
-        # add_file_log_handler / _write_test_report_markdown are algorithm-agnostic
-        # (they only touch the logger and the results dict). Reuse the single-agent
-        # implementations so the MA and SA reports stay in lockstep instead of
-        # drifting as two copies.
-        from test_extracted_rules_single import (
-            add_file_log_handler,
-            _write_test_report_markdown,
-            enrich_results_posthoc,
-        )
-
-        # Attach a dedicated FileHandler so per-rule log output lands in the
-        # experiment folder, not buried in pipeline_run.log.
-        file_handler = add_file_log_handler(test_log_path)
-        logger.info(f"Per-test log file: {test_log_path}")
-
-        results = test_ma(
-            rules_file=rules_file,
-            dataset_name=dataset,
-            seed=seed,
-            use_full_dataset=kwargs.get("use_full_dataset", True),
-        )
-
-        # The MA test-results dict doesn't carry these fields; tag them so the
-        # report header isn't 'unknown'.
-        results.setdefault("algorithm", kwargs.get("algorithm", "multi_agent"))
-        results.setdefault("model_type", "mlp")
-
-        # The MA compute path (BenchMARL/test_extracted_rules.py) skips the
-        # base-rate/lift/feature-importance enrichment that the SA compute path
-        # runs inline, so without this call the MA report shows base rate 0.000,
-        # lift 0.00x, and per-class "n samples" 0. Recovers per-class totals
-        # from the results dict itself (no dataset reload), so y_data is None.
-        try:
-            enrich_results_posthoc(results, y_data=None)
-        except Exception as e:
-            logger.warning(f"Could not enrich multi-agent results (lift/base rate): {e}")
-
-        with open(test_results_file, 'w') as f:
-            json.dump(_convert_for_json(results), f, indent=2)
-
-        try:
-            _write_test_report_markdown(results, test_md_path)
-        except Exception as e:
-            logger.warning(f"Could not write multi-agent markdown report: {e}")
-            test_md_path = None
-
-        logger.info(f"OK: Multi-agent test completed")
-        logger.info(f"  JSON:     {test_results_file}")
-        if test_md_path:
-            logger.info(f"  Markdown: {test_md_path}")
-        logger.info(f"  Log:      {test_log_path}")
-        return test_results_file
-    except Exception as e:
-        logger.error(f"FAIL: Multi-agent test: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-    finally:
-        # Detach the per-test file handler so the pipeline's root logger
-        # doesn't accumulate handlers across runs.
-        if file_handler is not None:
-            try:
-                logging.getLogger().removeHandler(file_handler)
-                file_handler.close()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# Summarize & Plot (subprocess — these scripts don't use TabularDatasetLoader)
-# ---------------------------------------------------------------------------
-
-def run_summarize_and_plot(
-    rules_file: str, dataset: str, output_dir: Optional[str] = None,
-    test_results_file: Optional[str] = None, seed: int = 42, **kwargs
-) -> bool:
-    """Run summarize and plot for a rules file.
-
-    NOTE: We never pass --run_tests to the subprocess because the summarize
-    scripts import test_extracted_rules which imports TabularDatasetLoader —
-    and our monkey-patch doesn't survive subprocess boundaries.  Instead, we
-    run tests in-process earlier in the pipeline and pass the saved results
-    via --test_results_file.
-    """
-    rules_path = Path(rules_file)
-    is_single = "single_agent" in rules_path.name.lower()
-
-    if is_single:
-        script = PROJECT_ROOT / "single_agent" / "summarize_and_plot_rules_single.py"
-        cwd = str(PROJECT_ROOT)
-        script_rel = "single_agent/summarize_and_plot_rules_single.py"
-    else:
-        script = PROJECT_ROOT / "BenchMARL" / "summarize_and_plot_rules.py"
-        cwd = str(PROJECT_ROOT / "BenchMARL")
-        script_rel = "summarize_and_plot_rules.py"
-
-    if not script.exists():
-        logger.error(f"Script not found: {script}")
-        return False
-
-    cmd = [
-        sys.executable, script_rel,
-        "--rules_file", str(rules_path.resolve()),
-        "--dataset", dataset,
-        "--seed", str(seed),
-    ]
-
-    if output_dir:
-        cmd.extend(["--output_dir", str(Path(output_dir).resolve())])
-
-    # Pass pre-computed test results instead of --run_tests
-    if test_results_file and Path(test_results_file).exists():
-        cmd.extend(["--test_results_file", str(Path(test_results_file).resolve())])
-
-    # Pass remaining kwargs (but filter out run_tests / use_full_dataset
-    # which are only relevant when --run_tests is used)
-    skip_keys = {"run_tests", "use_full_dataset"}
-    for key, value in kwargs.items():
-        if key in skip_keys:
-            continue
-        if value is not None:
-            if isinstance(value, bool):
-                if value: cmd.append(f"--{key}")
-            else:
-                cmd.extend([f"--{key}", str(value)])
-
-    label = "Single-Agent" if is_single else "Multi-Agent"
-    success, _ = run_command(cmd, f"Summarize & Plot ({label}): {dataset}", cwd=cwd)
-    return success
-
-
-# ---------------------------------------------------------------------------
-# Comparison Summary
+# Comparison Summary (revision.evaluate result JSONs)
 # ---------------------------------------------------------------------------
 
 def create_comparison_summary(
@@ -1007,7 +790,7 @@ Examples:
                         choices=["cpu", "cuda", "mps", "auto"], help="Device")
     parser.add_argument("--skip_training", action="store_true", help="Skip training")
     parser.add_argument("--skip_inference", action="store_true", help="Skip inference")
-    parser.add_argument("--skip_testing", action="store_true", help="Skip testing")
+    parser.add_argument("--skip_testing", action="store_true", help="Skip revision.evaluate")
     parser.add_argument("--force_retrain", action="store_true", help="Force retraining")
     parser.add_argument(
         "--force_reinference", action="store_true",
@@ -1153,8 +936,8 @@ Examples:
     logger.info(f"{'='*80}\n")
 
     # Track paths
-    sa_exp_dir = sa_rules = sa_summary = sa_test_results = None
-    ma_exp_dir = ma_rules = ma_summary = ma_test_results = None
+    sa_exp_dir = sa_rules = sa_test_results = None
+    ma_exp_dir = ma_rules = ma_test_results = None
 
     # ---- SINGLE-AGENT PIPELINE ----
     if not args.skip_single_agent:
@@ -1219,18 +1002,6 @@ Examples:
                 method="rlda", seed=args.seed,
                 out_dir=str(Path(sa_rules).parent),
             )
-
-        # Summarize & Plot (subprocess — pass pre-computed test results)
-        if sa_rules:
-            sa_out = output_path / "single_agent"
-            run_summarize_and_plot(
-                rules_file=sa_rules, dataset=args.dataset,
-                output_dir=str(sa_out),
-                test_results_file=sa_test_results, seed=args.seed,
-            )
-            sf = sa_out / "summary.json"
-            if sf.exists():
-                sa_summary = str(sf)
 
     # ---- MULTI-AGENT PIPELINE ----
     if not args.skip_multi_agent:
@@ -1301,52 +1072,14 @@ Examples:
                 out_dir=str(Path(ma_rules).parent),
             )
 
-        # Summarize & Plot (subprocess — pass pre-computed test results)
-        if ma_rules:
-            ma_out = output_path / "multi_agent"
-            run_summarize_and_plot(
-                rules_file=ma_rules, dataset=args.dataset,
-                output_dir=str(ma_out),
-                test_results_file=ma_test_results, seed=args.seed,
-            )
-            sf = ma_out / "summary.json"
-            if sf.exists():
-                ma_summary = str(sf)
-
     # ---- COMPARISON SUMMARY ----
-    if sa_summary or ma_summary:
+    if sa_test_results or ma_test_results:
         create_comparison_summary(
-            single_agent_summary=sa_summary,
-            multi_agent_summary=ma_summary,
+            single_agent_summary=sa_test_results,
+            multi_agent_summary=ma_test_results,
             output_dir=str(output_path),
             dataset=args.dataset,
         )
-
-    # ---- COMPARISON PLOTS ----
-    if sa_summary or ma_summary:
-        plot_script = PROJECT_ROOT / "plot_comparison.py"
-        if plot_script.exists():
-            cmd = [sys.executable, str(plot_script),
-                   "--dataset", args.dataset, "--output_dir", str(output_path)]
-            if sa_summary:
-                cmd.extend(["--single_agent_summary", sa_summary])
-            if ma_summary:
-                cmd.extend(["--multi_agent_summary", ma_summary])
-            run_command(cmd, "Generate comparison plots", cwd=str(PROJECT_ROOT))
-
-    # ---- CLASSIFIER RULES ANALYSIS ----
-    if sa_rules or ma_rules:
-        analyze_script = PROJECT_ROOT / "analyze_classifier_rules.py"
-        if analyze_script.exists():
-            analysis_dir = output_path / "classifier_rules_analysis"
-            analysis_dir.mkdir(parents=True, exist_ok=True)
-
-            for label, rf in [("single_agent", sa_rules), ("multi_agent", ma_rules)]:
-                if rf:
-                    cmd = [sys.executable, str(analyze_script),
-                           "--rules_file", rf, "--dataset", args.dataset,
-                           "--output_dir", str(analysis_dir / label)]
-                    run_command(cmd, f"Analyze {label} classifier rules", cwd=str(PROJECT_ROOT), capture_output=True)
 
     logger.info(f"\n{'='*80}")
     logger.info("PIPELINE COMPLETE!")

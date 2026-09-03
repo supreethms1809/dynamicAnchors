@@ -46,7 +46,6 @@ def _env(X, y, **extra):
     n = X.shape[1]
     cfg = {
         "max_cycles": 20,
-        "init_mode": "full_space",
         "precision_estimator": "empirical",
         "use_perturbation": False,
         "n_perturb": 64,

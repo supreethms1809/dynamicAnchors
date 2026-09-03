@@ -1,16 +1,13 @@
 """A zero-width quantile dim is an EQUALITY predicate, not an invalid box.
 
-Both envs gated `done` on `np.any(lower >= upper)`. Under neighbor_hull that is
-right -- the box is grown from a point, so zero width means it collapsed back
-onto that point. Under the quantile MDP it is wrong: bounds are Q_j(a_j),
-Q_j(b_j) through the class empirical CDF, so a band falling between two tied
-values yields Q_j(a_j) == Q_j(b_j) -- the predicate "f_j = v", with the real
-inclusive support of every row tied at v.
+Bounds are Q_j(a_j), Q_j(b_j) through the class empirical CDF, so a band falling
+between two tied values yields Q_j(a_j) == Q_j(b_j) -- the predicate "f_j = v",
+with the real inclusive support of every row tied at v.
 
 Rejecting it pinned `done = False` for entire runs: `both_targets_met` (+5.0)
-and all partial terminal credit never fired, and iris improved its best
-checkpoint once in 14 evaluations. Measured collapse at a [0.30, 0.70] band:
-uci_credit 5/15 dims before the policy narrows anything; iris 4/4 at width 0.02.
+and all partial terminal credit never fired. Measured collapse at a [0.30, 0.70]
+band: uci_credit 5/15 dims before the policy narrows anything; iris 4/4 at width
+0.02.
 """
 from __future__ import annotations
 
@@ -78,28 +75,21 @@ def _validator_src(path: Path) -> str:
     "single_agent/single_agentENV.py",
 ])
 def test_validator_is_representation_aware(rel):
-    """Strict under neighbor_hull, permissive under the quantile MDP."""
+    """Quantile MDP admits equality (lower == upper); only inverted boxes fail."""
     block = _validator_src(REPO / rel)
-    assert "_uses_quantile_mdp()" in block, (
-        f"{rel}: the zero-width test must branch on the representation"
-    )
-    # the quantile branch admits equality; the hull branch still rejects it
     assert "> agent_upper" in block or "> self.upper" in block
-    assert ">= agent_upper" in block or ">= self.upper" in block
+    assert ">= agent_upper" not in block and ">= self.upper" not in block
 
 
-@pytest.mark.parametrize("lower,upper,quantile,expected_valid", [
-    ([0.5], [0.5], True, True),    # equality predicate under quantile MDP
-    ([0.5], [0.5], False, False),  # collapsed hull box
-    ([0.7], [0.3], True, False),   # genuinely inverted
-    ([0.7], [0.3], False, False),
-    ([0.2], [0.8], True, True),
+@pytest.mark.parametrize("lower,upper,expected_valid", [
+    ([0.5], [0.5], True),    # equality predicate
+    ([0.7], [0.3], False),   # genuinely inverted
+    ([0.2], [0.8], True),
 ])
-def test_degenerate_rule_matches_the_env_expression(lower, upper, quantile,
-                                                    expected_valid):
+def test_degenerate_rule_matches_the_env_expression(lower, upper, expected_valid):
     """Pins the truth table both envs now implement."""
     lo, up = np.array(lower), np.array(upper)
-    degenerate = (lo > up) if quantile else (lo >= up)
+    degenerate = lo > up
     assert (not degenerate.any()) is expected_valid
 
 

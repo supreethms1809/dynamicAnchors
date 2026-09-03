@@ -17,42 +17,227 @@ target_classes: null # Optional: list of target classes (defaults to all unique 
 
 # Environment configuration dictionary
 env_config:
-  agents_per_class: 2  # Number of agents per class (1 for standard single-agent-per-class setup)
-  precision_target: 0.95
-  coverage_target: 0.5
-  use_perturbation: True
-  perturbation_mode: "adaptive"
-  n_perturb: 4096
+  # Paper rerun: Pthr = 0.90, Cthr = 0.1.
+  precision_target: 0.9
+  coverage_target: 0.1
+
+  # Quantile-position MDP (Anchors procedure order): empty-rule start, leave-corner actions.
+  # Terminate / shape on Track A Fid: P(ŷ=c | x in box) on real rows of the
+  # active split (train in the training env, val in FidCov). Conditional CRN
+  # P(ŷ(z)=c) is Track B / Anchors perturbation precision — a different r.v.
+  precision_estimator: empirical
+  n_perturb_train: 512
+  # Serving/inference CRN size (Track B measurement only; not the train done-switch).
+  n_perturb_eval: 256
+  # Do not count P≥τ_P on a 3-row box as success (iris C≥0.1 is 3 class rows).
+  require_min_support_to_terminate: true
+  quantile_eps: 0.001
+  max_quantile_step: 0.10
+  min_quantile_width: 0.02
+  # 0.85 made most actions fail to add a predicate (empty-rule / full-space boxes).
+  leave_threshold: 0.5
+  max_new_constraints_per_step: 1
+  activation_quantile: 0.05
+  reset_diversity_frac: 0.3
+  n_reset_landings: 2
+  # 0.95: horizon 1/(1-g)=20 matches the measured ep_len 4-18. At 0.99 the
+  # critic bootstraps a 100-step chain on episodes that never reach 18, so
+  # approximation error compounds uncorrected: mean Q drifted to -8.25 while
+  # true returns are +4.5. At 0.95 mean Q holds ~3.8 over 40k steps. Measured
+  # 2026-09-01, breast_cancer class_1, identical seed/env otherwise.
+  # MUST stay equal to the algorithm gamma: Ng potential-based shaping is only
+  # policy-invariant when the shaping discount equals the MDP discount.
+  discount: 0.95
+  sparsity_terminal_weight: 1.0
+  require_precision_gain_to_terminate: true
+  # Declared explicitly: each of these was ABSENT from this file, so MADA silently
+  # took a code default that differs from RLDA's configured value.
+  gate_margin: 0.1              # was absent -> 0.10 default (equal, now explicit)
+  partial_terminal_credit: 1.0  # was absent -> 0.0: RLDA paid truncation credit, MADA did not
+  # was absent -> "step": per-step revert whenever the floor binds. Measured on the
+  # hull env to bind on 197/200 steps and discard 82% of requested movement.
+  coverage_floor_mode: terminal
+  # Floor as min_support/n_class (capped at coverage_target) instead of a flat
+  # 0.005, matching RLDA -- otherwise the two arms use different collapse guards.
+  coverage_floor_relative: true
+  # Class-level rule selection (inference)
+  # Precision floor for class-level filtering/union is lift-aware:
+  #   floor = min(precision_target * 0.8, union_lift_k * class_prior)
+  # so minority-class rules are judged by lift over base rate, not an
+  # absolute threshold a 2%-prior class can never meet.
+  union_lift_k: 3.0
+  # Metric estimation: exact empirical evaluation over all real data rows in the
+  # box, using cached classifier predictions (computed once per env). Deterministic
+  # and matches the definitions used at inference/evaluation.
+  # - "uniform" measured model predictions on synthetic points the data never
+  #   visits (boxes scored well in empty space).
+  # - "adaptive" switched estimators mid-episode (bootstrap <-> uniform), which made
+  #   precision jump without the box changing and produced wrong results.
+  use_perturbation: False
+  perturbation_mode: "bootstrap"  # Only used if use_perturbation is re-enabled. Avoid "adaptive"/"uniform" (see above).
+  n_perturb: 2048
   step_fracs: [0.005, 0.01, 0.02]
   min_width: 0.05
   alpha: 0.7
-  beta: 0.6
-  gamma: 0.1
-  precision_blend_lambda: 0.5
-  drift_penalty_weight: 0.05
+  # Match RLDA: quantile MDP starts at C≈1, so a large beta pays to keep the
+  # unit cube. 0.25 lets precision-driven shrinking win.
+  beta: 0.25
+  gamma: 0.1  # Increased from 0.02 to prevent box collapse
+  # Control uses hard Fid (P(f̂=c | x∈B)). The 0.5 softmax blend is logged as
+  # precision_proxy only; it made τ_P unreachable on accurate but unconfident DNNs.
+  precision_blend_lambda: 1.0
+  drift_penalty_weight: 0.05  # Increased from 0.01 for more stable boxes
   min_coverage_floor: 0.005
-  js_penalty_weight: 0.05
+  # Potential-based reward shaping (reward = Phi(s') - Phi(s), see environment._potential)
+  terminal_bonus: 5.0           # One-time bonus when an episode terminates with targets met
+  # Cooperative analogue of terminal_bonus, paid ONCE per episode per class the
+  # first step that class's UNION of boxes clears both targets (union_precision >=
+  # effective target AND union_coverage >= coverage_target), to every agent of the
+  # class, then latched. Motivation: the local terminal_bonus is unreachable for
+  # minority classes (a high-precision box on a 2%-prior class can't also cover
+  # coverage_target samples), so in c0d31663 agents for classes 0/1/2 never earned
+  # it and had near-zero reward. The class UNION is reachable (multiple boxes cover
+  # more than one) and is exactly what inference extracts. 0.0 = disabled (opt-in).
+  shared_terminal_bonus: 5.0
+  use_class_aware_targets: true # Cap per-class precision target by classifier's own per-class precision
+  # Episode length (kept here so it is passed directly into AnchorEnv.__init__)
+  # Reduced from 500: with the noise-free potential-based reward, box shaping
+  # converges in tens of steps; long episodes only added noise-farming room.
+  # Aligned with single_agent/conf/anchor_single.yaml. Under the quantile MDP a
+  # good anchor is a handful of predicates, so 200 steps is mostly noise-farming
+  # room -- and RLDA/MADA must share the episode budget to stay comparable.
+  max_cycles: 50
+
+  # Minimum steps before target-based termination is allowed (prevents an agent
+  # from terminating straight from the initial box on step 1 and claiming the
+  # terminal bonus without shaping the anchor). Matches single-agent's value of 2.
+  min_steps_before_termination: 2
+
+  # Stabilization-based early termination (per-agent)
+  enable_stability_termination: true
+  stability_window: 20  # Increased from 10 to require more stable steps before early termination
+  stability_min_steps: 15  # Was 50 (= max_cycles), so stability termination never fired.
+  stability_precision_tol: 1e-3
+  stability_coverage_tol: 1e-3
+  stability_drift_tol: 1e-3
+
   initial_window: 0.1
-  max_action_scale: 0.1
-  min_absolute_step: 0.001
-  inter_class_overlap_weight: 0.1
-  shared_reward_weight: 0.02
-  class_union_cov_weight: 0.01
-  class_union_prec_weight: 0.01
+  centroid_snap_threshold: 0.0
+  # Training and inference: terminate only on both_targets_met (not
+  # excellent_precision / high_prec / reasonably_close), and only if
+  # class-cond C rose by at least one extra class point vs reset.
+  strict_target_termination: true
+  require_coverage_gain_to_terminate: true
+  max_action_scale: 0.1  # Reduced from 0.15 for more stable, gradual expansion
+  min_absolute_step: 0.001  # Reduced from 0.01 for finer control
+  # Inter-class overlap: potential-style delta of a [0,1] level.
+  # Quantile: Simpson(|A∩B|/min(|A|,|B|)) of this k>=1 claim vs the union
+  # of other-class k>=1 claims, on rows of D_active (eval conflict).
+  # Empty start claims nothing.
+  # 1.0 made a Simpson dodge (~0.4–1.0) dwarf Φ coverage (~0.02–0.1): Iris
+  # class 2 hid in a 2-row corner; breast still grew through it (conflict 0.22).
+  # 0.25 keeps the term live at the same scale as a coverage Φ step.
+  inter_class_overlap_weight: 0.25
+  # Same-class cooperative reward: agents of class c share
+  #   shared_reward_weight * (Phi_union_c(s') - Phi_union_c(s))
+  # where Phi_union_c = alpha * union_precision(c)
+  #                   + beta * sqrt(union_coverage(c)) * gate(union_precision(c)),
+  # with the same precision gate as the local potential, so the shared term
+  # cannot pay for raw union-coverage expansion at junk precision.
+  # Replaces the old global shared reward, which was identical for ALL agents
+  # (no credit assignment, rewarded other classes' progress) and positive-only
+  # (a farmable income stream that dwarfed the local signal).
+  # Restored to 0.5 (the c13ca693 value). The shared_reward_weight sweep
+  # (0.50 -> 0.25 -> 0.35) was abandoned: it only tunes the smooth shared term,
+  # which the minority classes barely benefit from — agents 0/1/2 NEVER reached
+  # target-based termination in c0d31663 (per-agent episode_reward_max <= 0.5,
+  # never the +5 terminal bonus), so they got essentially no learning signal.
+  # The new lever is shared_terminal_bonus below, which targets exactly that gap.
+  shared_reward_weight: 0.5
+  # Quantile-native same-class diversity: Simpson of this k>=1 claim vs
+  # teammates' k>=1 union, as a potential delta. Matched to inter-class
+  # so a copy is as costly as sitting on another class, relative to Φ.
+  # Hull/CDEA omit this key (0).
+  same_class_diversity_weight: 0.25
+  class_union_cov_weight: 0.0
+  class_union_prec_weight: 0.0
+  # Global coverage: logging only (no longer a reward stream)
   global_coverage_weight: 0.01
   global_coverage_threshold: 0.1
-  coverage_bonus_weight_met: 0.01
-  coverage_bonus_weight_high_prec: 0.03
-  coverage_bonus_weight_high_prec_progress: 0.07
-  coverage_bonus_weight_high_prec_distance: 0.02
-  coverage_bonus_weight_reasonable_prec: 0.01
-  coverage_bonus_weight_reasonable_prec_progress: 0.02
-  target_class_bonus_weight: 0.02
-  max_termination_count_both_targets: -1
-  max_termination_count_high_precision: 200
-  max_termination_count_both_close: 50
-  max_termination_count_excellent_precision: 30
+  # NashConv (ε-Nash exploitability) -- OFF.
+  # The gradient best-response reports q_has_action_grad=False on most
+  # evaluations and the random-search fallback then evaluates no candidate, so
+  # entire evaluations log "exploitability not measurable". It is expensive and
+  # unreportable in that state. With it off, best-model selection falls back to
+  # score-based (equilibrium min class score, then aggregate precision+coverage).
+  compute_nashconv: false
+  # Only consulted when compute_nashconv is true.
+  # Models with NashConv <= this threshold are considered close to Nash equilibrium.
+  nashconv_threshold: 0.01  # ε-Nash threshold for best model selection
+  # Covering probe: 3 agents per class (paper Sec. 7.1). Same-class Simpson
+  # is live. Inter-class Simpson still applies across classes.
+  # M=1 was a short-dataset trial; do not leave it as the default.
+  agents_per_class: 3
+  # IMPORTANT: inference must use the same agents_per_class as training so
+  # individual policies map onto the env agent names.
+  # Use class centroids to initialize the initial window (default: true)
+  # If true: initial window is set around class centroid (mean of class instances)
+  # If false: initial window is full space (0 to 1 for all features)
+  # For instance-based: x_star_unit overrides this (instance centroid is used)
+  use_class_centroids: true
+  # Optional: Precomputed cluster centroids per class (dict of {class: [centroid1, centroid2, ...]})
+  # If provided, a random centroid is sampled for each episode reset
+  # If None, mean centroid is computed from class data
+  cluster_centroids_per_class: null
+  # Optional: Fixed instances per class to use as centroids (dict of {class: [instance1, instance2, ...]})
+  # If provided, a random instance is sampled as centroid for each episode reset
+  # If None, mean centroid is computed from class data
+  fixed_instances_per_class: null
+  # Training initialization: ratio of instance-based vs centroid-based episodes
+  # 0.0 = all centroid-based, 1.0 = all instance-based, 0.1 = 10% instance-based, 90% class-based
+  # A5: was 1.0 (instance-only). Inference still generates class-level rules from
+  # centroid/k-means starts, so an instance-only policy was deployed on an initial
+  # state distribution it never trained on — the class rules that carry MADA's
+  # headline claims came from an off-distribution mode. The original reason to
+  # avoid class-based episodes (they optimised ground-truth label purity) was
+  # removed by C-09: that path now optimises model fidelity, the same objective as
+  # the instance path. Mixing the two therefore no longer mixes objectives, it just
+  # covers both initial-state distributions.
+  training_instance_ratio: 0.5
+  # Adaptive class-specific ratios: automatically increase ratio for minority classes in imbalanced datasets
+  use_adaptive_instance_ratios: true  # If true, uses higher ratios for minority classes (recommended for imbalanced datasets)
+  
+  # Evaluation settings
+  # Set to false to use training data for evaluation (matches baseline behavior)
+  # When coverage_on_all_data flag is used in inference, coverage is computed on all data (train+test combined)
+  eval_on_test_data: false
+  # C-10: rule generation / checkpoint selection use D_val. Reported metrics
+  # are computed by revision.evaluate on D_test, never inside the env.
+  eval_split: val
+
+  # C-08 / C-52: printed-rule sparsity and ranking (documented hyperparameters)
+  sparsity_width_ratio: 0.95   # drop a feature from the printed rule if width >= this fraction of full range
+  # A1: wilson_low(fid) * (1 + cov). The old `precision_coverage` used the point
+  # estimate, so a box covering ONE sample scored fid=1.0 and beat well-supported
+  # rules; those rules then covered nothing at test. Kept selectable for ablation.
+  ranking_score_formula: lcb_coverage
+  top_k_rules_by_score: 5      # union is over this same top-k; best = rank-1 of that set
+  min_support: 10              # n_covered below this is flagged uninformative (C-02)
+  categorical_freeze: instance # C-07: pin categoricals to the instance (or class_mode)
+
+  # DEPRECATED: termination-reason max counts removed (the disable mechanism made
+  # the MDP non-stationary mid-training; the terminal bonus replaces it)
+  # C-06: ξ_t in the paper is episode_phase = t / max_cycles (in the observation).
+  # It is a shared clock, not joint-action-dependent. Condition B of the MPG
+  # argument is therefore intact; the old shared counters are gone.
 
 # Logging verbosity control
 # Set to "verbose" for detailed debug logs, "normal" for standard logs, "quiet" for minimal logs
-logging_verbosity: "quiet"  # Options: "quiet", "normal", "verbose"
+# Controls logging in training, inference, and environment during rollouts
+logging_verbosity: "normal"  # Options: "quiet", "normal", "verbose"
+
+# Maximum number of steps per episode (source of truth is env_config.max_cycles; kept here for backward compatibility)
+# If your task wrapper reads only the top-level max_cycles, keep both in sync.
+max_cycles: 50
+
+

@@ -12,7 +12,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from utils.eval_harness import (  # noqa: E402
-    LEGACY_RULE_TESTER_WARNING,
     audit_selected_unit_rules,
 )
 from utils.metrics import (  # noqa: E402
@@ -224,15 +223,6 @@ def test_wine_feature_names_are_chemical_units():
     loader.load_dataset()
     assert loader.feature_names[0] != "feature_0"
     assert "alcohol" in [n.lower() for n in loader.feature_names]
-
-
-def test_legacy_testers_warn_about_revision_harness():
-    ma = (REPO / "BenchMARL" / "test_extracted_rules.py").read_text()
-    sa = (REPO / "single_agent" / "test_extracted_rules_single.py").read_text()
-    assert "revision.evaluate" in ma
-    assert "revision.evaluate" in sa
-    assert "C-01" in ma and "C-01" in sa
-    assert "unique_rules" in LEGACY_RULE_TESTER_WARNING
 
 
 def test_cart_does_not_reference_undefined_query_budget():

@@ -4,21 +4,12 @@
 # Environment configuration dictionary
 env_config:
   # Target metrics
-  # Paper rerun (Table 1 setting): Pthr = 0.90, Cthr = 0.2. Kept in sync with
+  # Paper rerun: Pthr = 0.90, Cthr = 0.1. Kept in sync with
   # BenchMARL/conf/anchor.yaml so RLDA and MADA stay directly comparable.
-  # NOTE: shared with the WyoDOT/CDEA pipeline — restore to 0.90 / 0.1 before
-  # running CDEA experiments.
   precision_target: 0.9
-  # Aligned with BenchMARL/conf/anchor.yaml and revision/run_paper_seed.py
-  # (TAU_C). Was 0.05, set during a probe under the OLD expand-from-a-hull
-  # representation; under the quantile MDP coverage starts at 1.0 and falls,
-  # so that rationale is gone. Training and evaluation must agree or the
-  # success/termination columns score a target the policy never optimised.
   coverage_target: 0.1
 
-  # Quantile-position MDP (Anchors procedure order). Snapshot of pre-remap
-  # CDEA/WyoDOT knobs: conf/snapshots/cdea_pre_quantile_mdp/
-  init_mode: full_space
+  # Quantile-position MDP (Anchors procedure order).
   # Terminate / shape on Track A Fid: P(ŷ=c | x in box) on real rows of the
   # active split (train in the training env, val in FidCov). Conditional CRN
   # P(ŷ(z)=c) is Track B / Anchors perturbation precision — a different r.v.
@@ -72,12 +63,6 @@ env_config:
   max_action_scale: 0.1
   min_absolute_step: 0.001
   initial_window: 0.1
-  init_min_neighbors: 5
-  init_neighbor_frac: 0.1
-  init_max_neighbors: 20
-  # Hull k is also capped so start class-cond C <= this fraction of τ_C
-  # (wins over init_min_neighbors). wine n≈35, τ_C=0.2 → k=3 not 5.
-  init_coverage_frac_of_target: 0.5
   centroid_snap_threshold: 0.0
   # Training and inference: terminate only on both_targets_met (not
   # excellent_precision / high_prec / reasonably_close), and only if
@@ -97,7 +82,6 @@ env_config:
   gamma: 0.1              # Weight for narrow-width penalty (prevents box collapse)
   precision_blend_lambda: 1.0
   drift_penalty_weight: 0.05  # Single movement penalty (JS proxy retired)
-  js_penalty_weight: 0.05  # DEPRECATED: JS proxy retired with potential-based reward
   # B2: precision ramp width for the coverage gate; credit is 0 below
   # (target - gate_margin) and 1 at the target.
   gate_margin: 0.10
@@ -122,15 +106,6 @@ env_config:
   partial_terminal_credit: 1.0
   use_class_aware_targets: true # Cap per-class precision target by classifier's own per-class precision
 
-  # DEPRECATED: coverage/target-class bonuses retired with potential-based reward
-  coverage_bonus_weight_met: 0.01
-  coverage_bonus_weight_high_prec: 0.03
-  coverage_bonus_weight_high_prec_progress: 0.07
-  coverage_bonus_weight_high_prec_distance: 0.02
-  coverage_bonus_weight_reasonable_prec: 0.01
-  coverage_bonus_weight_reasonable_prec_progress: 0.02
-  target_class_bonus_weight: 0.02
-  
   # Multi-agent compatibility fields (not used in single-agent, but kept for API consistency)
   inter_class_overlap_weight: 0.0   # Not applicable: single agent per environment
   shared_reward_weight: 0.0         # Not applicable: no shared rewards in single-agent

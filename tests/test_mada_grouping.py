@@ -6,7 +6,6 @@ grouping (agents named "str_int" grouped by "str") decided it instead, and
 `share_policy_params: True` then put every agent in a group on one parameter
 set. Result: `agents_per_class: 3` trained one network per class replicated
 three times, and `agents_per_class: 1` trained ONE network for every class.
-See docs/BUGS_mada_multiagent_design.md (M-01, M-02, M-03).
 
 Nothing in the suite covered grouping, which is why it survived several
 reward-shaping revisions. These tests pin the three pieces that have to agree:
