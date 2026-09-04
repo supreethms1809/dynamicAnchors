@@ -1,6 +1,6 @@
 # Extracted Rules
 
-Generated 2026-09-03 17:18. Branch `ma-training-config-bump`.
+Generated 2026-09-03 22:05. Branch `ma-training-config-bump`.
 
 The actual rule sets behind the numbers in `RESULTS_comparison.md`.
 Rules are the **validation-selected union**, scored on the **test** split.
@@ -194,21 +194,24 @@ its members.
     1. petal length (cm) ∈ [1.293334, 6.900000] and petal width (cm) ∈ [0.100000, 0.400000]  — Fid 1.000, Cov 0.800, n=8
   - seed 43 (k=1)
     1. petal length (cm) ∈ [1.100000, 1.706667] and petal width (cm) ∈ [0.100000, 0.406667]  — Fid 1.000, Cov 0.900, n=9
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal width (cm) ∈ [0.100000, 0.406667]  — Fid 1.000, Cov 0.900, n=9
 
 - `class_1`
   - seed 42 (k=1)
     1. petal width (cm) ∈ [1.000000, 2.500000]  — Fid 0.500, Cov 1.000, n=20
   - seed 43 (k=1)
     1. petal length (cm) ∈ [3.479986, 4.813334] and petal width (cm) ∈ [1.000000, 2.500000]  — Fid 1.000, Cov 1.000, n=10
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. sepal length (cm) ∈ [5.093333, 6.611758] and sepal width (cm) ∈ [2.000000, 3.200000]  — Fid 0.818, Cov 0.800, n=11
 
 - `class_2`
   - seed 42 (k=1)
     1. petal width (cm) ∈ [1.800000, 2.500000]  — Fid 1.000, Cov 0.900, n=9
   - seed 43 (k=1)
     1. petal length (cm) ∈ [4.886666, 6.700000] and petal width (cm) ∈ [1.790000, 2.500000]  — Fid 0.778, Cov 0.900, n=9
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. petal length (cm) ∈ [4.893333, 6.700000]  — Fid 0.900, Cov 1.000, n=10
 
 
 **RLDA**
@@ -523,7 +526,8 @@ its members.
     2. alcalinity_of_ash ∈ [15.900001, 30.000002] and proanthocyanins ∈ [1.460000, 3.280000]  — Fid 0.533, Cov 0.667, n=15
   - seed 43 (k=1)
     1. alcalinity_of_ash ∈ [12.000000, 17.920000] and flavanoids ∈ [2.648000, 3.930000] and color_intensity ∈ [3.984000, 13.000000]  — Fid 1.000, Cov 0.333, n=4
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. malic_acid ∈ [1.572438, 2.070000] and nonflavanoid_phenols ∈ [0.220000, 0.630000]  — Fid 0.636, Cov 0.583, n=11
 
 - `class_1`
   - seed 42 (k=1)
@@ -531,14 +535,17 @@ its members.
   - seed 43 (k=2)
     1. malic_acid ∈ [0.740000, 3.072000] and alcalinity_of_ash ∈ [16.859970, 30.000000] and proanthocyanins ∈ [1.184813, 2.960000]  — Fid 0.438, Cov 0.500, n=16
     2. malic_acid ∈ [0.740000, 3.072000] and total_phenols ∈ [1.100000, 2.740000] and od280/od315_of_diluted_wines ∈ [2.239000, 4.000000]  — Fid 0.727, Cov 0.571, n=11
-  - seed 44: _not run_
+  - seed 44 (k=2)
+    1. alcohol ∈ [11.795999, 12.909001] and alcalinity_of_ash ∈ [16.160000, 30.000000] and proanthocyanins ∈ [0.410000, 2.010000]  — Fid 0.500, Cov 0.357, n=10
+    2. alcohol ∈ [11.840000, 13.050000] and total_phenols ∈ [1.618000, 3.880000]  — Fid 0.667, Cov 0.429, n=9
 
 - `class_2`
   - seed 42 (k=1)
     1. malic_acid ∈ [0.740000, 4.036001] and ash ∈ [2.302000, 2.840000] and proline ∈ [341.999969, 759.000061]  — Fid 0.429, Cov 0.300, n=7
   - seed 43 (k=1)
     1. malic_acid ∈ [0.740000, 5.021999] and proanthocyanins ∈ [0.752449, 1.545500] and color_intensity ∈ [4.408572, 10.185068]  — Fid 1.000, Cov 0.800, n=8
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. alcohol ∈ [12.589458, 14.830000] and proanthocyanins ∈ [0.410000, 1.483397] and proline ∈ [312.000000, 752.000366]  — Fid 0.667, Cov 0.400, n=6
 
 
 **RLDA**
@@ -817,7 +824,9 @@ its members.
     1. mean radius ∈ [15.051996, 21.009918] and perimeter error ∈ [2.052192, 11.070000]  — Fid 0.957, Cov 0.524, n=23
     2. worst perimeter ∈ [99.313354, 176.606293] and worst area ∈ [185.200012, 2094.291504] and worst concavity ∈ [0.261619, 1.105000]  — Fid 0.833, Cov 0.738, n=36
     3. mean area ∈ [702.639404, 1357.714111] and mean fractal dimension ∈ [0.053491, 0.073578] and area error ∈ [24.559948, 233.000000]  — Fid 1.000, Cov 0.429, n=18
-  - seed 44: _not run_
+  - seed 44 (k=2)
+    1. area error ∈ [23.854000, 525.599915] and worst concave points ∈ [0.139120, 0.242520]  — Fid 0.966, Cov 0.667, n=29
+    2. area error ∈ [31.771999, 525.599915] and worst concave points ∈ [0.115040, 0.286700]  — Fid 0.947, Cov 0.881, n=38
 
 - `class_1`
   - seed 42 (k=1)
@@ -825,7 +834,12 @@ its members.
   - seed 43 (k=2)
     1. mean perimeter ∈ [43.790001, 94.713501]  — Fid 0.883, Cov 0.917, n=77
     2. mean area ∈ [386.129639, 690.314514] and worst smoothness ∈ [0.104755, 0.151980] and worst compactness ∈ [0.027290, 0.301980]  — Fid 0.930, Cov 0.528, n=43
-  - seed 44: _not run_
+  - seed 44 (k=5)
+    1. mean concave points ∈ [0.011467, 0.047422] and mean fractal dimension ∈ [0.050250, 0.072478]  — Fid 1.000, Cov 0.750, n=54
+    2. mean perimeter ∈ [43.790005, 88.094009] and mean concave points ∈ [0.007412, 0.184500]  — Fid 0.981, Cov 0.722, n=52
+    3. mean texture ∈ [13.438924, 33.810001] and mean perimeter ∈ [47.900703, 188.500000] and mean concavity ∈ [0.000666, 0.410800] and area error ∈ [7.228003, 22.934002] and concavity error ∈ [0.000666, 0.052738]  — Fid 0.943, Cov 0.472, n=35
+    4. mean texture ∈ [15.608999, 33.810001] and mean perimeter ∈ [48.336079, 188.500000] and area error ∈ [7.228003, 30.381002]  — Fid 0.889, Cov 0.681, n=54
+    5. mean radius ∈ [11.646001, 28.110001] and mean texture ∈ [9.709999, 19.132000] and mean perimeter ∈ [67.490005, 94.546074] and mean smoothness ∈ [0.077270, 0.142500]  — Fid 0.963, Cov 0.375, n=27
 
 
 **RLDA**
@@ -1062,7 +1076,8 @@ its members.
     1. feature_2 ∈ [-1.378004, 3.430854] and feature_4 ∈ [-1.886569, 1.410273] and feature_5 ∈ [-3.644516, 1.315525] and feature_7 ∈ [-0.554244, 3.962004] and feature_9 ∈ [-3.441975, 1.198165]  — Fid 0.867, Cov 0.260, n=30
     2. feature_0 ∈ [-4.417074, 1.195978] and feature_4 ∈ [-4.987191, 1.709342] and feature_5 ∈ [-3.644516, 0.586923] and feature_9 ∈ [-3.441975, 0.811636]  — Fid 0.822, Cov 0.380, n=45
     3. feature_1 ∈ [-2.209138, 0.409050] and feature_3 ∈ [-2.787386, 5.864470] and feature_5 ∈ [-0.557768, 2.870024] and feature_6 ∈ [-3.060544, 0.310358] and feature_7 ∈ [-1.467845, 1.824637]  — Fid 0.667, Cov 0.080, n=12
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. feature_7 ∈ [-4.907111, 0.635140]  — Fid 0.740, Cov 0.880, n=131
 
 - `class_1`
   - seed 42 (k=3)
@@ -1073,7 +1088,9 @@ its members.
     1. feature_0 ∈ [-0.343942, 5.282501] and feature_2 ∈ [-2.116620, 0.312801] and feature_3 ∈ [-7.876883, -1.026891]  — Fid 1.000, Cov 0.440, n=46
     2. feature_0 ∈ [-0.343928, 5.282501] and feature_2 ∈ [-2.462268, -0.032334] and feature_3 ∈ [-3.648659, -1.026899]  — Fid 1.000, Cov 0.390, n=41
     3. feature_2 ∈ [-2.115676, -0.032333] and feature_5 ∈ [-1.569860, 0.499156] and feature_6 ∈ [-1.228518, 2.859548] and feature_7 ∈ [-2.227543, 0.562137] and feature_8 ∈ [-0.261707, 5.184010]  — Fid 0.969, Cov 0.310, n=32
-  - seed 44: _not run_
+  - seed 44 (k=2)
+    1. feature_3 ∈ [-7.780115, 5.199388] and feature_6 ∈ [0.804981, 5.589865] and feature_7 ∈ [-0.234981, 5.722162] and feature_8 ∈ [-2.030559, 5.380715]  — Fid 0.935, Cov 0.400, n=46
+    2. feature_0 ∈ [-3.071198, 4.254667] and feature_2 ∈ [-1.858886, 0.785754] and feature_3 ∈ [-7.780115, 4.153638] and feature_6 ∈ [-0.664849, 5.589865] and feature_7 ∈ [0.531327, 5.722162] and feature_8 ∈ [-1.024493, 5.380715]  — Fid 0.941, Cov 0.300, n=34
 
 
 **RLDA**
@@ -1444,7 +1461,12 @@ its members.
     3. MedInc ∈ [0.499900, 2.567331] and HouseAge ∈ [1.000000, 48.057205] and AveRooms ∈ [3.865956, 5.485728] and AveBedrms ∈ [1.117661, 1.363717] and AveOccup ∈ [0.692308, 4.128926] and Longitude ∈ [-117.680000, -117.138863]  — Fid 0.941, Cov 0.013, n=17
     4. MedInc ∈ [0.499900, 3.568838] and HouseAge ∈ [1.000000, 35.000000] and AveRooms ∈ [3.835562, 16.886786] and AveBedrms ∈ [1.091060, 3.692989] and AveOccup ∈ [0.692308, 3.098574] and Longitude ∈ [-120.124359, -119.050003]  — Fid 0.860, Cov 0.026, n=43
     5. HouseAge ∈ [27.999998, 29.000000] and Latitude ∈ [32.549995, 39.729996] and Longitude ∈ [-121.652870, -119.790001]  — Fid 0.583, Cov 0.012, n=24
-  - seed 44: _not run_
+  - seed 44 (k=5)
+    1. MedInc ∈ [0.499900, 2.546020] and AveRooms ∈ [3.844110, 141.909088] and AveOccup ∈ [0.692308, 3.684293] and Latitude ∈ [33.990002, 41.950005]  — Fid 0.899, Cov 0.325, n=464
+    2. MedInc ∈ [0.499900, 2.546020] and AveRooms ∈ [3.844118, 141.909088] and AveOccup ∈ [0.692308, 3.482763] and Latitude ∈ [33.036915, 41.950005]  — Fid 0.888, Cov 0.331, n=489
+    3. MedInc ∈ [0.499900, 3.231267] and HouseAge ∈ [2.000002, 45.000000] and AveRooms ∈ [4.510300, 141.909088] and AveOccup ∈ [0.692308, 3.800313] and Latitude ∈ [33.948410, 41.950005]  — Fid 0.816, Cov 0.384, n=604
+    4. MedInc ∈ [0.499900, 3.131480] and AveOccup ∈ [0.692308, 4.120628] and Latitude ∈ [36.295639, 37.958138] and Longitude ∈ [-121.019997, -117.290009]  — Fid 0.986, Cov 0.124, n=142
+    5. HouseAge ∈ [0.999998, 41.161278] and AveRooms ∈ [4.776179, 5.712197] and AveBedrms ∈ [1.004890, 25.636364] and Population ∈ [584.658020, 1085.500000] and AveOccup ∈ [2.214530, 1243.333374] and Latitude ∈ [35.751999, 39.131405] and Longitude ∈ [-121.611946, -114.470001]  — Fid 0.902, Cov 0.027, n=41
 
 - `class_1`
   - seed 42 (k=1)
@@ -1452,7 +1474,10 @@ its members.
   - seed 43 (k=2)
     1. MedInc ∈ [2.225480, 4.375000] and AveBedrms ∈ [0.962676, 34.066666] and AveOccup ∈ [2.311464, 502.461548]  — Fid 0.351, Cov 0.560, n=1546
     2. MedInc ∈ [2.389097, 15.000101] and HouseAge ∈ [29.000000, 44.090786] and AveRooms ∈ [0.846154, 4.524498] and AveBedrms ∈ [0.333333, 1.030509] and Population ∈ [459.787659, 2140.000000] and Latitude ∈ [33.939999, 34.290001]  — Fid 0.487, Cov 0.019, n=39
-  - seed 44: _not run_
+  - seed 44 (k=3)
+    1. MedInc ∈ [0.499900, 4.678753] and AveRooms ∈ [0.846154, 3.666569] and AveOccup ∈ [4.050558, 5.901727]  — Fid 0.746, Cov 0.034, n=63
+    2. MedInc ∈ [2.009287, 3.236920] and AveRooms ∈ [0.846154, 4.373953] and AveBedrms ∈ [1.030443, 1.142514] and AveOccup ∈ [3.865996, 1243.333374] and Latitude ∈ [34.009998, 41.950005]  — Fid 0.679, Cov 0.017, n=28
+    3. MedInc ∈ [2.882483, 3.091428] and AveRooms ∈ [4.385695, 141.909088] and AveBedrms ∈ [0.333333, 1.166366] and Population ∈ [2.999878, 5042.233398] and AveOccup ∈ [2.646200, 1243.333374] and Longitude ∈ [-118.440002, -117.919998]  — Fid 0.429, Cov 0.011, n=21
 
 - `class_2`
   - seed 42 (k=2)
@@ -1462,7 +1487,9 @@ its members.
     1. MedInc ∈ [3.008879, 5.934507] and HouseAge ∈ [16.999998, 45.000000] and AveRooms ∈ [0.846154, 7.287680]  — Fid 0.456, Cov 0.507, n=1433
     2. MedInc ∈ [3.665660, 15.000101] and HouseAge ∈ [21.000000, 38.000000] and AveRooms ∈ [0.846154, 6.153610] and Population ∈ [3.000000, 690.834778] and AveOccup ∈ [2.769115, 3.612663] and Latitude ∈ [32.549995, 37.959999]  — Fid 0.815, Cov 0.012, n=27
     3. MedInc ∈ [3.826011, 5.594357] and HouseAge ∈ [25.000000, 52.000000] and AveRooms ∈ [4.273380, 132.533340] and AveBedrms ∈ [1.010607, 1.112964] and Population ∈ [544.999939, 35682.003906] and AveOccup ∈ [3.173123, 502.461548]  — Fid 0.729, Cov 0.032, n=59
-  - seed 44: _not run_
+  - seed 44 (k=2)
+    1. MedInc ∈ [2.986700, 5.587260] and HouseAge ∈ [12.999999, 51.999996]  — Fid 0.417, Cov 0.610, n=1824
+    2. HouseAge ∈ [21.702806, 26.000000] and AveRooms ∈ [0.846154, 4.950396] and AveBedrms ∈ [1.010594, 25.636364] and Population ∈ [2.999878, 2773.276855] and AveOccup ∈ [2.516473, 3.113820] and Latitude ∈ [32.540001, 37.959999] and Longitude ∈ [-124.300003, -117.930008]  — Fid 0.850, Cov 0.011, n=20
 
 - `class_3`
   - seed 42 (k=5)
@@ -1477,7 +1504,12 @@ its members.
     3. MedInc ∈ [5.903900, 15.000101] and HouseAge ∈ [1.000000, 37.295864] and AveRooms ∈ [5.933883, 132.533340] and AveBedrms ∈ [0.959359, 34.066666] and Population ∈ [657.999939, 35682.003906] and AveOccup ∈ [2.414443, 502.461548]  — Fid 0.900, Cov 0.207, n=251
     4. MedInc ∈ [5.903900, 15.000101] and HouseAge ∈ [14.886950, 52.000000] and AveRooms ∈ [4.133904, 132.533340] and AveBedrms ∈ [1.006938, 34.066666] and Population ∈ [3.000000, 2025.311401] and Longitude ∈ [-121.589996, -114.309998]  — Fid 0.923, Cov 0.111, n=130
     5. MedInc ∈ [5.903900, 15.000101] and HouseAge ∈ [14.000000, 52.000000] and AveRooms ∈ [4.655259, 132.533340] and AveBedrms ∈ [1.026954, 34.066666] and Population ∈ [3.000000, 1478.500244] and Longitude ∈ [-118.514999, -114.309998]  — Fid 0.955, Cov 0.062, n=67
-  - seed 44: _not run_
+  - seed 44 (k=5)
+    1. MedInc ∈ [5.959599, 15.000101] and HouseAge ∈ [11.924417, 51.999996] and AveRooms ∈ [5.155166, 141.909088] and AveBedrms ∈ [0.961780, 25.636364] and Latitude ∈ [33.069511, 41.950005]  — Fid 0.963, Cov 0.270, n=324
+    2. MedInc ∈ [5.959599, 15.000101] and HouseAge ∈ [0.999998, 37.294895] and AveRooms ∈ [5.154821, 8.078053] and AveBedrms ∈ [0.333333, 1.123401] and Population ∈ [394.935974, 28566.000000] and AveOccup ∈ [1.897181, 1243.333374]  — Fid 0.929, Cov 0.236, n=296
+    3. MedInc ∈ [5.350752, 7.824884] and HouseAge ∈ [22.000000, 51.999996] and AveRooms ∈ [4.114421, 141.909088] and AveBedrms ∈ [0.974432, 25.636364] and AveOccup ∈ [1.357419, 2.846856]  — Fid 0.962, Cov 0.133, n=157
+    4. MedInc ∈ [5.959599, 15.000101] and HouseAge ∈ [20.738373, 51.999996] and AveRooms ∈ [0.846154, 7.203638] and AveBedrms ∈ [0.919113, 25.636364] and Population ∈ [326.868286, 28566.000000] and Latitude ∈ [33.630001, 41.950005]  — Fid 0.974, Cov 0.137, n=155
+    5. MedInc ∈ [7.266260, 15.000101] and HouseAge ∈ [18.000000, 51.999996] and AveBedrms ∈ [0.963529, 25.636364] and AveOccup ∈ [2.674836, 1243.333374]  — Fid 1.000, Cov 0.064, n=66
 
 
 **RLDA**
@@ -1787,7 +1819,8 @@ its members.
     2. A9 = 't' and A7 = 'o'  — Fid 0.932, Cov 0.607, n=44
     3. A11 ∈ [5.000000, 10.141304] and A10 = 't' and A9 = 't' and A8 ∈ [0.375000, 28.500000]  — Fid 1.000, Cov 0.180, n=11
     4. A9 = 't' and A7 = 'h'  — Fid 0.929, Cov 0.180, n=14
-  - seed 44: _not run_
+  - seed 44 (k=1)
+    1. A9 = 't'  — Fid 0.737, Cov 0.934, n=76
 
 - `class_1`
   - seed 42 (k=1)
@@ -1796,7 +1829,9 @@ its members.
     1. A9 = 'f' and A4 = 'u'  — Fid 1.000, Cov 0.558, n=47
     2. A12 = 't' and A11 ∈ [0.000000, 2.000000] and A9 = 'f'  — Fid 1.000, Cov 0.338, n=28
     3. A9 = 'f' and A4 = 'y'  — Fid 1.000, Cov 0.247, n=19
-  - seed 44: _not run_
+  - seed 44 (k=2)
+    1. A9 = 'f' and A3 ∈ [0.000000, 11.516554]  — Fid 1.000, Cov 0.727, n=60
+    2. A9 = 'f' and A2 ∈ [15.170000, 45.011086]  — Fid 1.000, Cov 0.675, n=56
 
 
 **RLDA**
@@ -2048,7 +2083,10 @@ its members.
     3. age ∈ [26.999998, 90.000000] and fnlwgt ∈ [12285.000000, 389254.718750] and education = 'HS-grad'  — Fid 0.954, Cov 0.266, n=2433
     4. age ∈ [18.999996, 28.000000] and fnlwgt ∈ [63910.789062, 1490400.000000] and education-num ∈ [9.000000, 10.000000]  — Fid 0.993, Cov 0.180, n=1385
     5. age ∈ [24.773773, 90.000000] and fnlwgt ∈ [105685.992188, 442275.906250] and education = 'HS-grad'  — Fid 0.954, Cov 0.234, n=2117
-  - seed 44: _not run_
+  - seed 44 (k=3)
+    1. capital-gain ∈ [-0.000122, 4.684326] and hours-per-week ∈ [20.000002, 98.999992]  — Fid 0.865, Cov 0.897, n=8437
+    2. age ∈ [16.999998, 57.999996] and capital-gain ∈ [-0.000122, -0.000122]  — Fid 0.871, Cov 0.874, n=8119
+    3. race = 'White' and capital-gain ∈ [-0.000122, 5013.169434]  — Fid 0.865, Cov 0.839, n=7938
 
 - `class_1`
   - seed 42 (k=5)
@@ -2062,7 +2100,12 @@ its members.
     2. age ∈ [16.999998, 73.006699] and fnlwgt ∈ [12285.000000, 402363.125000] and education = 'Masters' and marital-status = 'Married-civ-spouse'  — Fid 0.942, Cov 0.093, n=293
     3. age ∈ [49.000000, 90.000000] and workclass = 'Private' and fnlwgt ∈ [108103.179688, 1490400.000000] and education = 'Bachelors' and marital-status = 'Married-civ-spouse' and relationship = 'Husband' and hours-per-week ∈ [40.000000, 40.000000] and native-country = 'United-States'  — Fid 0.976, Cov 0.012, n=41
     4. workclass = 'Private' and marital-status = 'Married-civ-spouse' and occupation = 'Exec-managerial' and relationship = 'Husband' and sex = 'Male' and capital-gain ∈ [0.000000, 15049.435547] and capital-loss ∈ [143.798462, 4356.000000] and native-country = 'United-States'  — Fid 0.821, Cov 0.014, n=39
-  - seed 44: _not run_
+  - seed 44 (k=5)
+    1. education-num ∈ [13.000000, 16.000000] and marital-status = 'Married-civ-spouse' and hours-per-week ∈ [40.488735, 50.000000]  — Fid 0.979, Cov 0.146, n=426
+    2. age ∈ [38.000000, 57.999996] and workclass = 'Private' and education = 'Bachelors' and marital-status = 'Married-civ-spouse' and relationship = 'Husband' and sex = 'Male' and capital-gain ∈ [-0.000122, 15024.000977] and capital-loss ∈ [0.000000, 4356.000000] and hours-per-week ∈ [40.000000, 98.999992]  — Fid 0.995, Cov 0.071, n=217
+    3. fnlwgt ∈ [12285.000000, 205117.437500] and education = 'Bachelors' and education-num ∈ [9.000000, 13.215202] and marital-status = 'Married-civ-spouse' and occupation = 'Exec-managerial' and capital-gain ∈ [-0.000122, 15051.276367] and hours-per-week ∈ [50.000000, 98.999992] and native-country = 'United-States'  — Fid 0.984, Cov 0.021, n=62
+    4. fnlwgt ∈ [12285.000000, 340765.625000] and education = 'Masters' and education-num ∈ [10.000000, 14.089846] and occupation = 'Exec-managerial' and relationship = 'Husband' and capital-gain ∈ [-0.000122, 5244.145020] and capital-loss ∈ [0.000000, 63.791359] and hours-per-week ∈ [40.488735, 98.999992] and native-country = 'United-States'  — Fid 1.000, Cov 0.015, n=39
+    5. race = 'White' and capital-gain ∈ [5178.000000, 7297.999512]  — Fid 0.910, Cov 0.052, n=133
 
 
 **RLDA**
