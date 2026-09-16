@@ -28,7 +28,7 @@ from utils.dataset_factory import make_tabular_loader  # noqa: E402
 def classifier_patience(dataset: str) -> int:
     """Must match single_agent/driver.py."""
     name = dataset.lower()
-    if name.startswith("folktables_") or name.startswith("uci_"):
+    if name.startswith("folktables_") or name.startswith("uci_") or name.startswith("wyodot"):
         return 200
     return {
         "housing": 200,

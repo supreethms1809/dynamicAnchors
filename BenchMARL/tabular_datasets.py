@@ -427,7 +427,7 @@ class TabularDatasetLoader:
             logger.info(f"  Features: {len(feature_names)}, Classes: {len(class_names)}")
 
         elif self.dataset_name in ("heloc", "fico_heloc"):
-            # C-23: FICO HELOC (~10k rows, 23 continuous). OpenML 45578 or sklearn fetch.
+            # C-23: FICO HELOC (~10k rows, 22 predictors after dropping the label).
             X, y, feature_names, class_names = self._load_heloc()
         elif self.dataset_name in ("sick", "thyroid_sick"):
             # Imbalanced medical: thyroid disease, ~3772 x 29, ~6.1% positive.

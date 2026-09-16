@@ -51,6 +51,8 @@ DATASET_CONFIGS: Dict[str, Dict[str, int]] = {
     "heloc":         {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
     "sick":          {"ma_frames": 360_000, "n_instances": 20, "n_classes": 2},
     "mammography":   {"ma_frames": 720_000, "n_instances": 25, "n_classes": 2},
+    # Paper WyoDOT only. Housing-scale frames (n≈34k, K=5). Never add wyodot_testbed.
+    "wyodot_kvdw_labeled": {"ma_frames": 720_000, "n_instances": 20, "n_classes": 5},
 }
 for _cfg in DATASET_CONFIGS.values():
     _cfg["ma_frames"] *= BUDGET_MULT
@@ -254,7 +256,11 @@ def evaluate_instances(dataset: str, method: str, rules: Path, seed: int, device
         raise SystemExit(f"No MADA[{ALGO}] experiment dir for Track B on {dataset}")
     clf = exp / "classifier.pth"
     track_a = result_path(dataset, method, seed)
-    large = dataset.startswith("folktables") or dataset in {"housing", "uci_adult"}
+    large = (
+        dataset.startswith("folktables")
+        or dataset.startswith("wyodot")
+        or dataset in {"housing", "uci_adult"}
+    )
     max_per = 200 if large else 0
     cmd = [
         sys.executable, "-m", "revision.evaluate_instances",

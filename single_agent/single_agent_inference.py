@@ -29,7 +29,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from BenchMARL.tabular_datasets import TabularDatasetLoader
+from utils.dataset_factory import make_tabular_loader
 from single_agentENV import SingleAgentAnchorEnv
 from anchor_trainer_sb3 import AnchorTrainerSB3
 from utils.inference_extract import (
@@ -1448,8 +1448,8 @@ def extract_rules_single_agent(
     logger.info(f"Algorithm: {algorithm.upper()}")
     
     # Load dataset
-    dataset_loader = TabularDatasetLoader(
-        dataset_name=dataset_name,
+    dataset_loader = make_tabular_loader(
+        dataset_name,
         test_size=0.2,
         random_state=seed
     )
@@ -3494,7 +3494,7 @@ def main():
     )
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography", "wyodot_kvdw_labeled"]
     
     # Add UCIML datasets if available
     try:

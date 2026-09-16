@@ -26,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Add single_agent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from BenchMARL.tabular_datasets import TabularDatasetLoader
+from utils.dataset_factory import make_tabular_loader
 from anchor_trainer_sb3 import AnchorTrainerSB3
 import argparse
 import logging
@@ -50,7 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description="Single-Agent Anchor Training Pipeline (SB3)")
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography", "bank_marketing"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography", "bank_marketing", "wyodot_kvdw_labeled"]
     
     # Add UCIML datasets if available
     try:
@@ -250,8 +250,8 @@ def main():
     print("="*80)
     
     # Load dataset
-    dataset_loader = TabularDatasetLoader(
-        dataset_name=args.dataset,
+    dataset_loader = make_tabular_loader(
+        args.dataset,
         test_size=0.2,
         random_state=args.seed
     )
@@ -299,8 +299,8 @@ def main():
         # Use dataset-specific patience: higher for complex/large datasets
         # Folktables and UCI datasets are large and need more patience
         dataset_lower = args.dataset.lower()
-        if dataset_lower.startswith("folktables_") or dataset_lower.startswith("uci_"):
-            # Large datasets (folktables, uci): use high patience
+        if dataset_lower.startswith("folktables_") or dataset_lower.startswith("uci_") or dataset_lower.startswith("wyodot"):
+            # Large datasets (folktables, uci, WyoDOT): use high patience
             dataset_patience = 200
             logger.info(f"Large dataset detected ({args.dataset}), using patience: {dataset_patience}")
         else:

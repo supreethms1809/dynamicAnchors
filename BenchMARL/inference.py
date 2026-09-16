@@ -14,7 +14,7 @@ _REPO = _Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from tabular_datasets import TabularDatasetLoader
+from utils.dataset_factory import make_tabular_loader
 from environment import AnchorEnv
 from utils.eval_harness import apply_train_val_slots, resolve_extracted_models_dir
 from utils.inference_extract import (
@@ -1416,8 +1416,8 @@ def extract_rules_from_policies(
         logger.info(f"  Policies are organized by class.")
     
     # Load dataset
-    dataset_loader = TabularDatasetLoader(
-        dataset_name=dataset_name,
+    dataset_loader = make_tabular_loader(
+        dataset_name,
         test_size=0.2,
         random_state=seed
     )
@@ -3830,7 +3830,7 @@ def main():
     )
     
     # Build dataset choices dynamically
-    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography"]
+    dataset_choices = ["breast_cancer", "wine", "iris", "synthetic", "moons", "circles", "covtype", "housing", "heloc", "sick", "mammography", "wyodot_kvdw_labeled"]
     
     # Add UCIML datasets if available
     try:
