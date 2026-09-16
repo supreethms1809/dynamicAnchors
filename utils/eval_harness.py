@@ -83,6 +83,10 @@ class GlobalRuleSetResult:
             "abstention_rate": _f(self.abstention_rate),
             "conflict_rate": _f(self.conflict_rate),
             "coverage": _f(self.coverage),
+            "effectiveness": (
+                0.0 if int(self.n_decided) == 0
+                else _f(self.global_fidelity * self.coverage)
+            ),
             "per_class_fired": {str(k): int(v) for k, v in self.per_class_fired.items()},
         }
 

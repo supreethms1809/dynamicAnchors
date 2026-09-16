@@ -23,6 +23,9 @@ from utils.metrics import (  # noqa: E402
     evaluate_mask,
     paired_wilcoxon,
     ranking_score,
+    track_a_eff,
+    track_a_cov_tau,
+    class_cov_tau,
 )
 from paper.make_tables import (  # noqa: E402
     build_success_table,
@@ -113,6 +116,24 @@ def test_c26_wilcoxon_effect_size_on_clear_difference():
     assert res["pvalue"] == pytest.approx(rev["pvalue"])
     assert rev["effect_size_rank_biserial"] == pytest.approx(-1.0)
     assert rev["mean_diff"] < 0
+
+
+def test_track_a_eff_empty_ruleset_is_zero_not_dropped():
+    assert track_a_eff({"global_fidelity": None, "coverage": 0.0, "n_decided": 0}) == 0.0
+    assert track_a_eff(fidelity=None, coverage=0.0, n_decided=0) == 0.0
+    assert track_a_eff(fidelity=0.8, coverage=0.5) == pytest.approx(0.4)
+    assert track_a_eff(fidelity=None, coverage=0.5, n_decided=10) is None
+
+
+def test_track_a_cov_tau_is_coverage_only_when_fid_clears_tau():
+    assert track_a_cov_tau({"global_fidelity": 0.91, "coverage": 0.8}) == pytest.approx(0.8)
+    assert track_a_cov_tau(fidelity=0.90, coverage=0.8) == pytest.approx(0.8)
+    assert track_a_cov_tau(fidelity=0.899, coverage=0.8) == 0.0
+    assert track_a_cov_tau({"global_fidelity": None, "coverage": 0.0, "n_decided": 0}) == 0.0
+    assert track_a_cov_tau(fidelity=None, coverage=0.5, n_decided=10) is None
+    assert class_cov_tau(0.95, 0.3) == pytest.approx(0.3)
+    assert class_cov_tau(0.80, 0.9) == 0.0
+    assert class_cov_tau(None, 0.0) == 0.0
 
 
 def test_print_leg_unwraps_nested_best_metrics():

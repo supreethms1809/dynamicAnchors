@@ -573,6 +573,109 @@ def mean_ci(values: Iterable[float], alpha: float = 0.05, n_boot: int = 2000, se
     return {"mean": mean, "ci_low": lo, "ci_high": hi, "n": int(arr.size), "std": float(arr.std(ddof=1))}
 
 
+def _finite_or_none(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if np.isfinite(x) else None
+
+
+def track_a_eff(
+    global_ruleset: Optional[Dict[str, Any]] = None,
+    *,
+    fidelity: Any = None,
+    coverage: Any = None,
+    n_decided: Any = None,
+) -> Optional[float]:
+    """Track A Eff = Fid × Cov.
+
+    Fid is undefined when no test row is decided (`n_decided=0` / Cov=0). The
+    product is still 0: the ruleset never fires, so it contributes no correct
+    decisions. Do not drop those cells from an Eff mean (that inflates random
+    search). Fid itself stays None.
+    """
+    if global_ruleset is not None:
+        if fidelity is None:
+            fidelity = global_ruleset.get("global_fidelity")
+        if coverage is None:
+            coverage = global_ruleset.get("coverage")
+        if n_decided is None:
+            n_decided = global_ruleset.get("n_decided")
+    cov = _finite_or_none(coverage)
+    fid = _finite_or_none(fidelity)
+    nd: Optional[int]
+    try:
+        nd = int(n_decided) if n_decided is not None else None
+    except (TypeError, ValueError):
+        nd = None
+    if nd == 0 or cov == 0.0:
+        return 0.0
+    if fid is None or cov is None:
+        return None
+    return float(fid * cov)
+
+
+TAU_P_DEFAULT = 0.90
+
+
+def track_a_cov_tau(
+    global_ruleset: Optional[Dict[str, Any]] = None,
+    *,
+    fidelity: Any = None,
+    coverage: Any = None,
+    n_decided: Any = None,
+    tau_p: float = TAU_P_DEFAULT,
+) -> Optional[float]:
+    """Precision-constrained coverage: Cov if Fid ≥ τ_P, else 0.
+
+    Matches the explanation claim (coverage subject to the precision floor),
+    not the replacement-classifier claim (Eff = Fid×Cov). Empty rulesets
+    (Cov=0 / n_decided=0) score 0, same convention as ``track_a_eff``.
+    """
+    if global_ruleset is not None:
+        if fidelity is None:
+            fidelity = global_ruleset.get("global_fidelity")
+        if coverage is None:
+            coverage = global_ruleset.get("coverage")
+        if n_decided is None:
+            n_decided = global_ruleset.get("n_decided")
+    cov = _finite_or_none(coverage)
+    fid = _finite_or_none(fidelity)
+    nd: Optional[int]
+    try:
+        nd = int(n_decided) if n_decided is not None else None
+    except (TypeError, ValueError):
+        nd = None
+    if nd == 0 or cov == 0.0:
+        return 0.0
+    if fid is None or cov is None:
+        return None
+    if float(fid) + 1e-12 >= float(tau_p):
+        return float(cov)
+    return 0.0
+
+
+def class_cov_tau(
+    fidelity: Any,
+    coverage: Any,
+    *,
+    tau_p: float = TAU_P_DEFAULT,
+) -> Optional[float]:
+    """Per-class analogue: Cov_c if class-union Fid ≥ τ_P, else 0."""
+    cov = _finite_or_none(coverage)
+    fid = _finite_or_none(fidelity)
+    if cov == 0.0:
+        return 0.0
+    if fid is None or cov is None:
+        return None
+    if float(fid) + 1e-12 >= float(tau_p):
+        return float(cov)
+    return 0.0
+
+
 def paired_wilcoxon(a: Sequence[float], b: Sequence[float]) -> Dict[str, Any]:
     """Paired Wilcoxon signed-rank test of a vs b.
 
