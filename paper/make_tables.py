@@ -1,10 +1,12 @@
 """
 Emit paper tables from revision result JSONs. No hand transcription (C-05).
 
-Reads every `rlda_mada_result_v1` file under --results_dir and writes LaTeX.
+Default dirs are the paper lock: 11-set 5-seed + WyoDOT DNN.
+Wilcoxon is dataset seed-means, n=12, Kerby signed r (`revision.paper_stats`).
 
 Usage:
-    python paper/make_tables.py --results_dir revision/results --out_dir paper/tables
+    python paper/make_tables.py
+    python paper/make_tables.py --results_dir runs/paper_fiveseed_overlap075/results
 """
 from __future__ import annotations
 
@@ -13,40 +15,55 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from utils.metrics import mean_ci, paired_wilcoxon  # noqa: E402
+from utils.metrics import mean_ci, paired_wilcoxon, track_a_cov_tau, track_a_eff  # noqa: E402
+
+DEFAULT_RESULTS_DIRS = [
+    str(REPO / "runs" / "paper_fiveseed_overlap075" / "results"),
+    str(REPO / "runs" / "wyodot_fiveseed_overlap075" / "dnn" / "results"),
+]
 
 RANKING_NOTE = (
     r"Ranking score: Wilson LCB$(\mathrm{fid})\times(1+\mathrm{cov})$ "
-    r"(C-52). $k$ is the top-$k$ pool shared by best and union (C-01). "
+    r"(`lcb_coverage`, C-52). $k$ is the top-$k$ pool shared by best and union (C-01). "
     r"All metrics on $D_{\mathrm{test}}$; selection on $D_{\mathrm{val}}$ (C-10). "
     r"$\dagger$: $n < $ min\_support$=10$ (C-02). "
     r"Single-seed cells show a Wilson 95\% CI on Fid; multi-seed cells show "
     r"bootstrap mean $\pm$ 95\% CI (C-11). "
     r"instC is marginal coverage of the best box; Cov$_{\mathrm{best}}$ is "
-    r"class-conditional."
+    r"class-conditional. Headline Wilcoxon: one pair per dataset (mean of seeds "
+    r"42--46), n=12 including WyoDOT DNN; empty random-search rulesets score Eff=0."
 )
 
 BASELINE_PREFERENCE = ("anchors", "sp_anchors", "greedy_anchors", "cart")
 
 
-def _load_results(results_dir: Path) -> List[Dict[str, Any]]:
+def _load_results(results_dirs: Sequence[Path]) -> List[Dict[str, Any]]:
     rows = []
-    for p in sorted(results_dir.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-        except Exception:
+    seen = set()
+    for results_dir in results_dirs:
+        if not results_dir.is_dir():
             continue
-        if data.get("schema") != "rlda_mada_result_v1":
-            continue
-        data["_path"] = str(p)
-        rows.append(data)
+        for p in sorted(results_dir.rglob("*.json")):
+            if "__instances__" in p.name:
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                continue
+            if data.get("schema") != "rlda_mada_result_v1":
+                continue
+            data["_path"] = str(p)
+            rows.append(data)
     return rows
 
 
@@ -184,10 +201,12 @@ def build_global_table(rows: List[Dict[str, Any]]) -> str:
         g = r.get("global_ruleset") or {}
         grouped[(r["dataset"], r["method"], r["tau_p"], r["tau_c"])].append(g)
     lines = [
-        "% Auto-generated global rule-set table (C-14).",
-        r"\begin{tabular}{llrrrr}",
+        "% Auto-generated global rule-set table (C-14). "
+        r"Cov$_{\tau}$ = Cov if Fid $\ge \tau_P$ else 0; Eff = Fid x Cov; empty RS -> 0.",
+        r"\begin{tabular}{llrrrrrr}",
         r"\toprule",
-        r"Dataset & Method & Global Fid & Abstention & Conflict & Coverage \\",
+        r"Dataset & Method & Global Fid & Abstention & Conflict & Coverage & "
+        r"Cov$_{\tau}$ & Eff \\",
         r"\midrule",
     ]
     for key in sorted(grouped.keys()):
@@ -197,8 +216,11 @@ def build_global_table(rows: List[Dict[str, Any]]) -> str:
         abs_ = mean_ci([g.get("abstention_rate") for g in gs])
         conf = mean_ci([g.get("conflict_rate") for g in gs])
         cov = mean_ci([g.get("coverage") for g in gs])
+        cov_tau = mean_ci([track_a_cov_tau(g) for g in gs])
+        eff = mean_ci([track_a_eff(g) for g in gs])
         lines.append(
-            f"{dataset} & {method} & {_fmt_ci(fid)} & {_fmt_ci(abs_)} & {_fmt_ci(conf)} & {_fmt_ci(cov)} \\\\"
+            f"{dataset} & {method} & {_fmt_ci(fid)} & {_fmt_ci(abs_)} & "
+            f"{_fmt_ci(conf)} & {_fmt_ci(cov)} & {_fmt_ci(cov_tau)} & {_fmt_ci(eff)} \\\\"
         )
     lines += [r"\bottomrule", r"\end{tabular}"]
     return "\n".join(lines) + "\n"
@@ -415,6 +437,115 @@ def build_wilcoxon_table(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def build_headline_table() -> str:
+    """n=12 seed-mean headline (11-set + WyoDOT DNN). Independent of --results_dir."""
+    from revision.paper_stats import METHODS, headline_seed_means, load_cells, N_CELLS
+
+    from revision.paper_stats import (
+        boot_ci_mean, dataset_means, vec, N_BOOT, N_DS,
+    )
+
+    cells = load_cells()
+    head = headline_seed_means(cells)
+    means = dataset_means(cells)
+    lines = [
+        f"% Paper-lock headline: {N_DS} datasets x 5 seeds, DNN black box.",
+        f"% Track A cells {len(cells)}/{N_CELLS}. Empty random-search rulesets score Eff=0 and Cov_tau=0.",
+        "% Primary is Eff = Fid x Cov. Cov_tau = Cov if Fid >= 0.90 else 0 is a",
+        "% reported diagnostic -- see RESULTS_comparison.md, Choosing the primary metric.",
+        "% 'sd' is dispersion over the 5 seed-means; the CI is a percentile bootstrap",
+        f"% over the {N_DS} dataset means ({N_BOOT} resamples) -- the unit the tests pair on.",
+        r"\begin{tabular}{lrrrrr}",
+        r"\toprule",
+        r"Method & Fid & Cov & Conf & Eff (sd over seeds) & Eff 95\% CI \\",
+        r"\midrule",
+    ]
+    for method in METHODS:
+        h = head[method]
+        lo, hi = boot_ci_mean(vec(means, method, "eff"))
+        ci = f"[{lo:.3f}, {hi:.3f}]" if lo is not None else "—"
+        lines.append(
+            f"{method} & {h['fid']:.3f} $\\pm$ {h['fid_sd']:.3f} & "
+            f"{h['cov']:.3f} $\\pm$ {h['cov_sd']:.3f} & "
+            f"{h['conf']:.3f} $\\pm$ {h['conf_sd']:.3f} & "
+            f"{h['eff']:.3f} $\\pm$ {h['eff_sd']:.3f} & {ci} \\\\"
+        )
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    return "\n".join(lines) + "\n"
+
+
+def build_paper_wilcoxon_table() -> str:
+    """Canonical paper test: dataset seed-means, n=12, Holm within the Eff family.
+
+    Three blocks: confirmatory Eff with Holm-adjusted p; the precision-constrained
+    Cov_tau reading, unadjusted and diagnostic; exploratory Fid/Cov/Conf.
+    """
+    from revision.paper_stats import (
+        wilcoxon_rows, dataset_means, load_cells, N_DS, PRIMARY_PAIRS, N_BOOT,
+    )
+
+    cells = load_cells()
+    rows = wilcoxon_rows(dataset_means(cells))
+
+    def _row(r, adjusted):
+        ps = f"{r['p']:.4f}" if r["p"] is not None else "—"
+        rs = f"{r['r']:+.3f}" if r["r"] is not None else "—"
+        mds = f"{r['mean_diff']:+.3f}" if r["mean_diff"] is not None else "—"
+        ci = (f"[{r['diff_ci_low']:+.3f}, {r['diff_ci_high']:+.3f}]"
+              if r["diff_ci_low"] is not None else "—")
+        if adjusted:
+            pa = f"{r['p_holm']:.4f}" if r["p_holm"] is not None else "—"
+            return (f"{r['a']} vs {r['b']} & {r['metric']} & {r['n']} & {ps} & {pa} & "
+                    f"{rs} & {mds} & {ci} & {r['sig_holm']} \\\\")
+        return (f"{r['a']} vs {r['b']} & {r['metric']} & {r['n']} & {ps} & "
+                f"{rs} & {mds} & {ci} & {r['sig']} \\\\")
+
+    lines = [
+        f"% Paired Wilcoxon on dataset seed-means (n={N_DS}). Do not use per-class Fid_union.",
+        r"% Unit = mean of seeds 42--46. Kerby (2014) $r=(T_+-T_-)/(T_++T_-)$.",
+        f"% Confirmatory family: all {len(PRIMARY_PAIRS)} Eff contrasts, Holm-adjusted.",
+        r"% Cov_tau was trialled as primary and rejected: unstable in tau, gates at the",
+        r"% RL arms' own training target, 1/9 significant. Kept as a diagnostic block.",
+        r"% CAVEAT: anchor-family rows use budget_per_class=5 against an RL candidate",
+        r"% pool of ~15-19. At a matched pool of 20 the Eff win over sp_anchors is ns",
+        r"% (rlda k=5 delta +0.003, p=0.970). Do not print these rows without the",
+        r"% matched-pool table -- the surviving claim is parity at ~1/5-1/11 the cost.",
+        f"% CIs are percentile bootstrap, {N_BOOT} resamples of the {N_DS} dataset means.",
+        r"\begin{tabular}{llrrrrrll}",
+        r"\toprule",
+        r"\multicolumn{9}{l}{\textit{Confirmatory: primary metric Eff, Holm-adjusted}} \\",
+        r"\midrule",
+        r"A vs B & metric & $n$ & $p$ & $p_{\mathrm{Holm}}$ & Kerby $r$ & "
+        r"Mean $\Delta$ (A$-$B) & $\Delta$ 95\% CI & sig \\",
+        r"\midrule",
+    ]
+    lines += [_row(r, True) for r in rows if r["family"] == "primary"]
+    lines += [
+        r"\midrule",
+        r"\multicolumn{9}{l}{\textit{Precision-constrained reading (Cov$_{\tau}$), unadjusted diagnostic}} \\",
+        r"\midrule",
+        r"A vs B & metric & $n$ & $p$ & Kerby $r$ & Mean $\Delta$ (A$-$B) & "
+        r"$\Delta$ 95\% CI & sig & \\",
+        r"\midrule",
+    ]
+    lines += [_row(r, False) + " &" for r in rows if r["family"] == "constrained"]
+    lines += [
+        r"\midrule",
+        r"\multicolumn{9}{l}{\textit{Exploratory: Fid / Cov / Conf, unadjusted}} \\",
+        r"\midrule",
+        r"A vs B & metric & $n$ & $p$ & Kerby $r$ & Mean $\Delta$ (A$-$B) & "
+        r"$\Delta$ 95\% CI & sig & \\",
+        r"\midrule",
+    ]
+    lines += [_row(r, False) + " &" for r in rows if r["family"] == "secondary"]
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        f"% n={N_DS} datasets (11-set + wyodot_kvdw_labeled DNN), DNN black box only.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def build_notes(rows: List[Dict[str, Any]]) -> str:
     formulas = sorted({
         r.get("ranking_formula") or (r.get("extra") or {}).get("ranking_formula")
@@ -450,16 +581,23 @@ def build_notes(rows: List[Dict[str, Any]]) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results_dir", default="revision/results")
+    ap.add_argument(
+        "--results_dir",
+        nargs="+",
+        default=DEFAULT_RESULTS_DIRS,
+        help="One or more roots; JSON is loaded recursively (instance files skipped).",
+    )
     ap.add_argument("--out_dir", default="paper/tables")
     args = ap.parse_args()
-    results_dir = Path(args.results_dir)
+    results_dirs = [Path(p) for p in args.results_dir]
     out_dir = Path(args.out_dir)
+    if not out_dir.is_absolute():
+        out_dir = REPO / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = _load_results(results_dir)
+    rows = _load_results(results_dirs)
     if not rows:
-        print(f"No rlda_mada_result_v1 files in {results_dir}")
+        print(f"No rlda_mada_result_v1 files in {results_dirs}")
         return
     assert_anchors_identical_across_tau_c(rows)
     writers = {
@@ -469,12 +607,17 @@ def main():
         "table_queries.tex": build_queries_table,
         "table_success.tex": build_success_table,
         "table_compactness.tex": build_compactness_table,
-        "table_wilcoxon.tex": build_wilcoxon_table,
     }
     for name, fn in writers.items():
         (out_dir / name).write_text(fn(rows))
+    (out_dir / "table_headline.tex").write_text(build_headline_table())
+    (out_dir / "table_wilcoxon.tex").write_text(build_paper_wilcoxon_table())
     (out_dir / "table_notes.tex").write_text(build_notes(rows))
-    print(f"Wrote {len(writers) + 1} tables in {out_dir} from {len(rows)} result files")
+    n_tables = len(writers) + 3
+    print(
+        f"Wrote {n_tables} tables in {out_dir} from {len(rows)} result files "
+        f"({', '.join(str(p) for p in results_dirs)})"
+    )
 
 
 if __name__ == "__main__":

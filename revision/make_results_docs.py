@@ -1,8 +1,10 @@
-"""Regenerate docs/RESULTS_comparison.md and docs/RULES.md from sweep result JSON.
+"""Regenerate obsolete cluster-sweep tables (not used for the paper rewrite).
 
-Multi-seed aware: every metric cell carries one value per seed plus the mean, so
-a dataset's DNN and RandomForest tables can be read side by side and a seed that
-has not finished shows as an em dash rather than silently shifting the mean.
+Paper numbers live in `docs/RESULTS_comparison.md` / `docs/RULES.md` via
+`python -m revision.make_local_docs --apply`. This script still rebuilds the
+old full-budget DNN/RF sweep (`runs/sweep_dnn`, `runs/sweep_rf`) and **will
+overwrite those two files**. Do not run it unless you intentionally want the
+cluster-sweep lab dump.
 
     python -m revision.make_results_docs [--seeds 42 43]
 """
@@ -458,6 +460,10 @@ def main():
     ap.add_argument("--results-out", default="docs/RESULTS_comparison.md")
     ap.add_argument("--rules-out", default="docs/RULES.md")
     args = ap.parse_args()
+    print(
+        "WARNING: this writes the obsolete cluster sweep, not the paper rewrite "
+        "tables. For manuscript numbers use: python -m revision.make_local_docs --apply"
+    )
 
     seeds = sorted(args.seeds)
     data = load_all(set(seeds))
