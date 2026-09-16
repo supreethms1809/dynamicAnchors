@@ -108,6 +108,11 @@ def test_c26_wilcoxon_effect_size_on_clear_difference():
     assert res["n"] == 8
     assert res["pvalue"] is not None and res["pvalue"] < 0.05
     assert res["mean_diff"] > 0
+    assert res["effect_size_rank_biserial"] == pytest.approx(1.0)
+    rev = paired_wilcoxon(b, a)
+    assert res["pvalue"] == pytest.approx(rev["pvalue"])
+    assert rev["effect_size_rank_biserial"] == pytest.approx(-1.0)
+    assert rev["mean_diff"] < 0
 
 
 def test_print_leg_unwraps_nested_best_metrics():

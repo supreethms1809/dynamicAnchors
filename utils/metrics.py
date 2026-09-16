@@ -574,9 +574,14 @@ def mean_ci(values: Iterable[float], alpha: float = 0.05, n_boot: int = 2000, se
 
 
 def paired_wilcoxon(a: Sequence[float], b: Sequence[float]) -> Dict[str, Any]:
-    """Paired Wilcoxon signed-rank test of a vs b (e.g. method vs Anchors)."""
+    """Paired Wilcoxon signed-rank test of a vs b.
+
+    Rank-biserial is Kerby (2014): r = (T+ − T−) / (T+ + T−) on a−b, zeros
+    dropped like ``zero_method='wilcox'``. Positive r means a > b. Do not use
+    1 − 2W / n(n+1) on scipy's W = min(T+, T−): that quantity is always ≥ 0.
+    """
     try:
-        from scipy.stats import wilcoxon
+        from scipy.stats import rankdata, wilcoxon
     except ImportError as exc:
         raise ImportError("scipy is required for Wilcoxon tests") from exc
     x = np.asarray(a, dtype=np.float64)
@@ -588,16 +593,27 @@ def paired_wilcoxon(a: Sequence[float], b: Sequence[float]) -> Dict[str, Any]:
         return {"pvalue": None, "statistic": None, "n": int(x.size), "note": "too few pairs", "mean_diff": md}
     d = x - y
     if np.allclose(d, 0.0):
-        return {"pvalue": 1.0, "statistic": 0.0, "n": int(x.size), "note": "all differences zero", "mean_diff": 0.0, "effect_size_rank_biserial": 0.0}
+        return {
+            "pvalue": 1.0, "statistic": 0.0, "n": int(x.size),
+            "n_nonzero": 0, "note": "all differences zero",
+            "mean_diff": 0.0, "effect_size_rank_biserial": 0.0,
+            "t_plus": 0.0, "t_minus": 0.0,
+        }
+    nz = d[~np.isclose(d, 0.0)]
+    ranks = rankdata(np.abs(nz), method="average")
+    t_plus = float(ranks[nz > 0].sum()) if np.any(nz > 0) else 0.0
+    t_minus = float(ranks[nz < 0].sum()) if np.any(nz < 0) else 0.0
+    denom = t_plus + t_minus
+    r_rb = (t_plus - t_minus) / denom if denom else 0.0
     try:
         stat, p = wilcoxon(x, y, zero_method="wilcox", alternative="two-sided")
-        # Rank-biserial correlation: r = 1 - 2W / (n(n+1)), W = Wilcoxon statistic.
-        n = float(x.size)
-        r_rb = 1.0 - (2.0 * float(stat)) / (n * (n + 1.0))
         return {
             "pvalue": float(p),
             "statistic": float(stat),
             "n": int(x.size),
+            "n_nonzero": int(nz.size),
+            "t_plus": t_plus,
+            "t_minus": t_minus,
             "effect_size_rank_biserial": float(r_rb),
             "mean_diff": float((x - y).mean()),
         }
