@@ -389,6 +389,7 @@ def run_anchors_family(
     query_budget: Optional[int] = None,
     min_support: int = MIN_SUPPORT_DEFAULT,
     methods: Sequence[str] = ("sp_anchors", "greedy_anchors"),
+    k_values: Optional[Sequence[int]] = None,
 ) -> List[str]:
     """Generate per-instance Anchors on D_val, pick a subset, evaluate on D_test.
 
@@ -502,59 +503,62 @@ def run_anchors_family(
     queries.attach_meter(meter)
     meter.__exit__(None, None, None)
     written = []
-    if "sp_anchors" in methods:
-        picked_val = {
-            cls: _submodular_pick(rules, y_val, cls, k)
-            for cls, rules in per_class_boxes.items()
-        }
-        picked = _select_on_val_report_on_test(
-            picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
-            y_test=y_test, y_hat_test=y_hat_test, k=k,
-            min_support=min_support,
-        )
-        written.append(_emit(
-            dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
-            out_dir=out_dir, k=k, min_support=min_support,
-            loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
-            per_class_ranked=picked, queries=queries,
-            extra={
-                "budget_per_class": budget_per_class,
-                "query_budget": query_budget,
-                "budget_exhausted": budget_exhausted,
-                "k": k,
-                "picker": "submodular",
-                "classifier_path": os.path.abspath(classifier_path),
-                "selection_split": "val",
-                "report_split": "test",
+    # One pool, many k. `anchor-exp`'s internal sampling is not seeded by our
+    # seed, so regenerating the pool per k would confound the union-size sweep
+    # with explainer noise (measured at +-0.014 Eff run-to-run). Reduce the same
+    # `per_class_boxes` at every k instead; the k subdirectory is the only thing
+    # that changes downstream.
+    for k_i in (k_values if k_values else [k]):
+        k_out = out_dir if len(k_values or [k]) == 1 else os.path.join(out_dir, f"k{k_i}")
+        common_extra = {
+            "budget_per_class": budget_per_class,
+            "query_budget": query_budget,
+            "budget_exhausted": budget_exhausted,
+            "k": k_i,
+            "pool_per_class": {
+                str(c): len(v) for c, v in per_class_boxes.items()
             },
-        ))
-    if "greedy_anchors" in methods:
-        picked_val = {
-            cls: greedy_set_cover(rules, y_val, cls, k, tau_p)
-            for cls, rules in per_class_boxes.items()
+            "pool_shared_across_k": bool(k_values and len(k_values) > 1),
+            "classifier_path": os.path.abspath(classifier_path),
+            "selection_split": "val",
+            "report_split": "test",
         }
-        picked = _select_on_val_report_on_test(
-            picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
-            y_test=y_test, y_hat_test=y_hat_test, k=k,
-            min_support=min_support,
-        )
-        # greedy_set_cover returns a subset; wrap as ranked list (already scored)
-        written.append(_emit(
-            dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
-            out_dir=out_dir, k=k, min_support=min_support,
-            loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
-            per_class_ranked=picked, queries=queries,
-            extra={
-                "budget_per_class": budget_per_class,
-                "query_budget": query_budget,
-                "budget_exhausted": budget_exhausted,
-                "k": k,
-                "picker": "greedy_set_cover",
-                "classifier_path": os.path.abspath(classifier_path),
-                "selection_split": "val",
-                "report_split": "test",
-            },
-        ))
+        if "sp_anchors" in methods:
+            picked_val = {
+                cls: _submodular_pick(rules, y_val, cls, k_i)
+                for cls, rules in per_class_boxes.items()
+            }
+            picked = _select_on_val_report_on_test(
+                picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
+                y_test=y_test, y_hat_test=y_hat_test, k=k_i,
+                min_support=min_support,
+            )
+            written.append(_emit(
+                dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p,
+                tau_c=tau_c, box_space="original",
+                out_dir=k_out, k=k_i, min_support=min_support,
+                loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
+                per_class_ranked=picked, queries=queries,
+                extra={**common_extra, "picker": "submodular"},
+            ))
+        if "greedy_anchors" in methods:
+            picked_val = {
+                cls: greedy_set_cover(rules, y_val, cls, k_i, tau_p)
+                for cls, rules in per_class_boxes.items()
+            }
+            picked = _select_on_val_report_on_test(
+                picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
+                y_test=y_test, y_hat_test=y_hat_test, k=k_i,
+                min_support=min_support,
+            )
+            written.append(_emit(
+                dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p,
+                tau_c=tau_c, box_space="original",
+                out_dir=k_out, k=k_i, min_support=min_support,
+                loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
+                per_class_ranked=picked, queries=queries,
+                extra={**common_extra, "picker": "greedy_set_cover"},
+            ))
     return written
 
 
@@ -779,6 +783,12 @@ def main():
         help="Maximum generation/selection black-box calls for Anchor baselines.",
     )
     p.add_argument("--n_candidates", type=int, default=512)
+    p.add_argument(
+        "--k_values", type=int, nargs="+", default=None,
+        help="Reduce ONE anchor pool at several union sizes; writes k<K>/ "
+             "subdirectories under --out_dir. Keeps the explainer's unseeded "
+             "sampling constant across k.",
+    )
     args = p.parse_args()
 
     written = []
@@ -800,6 +810,7 @@ def main():
             budget_per_class=args.budget_per_class,
             query_budget=args.query_budget,
             methods=anchor_methods,
+            k_values=args.k_values,
         ))
     for w in written:
         logger.info("Wrote %s", w)
