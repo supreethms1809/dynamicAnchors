@@ -119,6 +119,11 @@ class AnchorEnv(ParallelEnv):
         self.precision_target = env_config.get("precision_target", 0.9)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 1.0)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
+        # Independent of trajectory drift so the two terms can be ablated separately.
+        # Default matches the old shared-weight behaviour when the key is absent.
+        self.anchor_drift_penalty_weight = float(
+            env_config.get("anchor_drift_penalty_weight", self.drift_penalty_weight)
+        )
         
         # Diagnostics only. Max-count termination was removed: it made the MDP
         # non-stationary under the replay buffer.
@@ -1940,14 +1945,17 @@ class AnchorEnv(ParallelEnv):
                     union_terminal_bonus_by_class[cls] = float(self.shared_terminal_bonus)
                     self._class_union_bonus_paid[cls] = True
 
-        # Overlap as potential-style deltas from everyone's post-action boxes.
-        # Simpson of k>=1 claim masks (eval conflict on rows).
+        # Inter-class overlap: charge the LEVEL each step (weighted Simpson vs
+        # other-class k>=1 union) so the MDP directly prices the same quantity
+        # as eval conflict_rate. Same-class diversity stays delta-shaped.
         inter_overlap_delta: Dict[str, float] = {}
         same_overlap_delta: Dict[str, float] = {}
+        inter_overlap_level: Dict[str, float] = {}
         for agent in self.agents:
             level = self._compute_inter_class_overlap_penalty(agent)
             prev_level = self._prev_inter_overlap.get(agent, level)
             inter_overlap_delta[agent] = level - prev_level
+            inter_overlap_level[agent] = level
             self._prev_inter_overlap[agent] = level
             same_level = self._compute_same_class_overlap_penalty(agent)
             prev_same = self._prev_same_overlap.get(agent, same_level)
@@ -1973,22 +1981,24 @@ class AnchorEnv(ParallelEnv):
                 union_purity = float(m.get("union_purity", 0.0))
 
             overlap_delta = float(inter_overlap_delta.get(agent, 0.0))
+            overlap_level = float(inter_overlap_level.get(agent, 0.0))
             same_delta = float(same_overlap_delta.get(agent, 0.0))
             # One-time union-target bonus for this class (latched), paid to every
             # agent of the class on the step the union first clears both targets.
             union_bonus = float(union_terminal_bonus_by_class.get(cls, 0.0)) if cls is not None else 0.0
             final_reward = float(
-                local_r + shared_reward + union_bonus - overlap_delta - same_delta
+                local_r + shared_reward + union_bonus - overlap_level - same_delta
             )
             rewards[agent] = final_reward
             self._rt_total[agent] = float(
                 self._rt_total.get(agent, 0.0) + shared_reward + union_bonus
-                - overlap_delta - same_delta
+                - overlap_level - same_delta
             )
 
             # Update info to reflect the final reward decomposition
             if agent in infos:
-                infos[agent]["inter_class_overlap_penalty"] = overlap_delta
+                infos[agent]["inter_class_overlap_penalty"] = overlap_level
+                infos[agent]["inter_class_overlap_delta"] = overlap_delta
                 infos[agent]["same_class_overlap_penalty"] = same_delta
                 infos[agent]["shared_reward"] = float(shared_reward)
                 infos[agent]["shared_terminal_bonus"] = float(union_bonus)
@@ -2019,7 +2029,8 @@ class AnchorEnv(ParallelEnv):
                     "overlap_penalty": 0.0,
                     "drift_penalty": 0.0,
                     "anchor_drift_penalty": 0.0,
-                    "inter_class_overlap_penalty": overlap_delta,
+                    "inter_class_overlap_penalty": overlap_level,
+                    "inter_class_overlap_delta": overlap_delta,
                     "same_class_overlap_penalty": same_delta,
                     "coverage_floor_penalty": 0.0,
                     "class_union_coverage": float(union_cov),
@@ -2151,8 +2162,9 @@ class AnchorEnv(ParallelEnv):
 
         Simpson overlap of this k>=1 claim with the union of other-class k>=1
         claims, on rows of D_active. Empty start claims nothing (it is not a
-        rule). This is eval conflict. step() charges the CHANGE in this level,
-        not the level itself. Finished agents' boxes stay in the other-class union.
+        rule). This is eval conflict. step() subtracts this LEVEL each step
+        (not just its delta) so the live reward prices the reported conflict_rate.
+        Finished agents' boxes stay in the other-class union.
         """
         return self._quantile_overlap_level(agent, same_class=False)
 
@@ -2365,7 +2377,7 @@ class AnchorEnv(ParallelEnv):
             max_allowed_distance = self.initial_window * 2.0
             if anchor_distance > max_allowed_distance:
                 excess = anchor_distance - max_allowed_distance
-                anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5
+                anchor_drift_penalty = self.anchor_drift_penalty_weight * excess * 0.5
         return anchor_drift_penalty
     
     def _compute_group_map(self) -> Dict[str, List[str]]:

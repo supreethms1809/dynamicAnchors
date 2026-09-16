@@ -402,7 +402,8 @@ def main():
                 }}
             reward_keys = (
                 "alpha", "beta", "gamma", "precision_blend_lambda",
-                "drift_penalty_weight", "inter_class_overlap_weight",
+                "drift_penalty_weight", "anchor_drift_penalty_weight",
+                "inter_class_overlap_weight",
                 "shared_reward_weight", "shared_terminal_bonus",
                 "terminal_bonus", "coverage_target", "precision_target",
             )

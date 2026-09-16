@@ -54,6 +54,9 @@ env_config:
   gamma: 0.1  # narrow-width overlap weight (not MDP discount)
   precision_blend_lambda: 1.0  # control uses hard Fid; softmax blend is logged only
   drift_penalty_weight: 0.05
+  # Instance-mode: penalty when the box centre leaves initial_window around x*.
+  # Separate from trajectory drift so the two can be ablated independently.
+  anchor_drift_penalty_weight: 0.05
   min_coverage_floor: 0.005
   terminal_bonus: 5.0
   # Paid once per class when the UNION of that class's boxes clears both targets.
@@ -73,8 +76,9 @@ env_config:
   centroid_snap_threshold: 0.0
   strict_target_termination: true
   require_coverage_gain_to_terminate: true
-  # Simpson of this k>=1 claim vs other-class k>=1 union on D_active. Empty start claims nothing.
-  inter_class_overlap_weight: 0.25
+  # Simpson of this k>=1 claim vs other-class k>=1 union on D_active. Charged as
+  # level each step (aligned with eval conflict_rate).
+  inter_class_overlap_weight: 0.75
   # shared_reward_weight * (Phi_union(s') - Phi_union(s)), same precision gate as local Phi.
   shared_reward_weight: 0.5
   same_class_diversity_weight: 0.25

@@ -138,6 +138,9 @@ class SingleAgentAnchorEnv(Env):
         self.coverage_target = env_config.get("coverage_target", 0.2)
         self.precision_blend_lambda = env_config.get("precision_blend_lambda", 1.0)
         self.drift_penalty_weight = env_config.get("drift_penalty_weight", 0.05)
+        self.anchor_drift_penalty_weight = float(
+            env_config.get("anchor_drift_penalty_weight", self.drift_penalty_weight)
+        )
 
         self.precision_estimator = str(env_config.get("precision_estimator", "empirical")).lower()
         self.use_perturbation = env_config.get("use_perturbation", False)
@@ -1913,7 +1916,7 @@ class SingleAgentAnchorEnv(Env):
             max_allowed_distance = self.initial_window * 2.0
             if anchor_distance > max_allowed_distance:
                 excess = anchor_distance - max_allowed_distance
-                anchor_drift_penalty = self.drift_penalty_weight * excess * 0.5
+                anchor_drift_penalty = self.anchor_drift_penalty_weight * excess * 0.5
         return anchor_drift_penalty
 
     def extract_rule(

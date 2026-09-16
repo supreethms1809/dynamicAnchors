@@ -375,10 +375,19 @@ def _constrain(env, agent, j, a_lo, b_hi):
 
 
 def test_paper_yaml_enables_quantile_same_class_diversity():
+    """Pin the locked paper config, not the config the ablation ran at.
+
+    w=0.5 is the conflict-align *mechanism baseline*; the overlap-weight search
+    (`runs/mada_overlap*_seed42/`) selected **w=0.75** as the paper lock, which
+    is what `anchor.yaml` carries. This test asserted 0.5 and so failed against
+    the very config the paper reports.
+    """
     mae = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
     assert mae["same_class_diversity_weight"] == pytest.approx(0.25)
-    assert mae["inter_class_overlap_weight"] == pytest.approx(0.25)
+    assert mae["inter_class_overlap_weight"] == pytest.approx(0.75)
     assert mae["same_class_diversity_weight"] > 0.0
+    assert mae["shared_reward_weight"] == pytest.approx(0.5)
+    assert mae["agents_per_class"] == 3
 
 
 def test_quantile_empty_rule_is_not_a_claim():

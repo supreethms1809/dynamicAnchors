@@ -43,6 +43,7 @@ env_config:
   gamma: 0.1  # narrow-width overlap weight (not MDP discount)
   precision_blend_lambda: 1.0
   drift_penalty_weight: 0.05
+  anchor_drift_penalty_weight: 0.05
   gate_margin: 0.10
   coverage_floor_penalty: 0.0
   coverage_floor_projection_steps: 6
