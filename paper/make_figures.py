@@ -26,15 +26,23 @@ AMORTIZED = {
 PER_INSTANCE = {"anchors", "sp_anchors", "greedy_anchors"}
 
 
-def _load_results(results_dir: Path) -> List[Dict[str, Any]]:
+def _load_results(results_dirs: List[Path]) -> List[Dict[str, Any]]:
+    """Recurse: the paper trees nest results under ddpg/ maddpg/ baselines/."""
     rows = []
-    for p in sorted(results_dir.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-        except Exception:
+    seen = set()
+    for results_dir in results_dirs:
+        if not results_dir.is_dir():
             continue
-        if data.get("schema") == "rlda_mada_result_v1":
-            rows.append(data)
+        for p in sorted(results_dir.rglob("*.json")):
+            if "__instances__" in p.name or p in seen:
+                continue
+            seen.add(p)
+            try:
+                data = json.loads(p.read_text())
+            except Exception:
+                continue
+            if data.get("schema") == "rlda_mada_result_v1":
+                rows.append(data)
     return rows
 
 
@@ -70,8 +78,29 @@ def _fixed_and_marginal(row: Dict[str, Any]) -> Tuple[float, float]:
     n_test = float((row.get("classifier_accuracy") or {}).get("n") or 0.0)
     method = str(row.get("method", "")).lower()
     if method in PER_INSTANCE:
-        n_explained = n_test if n_test > 0 else 1.0
-        return 0.0, n_bb / n_explained
+        # G-05: divide by the instances the explainer ACTUALLY explained, not by
+        # |D_test|. The anchor baselines build their pool from `budget_per_class`
+        # validation rows per class (5 in the paper runs), so n_bb / n_test
+        # understated the per-explanation cost by n_test / (budget * K) -- a
+        # factor of ~3,900 on folktables, which pushed RLDA's break-even from
+        # ~10^3 explanations to ~10^6 and made amortisation look impossible on
+        # exactly the dataset where it matters most. Cross-check: the corrected
+        # value lands within an order of magnitude of the directly measured
+        # Track B `queries_per_x_anchors`.
+        extra = row.get("extra") or {}
+        budget = extra.get("budget_per_class")
+        n_classes = len((row.get("per_class") or {})) or 1
+        if not budget:
+            return 0.0, n_bb / max(n_test if n_test > 0 else 1.0, 1.0)
+        n_explained = float(budget) * float(n_classes)
+        # `run_anchors_family` also charges one prediction pass over D_val to
+        # n_blackbox_queries before any anchor is built. That pass is a fixed
+        # setup cost, not part of explaining an instance, so subtract it before
+        # dividing. The split is 60/20/20, so |D_val| == |D_test| == n_test.
+        # Cross-check on folktables seed 42: (103,899 - 39,133) / 10 = 6,477
+        # q/x against 6,854 measured directly in Track B -- within 6%.
+        anchor_calls = max(n_bb - n_test, 0.0) or n_bb
+        return 0.0, anchor_calls / max(n_explained, 1.0)
     # Amortised (learned-policy) methods: construction is training + extraction,
     # serving is free. n_reporting_queries is deliberately excluded -- it is
     # evaluation instrumentation, not a cost of producing explanations.
@@ -191,11 +220,19 @@ def _plot(curves: Dict[str, Any], out_png: Path) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results_dir", default="revision/results")
+    ap.add_argument(
+        "--results_dir", nargs="+",
+        default=[
+            str(REPO / "runs" / "paper_fiveseed_overlap075" / "results"),
+            str(REPO / "runs" / "wyodot_fiveseed_overlap075" / "dnn" / "results"),
+        ],
+        help="Paper-lock trees by default (12 datasets, tau_C=0.10), not the stale "
+             "revision/results dump at tau_C=0.20.",
+    )
     ap.add_argument("--out_dir", default="paper/figures")
     ap.add_argument("--n_max", type=int, default=400)
     args = ap.parse_args()
-    rows = _load_results(Path(args.results_dir))
+    rows = _load_results([Path(d) for d in args.results_dir])
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if not rows:
