@@ -77,9 +77,11 @@ LOG_DIR = ROOT / "logs"
 FORCE = False                         # re-run infer + Track A + Track B; never retrain
 FORCE_TRAIN = False                   # also retrain (rare; wipes nothing, starts a new exp)
 SKIP_TRAIN = False                    # never train; fail if no experiment dir
+SKIP_BASELINES = False                # skip CART / anchor baselines
 CLASSIFIER_PATH = None                # if set + exists: shards load it, skip classifier fit
 SA_TIMESTEPS = None                   # --sa_timesteps override (TOTAL across classes)
 CLASSIFIER_DEVICE = None              # device for the (one-time) classifier fit
+CLASSIFIER_TYPE = "dnn"
 
 
 def log(msg: str) -> None:
@@ -160,8 +162,11 @@ def ensure_dataset_classifier(dataset: str, seed: int, device: str) -> Path:
         log(f"{dataset}: using shared classifier {dest}")
         return dest
     clf_device = CLASSIFIER_DEVICE or device
-    log(f"{dataset}: fitting ONE shared classifier -> {dest} (device={clf_device})")
-    return fit_or_load(dataset, dest, seed=seed, device=clf_device)
+    log(f"{dataset}: fitting ONE shared classifier -> {dest} "
+        f"(device={clf_device}, type={CLASSIFIER_TYPE})")
+    return fit_or_load(
+        dataset, dest, seed=seed, device=clf_device, classifier_type=CLASSIFIER_TYPE,
+    )
 
 
 def train_rlda(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> None:
@@ -188,6 +193,7 @@ def train_rlda(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Non
             "--n_classes", str(n_cls), "--parallel_classes", str(n_cls),
             "--total_timesteps", str(per_class), "--n_envs", "1",
             "--device", device, "--output_dir", str(out) + "/",
+            "--classifier_type", CLASSIFIER_TYPE,
             "--extra_args", *extra,
         ],
         log_file=ds_log(dataset, f"rlda_train_seed{seed}.log"),
@@ -338,7 +344,8 @@ def run_dataset(dataset: str, seed: int, device: str) -> None:
     train_rlda(dataset, seed, cfg, device)
     rules = infer_rlda(dataset, seed, cfg)
     evaluate(dataset, "rlda", rules, seed)
-    baselines(dataset, seed)
+    if not SKIP_BASELINES:
+        baselines(dataset, seed)
     evaluate_instances(dataset, "rlda", rules, seed)
     log(f"=== {dataset} seed {seed} RLDA[{ALGO}] done ===")
 
@@ -378,10 +385,25 @@ def main() -> None:
     p.add_argument("--classifier-device", default=None,
                    choices=["cpu", "cuda", "mps", "auto"],
                    help="Device for the classifier fit (default: same as --device).")
+    p.add_argument(
+        "--classifier_type", "--classifier-type", dest="classifier_type",
+        default="dnn", choices=["dnn", "random_forest", "gradient_boosting"],
+        help="Black-box type for the shared classifier (default: dnn).",
+    )
+    p.add_argument("--tau_p", type=float, default=None, help="Precision threshold (default: 0.90).")
+    p.add_argument("--tau_c", type=float, default=None, help="Coverage threshold (default: 0.10).")
+    p.add_argument(
+        "--k", type=int, default=None,
+        help="Top-k union at evaluation (default: pipeline K).",
+    )
+    p.add_argument(
+        "--skip-baselines", action="store_true",
+        help="Skip CART / anchor baselines (re-eval RLDA arm only).",
+    )
     args = p.parse_args()
 
     global ALGO, SUBDIR, ROOT, OUT_DIR, RESULTS, LOG_DIR, FORCE, FORCE_TRAIN, SKIP_TRAIN
-    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, SA_TIMESTEPS
+    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, CLASSIFIER_TYPE, SA_TIMESTEPS, TAU_P, TAU_C, K, SKIP_BASELINES
     ALGO = args.algo
     SA_TIMESTEPS = args.sa_timesteps
     SUBDIR = f"{ALGO}_single_agent"
@@ -392,8 +414,16 @@ def main() -> None:
     FORCE = bool(args.force)
     FORCE_TRAIN = bool(args.force_train)
     SKIP_TRAIN = bool(args.skip_train)
+    SKIP_BASELINES = bool(args.skip_baselines)
     CLASSIFIER_PATH = args.classifier_path
     CLASSIFIER_DEVICE = args.classifier_device
+    CLASSIFIER_TYPE = str(args.classifier_type)
+    if args.tau_p is not None:
+        TAU_P = float(args.tau_p)
+    if args.tau_c is not None:
+        TAU_C = float(args.tau_c)
+    if args.k is not None:
+        K = int(args.k)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
@@ -402,7 +432,9 @@ def main() -> None:
     failed: List[str] = []
     log(f"RLDA-only sweep algo={ALGO} datasets={args.datasets} seed={args.seed} "
         f"device={args.device} root={ROOT} budget_mult={BUDGET_MULT} "
-        f"force={FORCE} skip_train={SKIP_TRAIN} force_train={FORCE_TRAIN}")
+        f"tau_p={TAU_P} tau_c={TAU_C} "
+        f"force={FORCE} skip_train={SKIP_TRAIN} force_train={FORCE_TRAIN} "
+        f"skip_baselines={SKIP_BASELINES}")
     for dataset in args.datasets:
         try:
             run_dataset(dataset, args.seed, args.device)

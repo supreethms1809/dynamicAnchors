@@ -223,6 +223,13 @@ def main():
         help="Path to checkpoint directory to load (skips training, only runs evaluation). "
              "Can be experiment folder or specific checkpoint file."
     )
+
+    parser.add_argument(
+        "--anchor_config",
+        type=str,
+        default=None,
+        help="Path to anchor env YAML (default: conf/anchor.yaml).",
+    )
     
     args = parser.parse_args()
 
@@ -349,6 +356,7 @@ def main():
         algorithm_config_path=args.algorithm_config,
         experiment_config_path=args.experiment_config,
         mlp_config_path=args.mlp_config,
+        anchor_config_path=args.anchor_config or "conf/anchor.yaml",
         output_dir=f"{args.output_dir}training/",
         seed=args.seed
     )

@@ -80,7 +80,10 @@ FORCE_TRAIN = False
 SKIP_TRAIN = False
 CLASSIFIER_PATH = None
 CLASSIFIER_DEVICE = None
+CLASSIFIER_TYPE = "dnn"
 MAX_N_FRAMES = None
+ANCHOR_CONFIG: Optional[str] = None
+METHOD = "mada"
 
 
 def log(msg: str) -> None:
@@ -161,8 +164,11 @@ def ensure_dataset_classifier(dataset: str, seed: int, device: str) -> Path:
         log(f"{dataset}: using shared classifier {dest}")
         return dest
     clf_device = CLASSIFIER_DEVICE or device
-    log(f"{dataset}: fitting ONE shared classifier -> {dest} (device={clf_device})")
-    return fit_or_load(dataset, dest, seed=seed, device=clf_device)
+    log(f"{dataset}: fitting ONE shared classifier -> {dest} "
+        f"(device={clf_device}, type={CLASSIFIER_TYPE})")
+    return fit_or_load(
+        dataset, dest, seed=seed, device=clf_device, classifier_type=CLASSIFIER_TYPE,
+    )
 
 
 def train_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> None:
@@ -176,9 +182,11 @@ def train_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Non
     out = mada_out(dataset, seed)
     out.mkdir(parents=True, exist_ok=True)
     clf_path = ensure_dataset_classifier(dataset, seed, device)
-    extra = ["--classifier_path", str(clf_path)]
+    extra = ["--classifier_path", str(clf_path), "--classifier_type", CLASSIFIER_TYPE]
     if CLASSIFIER_DEVICE:
         extra += ["--classifier_device", CLASSIFIER_DEVICE]
+    if ANCHOR_CONFIG:
+        extra += ["--anchor_config", str(ANCHOR_CONFIG)]
     log(f"{dataset} MADA[{ALGO}]: LOAD {clf_path} (no MADA-side fit)")
     run(
         [
@@ -285,8 +293,8 @@ def run_dataset(dataset: str, seed: int, device: str) -> None:
     )
     train_mada(dataset, seed, cfg, device)
     rules = infer_mada(dataset, seed, cfg, device)
-    evaluate(dataset, "mada", rules, seed)
-    evaluate_instances(dataset, "mada", rules, seed, device)
+    evaluate(dataset, METHOD, rules, seed)
+    evaluate_instances(dataset, METHOD, rules, seed, device)
     log(f"=== {dataset} seed {seed} MADA[{ALGO}] done ===")
 
 
@@ -320,6 +328,11 @@ def main() -> None:
     )
     p.add_argument("--classifier_device", default=None)
     p.add_argument(
+        "--classifier_type", default="dnn",
+        choices=["dnn", "random_forest", "gradient_boosting"],
+        help="Black-box type for the shared classifier (default: dnn).",
+    )
+    p.add_argument(
         "--max_n_frames", type=int, default=None,
         help="Override per-dataset ma_frames. Must be a multiple of "
              "evaluation_interval so FidCov eval fires.",
@@ -328,10 +341,21 @@ def main() -> None:
         "--k", type=int, default=None,
         help="Top-k union at evaluation (default: pipeline K).",
     )
+    p.add_argument("--tau_p", type=float, default=None, help="Precision threshold (default: 0.90).")
+    p.add_argument("--tau_c", type=float, default=None, help="Coverage threshold (default: 0.10).")
+    p.add_argument(
+        "--anchor-config", default=None,
+        help="Anchor env YAML for BenchMARL/driver.py (default: conf/anchor.yaml).",
+    )
+    p.add_argument(
+        "--method", default="mada",
+        help="Method label for revision.evaluate result JSON (default: mada).",
+    )
     args = p.parse_args()
 
     global ALGO, SUBDIR, ROOT, OUT_DIR, RESULTS, LOG_DIR, FORCE, FORCE_TRAIN, SKIP_TRAIN
-    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, MAX_N_FRAMES, K
+    global CLASSIFIER_PATH, CLASSIFIER_DEVICE, CLASSIFIER_TYPE, MAX_N_FRAMES, K, TAU_P, TAU_C
+    global ANCHOR_CONFIG, METHOD
     ALGO = args.algo
     SUBDIR = ALGO
     # MUST be absolute: train_mada runs BenchMARL/driver.py with cwd=BenchMARL/,
@@ -345,9 +369,16 @@ def main() -> None:
     SKIP_TRAIN = bool(args.skip_train)
     CLASSIFIER_PATH = args.classifier_path
     CLASSIFIER_DEVICE = args.classifier_device
+    CLASSIFIER_TYPE = str(args.classifier_type)
     MAX_N_FRAMES = args.max_n_frames
     if args.k is not None:
         K = int(args.k)
+    if args.tau_p is not None:
+        TAU_P = float(args.tau_p)
+    if args.tau_c is not None:
+        TAU_C = float(args.tau_c)
+    ANCHOR_CONFIG = args.anchor_config
+    METHOD = str(args.method)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
@@ -356,6 +387,7 @@ def main() -> None:
     failed: List[str] = []
     log(f"MADA-only sweep algo={ALGO} datasets={args.datasets} seed={args.seed} "
         f"device={args.device} root={ROOT} frames={MAX_N_FRAMES or 'per-dataset'} "
+        f"tau_p={TAU_P} tau_c={TAU_C} "
         f"force={FORCE} skip_train={SKIP_TRAIN} force_train={FORCE_TRAIN} k={K}")
     for dataset in args.datasets:
         try:
