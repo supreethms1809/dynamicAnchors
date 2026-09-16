@@ -531,30 +531,78 @@ def run_anchors_family(
     return written
 
 
+_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+
+
 def _apply_anchor_predicate(pred: str, feature_names: List[str], lo: np.ndarray, up: np.ndarray) -> None:
-    """Best-effort conversion of an Anchors predicate into interval bounds."""
+    """Convert one Anchors predicate into interval bounds on (lo, up).
+
+    `anchor-exp` discretizes continuous features, so a predicate is one of
+
+        feat <= v        feat > v         feat >= v        feat = v
+        a < feat <= b    a <= feat <= b                    (two-sided bin)
+
+    The two-sided form is the one that matters: it is ~13% of the predicates the
+    explainer emits on these datasets, and the value sits on the *left* of the
+    feature name. Matching only `feat <op> value` silently dropped every such
+    lower bound and left the box at the training minimum on that feature, so the
+    baseline's boxes were strictly wider than the anchors they encode.
+
+    Feature names are matched longest-first and must not be part of a longer
+    identifier, so `road_temp_set_1 <= 5` cannot also bind a feature named `temp`.
+    """
     import re
+
     s = str(pred)
-    for i, name in enumerate(feature_names):
-        if name not in s:
+    order = sorted(range(len(feature_names)), key=lambda i: -len(str(feature_names[i])))
+    bound_this_pred = False
+    for i in order:
+        name = str(feature_names[i])
+        if name not in s or bound_this_pred:
             continue
-        m = re.search(rf"{re.escape(name)}\s*<=\s*([-+eE0-9.]+)", s)
+        nm = rf"(?<![\w.]){re.escape(name)}(?![\w.])"
+
+        def _lower(v: float, strict: bool) -> None:
+            lo[i] = max(lo[i], np.nextafter(v, np.inf) if strict else v)
+
+        def _upper(v: float, strict: bool) -> None:
+            # Boxes are closed, so a strict `<` is represented by the value
+            # itself; shrinking below it would drop rows the anchor accepts.
+            up[i] = min(up[i], v)
+
+        matched = False
+        # value-on-the-left forms first: "a < feat <= b", "a <= feat < b"
+        m = re.search(rf"({_NUM})\s*(<=?)\s*{nm}", s)
         if m:
-            up[i] = min(up[i], float(m.group(1)))
-        m = re.search(rf"{re.escape(name)}\s*>=\s*([-+eE0-9.]+)", s)
+            _lower(float(m.group(1)), strict=(m.group(2) == "<"))
+            matched = True
+        m = re.search(rf"({_NUM})\s*(>=?)\s*{nm}", s)
         if m:
-            lo[i] = max(lo[i], float(m.group(1)))
-        m = re.search(rf"{re.escape(name)}\s*<\s*([-+eE0-9.]+)", s)
+            _upper(float(m.group(1)), strict=(m.group(2) == ">"))
+            matched = True
+        # name-on-the-left forms
+        m = re.search(rf"{nm}\s*<=\s*({_NUM})", s)
         if m:
-            up[i] = min(up[i], float(m.group(1)))
-        m = re.search(rf"{re.escape(name)}\s*>\s*([-+eE0-9.]+)", s)
+            _upper(float(m.group(1)), strict=False)
+            matched = True
+        elif (m := re.search(rf"{nm}\s*<\s*({_NUM})", s)):
+            _upper(float(m.group(1)), strict=True)
+            matched = True
+        m = re.search(rf"{nm}\s*>=\s*({_NUM})", s)
         if m:
-            lo[i] = max(lo[i], np.nextafter(float(m.group(1)), np.inf))
-        m = re.search(rf"{re.escape(name)}\s*=\s*([-+eE0-9.]+)", s)
-        if m and "<" not in s and ">" not in s:
-            v = float(m.group(1))
-            lo[i] = v
-            up[i] = v
+            _lower(float(m.group(1)), strict=False)
+            matched = True
+        elif (m := re.search(rf"{nm}\s*>\s*({_NUM})", s)):
+            _lower(float(m.group(1)), strict=True)
+            matched = True
+        if not matched:
+            m = re.search(rf"{nm}\s*=\s*({_NUM})", s)
+            if m and "<" not in s and ">" not in s:
+                v = float(m.group(1))
+                lo[i] = v
+                up[i] = v
+                matched = True
+        bound_this_pred = matched
 
 
 def _submodular_pick(rules: List[RankedRule], y: np.ndarray, cls: int, k: int) -> List[RankedRule]:
