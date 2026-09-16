@@ -585,6 +585,7 @@ def run_single_agent_rollout(
     # iris MADA: 21,330 reported, of which only ~1,080 was real per-agent
     # recompute; 20,250 was this artefact. Snapshot on entry, report the DELTA.
     _bbq_at_entry = int(getattr(env, "n_blackbox_queries", 0))
+    _ref_at_entry = int(getattr(env, "n_reference_table_queries", 0))
     obs, info = env.reset(seed=seed)
     
     # Start timing the rollout
@@ -661,6 +662,12 @@ def run_single_agent_rollout(
             if isinstance(value, (int, float, np.number)):
                 episode_data[f"metric_{key}"] = float(value)
     
+    # Split the delta: a rollout that only re-filled the shared prediction table
+    # over a fixed split did no per-instance black-box work, and must not be
+    # charged as if it had (see `n_reference_table_queries` in the env).
+    episode_data["n_reference_table_queries"] = max(
+        0, int(getattr(env, "n_reference_table_queries", 0)) - _ref_at_entry
+    )
     episode_data["n_blackbox_queries"] = max(
         0, int(getattr(env, "n_blackbox_queries", 0)) - _bbq_at_entry
     )
@@ -709,6 +716,7 @@ def _process_instances_for_class(
     rollout_times = []
     per_instance_results = []
     n_blackbox_queries = 0
+    n_reference_table_queries = 0
     
     n_samples = len(sampled_indices)
     
@@ -836,6 +844,9 @@ def _process_instances_for_class(
                 seed=rollout_seed
             )
             n_blackbox_queries += int(episode_data.get("n_blackbox_queries", 0))
+            n_reference_table_queries += int(
+                episode_data.get("n_reference_table_queries", 0)
+            )
         
             precision = episode_data.get("precision", 0.0)
             coverage = episode_data.get("coverage", 0.0)
@@ -1351,6 +1362,7 @@ def _process_instances_for_class(
         "instance_coverage_median": instance_coverage_median,
         "instance_coverage_iqr": instance_coverage_iqr,
         "n_blackbox_queries": int(n_blackbox_queries),
+        "n_reference_table_queries": int(n_reference_table_queries),
         "n_episodes_attempted": int(n_episodes_attempted),
     }
 
@@ -1558,6 +1570,10 @@ def extract_rules_single_agent(
             device=device,
         )
         dataset_loader.classifier = classifier
+        # Start metering on the marginal-call unit for the whole extraction, so
+        # production runs record it without a harness (no-op if one is active).
+        from utils.query_meter import start_meter_for as _start_meter
+        _own_meter = _start_meter(dataset_loader)
     else:
         # Provide helpful error message with all checked paths
         raise ValueError(
@@ -1819,6 +1835,7 @@ def extract_rules_single_agent(
         },
     }
     total_blackbox_queries = 0
+    total_reference_table_queries = 0
     
     # Prepare dataset for recomputation (respects eval_on_test_data and coverage_on_all_data)
     # This will be used when calling _process_instances_for_class, which will select the appropriate
@@ -2049,6 +2066,9 @@ def extract_rules_single_agent(
             )
             total_blackbox_queries += int(
                 process_results.get("n_blackbox_queries", 0)
+            )
+            total_reference_table_queries += int(
+                process_results.get("n_reference_table_queries", 0)
             )
             
             # Extract results for this predicted class
@@ -2414,6 +2434,9 @@ def extract_rules_single_agent(
                     )
                     total_blackbox_queries += int(
                         process_results.get("n_blackbox_queries", 0)
+                    )
+                    total_reference_table_queries += int(
+                        process_results.get("n_reference_table_queries", 0)
                     )
                     
                     # Extract results
@@ -2947,6 +2970,7 @@ def extract_rules_single_agent(
             )
             predictions_filter = logits_filter.argmax(dim=1).cpu().numpy()
         total_blackbox_queries += int(len(X_std_filter))
+        total_reference_table_queries += int(len(X_std_filter))
         
         logger.info(f"  Recomputing precision and coverage on {recompute_data_source} for {len(class_based_anchors_list)} class-based anchors")
         logger.info(f"    Total samples: {len(X_data_filter)} (eval_on_test_data={eval_on_test_data}, coverage_on_all_data={coverage_on_all_data})")
@@ -3296,6 +3320,13 @@ def extract_rules_single_agent(
         logger.warning(f"Could not read training_queries.json: {_e}")
     results["queries"] = {
         "n_blackbox_queries": int(total_blackbox_queries),
+        "n_reference_table_queries": int(total_reference_table_queries),
+        # Marginal-call unit: the only per-method cost that is comparable across
+        # methods. n_blackbox_queries above bills cached table re-reads and is a
+        # closed form in the split sizes; this is a measurement.
+        **({"marginal_cost": _mc.to_dict()}
+           if (_mc := __import__("utils.query_meter", fromlist=["x"]).active_meter())
+           else {}),
         "n_training_queries": int(_train_q),
         "n_training_queries_complete": bool(_train_q_complete),
         "n_serving_queries_per_explanation": 0,

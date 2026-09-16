@@ -264,6 +264,7 @@ class AnchorEnv(ParallelEnv):
         self._cached_probs = {"train": None, "val": None, "test": None}
         # C-12: black-box query counter (cache fills count as queries; lookups do not).
         self.n_blackbox_queries = 0
+        self.n_reference_table_queries = 0
         # C-07: freeze these feature indices to the instance/class-mode value.
         self.categorical_indices = list(env_config.get("categorical_indices") or [])
         self.categorical_value_names = {
@@ -2226,6 +2227,11 @@ class AnchorEnv(ParallelEnv):
             # Counted ONLY on a real miss: these are the distinct rows the black
             # box actually had to score.
             self.n_blackbox_queries += int(X.shape[0])
+            # Reusable table over a fixed split, tracked separately so that the
+            # cost is comparable with RLDA's sharded counterpart. MADA runs all
+            # K*M agents in one process, so it pays this once; RLDA pays it once
+            # per class shard for the same rows.
+            self.n_reference_table_queries += int(X.shape[0])
         return self._cached_probs[key]
 
     def _get_effective_precision_target(self, target_class: int) -> float:

@@ -205,9 +205,15 @@ class QueryCounter:
     def __init__(self):
         self.n_queries = 0
         self.n_reporting_queries = 0
+        self._meter = None
         self.n_cache_hits = 0
         self.wall_train_s = 0.0
         self.wall_infer_s = 0.0
+        # Wall-clock of the metered CONSTRUCTION region -- pool generation plus
+        # validation selection, table-build passes included, test-split
+        # reporting excluded. Defined identically for every method so the
+        # cost table's time column is comparable.
+        self.wall_construct_s = 0.0
 
     def add_queries(self, n: int, *, reporting: bool = False) -> None:
         if reporting:
@@ -218,18 +224,36 @@ class QueryCounter:
     def add_cache_hits(self, n: int) -> None:
         self.n_cache_hits += int(n)
 
+    def attach_meter(self, meter) -> None:
+        """Record a `utils.query_meter.QueryMeter` alongside the legacy counts.
+
+        The legacy `n_blackbox_queries` is not comparable across methods: it
+        charges the RL arms for repeated reads of a cached prediction table while
+        charging CART one pass for the same operation, and its RL values are exact
+        closed forms in the split sizes rather than measurements. The meter's
+        `marginal_rows` is the unit that is fair to all four methods.
+        """
+        self._meter = meter
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out = {
             "n_blackbox_queries": int(self.n_queries),
             "n_reporting_queries": int(self.n_reporting_queries),
             "query_policy": (
                 "n_blackbox_queries counts generation/selection calls; "
-                "held-out test reporting calls are separate"
+                "held-out test reporting calls are separate. LEGACY UNIT -- not "
+                "comparable across methods (it bills cached table re-reads); use "
+                "marginal_cost below where present."
             ),
             "n_cache_hits": int(self.n_cache_hits),
             "wall_train_seconds": float(self.wall_train_s),
             "wall_infer_seconds": float(self.wall_infer_s),
+            "wall_construct_seconds": float(self.wall_construct_s),
         }
+        meter = getattr(self, "_meter", None)
+        if meter is not None:
+            out["marginal_cost"] = meter.to_dict()
+        return out
 
 
 # ---------------------------------------------------------------------------

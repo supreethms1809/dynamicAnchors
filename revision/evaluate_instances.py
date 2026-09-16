@@ -267,6 +267,73 @@ def _load_rlda_models(experiment_dir: str, loader, env_config: Dict[str, Any], a
     return models, env_data
 
 
+def warm_reference_table(
+    kind: str,
+    *,
+    loader,
+    env_config: Dict[str, Any],
+    env_data: Dict[str, Any],
+    target_class: int,
+    device: str,
+) -> int:
+    """Pay the one-time black-box pass over the reference split, and count it.
+
+    Both arms read live precision/coverage off a table of f̂'s predictions on the
+    reference split. That table is built once per process and shared by every
+    explanation, so it is a *fixed* cost, not a per-instance serving cost. It was
+    previously charged to whichever episode happened to trigger the fill, which
+    made `queries_per_x` read as |D_ref| / n_scored for MADA (293.5 on folktables,
+    3.0 on the small sets) and 0.0 for RLDA only because `_load_rlda_models`
+    built an env — and warmed the cache — before the counter was reset.
+
+    Clear the cache, build one env, force the fill, and return the true cost.
+    Every rollout after this hits a warm cache, so the per-episode counters
+    report the genuine marginal cost of serving one more explanation.
+    """
+    cfg = dict(env_config)
+    cfg["mode"] = "inference"
+    if kind == "rlda":
+        import single_agentENV as _sa_env
+        from single_agentENV import SingleAgentAnchorEnv
+
+        _sa_env._PROBS_CACHE.clear()
+        env = SingleAgentAnchorEnv(
+            X_unit=env_data["X_unit"],
+            X_std=env_data["X_std"],
+            y=env_data["y"],
+            feature_names=list(loader.feature_names),
+            classifier=loader.classifier,
+            device=device,
+            target_class=int(target_class),
+            env_config=cfg,
+        )
+        env._get_cached_probs(split=env._active_split())
+    else:
+        import BenchMARL.environment as _ma_env
+        from BenchMARL.environment import AnchorEnv
+
+        _ma_env._PROBS_CACHE.clear()
+        cfg.update({
+            "normalize_data": False,
+            "X_min": env_data["X_min"],
+            "X_range": env_data["X_range"],
+        })
+        env = AnchorEnv(
+            X_unit=env_data["X_unit"],
+            X_std=env_data["X_std"],
+            y=env_data["y"],
+            feature_names=list(loader.feature_names),
+            classifier=loader.classifier,
+            device=device,
+            target_classes=[int(target_class)],
+            env_config=cfg,
+        )
+        env._get_cached_probs(env._active_split())
+    n = int(getattr(env, "n_blackbox_queries", 0))
+    logger.info("Reference prediction table (%s): %s one-time black-box queries", kind, n)
+    return n
+
+
 def _rollout_rlda(
     *,
     models,
@@ -705,6 +772,14 @@ def evaluate_instances(
         mada_pack = (policies, agents, index)
         models = None
 
+    # One-time reference table, measured before the loop so that the per-episode
+    # counters below report marginal serving cost only (see warm_reference_table).
+    reference_table_queries = warm_reference_table(
+        kind, loader=loader, env_config=env_config, env_data=env_data,
+        target_class=int(y_hat_test[int(indices[0])]) if len(indices) else 0,
+        device=device,
+    )
+
     rng = np.random.default_rng(int(seed) + 17)
     pi_rows: List[Dict[str, Any]] = []
     t_all = time.perf_counter()
@@ -818,18 +893,27 @@ def evaluate_instances(
         },
         "cost": {
             "queries_train": queries_train,
+            "reference_table_queries": int(reference_table_queries),
             "queries_per_x_pi": mean_q_pi,
             "queries_per_x_pi_perturb": mean_q_pi_perturb,
             "queries_per_x_anchors": mean_q_anc,
             "note": (
-                "queries_per_x_pi is serving cost (rollout CRN). "
-                "queries_per_x_pi_perturb is Track B measurement only and is not in break-even."
+                "queries_per_x_pi is the MARGINAL serving cost of one more "
+                "explanation, measured with the reference prediction table already "
+                "warm. reference_table_queries is the one-time |D_ref| pass that "
+                "table costs, shared by every explanation and already paid during "
+                "training; it is a fixed cost and is folded into break-even, not "
+                "into the per-instance column. queries_per_x_pi_perturb is Track B "
+                "measurement only and is in neither."
             ),
             "wall_s_per_x_pi": mean_t_pi,
             "wall_s_per_x_anchors": mean_t_anc,
             "break_even_n_queries": (
                 None if queries_train is None or mean_q_pi is None or mean_q_anc is None
-                else break_even_n(float(queries_train), float(mean_q_pi), float(mean_q_anc))
+                else break_even_n(
+                    float(queries_train) + float(reference_table_queries),
+                    float(mean_q_pi), float(mean_q_anc),
+                )
             ),
             "break_even_n_seconds": (
                 None if mean_t_pi is None or mean_t_anc is None

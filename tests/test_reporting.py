@@ -256,3 +256,17 @@ def test_c08_audit_detects_sparsity_coverage_change():
         feature_names=["a", "b"],
     )
     assert problems, "dropping a near-full-range axis should be flagged (C-08)"
+
+
+def test_query_counter_reports_construction_wall_clock():
+    """The cost table's time column needs a region that is defined identically
+    for every method: the metered construction region (pool generation plus
+    validation selection), test-split reporting excluded."""
+    from utils.eval_harness import QueryCounter
+
+    q = QueryCounter()
+    assert q.wall_construct_s == 0.0
+    q.wall_construct_s = 1.25
+    d = q.to_dict()
+    assert d["wall_construct_seconds"] == 1.25
+    assert "wall_infer_seconds" in d and "wall_train_seconds" in d

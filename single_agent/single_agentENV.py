@@ -287,6 +287,7 @@ class SingleAgentAnchorEnv(Env):
         # be looked up instead of re-running the classifier every step.
         self._cached_probs = {"train": None, "val": None, "test": None}
         self.n_blackbox_queries = 0
+        self.n_reference_table_queries = 0
         self.categorical_indices = list(env_config.get("categorical_indices") or [])
         self.categorical_value_names = {
             int(k): list(v)
@@ -628,6 +629,14 @@ class SingleAgentAnchorEnv(Env):
             # Counted ONLY on a real miss: these are the distinct rows the black
             # box actually had to score.
             self.n_blackbox_queries += int(X.shape[0])
+            # ...and tracked separately, because this pass is a REUSABLE table
+            # over a fixed split, not per-instance work. RLDA trains and extracts
+            # in one process per class shard, so each shard rebuilds the same
+            # table over the same rows; summing the shards charges |D| once per
+            # class for identical black-box work. Reporting this term separately
+            # lets the shard summation deduplicate it (see
+            # `dedupe_reference_table` in utils/eval_harness.py).
+            self.n_reference_table_queries += int(X.shape[0])
         return self._cached_probs[key]
 
     def _compute_effective_precision_target(self) -> float:

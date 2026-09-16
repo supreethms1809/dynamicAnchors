@@ -220,6 +220,22 @@ def _compactness_summary(per_class_out: Dict[str, Any]) -> Dict[str, Any]:
 # C-21 — depth-limited CART surrogate on model predictions
 # ---------------------------------------------------------------------------
 
+
+def _meter_for(loader) -> "QueryMeter":
+    """Meter every baseline on the marginal-call unit, alongside the legacy counts.
+
+    The legacy `n_blackbox_queries` bills cached table re-reads and is not
+    comparable across methods; `marginal_cost.marginal_rows` is.
+    """
+    from utils.query_meter import QueryMeter
+
+    refs = [
+        getattr(loader, n, None)
+        for n in ("X_train_scaled", "X_val_scaled", "X_test_scaled")
+    ]
+    return QueryMeter([r for r in refs if r is not None])
+
+
 def run_cart(
     dataset: str, seed: int, k: int, tau_p: float, tau_c: float, out_dir: str,
     classifier_path: str,
@@ -229,6 +245,9 @@ def run_cart(
 
     loader = _load(dataset, seed)
     _ensure_classifier(loader, classifier_path)
+    meter = _meter_for(loader)
+    meter.__enter__()
+    _t_construct = time.time()
     # Train on D_train predictions, rank leaves on D_val, report on D_test.
     y_hat_train = _predict(loader, loader.X_train_scaled)
     # Leaf count matched to k * n_classes (one path-rule per class, k of them)
@@ -298,6 +317,8 @@ def run_cart(
         min_support=min_support,
     )
 
+    queries.wall_construct_s = time.time() - _t_construct
+    queries.attach_meter(meter); meter.__exit__(None, None, None)
     return _emit(
         dataset=dataset, method="cart", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
         out_dir=out_dir, k=k, min_support=min_support,
@@ -381,6 +402,9 @@ def run_anchors_family(
 
     loader = _load(dataset, seed)
     _ensure_classifier(loader, classifier_path)
+    meter = _meter_for(loader)
+    meter.__enter__()
+    _t_construct = time.time()
     if getattr(loader, "X_val", None) is None:
         raise ValueError("SP-Anchors requires a val split (set val_size > 0)")
 
@@ -474,6 +498,9 @@ def run_anchors_family(
             break
     queries.wall_infer_s = time.time() - t0
 
+    queries.wall_construct_s = time.time() - _t_construct
+    queries.attach_meter(meter)
+    meter.__exit__(None, None, None)
     written = []
     if "sp_anchors" in methods:
         picked_val = {
@@ -652,6 +679,9 @@ def run_random_search(
     """
     loader = _load(dataset, seed)
     _ensure_classifier(loader, classifier_path)
+    meter = _meter_for(loader)
+    meter.__enter__()
+    _t_construct = time.time()
     if getattr(loader, "X_val_unit", None) is None:
         raise ValueError("random_search requires a val split")
 
@@ -706,6 +736,8 @@ def run_random_search(
         k=k,
         min_support=min_support,
     )
+    queries.wall_construct_s = time.time() - _t_construct
+    queries.attach_meter(meter); meter.__exit__(None, None, None)
     return _emit(
         dataset=dataset, method="random_search", seed=seed, tau_p=tau_p, tau_c=tau_c,
         out_dir=out_dir, k=k, min_support=min_support,

@@ -790,6 +790,7 @@ def run_rollout_with_policy(
     # iris MADA: 21,330 reported, of which only ~1,080 was real per-agent
     # recompute; 20,250 was this artefact. Snapshot on entry, report the DELTA.
     _bbq_at_entry = int(getattr(env, "n_blackbox_queries", 0))
+    _ref_at_entry = int(getattr(env, "n_reference_table_queries", 0))
     policy.to(device)
     policy.eval()
     
@@ -1266,6 +1267,9 @@ def run_rollout_with_policy(
             "stabilized": float(last_info_for_agent.get("stabilized", 0.0)),
         }
     
+    episode_data["n_reference_table_queries"] = max(
+        0, int(getattr(env, "n_reference_table_queries", 0)) - _ref_at_entry
+    )
     episode_data["n_blackbox_queries"] = max(
         0, int(getattr(env, "n_blackbox_queries", 0)) - _bbq_at_entry
     )
@@ -1434,6 +1438,10 @@ def extract_rules_from_policies(
             device=device,
         )
         dataset_loader.classifier = classifier
+        # Start metering on the marginal-call unit for the whole extraction, so
+        # production runs record it without a harness (no-op if one is active).
+        from utils.query_meter import start_meter_for as _start_meter
+        _own_meter = _start_meter(dataset_loader)
         logger.info("Classifier loaded successfully")
     else:
         raise ValueError(
@@ -2095,6 +2103,7 @@ def extract_rules_from_policies(
         },
     }
     total_blackbox_queries = 0
+    total_reference_table_queries = 0
     
     # Map agent names to target classes
     # Agent names can be:
@@ -2295,6 +2304,10 @@ def extract_rules_from_policies(
             _full_logits = classifier_for_recompute(_X_recompute_tensor)
             full_predictions_recompute = _full_logits.argmax(dim=1).cpu().numpy()
         total_blackbox_queries += int(len(X_data_std))
+        # Reusable table over a fixed split. Already hoisted OUT of the instance
+        # loop here -- the single-agent path was not, which is what made RLDA's
+        # extraction count ~5x MADA's for identical work.
+        total_reference_table_queries += int(len(X_data_std))
 
         for instance_idx_in_range, data_instance_idx in enumerate(sampled_indices):
             n_episodes_attempted += 1  # G-03: counted before anything can drop it
@@ -2416,6 +2429,9 @@ def extract_rules_from_policies(
             )
             total_blackbox_queries += int(
                 episode_data.get("n_blackbox_queries", 0)
+            )
+            total_reference_table_queries += int(
+                episode_data.get("n_reference_table_queries", 0)
             )
             
             # Debug logging for first episode of each class
@@ -3123,6 +3139,9 @@ def extract_rules_from_policies(
             total_blackbox_queries += int(
                 episode_data.get("n_blackbox_queries", 0)
             )
+            total_reference_table_queries += int(
+                episode_data.get("n_reference_table_queries", 0)
+            )
             
             # Extract metrics
             instance_precision = 0.0
@@ -3394,6 +3413,7 @@ def extract_rules_from_policies(
             )
             predictions_filter = logits_filter.argmax(dim=1).cpu().numpy()
         total_blackbox_queries += int(len(X_std_filter))
+        total_reference_table_queries += int(len(X_std_filter))
         
         # Lift-aware precision floor: judge class-level anchors by lift over the class
         # prior, capped by the absolute floor (see compute_class_precision_floor)
@@ -3764,6 +3784,13 @@ def extract_rules_from_policies(
         logger.warning(f"Could not read training_queries.json: {_e}")
     results["queries"] = {
         "n_blackbox_queries": int(total_blackbox_queries),
+        "n_reference_table_queries": int(total_reference_table_queries),
+        # Marginal-call unit: the only per-method cost that is comparable across
+        # methods. n_blackbox_queries above bills cached table re-reads and is a
+        # closed form in the split sizes; this is a measurement.
+        **({"marginal_cost": _mc.to_dict()}
+           if (_mc := __import__("utils.query_meter", fromlist=["x"]).active_meter())
+           else {}),
         "n_training_queries": int(_train_q),
         "n_training_queries_complete": bool(_train_q_complete),
         "n_serving_queries_per_explanation": 0,
