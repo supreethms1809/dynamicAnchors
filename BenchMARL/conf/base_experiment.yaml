@@ -111,10 +111,9 @@ render: True
 # Frequency of evaluation in terms of collected frames. MUST be a multiple of
 # the ACTUAL collected_frames_per_batch (4800) so total_frames lands on it
 # exactly and BenchMARL's `total_frames % evaluation_interval == 0` eval trigger
-# fires. 24_000 = 4800 * 5 -> evaluation every 5 iterations (48 evals over the
-# 1_152_000-frame run). Eval reward is spiky (periodic instability dips), so a
-# dense eval grid is what lets best_model checkpointing catch the good policies.
-evaluation_interval: 24_000
+# fires. 4_800 = one collection batch, so a 24_000-frame feel run gets 5 FidCov
+# evals. The 1_152_000-frame default then evaluates every iteration (240 evals).
+evaluation_interval: 4_800
 # Number of episodes that evaluation is run on
 # Production setting: Increased for more reliable evaluation metrics
 evaluation_episodes: 10

@@ -316,7 +316,7 @@ def main() -> None:
     p.add_argument(
         "--max_n_frames", type=int, default=None,
         help="Override per-dataset ma_frames. Must be a multiple of "
-             "evaluation_interval (24000) so FidCov eval fires.",
+             "evaluation_interval so FidCov eval fires.",
     )
     p.add_argument(
         "--k", type=int, default=None,
