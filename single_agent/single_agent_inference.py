@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from typing import Dict, Any, List, Optional, Tuple
 import argparse
+import hashlib
 import json
 import logging
 import time
@@ -717,6 +718,14 @@ def _process_instances_for_class(
     per_instance_results = []
     n_blackbox_queries = 0
     n_reference_table_queries = 0
+    # The recompute split does not change between instances, but the block that
+    # scores it lives inside the per-instance loop, so every instance re-ran the
+    # classifier over the whole split: on iris that was 20 instances x 3 class
+    # shards x 90 train rows = 5,400 of 5,730 reported "extraction" queries for
+    # 90 distinct rows. The `full_predictions` guard below only helps when a
+    # caller happens to pass a matching array. Memoise on the array itself so
+    # the split is scored once per process regardless.
+    _recompute_pred_cache: dict = {}
     
     n_samples = len(sampled_indices)
     
@@ -1038,13 +1047,27 @@ def _process_instances_for_class(
                 logger.debug(f"  Reusing passed-in full_predictions for recompute dataset ({len(full_predictions)} samples)")
         
         if not use_passed_predictions:
-            # Compute predictions for recompute dataset
-            classifier.eval()
-            with torch.no_grad():
-                X_recompute_tensor = torch.from_numpy(X_recompute_std.astype(np.float32)).to(device)
-                full_logits_recompute = classifier(X_recompute_tensor)
-                full_predictions_recompute = full_logits_recompute.argmax(dim=1).cpu().numpy()
-            n_blackbox_queries += int(len(X_recompute_std))
+            _ck = (
+                id(classifier),
+                X_recompute_std.shape,
+                hashlib.sha1(
+                    np.ascontiguousarray(X_recompute_std, dtype=np.float32)
+                ).hexdigest(),
+            )
+            _hit = _recompute_pred_cache.get(_ck)
+            if _hit is not None:
+                full_predictions_recompute = _hit
+            else:
+                # Compute predictions for recompute dataset
+                classifier.eval()
+                with torch.no_grad():
+                    X_recompute_tensor = torch.from_numpy(X_recompute_std.astype(np.float32)).to(device)
+                    full_logits_recompute = classifier(X_recompute_tensor)
+                    full_predictions_recompute = full_logits_recompute.argmax(dim=1).cpu().numpy()
+                _recompute_pred_cache[_ck] = full_predictions_recompute
+                # Charged once per distinct split, not once per instance.
+                n_blackbox_queries += int(len(X_recompute_std))
+                n_reference_table_queries += int(len(X_recompute_std))
         
         for rollout_data in instance_rollouts:
             if rollout_data.get("lower_bounds_normalized") is not None and rollout_data.get("upper_bounds_normalized") is not None:
