@@ -378,6 +378,9 @@ def main() -> None:
     if args.tau_c is not None:
         TAU_C = float(args.tau_c)
     ANCHOR_CONFIG = args.anchor_config
+    if ANCHOR_CONFIG:
+        # inference.py constructs its own AnchorTrainer; export so it reads the same YAML.
+        ENV["ANCHOR_CONFIG"] = str(Path(ANCHOR_CONFIG).resolve())
     METHOD = str(args.method)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

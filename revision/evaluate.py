@@ -387,6 +387,7 @@ def evaluate_rules_file(
             "selection_split": "val",
             "report_split": "test",
             "bounds_space": "unit",
+            "coverage_basis": __import__("utils.metrics", fromlist=["x"]).get_coverage_basis(),
             "k": k,
             "ranking_formula": ranking_formula,
             "sparsity_width_ratio": sparsity,
@@ -427,7 +428,14 @@ def main():
         help="Reported metrics are always test-only; selection always uses validation.",
     )
     p.add_argument("--out_dir", default="revision/results")
+    p.add_argument(
+        "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "true_label"),
+        choices=["true_label", "predicted"],
+        help="Class-conditional coverage denominator: P(x in B | y=c) or P(x in B | f_hat=c).",
+    )
     args = p.parse_args()
+    from utils.metrics import set_coverage_basis
+    set_coverage_basis(args.coverage_basis)
     with open(args.rules_file) as f:
         stored = json.load(f)
     metadata = stored.get("metadata", {})

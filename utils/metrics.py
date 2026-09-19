@@ -22,6 +22,57 @@ RANKING_SCORE_FIDELITY = "fidelity"
 # well-supported rule. fid=1.0 on n=1 has a lower bound of ~0.21; fid=0.92 on n=25 is
 # ~0.75. The point-estimate formulas above are kept for ablation / backwards checks.
 RANKING_SCORE_LCB_COVERAGE = "lcb_coverage"  # score = wilson_low(fid) * (1 + cov)
+# Precision-gated LCB. lcb_coverage has no floor on fidelity, so a one-predicate
+# box at Fid 0.55 / Cov 0.97 (score 0.95) outranked a supported Fid 0.89 / Cov 0.24
+# box (0.89) whenever the precise boxes were narrow. Rules whose point Fid clears
+# the same B2 gate the reward uses (tau_P - gate_margin) form a tier that always
+# ranks above the rest; inside each tier the usual lcb_coverage order applies.
+RANKING_SCORE_LCB_GATED = "lcb_gated"
+
+# Class-conditional coverage denominator.
+#   "true_label": P(x in B | y = c)       -- original convention
+#   "predicted" : P(x in B | f_hat(x) = c) -- the model being explained
+# For a fidelity-based explanation y never enters the question: a rule that
+# covers rows the model labels c explains the model even where it is wrong, and
+# under "true_label" those rows did not count toward coverage. Selection,
+# union and reporting all read this, so one switch changes the whole pipeline.
+COVERAGE_TRUE_LABEL, COVERAGE_PREDICTED = "true_label", "predicted"
+_COVERAGE_BASIS = COVERAGE_TRUE_LABEL
+_COVERAGE_BASIS_ALIASES = {
+    "true_label": COVERAGE_TRUE_LABEL,
+    "labels": COVERAGE_TRUE_LABEL,
+    "true": COVERAGE_TRUE_LABEL,
+    "y": COVERAGE_TRUE_LABEL,
+    "predicted": COVERAGE_PREDICTED,
+    "fhat": COVERAGE_PREDICTED,
+    "yhat": COVERAGE_PREDICTED,
+}
+
+
+def parse_coverage_basis(raw: Any, default: str = COVERAGE_PREDICTED) -> str:
+    """Normalize a YAML/CLI coverage_basis string. Training default is predicted."""
+    if raw is None or str(raw).strip() == "":
+        raw = default
+    key = str(raw).strip().lower()
+    if key not in _COVERAGE_BASIS_ALIASES:
+        raise ValueError(
+            f"coverage_basis must be {COVERAGE_TRUE_LABEL!r} or {COVERAGE_PREDICTED!r}, got {raw!r}"
+        )
+    return _COVERAGE_BASIS_ALIASES[key]
+
+
+def set_coverage_basis(basis: str) -> None:
+    global _COVERAGE_BASIS
+    if basis not in (COVERAGE_TRUE_LABEL, COVERAGE_PREDICTED):
+        raise ValueError(f"coverage basis must be {COVERAGE_TRUE_LABEL!r} or {COVERAGE_PREDICTED!r}, got {basis!r}")
+    _COVERAGE_BASIS = basis
+
+
+def get_coverage_basis() -> str:
+    return _COVERAGE_BASIS
+GATED_TAU_P_DEFAULT = 0.90     # conf precision_target
+GATED_MARGIN_DEFAULT = 0.10    # conf gate_margin
+_GATED_TIER_OFFSET = 2.0       # lcb * (1 + cov) <= 2, so qualified rules always win
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +237,9 @@ def evaluate_mask(
     mask = np.asarray(mask, dtype=bool)
     n_eval = int(mask.shape[0])
     n_covered = int(mask.sum())
-    class_mask = (y == target_class)
+    # Coverage denominator: true class or the model's predicted class (see
+    # set_coverage_basis). Purity stays on y by definition.
+    class_mask = (y_hat == target_class) if _COVERAGE_BASIS == COVERAGE_PREDICTED else (y == target_class)
     n_class = int(class_mask.sum())
     n_covered_class = int((mask & class_mask).sum())
 
@@ -235,6 +288,8 @@ def ranking_score(
     formula: str = RANKING_SCORE_LCB_COVERAGE,
     n_covered: Optional[int] = None,
     min_support: Optional[int] = None,
+    tau_p: float = GATED_TAU_P_DEFAULT,
+    gate_margin: float = GATED_MARGIN_DEFAULT,
 ) -> float:
     """Configurable rule-ranking score.
 
@@ -258,15 +313,19 @@ def ranking_score(
         return float("-inf")
     fid = float(fidelity)
     cov = 0.0 if coverage is None or (isinstance(coverage, float) and np.isnan(coverage)) else float(coverage)
-    if formula == RANKING_SCORE_LCB_COVERAGE:
+    if formula in (RANKING_SCORE_LCB_COVERAGE, RANKING_SCORE_LCB_GATED):
         if n_covered is None:
-            return fid * (1.0 + cov)
-        n = int(n_covered)
-        floor = 1 if min_support is None else int(min_support)
-        if n < floor:
-            return float("-inf")
-        lo, _ = wilson_interval(int(round(fid * n)), n)
-        return float(lo) * (1.0 + cov)
+            base = fid * (1.0 + cov)
+        else:
+            n = int(n_covered)
+            floor = 1 if min_support is None else int(min_support)
+            if n < floor:
+                return float("-inf")
+            lo, _ = wilson_interval(int(round(fid * n)), n)
+            base = float(lo) * (1.0 + cov)
+        if formula == RANKING_SCORE_LCB_GATED and fid >= float(tau_p) - float(gate_margin) - 1e-12:
+            return _GATED_TIER_OFFSET + base
+        return base
     if formula == RANKING_SCORE_PRECISION_COVERAGE:
         return fid * (1.0 + cov)
     if formula == RANKING_SCORE_F1:

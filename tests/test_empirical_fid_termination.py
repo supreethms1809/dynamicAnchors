@@ -47,7 +47,6 @@ def _env(X, y, **extra):
     cfg = {
         "max_cycles": 20,
         "precision_estimator": "empirical",
-        "use_perturbation": False,
         "n_perturb": 64,
         "n_perturb_train": 64,
         "leave_threshold": 0.5,
@@ -80,10 +79,12 @@ def test_shipped_yaml_uses_empirical_fid_and_min_support_gate():
     sae = yaml.safe_load(open(REPO / "single_agent" / "conf" / "anchor_single.yaml"))["env_config"]
     assert sae["precision_estimator"] == "empirical"
     assert mae["precision_estimator"] == "empirical"
-    assert sae["use_perturbation"] is False
+    assert "use_perturbation" not in sae and "use_perturbation" not in mae
     assert mae["require_min_support_to_terminate"] is True
     assert sae["require_min_support_to_terminate"] is True
     assert sae["min_support"] == 10
+    assert mae["coverage_basis"] == "predicted"
+    assert sae["coverage_basis"] == "predicted"
 
 
 def test_empirical_p_is_real_row_fid_not_crn_count():

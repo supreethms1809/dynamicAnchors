@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import dataclasses
 import os
 import sys
 import time
@@ -32,7 +33,10 @@ from utils.eval_harness import (  # noqa: E402
 )
 from utils.metrics import (  # noqa: E402
     MIN_SUPPORT_DEFAULT,
+    active_feature_mask,
+    get_coverage_basis,
     RANKING_SCORE_LCB_COVERAGE,
+    RANKING_SCORE_LCB_GATED,
     RankedRule,
     box_mask,
     evaluate_mask,
@@ -62,6 +66,51 @@ def _ensure_classifier(loader, classifier_path: str, device: str = "cpu"):
     # load_classifier returns the model but does not assign loader.classifier.
     loader.classifier = loader.load_classifier(filepath=classifier_path, device=device)
     return loader.classifier
+
+
+FID_EMPIRICAL, FID_PERTURBED = "empirical", "perturbed"
+
+
+def _perturbed_fid_scorer(loader, space: str, n_samples: int, sparsity_width_ratio: float = 0.95):
+    """Score a candidate box by Fid under Anchors' D(z|B) instead of real rows.
+
+    CART and random search rank candidates by agreement with f_hat on the real
+    D_val rows inside the box; the Anchors family already searches on perturbed
+    precision (`explain_instance(threshold=tau_P)`). Without this, comparing all
+    of them on perturbed Fid measures two different objectives. Coverage stays on
+    real rows either way -- perturbed samples have no coverage semantics.
+
+    Returns None when the estimator is empirical, else fn(lower, upper, cls, rng).
+    """
+    from revision.dual_estimator_rescore import sample_anchors_conditional
+
+    pool = np.asarray(
+        loader.X_train_unit if space == "unit" else loader.X_train, dtype=np.float32
+    )
+    if space == "unit":
+        X_min = np.asarray(loader.X_min, dtype=np.float64)
+        X_range = np.asarray(loader.X_range, dtype=np.float64)
+        to_std = lambda Z: np.asarray(Z, dtype=np.float64) * X_range + X_min  # noqa: E731
+        f_min = f_max = None
+    else:
+        mean = np.asarray(loader.scaler.mean_, dtype=np.float64)
+        scale = np.asarray(loader.scaler.scale_, dtype=np.float64)
+        to_std = lambda Z: (np.asarray(Z, dtype=np.float64) - mean) / scale  # noqa: E731
+        f_min = np.min(pool, axis=0).astype(np.float64)
+        f_max = np.max(pool, axis=0).astype(np.float64)
+
+    def score(lower, upper, cls: int, rng) -> float:
+        lower = np.asarray(lower, dtype=np.float32).reshape(-1)
+        upper = np.asarray(upper, dtype=np.float32).reshape(-1)
+        active = active_feature_mask(
+            lower, upper, sparsity_width_ratio=sparsity_width_ratio,
+            feature_min=f_min, feature_max=f_max,
+        )
+        z, _ = sample_anchors_conditional(pool, lower, upper, active, n_samples, rng)
+        preds = _predict(loader, to_std(z).astype(np.float32))
+        return float((preds == int(cls)).mean())
+
+    return score
 
 
 def _select_on_val_report_on_test(
@@ -122,6 +171,7 @@ def _emit(
     dataset, method, seed, tau_p, tau_c, out_dir, k, min_support,
     loader, y_eval, y_hat_eval, per_class_ranked: Dict[int, List[RankedRule]],
     queries: QueryCounter, extra: Dict[str, Any], box_space: str = "unit",
+    ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
 ) -> str:
     # Compactness compares a box side against the feature's full range. The RL
     # arms build boxes in unit space, where that range is [0, 1] and the default
@@ -190,12 +240,12 @@ def _emit(
         queries=queries.to_dict(),
         n_covered_note=(
             f"Baseline {method}; selection on D_val and reporting on D_test; "
-            f"union over top-k={k} ranked by {RANKING_SCORE_LCB_COVERAGE}; "
+            f"union over top-k={k} ranked by {ranking_formula}; "
             f"min_support={min_support}."
         ),
-        extra=extra,
+        extra={**extra, "coverage_basis": get_coverage_basis()},
         compactness=_compactness_summary(per_class_out),
-        ranking_formula=RANKING_SCORE_LCB_COVERAGE,
+        ranking_formula=ranking_formula,
         min_support=min_support,
     )
 
@@ -240,6 +290,9 @@ def run_cart(
     dataset: str, seed: int, k: int, tau_p: float, tau_c: float, out_dir: str,
     classifier_path: str,
     min_support: int = MIN_SUPPORT_DEFAULT,
+    ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
+    fid_estimator: str = FID_EMPIRICAL,
+    perturb_samples: int = 512,
 ) -> str:
     from sklearn.tree import DecisionTreeClassifier, _tree
 
@@ -255,10 +308,29 @@ def run_cart(
     max_leaf = max(n_classes, k * n_classes)
     tree = DecisionTreeClassifier(max_leaf_nodes=max_leaf, random_state=seed)
     t0 = time.time()
-    tree.fit(loader.X_train, y_hat_train)  # original units, like printed rules
     queries = QueryCounter()
-    queries.wall_train_s = time.time() - t0
+    X_fit, y_fit = loader.X_train, y_hat_train
     queries.add_queries(len(loader.X_train))  # one f_hat call per train row
+    if fid_estimator == FID_PERTURBED:
+        # At k=1 the tree has one leaf per class, so ranking leaves on perturbed
+        # Fid changes nothing -- there is nothing to choose between. The fit is
+        # what has to move: augment D_train with coordinate-independent draws
+        # from the per-feature train marginals, labelled by f_hat. That is the
+        # same recombination D(z|B) samples from, so the surrogate is fit to
+        # agree off the data manifold as well as on it.
+        arng = np.random.default_rng(seed)
+        Xtr = np.asarray(loader.X_train, dtype=np.float64)
+        Z = np.column_stack([
+            Xtr[arng.integers(0, Xtr.shape[0], size=Xtr.shape[0]), j]
+            for j in range(Xtr.shape[1])
+        ])
+        y_hat_aug = _predict(loader, loader.scaler.transform(Z))
+        queries.add_queries(len(Z))
+        X_fit = np.vstack([Xtr, Z])
+        y_fit = np.concatenate([y_hat_train, y_hat_aug])
+        logger.info("CART perturbed fit: %s real + %s recombined rows", len(Xtr), len(Z))
+    tree.fit(X_fit, y_fit)  # original units, like printed rules
+    queries.wall_train_s = time.time() - t0
 
     X_val, X_val_std, _, y_val = _split_arrays(loader, "val")
     X_test, X_test_std, _, y_test = _split_arrays(loader, "test")
@@ -270,6 +342,9 @@ def run_cart(
     feature_names = list(loader.feature_names)
     t = tree.tree_
     per_class_ranked: Dict[int, List[RankedRule]] = {c: [] for c in range(n_classes)}
+    pfid = (_perturbed_fid_scorer(loader, "original", perturb_samples)
+            if fid_estimator == FID_PERTURBED else None)
+    prng = np.random.default_rng(seed)
 
     def recurse(node, lower, upper, path):
         if t.feature[node] == _tree.TREE_UNDEFINED:
@@ -283,12 +358,13 @@ def run_cart(
                 class_conditional=True, min_support=min_support,
             )
             display = " and ".join(path) if path else "any values"
+            sel_fid = metrics.fidelity if pfid is None else pfid(lo, up, pred_cls, prng)
             per_class_ranked[pred_cls].append(RankedRule(
                 rule_id=f"cart:{pred_cls}:{node}",
                 lower=lo, upper=up, mask=mask, metrics=metrics,
                 score=ranking_score(
-                    metrics.fidelity, metrics.coverage,
-                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    sel_fid, metrics.coverage,
+                    formula=ranking_formula,
                     n_covered=metrics.n_covered,
                 ),
                 display_rule=display,
@@ -320,13 +396,16 @@ def run_cart(
     queries.wall_construct_s = time.time() - _t_construct
     queries.attach_meter(meter); meter.__exit__(None, None, None)
     return _emit(
-        dataset=dataset, method="cart", seed=seed, tau_p=tau_p, tau_c=tau_c, box_space="original",
+        dataset=dataset, method="cart", seed=seed, tau_p=tau_p, tau_c=tau_c, ranking_formula=ranking_formula, box_space="original",
         out_dir=out_dir, k=k, min_support=min_support,
         loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
         per_class_ranked=per_class_reported, queries=queries,
         extra={
             "max_leaf_nodes": max_leaf,
             "k": k,
+            "fid_estimator": fid_estimator,
+            "perturb_samples": int(perturb_samples) if fid_estimator == FID_PERTURBED else 0,
+            "cart_fit_rows": int(len(X_fit)),
             "classifier_path": os.path.abspath(classifier_path),
             "selection_split": "val",
             "report_split": "test",
@@ -390,6 +469,7 @@ def run_anchors_family(
     min_support: int = MIN_SUPPORT_DEFAULT,
     methods: Sequence[str] = ("sp_anchors", "greedy_anchors"),
     k_values: Optional[Sequence[int]] = None,
+    ranking_formulas: Sequence[str] = (RANKING_SCORE_LCB_COVERAGE,),
 ) -> List[str]:
     """Generate per-instance Anchors on D_val, pick a subset, evaluate on D_test.
 
@@ -489,7 +569,7 @@ def run_anchors_family(
                 lower=lo, upper=up, mask=mask_val, metrics=metrics,
                 score=ranking_score(
                     metrics.fidelity, metrics.coverage,
-                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    formula=ranking_formulas[0],
                     n_covered=metrics.n_covered,
                 ),
                 display_rule=display,
@@ -503,62 +583,73 @@ def run_anchors_family(
     queries.attach_meter(meter)
     meter.__exit__(None, None, None)
     written = []
-    # One pool, many k. `anchor-exp`'s internal sampling is not seeded by our
-    # seed, so regenerating the pool per k would confound the union-size sweep
-    # with explainer noise (measured at +-0.014 Eff run-to-run). Reduce the same
-    # `per_class_boxes` at every k instead; the k subdirectory is the only thing
-    # that changes downstream.
-    for k_i in (k_values if k_values else [k]):
-        k_out = out_dir if len(k_values or [k]) == 1 else os.path.join(out_dir, f"k{k_i}")
-        common_extra = {
-            "budget_per_class": budget_per_class,
-            "query_budget": query_budget,
-            "budget_exhausted": budget_exhausted,
-            "k": k_i,
-            "pool_per_class": {
-                str(c): len(v) for c, v in per_class_boxes.items()
-            },
-            "pool_shared_across_k": bool(k_values and len(k_values) > 1),
-            "classifier_path": os.path.abspath(classifier_path),
-            "selection_split": "val",
-            "report_split": "test",
+    base_boxes = per_class_boxes
+    for formula in ranking_formulas:
+        # Same pool for every formula: only the candidate score changes.
+        per_class_boxes = {
+            cls: [dataclasses.replace(r, score=ranking_score(
+                r.metrics.fidelity, r.metrics.coverage, formula=formula,
+                n_covered=r.metrics.n_covered, tau_p=tau_p,
+            )) for r in rules]
+            for cls, rules in base_boxes.items()
         }
-        if "sp_anchors" in methods:
-            picked_val = {
-                cls: _submodular_pick(rules, y_val, cls, k_i)
-                for cls, rules in per_class_boxes.items()
+        f_out = out_dir if len(ranking_formulas) == 1 else os.path.join(out_dir, formula)
+        # One pool, many k. `anchor-exp`'s internal sampling is not seeded by our
+        # seed, so regenerating the pool per k would confound the union-size sweep
+        # with explainer noise (measured at +-0.014 Eff run-to-run). Reduce the same
+        # `per_class_boxes` at every k instead; the k subdirectory is the only thing
+        # that changes downstream.
+        for k_i in (k_values if k_values else [k]):
+            k_out = f_out if len(k_values or [k]) == 1 else os.path.join(f_out, f"k{k_i}")
+            common_extra = {
+                "budget_per_class": budget_per_class,
+                "query_budget": query_budget,
+                "budget_exhausted": budget_exhausted,
+                "k": k_i,
+                "pool_per_class": {
+                    str(c): len(v) for c, v in per_class_boxes.items()
+                },
+                "pool_shared_across_k": bool(k_values and len(k_values) > 1),
+                "classifier_path": os.path.abspath(classifier_path),
+                "selection_split": "val",
+                "report_split": "test",
             }
-            picked = _select_on_val_report_on_test(
-                picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
-                y_test=y_test, y_hat_test=y_hat_test, k=k_i,
-                min_support=min_support,
-            )
-            written.append(_emit(
-                dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p,
-                tau_c=tau_c, box_space="original",
-                out_dir=k_out, k=k_i, min_support=min_support,
-                loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
-                per_class_ranked=picked, queries=queries,
-                extra={**common_extra, "picker": "submodular"},
-            ))
-        if "greedy_anchors" in methods:
-            picked_val = {
-                cls: greedy_set_cover(rules, y_val, cls, k_i, tau_p)
-                for cls, rules in per_class_boxes.items()
-            }
-            picked = _select_on_val_report_on_test(
-                picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
-                y_test=y_test, y_hat_test=y_hat_test, k=k_i,
-                min_support=min_support,
-            )
-            written.append(_emit(
-                dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p,
-                tau_c=tau_c, box_space="original",
-                out_dir=k_out, k=k_i, min_support=min_support,
-                loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
-                per_class_ranked=picked, queries=queries,
-                extra={**common_extra, "picker": "greedy_set_cover"},
-            ))
+            if "sp_anchors" in methods:
+                picked_val = {
+                    cls: _submodular_pick(rules, y_val, cls, k_i)
+                    for cls, rules in per_class_boxes.items()
+                }
+                picked = _select_on_val_report_on_test(
+                    picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
+                    y_test=y_test, y_hat_test=y_hat_test, k=k_i,
+                    min_support=min_support,
+                )
+                written.append(_emit(
+                    dataset=dataset, method="sp_anchors", seed=seed, tau_p=tau_p,
+                    tau_c=tau_c, box_space="original",
+                    out_dir=k_out, k=k_i, min_support=min_support,
+                    loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
+                    per_class_ranked=picked, queries=queries, ranking_formula=formula,
+                    extra={**common_extra, "picker": "submodular"},
+                ))
+            if "greedy_anchors" in methods:
+                picked_val = {
+                    cls: greedy_set_cover(rules, y_val, cls, k_i, tau_p)
+                    for cls, rules in per_class_boxes.items()
+                }
+                picked = _select_on_val_report_on_test(
+                    picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
+                    y_test=y_test, y_hat_test=y_hat_test, k=k_i,
+                    min_support=min_support,
+                )
+                written.append(_emit(
+                    dataset=dataset, method="greedy_anchors", seed=seed, tau_p=tau_p,
+                    tau_c=tau_c, box_space="original",
+                    out_dir=k_out, k=k_i, min_support=min_support,
+                    loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
+                    per_class_ranked=picked, queries=queries, ranking_formula=formula,
+                    extra={**common_extra, "picker": "greedy_set_cover"},
+                ))
     return written
 
 
@@ -674,6 +765,9 @@ def run_random_search(
     classifier_path: str,
     n_candidates: int = 512,
     min_support: int = MIN_SUPPORT_DEFAULT,
+    ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
+    fid_estimator: str = FID_EMPIRICAL,
+    perturb_samples: int = 512,
 ) -> str:
     """Random axis-aligned boxes, scored on D_val, reported on D_test.
 
@@ -698,6 +792,8 @@ def run_random_search(
     queries.add_queries(len(X_test_unit), reporting=True)
 
     rng = np.random.default_rng(seed)
+    pfid = (_perturbed_fid_scorer(loader, "unit", perturb_samples)
+            if fid_estimator == FID_PERTURBED else None)
     d = X_val_unit.shape[1]
     per_class_ranked: Dict[int, List[RankedRule]] = {c: [] for c in range(loader.n_classes)}
     t0 = time.time()
@@ -719,12 +815,13 @@ def run_random_search(
                 class_conditional=True, min_support=min_support,
             )
             # Candidate metrics and scores are validation-only.
+            sel_fid = m_val.fidelity if pfid is None else pfid(lo, up, cls, rng)
             per_class_ranked[cls].append(RankedRule(
                 rule_id=f"rs:{cls}:{i}",
                 lower=lo, upper=up, mask=mask_val, metrics=m_val,
                 score=ranking_score(
-                    m_val.fidelity, m_val.coverage,
-                    formula=RANKING_SCORE_LCB_COVERAGE,
+                    sel_fid, m_val.coverage,
+                    formula=ranking_formula,
                     n_covered=m_val.n_covered,
                 ),
                 display_rule=f"random box {i}",
@@ -743,13 +840,15 @@ def run_random_search(
     queries.wall_construct_s = time.time() - _t_construct
     queries.attach_meter(meter); meter.__exit__(None, None, None)
     return _emit(
-        dataset=dataset, method="random_search", seed=seed, tau_p=tau_p, tau_c=tau_c,
+        dataset=dataset, method="random_search", seed=seed, tau_p=tau_p, tau_c=tau_c, ranking_formula=ranking_formula,
         out_dir=out_dir, k=k, min_support=min_support,
         loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
         per_class_ranked=per_class_reported, queries=queries,
         extra={
             "n_candidates": n_candidates,
             "k": k,
+            "fid_estimator": fid_estimator,
+            "perturb_samples": int(perturb_samples) if fid_estimator == FID_PERTURBED else 0,
             "classifier_path": os.path.abspath(classifier_path),
             "selection_split": "val",
             "report_split": "test",
@@ -784,24 +883,51 @@ def main():
     )
     p.add_argument("--n_candidates", type=int, default=512)
     p.add_argument(
+        "--fid_estimator", default=FID_EMPIRICAL, choices=[FID_EMPIRICAL, FID_PERTURBED],
+        help="Candidate ranking Fid for CART / random_search: real D_val rows in the box "
+             "(empirical) or Anchors' D(z|B) (perturbed). The Anchors family always "
+             "searches on perturbed precision; coverage is always on real rows.",
+    )
+    p.add_argument("--perturb_samples", type=int, default=512)
+    p.add_argument(
+        "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "true_label"),
+        choices=["true_label", "predicted"],
+        help="Class-conditional coverage denominator: P(x in B | y=c) or P(x in B | f_hat=c).",
+    )
+    p.add_argument(
+        "--ranking_formulas", nargs="+",
+        default=[RANKING_SCORE_LCB_COVERAGE],
+        choices=[RANKING_SCORE_LCB_COVERAGE, RANKING_SCORE_LCB_GATED],
+        help="Candidate ranking on D_val. Several => one <formula>/ subdir each; the "
+             "Anchors pool is generated once and re-scored per formula.",
+    )
+    p.add_argument(
         "--k_values", type=int, nargs="+", default=None,
         help="Reduce ONE anchor pool at several union sizes; writes k<K>/ "
              "subdirectories under --out_dir. Keeps the explainer's unseeded "
              "sampling constant across k.",
     )
     args = p.parse_args()
+    from utils.metrics import set_coverage_basis
+    set_coverage_basis(args.coverage_basis)
 
     written = []
-    if "cart" in args.methods:
-        written.append(run_cart(
-            args.dataset, args.seed, args.k, args.tau_p, args.tau_c,
-            args.out_dir, args.classifier_path,
-        ))
-    if "random_search" in args.methods:
-        written.append(run_random_search(
-            args.dataset, args.seed, args.k, args.tau_p, args.tau_c, args.out_dir,
-            args.classifier_path, n_candidates=args.n_candidates,
-        ))
+    multi = len(args.ranking_formulas) > 1
+    for formula in args.ranking_formulas:
+        f_out = os.path.join(args.out_dir, formula) if multi else args.out_dir
+        if "cart" in args.methods:
+            written.append(run_cart(
+                args.dataset, args.seed, args.k, args.tau_p, args.tau_c,
+                f_out, args.classifier_path, ranking_formula=formula,
+                fid_estimator=args.fid_estimator, perturb_samples=args.perturb_samples,
+            ))
+        if "random_search" in args.methods:
+            written.append(run_random_search(
+                args.dataset, args.seed, args.k, args.tau_p, args.tau_c, f_out,
+                args.classifier_path, n_candidates=args.n_candidates,
+                ranking_formula=formula,
+                fid_estimator=args.fid_estimator, perturb_samples=args.perturb_samples,
+            ))
     anchor_methods = [m for m in args.methods if m in ("sp_anchors", "greedy_anchors")]
     if anchor_methods:
         written.extend(run_anchors_family(
@@ -811,6 +937,7 @@ def main():
             query_budget=args.query_budget,
             methods=anchor_methods,
             k_values=args.k_values,
+            ranking_formulas=args.ranking_formulas,
         ))
     for w in written:
         logger.info("Wrote %s", w)

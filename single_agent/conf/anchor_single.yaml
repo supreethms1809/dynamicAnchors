@@ -5,9 +5,14 @@ env_config:
   coverage_target: 0.1
 
   # Quantile-position MDP: empty-rule start, leave-corner actions.
-  # Training / FidCov use Track A empirical Fid P(ŷ=c | x in box).
-  # Conditional CRN P(ŷ(z)=c) is Track B / instance evaluation only.
+  # precision_estimator: empirical   -> Fid = P(ŷ(x)=c | x in B) on real rows (cached preds)
+  #                      conditional -> Fid = P(ŷ(z)=c), z ~ Anchors-style D(z|B) (CRN-frozen
+  #                                     draws, n_perturb_train/eval live classifier calls per step)
+  # coverage_basis: predicted  -> C = P(x in B | f̂(x)=c)  (same object of explanation as Fid)
+  #                 true_label -> C = P(x in B | y=c)      (legacy Eq 7)
+  # Coverage is always measured on real rows; only the class denominator switches.
   precision_estimator: empirical
+  coverage_basis: predicted
   n_perturb_train: 512
   n_perturb_eval: 256
   require_min_support_to_terminate: true
@@ -25,10 +30,6 @@ env_config:
   require_precision_gain_to_terminate: true
 
   union_lift_k: 3.0
-
-  use_perturbation: False
-  perturbation_mode: "bootstrap"
-  n_perturb: 2048
 
   min_width: 0.05
   initial_window: 0.1

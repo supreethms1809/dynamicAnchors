@@ -51,7 +51,6 @@ def _sa_cfg(n_features, **extra):
         "coverage_target": 0.2,
         "require_coverage_gain_to_terminate": True,
         "precision_estimator": "empirical",
-        "use_perturbation": False,
         "mode": "training",
         "use_class_centroids": True,
         "training_instance_ratio": 1.0,

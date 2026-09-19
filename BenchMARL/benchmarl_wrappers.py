@@ -37,6 +37,40 @@ def obs_precision_coverage(obs_vec) -> tuple:
         raise ValueError(f"observation too short to carry (P, C): len={v.shape[0]}")
     return float(v[-4]), float(v[-3])
 
+def final_live_obs_rows(obs) -> list:
+    """Each agent's final observation of the episode, as 1-D numpy rows.
+
+    Reading obs[-1][-1] scored ONE agent (the group's last) at the rollout's last
+    step, and that row is wrong: measured on BenchMARL eval rollouts (iris,
+    2026-09-16), once an agent has finished its later rows keep the box bounds
+    but carry P = C = 0 exactly, the per-agent done/mask never flip, and after
+    every agent is done the last row can hold the next episode's reset obs.
+
+    The final box is therefore the END OF THE FIRST RUN of steps whose (P, C) is
+    not (0, 0). Accepts [d], [T, d] (one agent over time) or [..., T, n_agents, d].
+    """
+    t = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs)
+    t = t.detach().cpu().float()
+    if t.dim() == 1:
+        return [t.numpy()] if t.shape[0] >= 5 and bool((t[-4:-2].abs() > 0).any()) else []
+    d = t.shape[-1]
+    if d < 5:
+        return []
+    if t.dim() == 2:
+        t = t.unsqueeze(1)
+    t = t.reshape(-1, t.shape[-2], d)
+    rows = []
+    for j in range(t.shape[1]):
+        live = (t[:, j, -4:-2].abs().sum(dim=-1) > 0).tolist()
+        if not live or not live[0]:
+            continue
+        end = 0
+        while end + 1 < len(live) and live[end + 1]:
+            end += 1
+        rows.append(t[end, j, :].numpy())
+    return rows
+
+
 class AnchorTaskClass(TaskClass):
     
     def get_env_fun(
@@ -181,7 +215,7 @@ class AnchorTask(Task):
 
 class AnchorMetricsCallback(Callback):
     
-    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01, ranking_score_formula: str = "precision_coverage"):
+    def __init__(self, log_training_metrics: bool = True, log_evaluation_metrics: bool = True, save_to_file: bool = True, collect_anchor_data: bool = False, save_frequency: int = 10, save_during_training: bool = True, save_best_model: bool = True, compute_nashconv: bool = True, nashconv_batch_size: int = 32, nashconv_lr: float = 0.01, nashconv_steps: int = 10, nashconv_compute_frequency: int = 10, nashconv_threshold: float = 0.01, ranking_score_formula: str = "precision_coverage", checkpoint_selection: str = "global"):
         super().__init__()
         self.log_training_metrics = log_training_metrics
         self.log_evaluation_metrics = log_evaluation_metrics
@@ -211,6 +245,14 @@ class AnchorMetricsCallback(Callback):
         self.best_eval_score = -float('inf')  # Track best evaluation score (precision + coverage)
         self.best_model_path = None  # Path to best model checkpoint
         self.ranking_score_formula = ranking_score_formula
+        # "global": one score over every class picks ONE checkpoint for all actors.
+        # "per_class": each class keeps the actors from its own best eval, the
+        # same rule RLDA applies (one FidCov best_model per class shard).
+        if checkpoint_selection not in ("global", "per_class"):
+            raise ValueError(f"checkpoint_selection must be 'global' or 'per_class', got {checkpoint_selection!r}")
+        self.checkpoint_selection = checkpoint_selection
+        self._class_best: Dict[str, Dict[str, Any]] = {}   # group -> best eval record
+        self._last_group_eval: Dict[str, Dict[str, Any]] = {}
         # Track best models per class (for multi-agent equilibrium evaluation)
         self.best_eval_score_per_class = {}  # class -> best score
         self.best_model_path_per_class = {}  # class -> best model path
@@ -1239,6 +1281,105 @@ class AnchorMetricsCallback(Callback):
                 
                 self.training_metrics = []
     
+    def _eval_class_counts(self) -> Dict[int, int]:
+        """Per-class row counts on the split the BenchMARL eval env scores on.
+
+        Box support cannot come from rollout infos: PettingZooWrapper builds the
+        info spec from reset() infos, which AnchorEnv keeps empty (a non-empty
+        spec would KeyError on any step key reset did not declare). The final
+        observation carries class-conditional C, so n_class_in_box = C * n_class.
+        """
+        cached = getattr(self, "_eval_class_counts_cache", None)
+        if cached is not None:
+            return cached
+        counts: Dict[int, int] = {}
+        seen = set()
+
+        def _visit(obj) -> Optional[AnchorEnv]:
+            if obj is None or id(obj) in seen:
+                return None
+            seen.add(id(obj))
+            if isinstance(obj, AnchorEnv):
+                return obj
+            for attr in ("base_env", "_env", "env"):
+                try:
+                    found = _visit(getattr(obj, attr, None))
+                except (AttributeError, RuntimeError):
+                    continue
+                if found is not None:
+                    return found
+            return None
+
+        env = _visit(getattr(self.experiment, "test_env", None))
+        if env is not None:
+            try:
+                _, _, y_eval, _ = env._active_data()
+                if y_eval is not None:
+                    vals, cnts = np.unique(np.asarray(y_eval), return_counts=True)
+                    counts = {int(v): int(c) for v, c in zip(vals, cnts)}
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Could not read eval-split class counts for box support: {e}")
+        self._eval_class_counts_cache = counts
+        return counts
+
+    def _support_aware_score(self, precision: float, coverage: float,
+                             support: Optional[float]) -> float:
+        """ranking_score with support, floored at ONE row.
+
+        Early evals often end every box at C = 0, so support rounds to 0 and
+        lcb_coverage would return -inf -- no checkpoint would ever be saved. The
+        point estimate is not a safe fallback either: it jumps ABOVE the Wilson
+        bound, so shrinking a box below half a row would raise its score
+        (measured on iris: support 0.33 -> 0.83 vs support 1.2 -> 0.23). A one-row
+        floor keeps the score finite and monotone in support.
+        """
+        n_cov = max(1, int(round(float(support)))) if support is not None else None
+        return ranking_score(float(precision), float(coverage), self.ranking_score_formula, n_covered=n_cov)
+
+    def _save_best_per_class_if_improved(self) -> None:
+        """Per-class checkpointing: re-extract only the classes whose eval improved.
+
+        A class's actors in individual_models_best/ are always the ones from that
+        class's own best evaluation, so one strong class can no longer choose the
+        checkpoint for a weak one (and vice versa).
+        """
+        if (self.checkpoint_selection != "per_class" or not self.save_best_model
+                or self.experiment is None or not self._last_group_eval):
+            return
+        it = int(getattr(self.experiment, "n_iters_performed", -1))
+        improved = []
+        for group, m in sorted(self._last_group_eval.items()):
+            score = self._support_aware_score(m["precision"], m["coverage"], m["support"])
+            prev = self._class_best.get(group, {}).get("score", -float("inf"))
+            logger.info(
+                "Per-class eval %s: P=%.4f C=%.4f support=%s score=%.4f (best %s)",
+                group, m["precision"], m["coverage"],
+                None if m["support"] is None else round(m["support"], 2), score,
+                "none" if prev == -float("inf") else f"{prev:.4f}",
+            )
+            if score > prev:
+                improved.append((group, score, m))
+        if not improved:
+            return
+        groups = [g for g, _, _ in improved]
+        if self.extract_best_fn is not None:
+            try:
+                self.extract_best_fn(groups=groups)
+            except Exception as e:
+                logger.warning("Per-class best extraction failed for %s: %s", groups, e)
+                return
+        for group, score, m in improved:
+            self._class_best[group] = {"score": float(score), "iteration": it, **m}
+            logger.info(f"  ✓ {group} best actors saved: score {score:.4f} at iteration {it}")
+        folder = getattr(self.experiment, "folder_name", None)
+        if folder is not None:
+            try:
+                import json as _json
+                with open(os.path.join(str(folder), "best_per_class.json"), "w") as fh:
+                    _json.dump({"formula": self.ranking_score_formula, "classes": self._class_best}, fh, indent=2)
+            except Exception as e:
+                logger.warning("Could not write best_per_class.json: %s", e)
+
     def _extract_eval_score(self, aggregated: Dict[str, float]) -> Optional[float]:
         """Pull a single scalar 'how good is this eval' score from the aggregated
         metrics, robustly across algorithms.
@@ -1270,18 +1411,31 @@ class AnchorMetricsCallback(Callback):
         # checkpoints on different criteria.
         support = aggregated.get("evaluation/box_support_mean")
         n_cov = int(round(float(support))) if support is not None else None
-        if n_cov is None:
+        if n_cov is not None and n_cov < 1:
+            # Final-observation C is often 0 early in training; lcb_coverage scores
+            # zero support as -inf (no best_model ever saved). Floor at one row
+            # rather than switching to the point estimate, which would rank a
+            # box that shrank below half a row ABOVE a supported one.
+            n_cov = 1
+        elif n_cov is None:
             logger.warning(
                 "Best-model scoring has no box support; %s falls back to the "
                 "point estimate for this evaluation.", self.ranking_score_formula,
             )
         if "evaluation/box_precision_mean" in aggregated and "evaluation/box_coverage_mean" in aggregated:
-            return ranking_score(
+            score = ranking_score(
                 float(aggregated["evaluation/box_precision_mean"]),
                 float(aggregated["evaluation/box_coverage_mean"]),
                 self.ranking_score_formula,
                 n_covered=n_cov,
             )
+            logger.info(
+                "Best-model eval: P=%.4f C=%.4f support=%s score=%s",
+                float(aggregated["evaluation/box_precision_mean"]),
+                float(aggregated["evaluation/box_coverage_mean"]),
+                n_cov, score,
+            )
+            return score
         prec_keys = [k for k in aggregated if "anchor_precision" in k and "mean" in k and "evaluation" in k]
         cov_keys = [k for k in aggregated if "anchor_coverage" in k and "mean" in k and "evaluation" in k]
         if prec_keys and cov_keys:
@@ -1334,7 +1488,7 @@ class AnchorMetricsCallback(Callback):
                 f"  ✓ best_model saved (robust path): eval score {score:.4f} "
                 f"(prev best {prev if prev != -float('inf') else 'none'}) -> {best_model_path}"
             )
-            if self.extract_best_fn is not None:
+            if self.extract_best_fn is not None and self.checkpoint_selection == "global":
                 try:
                     self.extract_best_fn()
                     logger.info("  ✓ individual_models_best extracted from in-memory actors")
@@ -1542,17 +1696,11 @@ class AnchorMetricsCallback(Callback):
                 else ["agent"]
             )
 
-            def _final_obs_vec(obs):
-                # Last timestep of the episode -> 1-D numpy vector
-                t = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs)
-                t = t.detach().cpu()
-                while t.dim() > 1:
-                    t = t[-1]
-                return t.numpy()
-
             ep_returns, ep_precisions, ep_coverages = [], [], []
 
             ep_supports = []
+            class_counts = self._eval_class_counts()
+            group_acc: Dict[str, Dict[str, List[float]]] = {}
             for rollout in rollouts:
                 nxt = rollout.get("next", None) if hasattr(rollout, "get") else None
                 group_returns, group_prec, group_cov, group_support = [], [], [], []
@@ -1570,11 +1718,19 @@ class AnchorMetricsCallback(Callback):
                                 rew_t = rew if isinstance(rew, torch.Tensor) else torch.as_tensor(rew)
                                 group_returns.append(float(rew_t.sum()))
                             if "observation" in gkeys:
-                                fo = _final_obs_vec(gd["observation"])
-                                if fo.shape[0] >= 5:
+                                _grp_cls = str(group).rsplit("_", 1)[-1]
+                                for fo in final_live_obs_rows(gd["observation"]):
+                                    if fo.shape[0] < 5:
+                                        continue
                                     _p, _c = obs_precision_coverage(fo)
                                     group_prec.append(_p)
                                     group_cov.append(_c)
+                                    _acc = group_acc.setdefault(group, {"p": [], "c": [], "s": []})
+                                    _acc["p"].append(_p)
+                                    _acc["c"].append(_c)
+                                    if "info" not in gkeys and _grp_cls.isdigit() and int(_grp_cls) in class_counts:
+                                        group_support.append(float(_c) * class_counts[int(_grp_cls)])
+                                        _acc["s"].append(float(_c) * class_counts[int(_grp_cls)])
                             # P-02: support count, so best-model scoring can use
                             # the Wilson lower bound instead of the point estimate.
                             if "info" in gkeys:
@@ -1606,6 +1762,15 @@ class AnchorMetricsCallback(Callback):
                 aggregated["evaluation/box_coverage_mean"] = sum(ep_coverages) / len(ep_coverages)
             if ep_supports:
                 aggregated["evaluation/box_support_mean"] = sum(ep_supports) / len(ep_supports)
+            self._last_group_eval = {
+                g: {
+                    "precision": sum(a["p"]) / len(a["p"]),
+                    "coverage": sum(a["c"]) / len(a["c"]),
+                    "support": (sum(a["s"]) / len(a["s"])) if a["s"] else None,
+                    "n_boxes": len(a["p"]),
+                }
+                for g, a in group_acc.items() if a["p"]
+            }
         except Exception as e:
             logger.debug(f"Could not compute eval reward/precision/coverage for best-model scoring: {e}")
 
@@ -1618,6 +1783,10 @@ class AnchorMetricsCallback(Callback):
             self._save_best_model_if_improved(aggregated)
         except Exception as e:
             logger.warning(f"best-model save (robust path) failed: {e}")
+        try:
+            self._save_best_per_class_if_improved()
+        except Exception as e:
+            logger.warning(f"per-class best save failed: {e}")
 
         # Compute NashConv/exploitability metrics (always compute, even if other metrics are empty)
         if self.compute_nashconv:

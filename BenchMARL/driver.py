@@ -356,7 +356,7 @@ def main():
         algorithm_config_path=args.algorithm_config,
         experiment_config_path=args.experiment_config,
         mlp_config_path=args.mlp_config,
-        anchor_config_path=args.anchor_config or "conf/anchor.yaml",
+        anchor_config_path=args.anchor_config,
         output_dir=f"{args.output_dir}training/",
         seed=args.seed
     )

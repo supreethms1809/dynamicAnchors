@@ -307,3 +307,47 @@ def test_a1_reporting_side_does_not_refilter_on_support():
     )
     assert union is not None
     assert set(union.selected_ids) == {"tiny", "broad"}
+
+
+def test_lcb_gated_ranks_a_precise_narrow_box_above_a_wide_coin_flip():
+    """synthetic MADA class 1 (perturb-fid pilot): lcb_coverage picked Fid 0.55 /
+    Cov 0.97 over Fid 0.89 / Cov 0.24 because it has no fidelity floor."""
+    from utils.metrics import ranking_score
+    wide = dict(fidelity=0.55, coverage=0.97, n_covered=175)
+    narrow = dict(fidelity=0.89, coverage=0.24, n_covered=27)
+    assert ranking_score(formula="lcb_coverage", **wide) > ranking_score(formula="lcb_coverage", **narrow)
+    assert ranking_score(formula="lcb_gated", **narrow) > ranking_score(formula="lcb_gated", **wide)
+
+
+def test_lcb_gated_keeps_lcb_order_inside_each_tier_and_honours_support():
+    from utils.metrics import ranking_score
+    a = ranking_score(0.95, 0.40, "lcb_gated", n_covered=60)
+    b = ranking_score(0.95, 0.10, "lcb_gated", n_covered=60)
+    assert a > b
+    assert a == pytest.approx(2.0 + ranking_score(0.95, 0.40, "lcb_coverage", n_covered=60))
+    below = ranking_score(0.70, 0.90, "lcb_gated", n_covered=200)
+    assert below == pytest.approx(ranking_score(0.70, 0.90, "lcb_coverage", n_covered=200))
+    assert ranking_score(1.0, 0.5, "lcb_gated", n_covered=3, min_support=10) == float("-inf")
+    # gate follows tau_p
+    assert ranking_score(0.82, 0.3, "lcb_gated", n_covered=50, tau_p=0.95) < 2.0
+
+
+def test_coverage_basis_switches_the_class_denominator_only():
+    """predicted: P(x in B | f_hat = c). Fid and Pur are unchanged by the switch."""
+    import numpy as np
+    from utils.metrics import evaluate_mask, set_coverage_basis
+    y = np.array([0, 0, 1, 1, 1, 1])
+    y_hat = np.array([0, 1, 1, 1, 0, 0])      # model calls rows 1-3 class 1
+    mask = np.array([False, True, True, False, False, False])
+    try:
+        set_coverage_basis("true_label")
+        a = evaluate_mask(y=y, y_hat=y_hat, mask=mask, target_class=1)
+        set_coverage_basis("predicted")
+        b = evaluate_mask(y=y, y_hat=y_hat, mask=mask, target_class=1)
+    finally:
+        set_coverage_basis("true_label")
+    assert a.coverage == pytest.approx(1 / 4)     # 1 true-class-1 row of 4 in the box
+    assert b.coverage == pytest.approx(2 / 3)     # 2 predicted-class-1 rows of 3 in the box
+    assert a.fidelity == b.fidelity and a.purity == b.purity
+    with pytest.raises(ValueError):
+        set_coverage_basis("labels")

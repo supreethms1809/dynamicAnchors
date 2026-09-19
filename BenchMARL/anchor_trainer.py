@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Sequence, Dict, Optional, List, Any, Tuple
 from pathlib import Path
 import os
 import sys
@@ -13,7 +13,7 @@ from benchmarl.experiment import Experiment, ExperimentConfig
 from benchmarl.models.mlp import MlpConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmarl_wrappers import AnchorTask, AnchorMetricsCallback, obs_precision_coverage
+from benchmarl_wrappers import AnchorTask, AnchorMetricsCallback, obs_precision_coverage, final_live_obs_rows
 from environment import AnchorEnv
 
 
@@ -96,7 +96,7 @@ class AnchorTrainer:
         algorithm_config_path: Optional[str] = None,
         experiment_config_path: str = "conf/base_experiment.yaml",
         mlp_config_path: str = "conf/mlp.yaml",
-        anchor_config_path: str = "conf/anchor.yaml",
+        anchor_config_path: Optional[str] = None,
         output_dir: str = "./output/anchor_training/",
         seed: int = 0
     ):
@@ -113,7 +113,12 @@ class AnchorTrainer:
         self.algorithm_config_path = algorithm_config_path or default_algorithm_path
         self.experiment_config_path = experiment_config_path
         self.mlp_config_path = mlp_config_path
-        self.anchor_config_path = anchor_config_path
+        # ANCHOR_CONFIG lets a sweep point BOTH training (driver.py) and inference
+        # (inference.py builds its own trainer) at the same env YAML. Without it,
+        # inference silently fell back to conf/anchor.yaml whatever training used.
+        self.anchor_config_path = (
+            anchor_config_path or os.environ.get("ANCHOR_CONFIG") or "conf/anchor.yaml"
+        )
         self.output_dir = output_dir
         self.seed = seed
         
@@ -582,6 +587,7 @@ class AnchorTrainer:
             ranking_score_formula=env_config.get(
                 "ranking_score_formula", "precision_coverage"
             ),
+            checkpoint_selection=str(env_config.get("checkpoint_selection", "global")),
         )
         self.experiment = Experiment(
             config=self.experiment_config,
@@ -595,10 +601,11 @@ class AnchorTrainer:
         # Extract individual_models_best from in-memory actors whenever eval
         # improves. Experiment.state_dict() can fail after training (collector
         # has no .env), so this is the reliable path to BEST weights.
-        self.callback.extract_best_fn = lambda: self.extract_and_save_individual_models(
+        self.callback.extract_best_fn = lambda groups=None: self.extract_and_save_individual_models(
             save_policies=True,
             save_critics=False,
             models_subdir="individual_models_best",
+            groups=groups,
         )
 
         # BenchMARL constructs a dedicated ``test_env`` for periodic evaluation,
@@ -1144,20 +1151,9 @@ class AnchorTrainer:
                             # Extract P,C from the 3n+4 observation via obs_precision_coverage.
                             # Observation structure: [a, b, q*, P, C, mode, phase]
                             if obs is not None:
-                                if hasattr(obs, 'shape') and obs.shape[0] > 0:
-                                    final_obs = obs[-1]
-                                elif isinstance(obs, (list, tuple)) and len(obs) > 0:
-                                    final_obs = obs[-1]
-                                else:
-                                    final_obs = obs
-                                
-                                # Convert to numpy
-                                if isinstance(final_obs, torch.Tensor):
-                                    final_obs_np = final_obs.cpu().numpy()
-                                elif isinstance(final_obs, np.ndarray):
-                                    final_obs_np = final_obs
-                                else:
-                                    final_obs_np = np.array(final_obs)
+                                # Last step this agent was alive; later rows are all-zero.
+                                _live = final_live_obs_rows(np.asarray(obs) if isinstance(obs, (list, tuple)) else obs)
+                                final_obs_np = _live[-1] if _live else np.zeros(0, dtype=np.float32)
                                 
                                 # Extract precision and coverage from observation
                                 obs_len = len(final_obs_np) if hasattr(final_obs_np, '__len__') else final_obs_np.shape[0] if hasattr(final_obs_np, 'shape') else 0
@@ -1404,6 +1400,20 @@ class AnchorTrainer:
                 best_dir,
             )
             results["best"] = {"existing": best_dir}
+            if getattr(self.callback, "checkpoint_selection", "global") == "per_class":
+                import json as _json
+                with open(best_index) as f:
+                    have = set(_json.load(f).get("policies_by_class", {}).keys())
+                missing = [g for g in self.experiment.algorithm.group_map.keys() if g not in have]
+                if missing:
+                    logger.warning(
+                        "Per-class checkpointing: %s never saved a best eval; using FINAL actors for them.",
+                        missing,
+                    )
+                    results["best_final_fill"] = self.extract_and_save_individual_models(
+                        save_policies=save_policies, save_critics=False,
+                        models_subdir="individual_models_best", groups=missing,
+                    )
             return results
 
         best_ckpt = os.path.join(str(self.experiment.folder_name), "best_model", "best_checkpoint.pt")
@@ -1547,7 +1557,11 @@ class AnchorTrainer:
         save_policies: bool = True,
         save_critics: bool = False,
         models_subdir: str = "individual_models",
+        groups: Optional[Sequence[str]] = None,
     ) -> Dict[str, str]:
+        """Save per-agent actors. `groups` restricts extraction to those groups
+        (per-class checkpointing); classes already in policies_index.json that
+        are not re-extracted keep their earlier entries."""
         if self.experiment is None:
             raise ValueError(
                 "Experiment not set up yet. Call setup_experiment() first."
@@ -1627,6 +1641,8 @@ class AnchorTrainer:
                 logger.warning(f"  Environment agents: {unwrapped_env.possible_agents if unwrapped_env else 'N/A'}")
         
         for group in algorithm.group_map.keys():
+            if groups is not None and group not in groups:
+                continue
             # Get all agents in this group
             agents_in_group = algorithm.group_map.get(group, [group])
             logger.info(f"\nExtracting models for group: {group} (contains {len(agents_in_group)} agent(s): {agents_in_group})")
@@ -1806,6 +1822,10 @@ class AnchorTrainer:
                 "seed": self.seed,  # Save seed to match training seed during inference
                 "policies_by_class": {}
             }
+            existing_index = os.path.join(output_dir, "policies_index.json")
+            if groups is not None and os.path.isfile(existing_index):
+                with open(existing_index) as f:
+                    index_data["policies_by_class"] = dict(json.load(f).get("policies_by_class", {}))
             for class_id, policies in sorted(policies_by_class.items()):
                 index_data["policies_by_class"][f"class_{class_id}"] = {
                     "class": int(class_id),

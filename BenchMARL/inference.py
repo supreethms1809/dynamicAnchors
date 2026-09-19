@@ -1803,11 +1803,7 @@ def extract_rules_from_policies(
     elif env_config.get("logging_verbosity") == "quiet":
         logger.warning("Quiet logging mode enabled - only warnings and errors will be shown")
     
-    if env_config.get("use_perturbation"):
-        logger.info(
-            f"Inference Fid uses resampled samples "
-            f"(mode={env_config.get('perturbation_mode')})"
-        )
+    logger.info(f"Inference Fid estimator: {env_config.get('precision_estimator', 'empirical')}")
     
     # For class-level inference, compute cluster centroids per class
     logger.info("\nComputing cluster centroids per class for class-level inference...")
@@ -2587,7 +2583,7 @@ def extract_rules_from_policies(
                 })
 
                 # Recompute precision/coverage on the full evaluation dataset.
-                # Rollout Fid is Track A empirical unless use_perturbation is on.
+                # Rollout Fid follows env_config precision_estimator.
                 orig_pred = episode_data.get("original_prediction")
                 if orig_pred is None:
                     orig_pred = int(full_predictions_recompute[data_instance_idx])

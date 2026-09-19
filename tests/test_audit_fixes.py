@@ -688,3 +688,95 @@ def test_new_datasets_are_wired_into_both_pipelines():
         for p in ("revision/run_mada_pipeline.py", "revision/run_rlda_pipeline.py"):
             assert f'"{name}"' in (REPO / p).read_text(), f"{name} missing from {p}"
         assert f'"{name}"' in (REPO / "BenchMARL" / "tabular_datasets.py").read_text()
+
+
+def test_mada_box_support_falls_back_to_coverage_times_class_count():
+    """Rollouts carry no info (empty reset-info spec), so P-02 support was never
+    populated and every MADA eval logged 'no box support'."""
+    src = (REPO / "BenchMARL" / "benchmarl_wrappers.py").read_text()
+    assert "def _eval_class_counts" in src
+    loop = src[src.index("ep_supports = []"):src.index('aggregated["evaluation/box_support_mean"]')]
+    assert "class_counts[int(_grp_cls)]" in loop
+
+
+def test_final_live_obs_rows_reads_each_agents_terminal_box():
+    """BenchMARL eval rollouts (measured): after an agent finishes, its rows keep
+    the box but P = C = 0; done/mask never flip; the last row can be a reset obs.
+    obs[-1][-1] therefore scored the group's last agent as P = C = 0."""
+    import numpy as np
+    import torch
+    sys.path.insert(0, str(REPO / "BenchMARL"))
+    from benchmarl_wrappers import final_live_obs_rows, obs_precision_coverage
+
+    d = 3 * 2 + 4
+    obs = torch.full((6, 3, d), 0.5)
+    obs[:, :, -4:-2] = 0.0
+    # agent 0 finishes at step 2, then a reset row appears at the last step
+    obs[:3, 0, -4], obs[:3, 0, -3] = 1.0, 0.1
+    obs[5, 0, -4], obs[5, 0, -3] = 0.57, 0.7
+    # agent 1 alive to the end with a real P=1, C=0 box
+    obs[:, 1, -4] = 1.0
+    # agent 2 finishes at step 0
+    obs[0, 2, -4], obs[0, 2, -3] = 0.8, 0.4
+    got = [obs_precision_coverage(r) for r in final_live_obs_rows(obs)]
+    assert got == [pytest.approx((1.0, 0.1)), pytest.approx((1.0, 0.0)), pytest.approx((0.8, 0.4))]
+    assert np.allclose(obs_precision_coverage(obs[-1][-1].numpy()), (0.0, 0.0))
+    assert obs_precision_coverage(final_live_obs_rows(obs[:, 2, :])[0]) == pytest.approx((0.8, 0.4))
+
+
+def test_mada_per_class_checkpointing_extracts_only_improved_classes(tmp_path):
+    """per_class: a class re-extracts its actors only when ITS eval improves."""
+    import json
+    import types
+    sys.path.insert(0, str(REPO / "BenchMARL"))
+    from benchmarl_wrappers import AnchorMetricsCallback
+
+    cb = AnchorMetricsCallback(ranking_score_formula="lcb_coverage", checkpoint_selection="per_class",
+                               compute_nashconv=False)
+    cb.experiment = types.SimpleNamespace(n_iters_performed=1, folder_name=str(tmp_path))
+    calls = []
+    cb.extract_best_fn = lambda groups=None: calls.append(list(groups))
+
+    cb._last_group_eval = {
+        "class_0": {"precision": 0.95, "coverage": 0.4, "support": 40.0, "n_boxes": 30},
+        "class_1": {"precision": 0.60, "coverage": 0.9, "support": 90.0, "n_boxes": 30},
+    }
+    cb._save_best_per_class_if_improved()
+    assert calls == [["class_0", "class_1"]]
+
+    cb.experiment.n_iters_performed = 2
+    cb._last_group_eval = {
+        "class_0": {"precision": 0.70, "coverage": 0.2, "support": 20.0, "n_boxes": 30},   # worse
+        "class_1": {"precision": 0.95, "coverage": 0.8, "support": 80.0, "n_boxes": 30},   # better
+    }
+    cb._save_best_per_class_if_improved()
+    assert calls[-1] == ["class_1"]
+    rec = json.loads((tmp_path / "best_per_class.json").read_text())["classes"]
+    assert rec["class_0"]["iteration"] == 1 and rec["class_1"]["iteration"] == 2
+
+    # sub-row support is floored at one row: finite, and never above a supported box
+    from utils.metrics import ranking_score
+    tiny = cb._support_aware_score(0.9, 0.0, 0.2)
+    assert tiny == pytest.approx(ranking_score(0.9, 0.0, "lcb_coverage", n_covered=1))
+    assert tiny < cb._support_aware_score(0.9, 0.1, 12.0)
+
+
+def test_mada_global_checkpointing_skips_per_class_path_and_rejects_unknown_mode():
+    sys.path.insert(0, str(REPO / "BenchMARL"))
+    from benchmarl_wrappers import AnchorMetricsCallback
+    cb = AnchorMetricsCallback(checkpoint_selection="global", compute_nashconv=False)
+    cb._last_group_eval = {"class_0": {"precision": 1.0, "coverage": 1.0, "support": 10.0, "n_boxes": 1}}
+    calls = []
+    cb.extract_best_fn = lambda groups=None: calls.append(groups)
+    cb.experiment = object()
+    cb._save_best_per_class_if_improved()
+    assert calls == []
+    with pytest.raises(ValueError):
+        AnchorMetricsCallback(checkpoint_selection="per_agent")
+
+
+def test_shipped_mada_yaml_uses_per_class_checkpointing():
+    import yaml
+    cfg = yaml.safe_load(open(REPO / "BenchMARL" / "conf" / "anchor.yaml"))["env_config"]
+    assert cfg["checkpoint_selection"] == "per_class"
+

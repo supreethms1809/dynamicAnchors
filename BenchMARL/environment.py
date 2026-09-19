@@ -15,7 +15,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.device_utils import get_device
 from utils.networks import predict_proba_torch
-from utils.metrics import active_feature_mask, ranking_score as _ranking_score
+from utils.metrics import active_feature_mask, ranking_score as _ranking_score, parse_coverage_basis
 from utils import quantile_mdp as qmdp
 import logging
 logger = logging.getLogger(__name__)
@@ -134,6 +134,16 @@ class AnchorEnv(ParallelEnv):
         self.precision_estimator = str(
             env_config.get("precision_estimator", "empirical")
         ).lower()
+
+        if self.precision_estimator not in ("empirical", "conditional"):
+            raise ValueError(
+                f"precision_estimator must be 'empirical' or 'conditional', got {self.precision_estimator!r}"
+            )
+        # Training C denominator. predicted = P(x in B | f̂=c), matching Fid (Eq 6).
+        # true_label = P(x in B | y=c), the legacy Eq 7 definition.
+        self.coverage_basis = parse_coverage_basis(
+            env_config.get("coverage_basis", "predicted")
+        )
         self.quantile_eps = float(env_config.get("quantile_eps", 1e-3))
         self.max_quantile_step = float(env_config.get("max_quantile_step", 0.10))
         self.min_quantile_width = float(env_config.get("min_quantile_width", 0.02))
@@ -171,9 +181,7 @@ class AnchorEnv(ParallelEnv):
         # (agents of the same class share them).
         self._quantile_cdfs_by_class: Dict[int, Dict[str, np.ndarray]] = {}
 
-        self.use_perturbation = env_config.get("use_perturbation", False)
-        self.perturbation_mode = env_config.get("perturbation_mode", "bootstrap")
-        self.n_perturb = int(env_config.get("n_perturb_train", env_config.get("n_perturb", 2048)))
+        self.n_perturb = int(env_config.get("n_perturb_train", 512))
         self.n_perturb_eval = int(env_config.get("n_perturb_eval", self.n_perturb))
         self.X_min = env_config.get("X_min", None)
         self.X_range = env_config.get("X_range", None)
@@ -265,6 +273,19 @@ class AnchorEnv(ParallelEnv):
         # C-12: black-box query counter (cache fills count as queries; lookups do not).
         self.n_blackbox_queries = 0
         self.n_reference_table_queries = 0
+        # Recompute the relative floor now that f̂ is available (the earlier pass
+        # used y because the prediction cache did not exist yet).
+        if self.coverage_floor_relative:
+            try:
+                labels = self._coverage_class_labels(np.asarray(y), split="train")
+                _counts = [int((labels == c).sum()) for c in np.unique(labels)]
+                _n_min = max(1, min([c for c in _counts if c > 0], default=1))
+                self.min_coverage_floor = float(self.coverage_floor_min_support) / float(_n_min)
+                _ct = float(self.coverage_target)
+                if _ct > 0.0:
+                    self.min_coverage_floor = max(min(float(self.min_coverage_floor), _ct), 1e-6)
+            except Exception:
+                pass
         # C-07: freeze these feature indices to the instance/class-mode value.
         self.categorical_indices = list(env_config.get("categorical_indices") or [])
         self.categorical_value_names = {
@@ -300,7 +321,6 @@ class AnchorEnv(ParallelEnv):
         
         # Track warnings per agent per episode to reduce log spam
         # Only warn once per episode about adaptive mode switching and precision-coverage mismatch
-        self._adaptive_uniform_warned_this_episode = defaultdict(bool)  # agent -> bool
         self._precision_coverage_mismatch_warned_this_episode = defaultdict(bool)  # agent -> bool
         self._rt_shaping = defaultdict(float)
         self._rt_overlap = defaultdict(float)
@@ -386,7 +406,8 @@ class AnchorEnv(ParallelEnv):
             f"precision_target={self.precision_target}",
             f"coverage_target={self.coverage_target}",
             f"max_cycles={self.max_cycles}",
-            f"use_perturbation={self.use_perturbation}",
+            f"precision_estimator={self.precision_estimator}",
+            f"coverage_basis={self.coverage_basis}",
             f"precision_blend_lambda={self.precision_blend_lambda}",
             f"training_instance_ratio={self.training_instance_ratio}",
             f"eval_split={self.eval_split}",
@@ -493,13 +514,39 @@ class AnchorEnv(ParallelEnv):
             return self.X_val_unit, self.X_val_std, self.y_val, "val"
         return self.X_unit, self.X_std, self.y, "training"
 
-    @staticmethod
+    def _coverage_class_labels(
+        self, y_data: np.ndarray, split: Optional[str] = None
+    ) -> np.ndarray:
+        """Class labels for the training coverage denominator.
+
+        predicted: cached f̂, so C and Fid share the object of explanation.
+        true_label: y. Episode sampling / centroids still use y.
+        """
+        y_data = np.asarray(y_data)
+        if getattr(self, "coverage_basis", "predicted") != "predicted":
+            return y_data
+        if getattr(self, "_cached_probs", None) is None:
+            return y_data
+        try:
+            if split is None:
+                split = self._active_split() if hasattr(self, "_active_split") else "train"
+            preds = np.asarray(self._get_cached_probs(split)).argmax(axis=1)
+        except Exception:
+            return y_data
+        if len(preds) != len(y_data):
+            return y_data
+        return preds.astype(int, copy=False)
+
+    def _n_coverage_class(self, cls: int) -> int:
+        y_data = self._active_data()[2]
+        return int((self._coverage_class_labels(y_data) == int(cls)).sum())
+
     def _class_conditional_coverage(
-        mask: np.ndarray, y_data: np.ndarray, target_class: int
+        self, mask: np.ndarray, y_data: np.ndarray, target_class: int
     ) -> Tuple[float, float, int, int]:
         """Return (class_cond_C, marginal_C, n_class_in_box, n_class)."""
         coverage_marginal = float(mask.mean()) if len(mask) else 0.0
-        class_mask = y_data == target_class
+        class_mask = self._coverage_class_labels(y_data) == target_class
         n_class = int(class_mask.sum())
         if n_class == 0 or len(mask) != len(class_mask):
             return 0.0, coverage_marginal, 0, n_class
@@ -851,6 +898,24 @@ class AnchorEnv(ParallelEnv):
                                        n_class_samples: int, data_source: str,
                                        covered: np.ndarray) -> tuple:
         """Anchors' D(z|A) with frozen (idx, U) so Phi(s')-Phi(s) is CRN-coupled."""
+        # Class-level box with no real rows: Anchors' D(z|B) has nothing to sample
+        # from, and crn_perturb would pin the empty dims to the class centroid, so
+        # the classifier "agrees" on synthetic centroid points. That paid P for
+        # collapsing the box onto no data (smoke: every eval box C=0, P=0.57).
+        # Score it like the empirical estimator does. Instance boxes contain x*.
+        if self.x_star_unit.get(agent) is None and covered.size == 0:
+            return 0.0, coverage, {
+                "hard_precision": 0.0,
+                "avg_prob": 0.0,
+                "n_points": 0,
+                "n_covered": 0,
+                "sampler": "conditional_crn_empty",
+                "data_source": data_source,
+                "cov_real": float(coverage),
+                "coverage_marginal": float(coverage_marginal),
+                "n_class_in_box": int(n_class_in_box),
+                "n_class_samples": int(n_class_samples),
+            }
         if self._crn_idx.get(agent) is None or self._crn_U.get(agent) is None:
             self._draw_crn(agent)
         cls = self._get_class_for_agent(agent)
@@ -944,9 +1009,11 @@ class AnchorEnv(ParallelEnv):
                 y_data = self.y_test if self.eval_on_test_data else self.y
                 logger.warning(f"  Corrected y_data to match mask length")
         
-        # Coverage is always class-conditional P(x in box | y = target_class),
-        # including instance-based episodes. Marginal P(x in box) is logged only.
-        # Precision stays instance prediction-matching when x_star is set.
+        # Coverage is class-conditional on coverage_basis:
+        #   predicted  -> P(x in B | f̂(x) = target_class)  (same object as Fid)
+        #   true_label -> P(x in B | y = target_class)
+        # Marginal P(x in B) is logged only. Precision stays instance
+        # prediction-matching when x_star is set.
         is_instance_based = self.x_star_unit.get(agent) is not None
         
         if self.mode == "inference" and not is_instance_based:
@@ -984,14 +1051,19 @@ class AnchorEnv(ParallelEnv):
                 f"Target class: {target_class}, Class samples in dataset: {n_class_samples}"
             )
         
-        if covered.size == 0 and self.precision_estimator != "conditional" and not (
-            self.use_perturbation and self.perturbation_mode in ["uniform", "adaptive"]
-        ):
-            logger.debug(f"Agent {agent}: No covered points (coverage={coverage:.4f}) and perturbation not enabled for uniform/adaptive modes - returning precision=0")
+        if self.precision_estimator == "conditional":
+            # Anchors-style D(z|B): Fid on perturbed samples; C stays on real rows.
+            return self._conditional_precision_metrics(
+                agent, coverage, coverage_marginal, n_class_in_box, n_class_samples,
+                data_source, covered,
+            )
+
+        if covered.size == 0:
+            logger.debug(f"Agent {agent}: no covered rows (coverage={coverage:.4f}) - precision=0")
             return 0.0, coverage, {
-                "hard_precision": 0.0, 
-                "avg_prob": 0.0, 
-                "n_points": 0, 
+                "hard_precision": 0.0,
+                "avg_prob": 0.0,
+                "n_points": 0,
                 "sampler": "none",
                 "data_source": data_source,
                 "coverage_marginal": float(coverage_marginal),
@@ -999,185 +1071,18 @@ class AnchorEnv(ParallelEnv):
                 "n_class_samples": int(n_class_samples),
             }
 
-        # Row indices into the active dataset when evaluation uses real rows
-        # (empirical/bootstrap paths). Lets us look up cached classifier
-        # probabilities instead of re-running the classifier every step.
-        if self.precision_estimator == "conditional":
-            return self._conditional_precision_metrics(
-                agent, coverage, coverage_marginal, n_class_in_box, n_class_samples,
-                data_source, covered,
-            )
-
-        eval_row_idx = None
-
-        if not self.use_perturbation:
-            X_eval = X_data_std[covered]
-            y_eval = y_data[covered]
-            eval_row_idx = covered
-            n_points = int(X_eval.shape[0])
-            sampler_note = f"empirical_{data_source}"
-            logger.debug(f"Agent {agent}: Perturbation disabled - using {n_points} empirical points from {data_source} data")
-        else:
-            if self.perturbation_mode == "bootstrap":
-                if covered.size == 0:
-                    data_source = "test" if self.eval_on_test_data else "training"
-                    logger.debug(f"Agent {agent}: Bootstrap mode - no covered points, returning precision=0, coverage={coverage:.4f}")
-                    return 0.0, coverage, {
-                        "hard_precision": 0.0, 
-                        "avg_prob": 0.0, 
-                        "n_points": 0, 
-                        "sampler": "none",
-                        "data_source": data_source,
-                        "coverage_marginal": float(coverage_marginal),
-                        "n_class_in_box": int(n_class_in_box),
-                        "n_class_samples": int(n_class_samples),
-                    }
-                n_samp = min(self.n_perturb, max(1, covered.size))
-                idx = self.rng.choice(covered, size=n_samp, replace=True)
-                X_eval = X_data_std[idx]
-                y_eval = y_data[idx]
-                eval_row_idx = idx
-                n_points = int(n_samp)
-                sampler_note = f"bootstrap_{data_source}"
-                logger.debug(f"Agent {agent}: Bootstrap mode - sampled {n_points} points from {covered.size} covered points (n_perturb={self.n_perturb})")
-            elif self.perturbation_mode == "uniform":
-                n_samp = self.n_perturb
-                U = np.zeros((n_samp, self.n_features), dtype=np.float32)
-                for j in range(self.n_features):
-                    low, up = float(self.lower[agent][j]), float(self.upper[agent][j])
-                    width = max(up - low, self.min_width)
-                    mid = 0.5 * (low + up)
-                    low = max(0.0, mid - width / 2.0)
-                    up = min(1.0, mid + width / 2.0)
-                    U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
-                
-                # For instance-based anchors, always include the original instance
-                # This ensures precision calculation includes at least one point (the instance itself)
-                # that matches the original prediction, preventing precision from being incorrectly 0.0
-                if is_instance_based and self.x_star_unit.get(agent) is not None:
-                    x_star_unit = np.array(self.x_star_unit[agent], dtype=np.float32).reshape(1, -1)
-                    # Prepend the original instance to the uniform samples
-                    U = np.vstack([x_star_unit, U])
-                    n_samp = n_samp + 1
-                
-                X_eval = self._unit_to_std(U)
-                y_eval = None
-                n_points = int(n_samp)
-                sampler_note = f"uniform_{data_source}"
-                logger.debug(f"Agent {agent}: Uniform mode - generating {n_points} synthetic samples (coverage={coverage:.4f} from {covered.size} real points)")
-            elif self.perturbation_mode == "adaptive":
-                # Adaptive mode: use bootstrap when enough covered points, otherwise use uniform
-                min_points_for_bootstrap = max(1, int(0.1 * self.n_perturb))
-                
-                if covered.size >= min_points_for_bootstrap:
-                    # Use bootstrap sampling from real data points
-                    n_samp = min(self.n_perturb, covered.size)
-                    idx = self.rng.choice(covered, size=n_samp, replace=True)
-                    X_eval = X_data_std[idx]
-                    y_eval = y_data[idx]
-                    eval_row_idx = idx
-                    n_points = int(n_samp)
-                    sampler_note = f"adaptive_bootstrap_{data_source}"
-                    logger.debug(f"Agent {agent}: Adaptive mode - using bootstrap sampling: {n_points} points from {covered.size} covered points "
-                               f"(threshold={min_points_for_bootstrap}, coverage={coverage:.4f})")
-                else:
-                    # Fall back to uniform sampling when not enough covered points
-                    n_samp = self.n_perturb
-                    U = np.zeros((n_samp, self.n_features), dtype=np.float32)
-                    for j in range(self.n_features):
-                        low, up = float(self.lower[agent][j]), float(self.upper[agent][j])
-                        width = max(up - low, self.min_width)
-                        mid = 0.5 * (low + up)
-                        low = max(0.0, mid - width / 2.0)
-                        up = min(1.0, mid + width / 2.0)
-                        U[:, j] = self.rng.uniform(low=low, high=up, size=n_samp).astype(np.float32)
-                    
-                    # For instance-based anchors, always include the original instance
-                    # This ensures precision calculation includes at least one point (the instance itself)
-                    # that matches the original prediction, preventing precision from being incorrectly 0.0
-                    if is_instance_based and self.x_star_unit.get(agent) is not None:
-                        x_star_unit = np.array(self.x_star_unit[agent], dtype=np.float32).reshape(1, -1)
-                        # Prepend the original instance to the uniform samples
-                        U = np.vstack([x_star_unit, U])
-                        n_samp = n_samp + 1
-                    
-                    X_eval = self._unit_to_std(U)
-                    y_eval = None
-                    n_points = int(n_samp)
-                    sampler_note = f"adaptive_uniform_{data_source}"
-                    # Only warn once per episode to reduce log spam
-                    # if not self._adaptive_uniform_warned_this_episode[agent]:
-                    #     logger.warning(f"Agent {agent}: Adaptive mode - switching to uniform sampling! "
-                    #                  f"covered.size={covered.size} < threshold={min_points_for_bootstrap}, "
-                    #                  f"coverage={coverage:.4f}. Precision will be calculated from synthetic samples, "
-                    #                  f"but coverage is from real data points. This may cause precision-coverage mismatch. "
-                    #                  f"(This warning will appear once per episode)")
-                    #     self._adaptive_uniform_warned_this_episode[agent] = True
-                    # else:
-                    #     logger.debug(f"Agent {agent}: Adaptive mode using uniform sampling (covered.size={covered.size} < threshold={min_points_for_bootstrap}, coverage={coverage:.4f})")
-            else:
-                raise ValueError(f"Unknown perturbation_mode '{self.perturbation_mode}'. Use 'bootstrap', 'uniform', or 'adaptive'.")
-
-        if eval_row_idx is not None:
-            # Dataset rows: look up cached probabilities (computed once per env)
-            probs = self._get_cached_probs(self._active_split())[eval_row_idx]
-        else:
-            # Fresh uniform samples: must run the classifier
-            if hasattr(self.classifier, 'eval'):
-                self.classifier.eval()
-            if hasattr(self.classifier, 'model') and hasattr(self.classifier.model, 'eval'):
-                self.classifier.model.eval()
-
-            with torch.no_grad():
-                inputs = torch.from_numpy(X_eval).float().to(self.device)
-                probs = predict_proba_torch(self.classifier, inputs).cpu().numpy()
-            self.n_blackbox_queries += int(X_eval.shape[0])
-
+        # Empirical Fid (Track A): P(ŷ=c | x in B) on the real rows in the box, read
+        # from the cached classifier predictions (no fresh black-box queries).
+        probs = self._get_cached_probs(self._active_split())[covered]
+        y_eval = y_data[covered]
         preds = probs.argmax(axis=1)
-        positive_idx = (preds == target_class)
-        
-        # Empirical Fid (paper / Track A): P(ŷ=c | x in box) on real rows.
-        # Instance-route P(ŷ=ŷ(x*)) is Track B; not the train done-switch.
-        use_track_a_fid = (
-            str(self.precision_estimator).lower() == "empirical"
-            and not self.use_perturbation
-        )
-        if is_instance_based and not use_track_a_fid:
-            # Instance-based mode: Match original Anchor paper definition
-            # Precision = fraction of samples where prediction matches original instance's prediction
-            if agent in self.original_predictions:
-                original_pred = self.original_predictions[agent]
-                matches_original = (preds == original_pred)
-                hard_precision = float(matches_original.mean())
-                logger.debug(f"Agent {agent}: Instance-based precision (prediction matching): {hard_precision:.4f} "
-                           f"(original prediction: {original_pred}, target class: {target_class})")
-            else:
-                # Fallback: if original prediction not stored, use class-based precision
-                logger.warning(f"Agent {agent}: Original prediction not found for instance-based anchor, "
-                             f"falling back to class-based precision calculation")
-                if y_eval is None:
-                    hard_precision = float(positive_idx.mean())
-                else:
-                    hard_precision = float((preds == target_class).mean())
-            purity = float((y_eval == (self.original_predictions.get(agent, target_class))).mean()) if y_eval is not None else float("nan")
-        else:
-            # C-09 / Track A: PRIMARY is model fidelity P(ŷ(x) = c | x in B).
-            hard_precision = float(positive_idx.mean())
-            using_synthetic_samples = y_eval is None
-            purity = float((y_eval == target_class).mean()) if y_eval is not None else float("nan")
-
-        if is_instance_based and not use_track_a_fid and agent in self.original_predictions:
-            original_pred = self.original_predictions[agent]
-            avg_prob = float(probs[:, original_pred].mean())
-            logger.debug(f"Agent {agent}: Instance-based precision proxy using original prediction class {original_pred} probability")
-        else:
-            avg_prob = float(probs[:, target_class].mean())
-        
+        hard_precision = float((preds == target_class).mean())
+        purity = float((y_eval == target_class).mean())
+        avg_prob = float(probs[:, target_class].mean())
         precision_proxy = (
             self.precision_blend_lambda * hard_precision + (1.0 - self.precision_blend_lambda) * avg_prob
         )
-        target_class_fraction = hard_precision  # Same as hard_precision when y_eval is available
-        
+
         # Control signal is hard Fid. Softmax blend made τ_P unreachable on
         # low-confidence but accurate DNNs (wine p̂_max≈0.37 → proxy 0.68).
         return hard_precision, coverage, {
@@ -1185,10 +1090,10 @@ class AnchorEnv(ParallelEnv):
             "precision_proxy": precision_proxy,
             "purity": purity,
             "avg_prob": avg_prob,
-            "n_points": int(n_points),
+            "n_points": int(covered.size),
             "n_covered": int(covered.size),
-            "sampler": sampler_note,
-            "target_class_fraction": target_class_fraction,
+            "sampler": f"empirical_{data_source}",
+            "target_class_fraction": hard_precision,
             "data_source": data_source,
             "cov_real": float(coverage),
             "coverage_marginal": float(coverage_marginal),
@@ -1368,7 +1273,6 @@ class AnchorEnv(ParallelEnv):
             # Reset stabilization counter
             self._stable_counts[agent] = 0
             # Reset warning flags for this episode
-            self._adaptive_uniform_warned_this_episode[agent] = False
             self._precision_coverage_mismatch_warned_this_episode[agent] = False
             
             precision, coverage, initial_details = self._current_metrics(agent)
@@ -1378,7 +1282,7 @@ class AnchorEnv(ParallelEnv):
             if n_class <= 0:
                 cls = self._get_class_for_agent(agent)
                 if cls is not None:
-                    n_class = int((self._active_data()[2] == cls).sum())
+                    n_class = self._n_coverage_class(cls)
             self._coverage_at_reset[agent] = float(coverage)
             self._coverage_gain_eps[agent] = 1.0 / max(n_class, 1)
             # episode_phase is 0.0 at reset (self.timestep was just set to 0)
@@ -1940,7 +1844,7 @@ class AnchorEnv(ParallelEnv):
                         not self.require_coverage_gain_to_terminate
                         or union_cov
                         > self._union_coverage_at_reset.get(cls, 0.0)
-                        + (1.0 / max(int((self._active_data()[2] == cls).sum()), 1))
+                        + (1.0 / max(self._n_coverage_class(cls), 1))
                     )
                 ):
                     union_terminal_bonus_by_class[cls] = float(self.shared_terminal_bonus)
@@ -2303,6 +2207,26 @@ class AnchorEnv(ParallelEnv):
                          and (p_reset is None or precision > float(p_reset) + 1e-12)) else 0.0
         return float(self.alpha * p_tilde + self.beta * np.sqrt(coverage) * gate * cov_ok)
 
+    def _conditional_union_fidelity(self, agents: List[str], fallback: float) -> float:
+        """Union Fid under D(z|B): mixture of each rule's perturbed Fid.
+
+        Sampling z from the union means picking a box in proportion to its real-row
+        mass and then drawing z ~ D(z|B_i), so P(ŷ(z)=c) is the covered-row-weighted
+        mean of the per-box perturbed Fid already computed this step. Keeps the
+        shared Φ^∪ on the same estimand as the local Φ.
+        """
+        num, den = 0.0, 0.0
+        for agent in agents:
+            cached = self._last_step_metrics.get(agent)
+            if cached is None:
+                continue
+            p, _c, det = cached
+            w = float(det.get("n_covered", 0) or 0)
+            if w > 0 and np.isfinite(p):
+                num += w * float(p)
+                den += w
+        return float(num / den) if den > 0 else float(fallback)
+
     def _compute_class_union_metrics(self) -> Dict[int, Dict[str, float]]:
         """Fid/C of the union of real rules per class.
 
@@ -2327,7 +2251,7 @@ class AnchorEnv(ParallelEnv):
                 if mask_agent.shape[0] == union_mask.shape[0]:
                     union_mask |= mask_agent
 
-            mask_cls = (y_data == cls)
+            mask_cls = (self._coverage_class_labels(y_data) == cls)
             if mask_cls.sum() > 0:
                 cov_union = float(union_mask[mask_cls].mean())
             else:
@@ -2337,6 +2261,8 @@ class AnchorEnv(ParallelEnv):
                 preds = self._get_cached_probs(self._active_split()).argmax(axis=1)
                 fidelity_union = float((preds[union_mask] == cls).mean())
                 purity_union = float((y_data[union_mask] == cls).mean())
+                if self.precision_estimator == "conditional":
+                    fidelity_union = self._conditional_union_fidelity(valid_agents, fidelity_union)
             else:
                 fidelity_union = 0.0
                 purity_union = 0.0
@@ -2584,7 +2510,6 @@ def main():
     env_config = {
         "precision_target": 0.8,
         "coverage_target": 0.1,
-        "use_perturbation": False,
         "X_min": X_min,
         "X_range": X_range,
     }

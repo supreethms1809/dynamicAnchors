@@ -171,6 +171,40 @@ def compute_box_iou(
     return float(intersection_volume / union_volume)
 
 
+def cap_top_k_anchors(anchors, env_config, precision_keys, coverage_keys):
+    """Keep the top_k_rules_by_score anchors, exactly as MADA's inference does.
+
+    BenchMARL/inference.py truncates its pool to top_k_rules_by_score after NMS
+    (per agent, instance-based and class-based alike). This file used to compute
+    the same ranking but only write it out as a report field while keeping every
+    post-NMS box, so RLDA handed revision.evaluate a larger pool than MADA did --
+    measured seed 42: RLDA slots up to 25 boxes, MADA agents never above 5.
+    """
+    k = env_config.get("top_k_rules_by_score", None)
+    if k is None or int(k) <= 0 or len(anchors) <= int(k):
+        return list(anchors)
+    from utils.metrics import ranking_score as _ranking_score
+    formula = env_config.get("ranking_score_formula", "precision_coverage")
+
+    def _first(a, keys):
+        for key in keys:
+            if a.get(key) is not None:
+                return float(a[key])
+        return 0.0
+
+    scored = []
+    for a in anchors:
+        n_cov = a.get("n_covered", a.get("metric_n_covered"))
+        scored.append((_ranking_score(
+            _first(a, precision_keys), _first(a, coverage_keys), formula,
+            n_covered=None if n_cov is None else int(n_cov),
+        ), a))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    kept = [a for _, a in scored[:int(k)]]
+    logger.info(f"  Selected top {int(k)} anchors by score (from {len(anchors)} after NMS)")
+    return kept
+
+
 def nms_deduplicate_anchors(
     anchors_list: List[Dict[str, Any]],
     iou_threshold: float = 0.9,
@@ -2153,8 +2187,12 @@ def extract_rules_single_agent(
                 iou_threshold=nms_iou_threshold
             )
             
-            # Update anchors_list_per_class with deduplicated anchors
-            anchors_list_per_class = anchors_after_nms
+            # Step 3: top-K by score, same cap MADA applies (was report-only here).
+            anchors_list_per_class = cap_top_k_anchors(
+                anchors_after_nms, env_config,
+                precision_keys=("precision_recomputed", "precision"),
+                coverage_keys=("coverage_recomputed", "coverage"),
+            )
             
             # Extract unique rules from deduplicated anchors (for backward compatibility)
             unique_rules_per_class = list(set([
@@ -2940,8 +2978,12 @@ def extract_rules_single_agent(
             key_coverage="coverage_rollout_estimated"
         )
         
-        # Update class_based_anchors_list with deduplicated anchors
-        class_based_anchors_list = class_based_anchors_after_nms
+        # Step 3: top-K by score, same cap MADA applies to its class-based slot.
+        class_based_anchors_list = cap_top_k_anchors(
+            class_based_anchors_after_nms, env_config,
+            precision_keys=("precision_rollout_estimated", "precision"),
+            coverage_keys=("coverage_rollout_estimated", "coverage"),
+        )
         
         # Extract unique rules from deduplicated anchors (for backward compatibility)
         class_based_unique_rules = list(set([

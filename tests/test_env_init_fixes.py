@@ -156,7 +156,7 @@ def test_pool_class_anchors_keeps_class_based_sibling():
 
 def test_instance_coverage_is_class_conditional_not_marginal():
     X, y = _clustered_data(n_per_class=40)
-    env = _make_env(X, y, extra_cfg={"mode": "inference"})
+    env = _make_env(X, y, extra_cfg={"mode": "inference", "coverage_basis": "true_label"})
     env.x_star_unit = X[0]
     env.reset()
     a = np.zeros(env.n_features, dtype=np.float64)
@@ -234,3 +234,17 @@ def test_no_terminal_bonus_without_coverage_gain():
     assert info["termination_reason"] == 1.0
     assert env.n_predicates() >= 1
     assert reward >= 3.0
+
+
+def test_rlda_inference_caps_the_pool_at_top_k_like_mada():
+    """single_agent_inference used to compute top-K only as a report field."""
+    sys.path.insert(0, str(REPO / "single_agent"))
+    from single_agent_inference import cap_top_k_anchors
+    anchors = [{"precision": p, "coverage": 0.5, "n_covered": 40, "id": i}
+               for i, p in enumerate([0.5, 0.9, 0.7, 0.99, 0.6, 0.8, 0.95])]
+    cfg = {"top_k_rules_by_score": 3, "ranking_score_formula": "lcb_coverage"}
+    kept = cap_top_k_anchors(anchors, cfg, ("precision",), ("coverage",))
+    assert [a["id"] for a in kept] == [3, 6, 1]
+    assert len(cap_top_k_anchors(anchors[:2], cfg, ("precision",), ("coverage",))) == 2
+    assert len(cap_top_k_anchors(anchors, {"top_k_rules_by_score": None},
+                                 ("precision",), ("coverage",))) == 7

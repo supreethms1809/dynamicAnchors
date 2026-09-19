@@ -97,7 +97,7 @@ Multi-agent: multiple agents per class. Checkpoint selection uses FidCov + NashC
 Do not hardcode hyperparameters:
 
 - `BenchMARL/conf/base_experiment.yaml` — training loop (lr, batch, frames, device)
-- `BenchMARL/conf/anchor.yaml` — env/reward (`precision_target`, `coverage_target`, `alpha`, `beta`, `gamma`, `discount`, `initial_window`, `agents_per_class`, `precision_estimator: empirical`)
+- `BenchMARL/conf/anchor.yaml` — env/reward (`precision_target`, `coverage_target`, `alpha`, `beta`, `gamma`, `discount`, `initial_window`, `agents_per_class`, `precision_estimator`: `empirical` real-row Fid or `conditional` Anchors-style perturbed Fid)
 - `BenchMARL/conf/maddpg.yaml` / `masac.yaml` — algorithm
 - `BenchMARL/conf/mlp.yaml` — network
 - `single_agent/conf/anchor_single.yaml` — single-agent equivalent (multi-agent fields 0)

@@ -482,3 +482,52 @@ def test_quantile_same_class_diversity_penalizes_copies():
     env.lower[b], env.upper[b] = np.zeros(n), np.ones(n)
     env.lower[b][0], env.upper[b][0] = 0.6, 1.0
     assert env._compute_same_class_overlap_penalty(a) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_unknown_precision_estimator_is_rejected():
+    with pytest.raises(ValueError, match="precision_estimator"):
+        _env(precision_estimator="bootstrap")
+
+
+def test_conditional_fid_uses_perturbations_but_coverage_uses_real_rows():
+    env = _env(precision_estimator="conditional")
+    obs, _ = env.reset(seed=0)
+    a0 = list(obs.keys())[0]
+    p, c, det = env._current_metrics(a0)
+    assert det["sampler"] == "conditional_crn"
+    assert int(det["n_points"]) == env.n_perturb
+    emp = _env(precision_estimator="empirical")
+    emp.reset(seed=0)
+    _, c_emp, _ = emp._current_metrics(a0)
+    assert c == pytest.approx(c_emp)
+
+
+def test_conditional_union_fid_is_covered_row_weighted_mixture():
+    env = _env(precision_estimator="conditional", agents_per_class=2)
+    obs, _ = env.reset(seed=0)
+    cls0 = [a for a in obs if env._get_class_for_agent(a) == 0]
+    assert len(cls0) == 2
+    env._last_step_metrics[cls0[0]] = (1.0, 0.5, {"n_covered": 30})
+    env._last_step_metrics[cls0[1]] = (0.5, 0.5, {"n_covered": 10})
+    assert env._conditional_union_fidelity(cls0, fallback=0.0) == pytest.approx(0.875)
+    env._last_step_metrics[cls0[0]] = (1.0, 0.0, {"n_covered": 0})
+    env._last_step_metrics[cls0[1]] = (0.5, 0.0, {"n_covered": 0})
+    assert env._conditional_union_fidelity(cls0, fallback=0.3) == pytest.approx(0.3)
+
+
+def test_conditional_fid_is_zero_on_a_class_box_with_no_real_rows():
+    """crn_perturb pins empty dims to the class centroid; without the guard an
+    empty class box scored high perturbed Fid (reward for collapsing onto no data)."""
+    env = _env(precision_estimator="conditional", training_instance_ratio=0.0)
+    obs, _ = env.reset(seed=0)
+    a0 = list(obs.keys())[0]
+    assert env.x_star_unit.get(a0) is None
+    # Feature 0 separates the classes at 0.25 / 0.75; nothing lives in [0.48, 0.52].
+    env.lower[a0][:] = 0.0
+    env.upper[a0][:] = 1.0
+    env.lower[a0][0], env.upper[a0][0] = 0.48, 0.52
+    env.a[a0][0], env.b[a0][0] = 0.45, 0.55
+    p, c, det = env._current_metrics(a0)
+    assert c == 0.0
+    assert p == 0.0
+    assert det["sampler"] == "conditional_crn_empty"

@@ -915,7 +915,12 @@ class AnchorTrainerSB3:
     
     def _get_default_env_config(self) -> Dict[str, Any]:
         """Load env knobs from conf/anchor_single.yaml. Do not silently substitute stale defaults."""
-        config_path = os.path.join(os.path.dirname(__file__), "conf", "anchor_single.yaml")
+        # ANCHOR_SINGLE_CONFIG lets a sweep point the SA arm at an alternate env
+        # YAML, mirroring the MA arm's driver.py --anchor_config. Unset => default.
+        config_path = os.environ.get(
+            "ANCHOR_SINGLE_CONFIG",
+            os.path.join(os.path.dirname(__file__), "conf", "anchor_single.yaml"),
+        )
         if not os.path.exists(config_path):
             raise FileNotFoundError(
                 f"Environment YAML not found: {config_path}. "
