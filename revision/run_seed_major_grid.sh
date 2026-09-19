@@ -11,7 +11,8 @@
 #
 #   bash revision/run_seed_major_grid.sh --go
 #   bash revision/run_seed_major_grid.sh --go 42
-cd /Users/ssuresh/dynAnc_codeCleanup/dynamicAnchors/.claude/worktrees/perturb-fid || exit 1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 1
 PY=/opt/anaconda3/envs/marl/bin/python
 L=revision/run_perturb_fid_seed42.py
 MAIN_RUNS="${PAPER_RUNS_DIR:-/Users/ssuresh/dynAnc_codeCleanup/dynamicAnchors/runs}"
