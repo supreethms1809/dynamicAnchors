@@ -228,6 +228,11 @@ def infer_mada(dataset: str, seed: int, cfg: Dict[str, int], device: str) -> Pat
     return rules
 
 
+def coverage_basis() -> str:
+    """Match training YAML (predicted) unless the launcher set DYNANC_COVERAGE_BASIS."""
+    return os.environ.get("DYNANC_COVERAGE_BASIS", "predicted")
+
+
 def evaluate(dataset: str, method: str, rules: Path, seed: int) -> None:
     dest = result_path(dataset, method, seed)
     if FORCE:
@@ -242,6 +247,7 @@ def evaluate(dataset: str, method: str, rules: Path, seed: int) -> None:
             "--rules_file", str(rules), "--dataset", dataset, "--method", method,
             "--seed", str(seed), "--tau_p", str(TAU_P), "--tau_c", str(TAU_C),
             "--k", str(K), "--out_dir", str(RESULTS),
+            "--coverage_basis", coverage_basis(),
         ],
         log_file=ds_log(dataset, f"eval_{method}_seed{seed}.log"),
     )

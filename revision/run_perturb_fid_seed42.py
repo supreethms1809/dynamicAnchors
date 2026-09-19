@@ -216,6 +216,10 @@ class Sweep:
         self.log(f"PERTURB-FID PILOT root={self.root} smoke={self.smoke} "
                  f"estimator={self.estimator} tau_c={self.tau_c} "
                  f"arms={sorted({a for q in self.queues.values() for _, a in q})}")
+        self.log(f"lanes: {LANE_SLOTS['big']} big + {LANE_SLOTS['small']} small "
+                 f"(dataset×arm jobs); RLDA class shards = n_classes")
+        self.log(f"big datasets: {BIG}")
+        self.log(f"small datasets: {SMALL}")
         self.log(f"queues: big={self.queues['big']}  small={self.queues['small']}")
         running: dict = {}
         failures = 0

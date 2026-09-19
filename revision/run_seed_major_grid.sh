@@ -11,16 +11,27 @@
 #
 #   bash revision/run_seed_major_grid.sh --go
 #   bash revision/run_seed_major_grid.sh --go 42
+#   bash revision/run_seed_major_grid.sh --go 42 43     # this machine
+#   bash revision/run_seed_major_grid.sh --go 44 45 46  # other machine
+#
+# Each cell uses 4 concurrent (dataset, arm) jobs: 2 big + 2 small.
+# RLDA then shards classes: --parallel_classes = n_classes, --n_envs 1.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 PY=/opt/anaconda3/envs/marl/bin/python
 L=revision/run_perturb_fid_seed42.py
-MAIN_RUNS="${PAPER_RUNS_DIR:-/Users/ssuresh/dynAnc_codeCleanup/dynamicAnchors/runs}"
+MAIN_RUNS="${PAPER_RUNS_DIR:-$ROOT/runs}"
 PF=runs/paper_final
-LOG=$PF/seed_major.out
 mkdir -p "$PF"
 stamp() { date "+%m-%d %H:%M:%S"; }
-say() { echo "[$(stamp)] $*"; }
+say() {
+  local msg="[$(stamp)] $*"
+  echo "$msg"
+  if [[ -n "${LOG:-}" ]]; then
+    mkdir -p "$(dirname "$LOG")"
+    echo "$msg" >> "$LOG"
+  fi
+}
 
 if [[ "${1:-}" != "--go" ]]; then
   echo "refusing to start: pass --go"
@@ -33,6 +44,8 @@ if [[ $# -eq 0 ]]; then
 else
   SEEDS=("$@")
 fi
+HOST=$(hostname 2>/dev/null | tr ' /' '_' || echo unknown)
+LOG="$PF/seed_major_${HOST}_s${SEEDS[0]}.out"
 DS_ABL="iris synthetic wine sick breast_cancer uci_credit mammography housing heloc uci_adult folktables_income_CA_2018"
 DS_ALL="$DS_ABL wyodot_kvdw_labeled"
 NOCROSS="--override shared_terminal_bonus=0.0 --override inter_class_overlap_weight=0.0 --override shared_reward_weight=0.0"
@@ -77,24 +90,29 @@ run_baselines() {
       say "BASELINES missing classifier $clf (skip $ds)"
       continue
     fi
+    # Same out_dir for both τ_C; evaluate filenames already include tc0p10 / tc0p20.
     out=$PF/baselines_emp
     mkdir -p "$out"
-    $PY -m revision.baselines --dataset "$ds" --seed "$seed" --k 1 \
-        --tau_p 0.90 --tau_c 0.10 --coverage_basis predicted \
-        --fid_estimator empirical \
-        --methods cart random_search sp_anchors greedy_anchors \
-        --budget_per_class 5 --n_candidates 256 \
-        --classifier_path "$clf" --out_dir "$out" \
-        >> "$PF/baselines_emp_seed${seed}.log" 2>&1
+    for tau in 0.10 0.20; do
+      $PY -m revision.baselines --dataset "$ds" --seed "$seed" --k 1 \
+          --tau_p 0.90 --tau_c "$tau" --coverage_basis predicted \
+          --fid_estimator empirical \
+          --methods cart random_search sp_anchors greedy_anchors \
+          --budget_per_class 5 --n_candidates 256 \
+          --classifier_path "$clf" --out_dir "$out" \
+          >> "$PF/baselines_emp_seed${seed}.log" 2>&1
+    done
     out=$PF/baselines_pert
     mkdir -p "$out"
-    $PY -m revision.baselines --dataset "$ds" --seed "$seed" --k 1 \
-        --tau_p 0.90 --tau_c 0.10 --coverage_basis predicted \
-        --fid_estimator perturbed \
-        --methods cart random_search \
-        --budget_per_class 5 --n_candidates 256 \
-        --classifier_path "$clf" --out_dir "$out" \
-        >> "$PF/baselines_pert_seed${seed}.log" 2>&1
+    for tau in 0.10 0.20; do
+      $PY -m revision.baselines --dataset "$ds" --seed "$seed" --k 1 \
+          --tau_p 0.90 --tau_c "$tau" --coverage_basis predicted \
+          --fid_estimator perturbed \
+          --methods cart random_search \
+          --budget_per_class 5 --n_candidates 256 \
+          --classifier_path "$clf" --out_dir "$out" \
+          >> "$PF/baselines_pert_seed${seed}.log" 2>&1
+    done
     say "BASELINES done $ds seed=$seed"
   done
   say "BASELINES complete seed=$seed"
@@ -153,6 +171,10 @@ run_seed() {
 }
 
 say "SEED-MAJOR GRID START seeds=${SEEDS[*]}  C_train=predicted  root=$PF"
+say "host=$HOST  python=$PY  repo=$ROOT  classifiers=$MAIN_RUNS"
+say "lanes: 2 big + 2 small (dataset×arm jobs in run_perturb_fid_seed42.py)"
+say "RLDA: run_parallel_classes.py --parallel_classes=n_classes --n_envs=1"
+say "log=$LOG"
 for s in "${SEEDS[@]}"; do
   run_seed "$s"
 done

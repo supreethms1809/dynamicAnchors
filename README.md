@@ -23,7 +23,20 @@ pip install -r BenchMARL/requirements.txt
 
 ## Results pipeline (what produces today's numbers)
 
-Overnight sweep and paper-seed runs use the same stack:
+Headline 2×2 (empirical/perturbed × τ_C 0.10/0.20, C_train=C_eval=predicted)
+is the seed-major grid. Split seeds across machines; each cell already runs
+**2 big + 2 small** dataset jobs, and RLDA trains **one process per class**.
+
+```bash
+# machine A
+bash revision/run_seed_major_grid.sh --go 42 43
+# machine B
+bash revision/run_seed_major_grid.sh --go 44 45 46
+```
+
+Layout, merge, and settings: [`runs/paper_final/README.md`](runs/paper_final/README.md).
+
+Older helpers still in the repo:
 
 ```bash
 # Full overnight sweep (RLDA + MADA, multiple seeds)

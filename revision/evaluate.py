@@ -429,7 +429,7 @@ def main():
     )
     p.add_argument("--out_dir", default="revision/results")
     p.add_argument(
-        "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "true_label"),
+        "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "predicted"),
         choices=["true_label", "predicted"],
         help="Class-conditional coverage denominator: P(x in B | y=c) or P(x in B | f_hat=c).",
     )

@@ -33,9 +33,46 @@ from revision.paper_stats import (  # noqa: E402
 )
 from utils.metrics import track_a_cov_tau, track_a_eff  # noqa: E402
 
-PF = REPO / "runs" / "paper_final" / "results" / "predicted"
+PF_ROOT = REPO / "runs" / "paper_final"
+PF = PF_ROOT / "results" / "predicted"
 OLD_PAPER = MAIN / "runs" / "paper_fiveseed_overlap075" / "results"
 OLD_WYODOT = MAIN / "runs" / "wyodot_fiveseed_overlap075" / "dnn" / "results"
+
+# Live seed-major trees. Collector copies into PF/<label>/ as a fallback.
+_LIVE_RL = {
+    ("rlda", "emp", "0p10"): PF_ROOT / "emp_tc0p10" / "results" / "ddpg",
+    ("mada", "emp", "0p10"): PF_ROOT / "emp_tc0p10" / "results" / "maddpg",
+    ("rlda", "emp", "0p20"): PF_ROOT / "emp_tc0p20" / "results" / "ddpg",
+    ("mada", "emp", "0p20"): PF_ROOT / "emp_tc0p20" / "results" / "maddpg",
+    ("rlda", "pert", "0p10"): PF_ROOT / "pert_tc0p10" / "results" / "ddpg",
+    ("mada", "pert", "0p10"): PF_ROOT / "pert_tc0p10" / "results" / "maddpg",
+    ("rlda", "pert", "0p20"): PF_ROOT / "pert_tc0p20" / "results" / "ddpg",
+    ("mada", "pert", "0p20"): PF_ROOT / "pert_tc0p20" / "results" / "maddpg",
+}
+_LIVE_BASE = {
+    "emp": PF_ROOT / "baselines_emp",
+    "pert": PF_ROOT / "baselines_pert",
+}
+_COPY_FOLDER = {
+    ("rlda", "emp", "0p10"): "RLDA-emp",
+    ("mada", "emp", "0p10"): "MADA-emp",
+    ("rlda", "emp", "0p20"): "RLDA-emp-tc020",
+    ("mada", "emp", "0p20"): "MADA-emp-tc020",
+    ("rlda", "pert", "0p10"): "RLDA-pert",
+    ("mada", "pert", "0p10"): "MADA-pert",
+    ("rlda", "pert", "0p20"): "RLDA-pert-tc020",
+    ("mada", "pert", "0p20"): "MADA-pert-tc020",
+    ("cart", "emp", "0p10"): "CART-emp",
+    ("random_search", "emp", "0p10"): "RandS-emp",
+    ("sp_anchors", "emp", "0p10"): "SP-Anch",
+    ("greedy_anchors", "emp", "0p10"): "GreedyAnch",
+    ("cart", "pert", "0p10"): "CART-pert",
+    ("random_search", "pert", "0p10"): "RandS-pert",
+    ("cart", "emp", "0p20"): "CART-emp-tc020",
+    ("random_search", "emp", "0p20"): "RandS-emp-tc020",
+    ("cart", "pert", "0p20"): "CART-pert-tc020",
+    ("random_search", "pert", "0p20"): "RandS-pert-tc020",
+}
 OUT1 = REPO / "docs" / "RESULTS_paper_final_predicted.md"
 OUT2 = REPO / "docs" / "RESULTS_old_lock_vs_paper_final.md"
 
@@ -75,39 +112,69 @@ def _gr(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text()).get("global_ruleset") or {}
 
 
+def locate(method: str, ds: str, seed: int, tau: str = "0p10",
+           estimator: str = "emp") -> Optional[Path]:
+    """Prefer the live 2×2 cell; fall back to a collector copy under results/predicted/."""
+    name = f"{ds}__{method}__seed{seed}__tp0p90__tc{tau}.json"
+    if method in ("rlda", "mada"):
+        live_dir = _LIVE_RL.get((method, estimator, tau))
+        if live_dir is not None:
+            p = live_dir / name
+            if p.is_file():
+                return p
+    else:
+        live_dir = _LIVE_BASE.get(estimator)
+        if live_dir is not None:
+            p = live_dir / name
+            if p.is_file():
+                return p
+    folder = _COPY_FOLDER.get((method, estimator, tau)) or FOLDER.get(method)
+    if folder:
+        p = PF / folder / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _record(path: Path) -> Dict[str, Optional[float]]:
+    blob = json.loads(path.read_text())
+    gr = blob.get("global_ruleset") or {}
+    extra = blob.get("extra") or {}
+    compact = blob.get("compactness") or {}
+    rec: Dict[str, Optional[float]] = {
+        "fid": _finite(gr.get("global_fidelity")),
+        "cov": _finite(gr.get("coverage")),
+        "conf": _finite(gr.get("conflict_rate")),
+        "pur": _finite(gr.get("global_purity")),
+        "eff": track_a_eff(gr),
+        "cov_tau": track_a_cov_tau(gr),
+        "n_active": _finite(compact.get("mean_active_features")),
+        "basis": extra.get("coverage_basis"),
+    }
+    unions = []
+    for blk in (blob.get("per_class") or {}).values():
+        u = (blk or {}).get("union") or {}
+        unions.append({
+            "fid": _finite(u.get("fidelity")),
+            "cov": _finite(u.get("coverage")),
+        })
+    rec["n_classes"] = float(len(unions))
+    rec["_unions"] = unions  # type: ignore[assignment]
+    rec["_blob"] = blob  # type: ignore[assignment]
+    return rec
+
+
 def ingest_paper_final() -> Dict[Tuple[str, str, int], Dict[str, Optional[float]]]:
+    """Headline ingest: empirical Fid, τ_C=0.10, C=predicted (emp_tc0p10 + baselines_emp)."""
     out: Dict[Tuple[str, str, int], Dict[str, Optional[float]]] = {}
-    for method, folder in FOLDER.items():
+    for method in FOLDER:
+        est = "emp"
         for ds in DATASETS:
             for seed in SEEDS:
-                p = PF / folder / f"{ds}__{method}__seed{seed}__tp0p90__tc0p10.json"
-                if not p.is_file():
+                p = locate(method, ds, seed, tau="0p10", estimator=est)
+                if p is None:
                     continue
-                blob = json.loads(p.read_text())
-                gr = blob.get("global_ruleset") or {}
-                extra = blob.get("extra") or {}
-                compact = blob.get("compactness") or {}
-                rec: Dict[str, Optional[float]] = {
-                    "fid": _finite(gr.get("global_fidelity")),
-                    "cov": _finite(gr.get("coverage")),
-                    "conf": _finite(gr.get("conflict_rate")),
-                    "pur": _finite(gr.get("global_purity")),
-                    "eff": track_a_eff(gr),
-                    "cov_tau": track_a_cov_tau(gr),
-                    "n_active": _finite(compact.get("mean_active_features")),
-                    "basis": extra.get("coverage_basis"),
-                }
-                unions = []
-                for blk in (blob.get("per_class") or {}).values():
-                    u = (blk or {}).get("union") or {}
-                    unions.append({
-                        "fid": _finite(u.get("fidelity")),
-                        "cov": _finite(u.get("coverage")),
-                    })
-                rec["n_classes"] = float(len(unions))
-                rec["_unions"] = unions  # type: ignore[assignment]
-                rec["_blob"] = blob  # type: ignore[assignment]
-                out[(ds, method, seed)] = rec
+                out[(ds, method, seed)] = _record(p)
     return out
 
 
@@ -164,12 +231,12 @@ def seed42_pert_rows() -> List[str]:
         "| method | Fid | Cov | Conf | Eff |",
         "|---|---:|---:|---:|---:|",
     ]
-    for method, folder in PERT_FOLDERS.items():
+    for method in PERT_FOLDERS:
         fids, covs, confs, effs = [], [], [], []
         n = 0
         for ds in DATASETS:
-            p = PF / folder / f"{ds}__{method}__seed42__tp0p90__tc0p10.json"
-            if not p.is_file():
+            p = locate(method, ds, 42, tau="0p10", estimator="pert")
+            if p is None:
                 continue
             gr = _gr(p)
             n += 1
