@@ -145,6 +145,8 @@ class AnchorEnv(ParallelEnv):
             env_config.get("coverage_basis", "predicted")
         )
         self.quantile_eps = float(env_config.get("quantile_eps", 1e-3))
+        # Inference-only option: keep x* inside the unit box (see qmdp.contain_point).
+        self.enforce_instance_containment = bool(env_config.get("enforce_instance_containment", False))
         self.max_quantile_step = float(env_config.get("max_quantile_step", 0.10))
         self.min_quantile_width = float(env_config.get("min_quantile_width", 0.02))
         self.leave_threshold = float(env_config.get("leave_threshold", 0.85))
@@ -743,6 +745,9 @@ class AnchorEnv(ParallelEnv):
         lo, up = qmdp.quantile_to_unit_bounds(
             self.a[agent], self.b[agent], self._cdfs(agent)["v_class"], self.quantile_eps
         )
+        x_star = self.x_star_unit.get(agent)
+        if self.enforce_instance_containment and x_star is not None:
+            lo, up = qmdp.contain_point(lo, up, x_star)
         self.lower[agent], self.upper[agent] = lo, up
 
     def _values_to_q(self, agent: str, x_unit: np.ndarray) -> np.ndarray:

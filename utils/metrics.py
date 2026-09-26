@@ -580,7 +580,9 @@ def active_feature_mask(
     feature_min = np.asarray(feature_min, dtype=np.float64).reshape(-1)
     feature_max = np.asarray(feature_max, dtype=np.float64).reshape(-1)
     full = np.maximum(feature_max - feature_min, 1e-12)
-    width = np.maximum(upper - lower, 0.0)
+    # A face beyond the observed range constrains nothing: clip before measuring,
+    # or a one-sided rule with an open face (CART leaf, x <= t) reads as inactive.
+    width = np.maximum(np.minimum(upper, feature_max) - np.maximum(lower, feature_min), 0.0)
     return width < (float(sparsity_width_ratio) * full)
 
 

@@ -316,7 +316,10 @@ def evaluate_rules_file(
         for r in union.individual:
             umask |= r.mask
         class_union_masks[cls] = umask
-        class_union_fid[cls] = union.union_metrics.fidelity if np.isfinite(union.union_metrics.fidelity) else -np.inf
+        # Conflict tie-break uses the D_val union Fid: the D_test value would let
+        # test-set f_hat labels decide which class a conflicted row is given.
+        val_fid = selected_val.union_metrics.fidelity
+        class_union_fid[cls] = val_fid if np.isfinite(val_fid) else -np.inf
 
         logger.info(
             "Class %s: k=%s best Fid=%.3f Pur=%.3f cov=%.3f n=%s | "
@@ -384,6 +387,7 @@ def evaluate_rules_file(
         ),
         extra={
             "rules_file": os.path.abspath(rules_file),
+            "conflict_tiebreak": "class-union fidelity on D_val",
             "selection_split": "val",
             "report_split": "test",
             "bounds_space": "unit",

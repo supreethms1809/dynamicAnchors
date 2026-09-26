@@ -111,8 +111,12 @@ def verify(path: Path) -> tuple[list[str], dict]:
     ds, method, seed = r["dataset"], r["method"], int(r["seed"])
     space = "unit" if method in UNIT_METHODS else "original"
     extra = r.get("extra") or {}
-    loader, y_hat, _ = get_loader(ds, seed, extra.get("classifier_path"),
-                                  extra.get("rules_file") or str(path))
+    loader, y_hat, y_hat_val = get_loader(ds, seed, extra.get("classifier_path"),
+                                          extra.get("rules_file") or str(path))
+    # Artifacts written after the tie-break fix settle conflicts by D_val union
+    # Fid (extra.conflict_tiebreak); older ones used the D_test union Fid.
+    val_tiebreak = bool(extra.get("conflict_tiebreak"))
+    X_val = np.asarray(loader.X_val_unit if space == "unit" else loader.X_val, dtype=np.float32)
     y = np.asarray(loader.y_test)
     basis = extra.get("coverage_basis", "true_label")
     X = np.asarray(loader.X_test_unit if space == "unit" else loader.X_test, dtype=np.float32)
@@ -159,7 +163,15 @@ def verify(path: Path) -> tuple[list[str], dict]:
             if mine["coverage"] + 1e-9 < mm["coverage"]:
                 problems.append(f"{key}: union coverage < member {i} coverage")
         union_masks[cls] = umask
-        union_fid[cls] = mine["fidelity"] if math.isfinite(mine["fidelity"]) else -np.inf
+        if val_tiebreak:
+            vmask = np.zeros(X_val.shape[0], dtype=bool)
+            for rule in rules:
+                if rule.get("lower_bounds") is not None and rule.get("upper_bounds") is not None:
+                    vmask |= mask_of(X_val, rule["lower_bounds"], rule["upper_bounds"])
+            tb = float((y_hat_val[vmask] == cls).mean()) if vmask.any() else float("nan")
+        else:
+            tb = mine["fidelity"]
+        union_fid[cls] = tb if math.isfinite(tb) else -np.inf
 
     # ---- global rule set ---------------------------------------------------
     g = r.get("global_ruleset") or {}
