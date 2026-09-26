@@ -124,7 +124,21 @@ def score_tree(tree, fp: FastPerturb, Xt: np.ndarray, y_hat: np.ndarray, rng) ->
             raise AssertionError(f"leaf {i} box != tree routing")
     row_pf = np.array([pf[i] for i in leaf])
     pred = tree.predict(Xt)
+    leaf_cls = {i: c for i, (_, _, c) in boxes.items()}
+    per_class = {}
+    for c in sorted(set(leaf_cls.values())):
+        rows = pred == c
+        fc = np.array([pf[i] for i in ids if leaf_cls[i] == c])
+        per_class[c] = {
+            "n_leaves": int(fc.size),
+            "pert_fid_rows": float(row_pf[rows].mean()) if rows.any() else None,
+            "pert_fid_rule_mean": float(fc.mean()),
+            "rows_pert_ge_tau": float((row_pf[rows] >= TAU_P).mean()) if rows.any() else None,
+            "emp_fid": float((y_hat[rows] == c).mean()) if rows.any() else None,
+            "test_rows": int(rows.sum()),
+        }
     return {
+        "per_class": per_class,
         "emp_fid": float((pred == y_hat).mean()),
         "pert_fid_rows": float(row_pf.mean()),
         "pert_fid_rule_mean": float(fid.mean()),
@@ -150,7 +164,20 @@ def score_rl(cell: Dict[str, Any], sd, fp: FastPerturb, rng) -> Dict[str, Any]:
     fid, n_act = fp.fids(boxes, rng)
     w = np.asarray(cover, float)
     g = cell["global_ruleset"]
+    cls_of = np.array([c for _, _, c in boxes])
+    per_class = {}
+    for c in sorted(set(cls_of.tolist())):
+        m = cls_of == c
+        wc = w[m]
+        per_class[int(c)] = {
+            "n_rules": int(m.sum()),
+            "pert_fid_rows": float((fid[m] * wc).sum() / wc.sum()) if wc.sum() else None,
+            "pert_fid_rule_mean": float(fid[m].mean()),
+            "rows_pert_ge_tau": float(wc[fid[m] >= TAU_P].sum() / wc.sum()) if wc.sum() else None,
+            "union_emp_fid": (cell["per_class"].get(f"class_{c}", {}).get("union") or {}).get("fidelity"),
+        }
     return {
+        "per_class": per_class,
         "emp_fid": g["global_fidelity"], "coverage": g["coverage"], "eff": g["effectiveness"],
         "pert_fid_rows": float((fid * w).sum() / w.sum()) if w.sum() else float("nan"),
         "pert_fid_rule_mean": float(fid.mean()),
