@@ -14,6 +14,7 @@ from revision.paper_stats import DATASETS
 ap=argparse.ArgumentParser(); ap.add_argument('--cfix_dir',default=str(REPO.parent/'results'/'containment_fix')); R=ap.parse_args().cfix_dir.rstrip('/')+'/'
 nm=lambda s:{'folktables_income_CA_2018':'folktables','wyodot_kvdw_labeled':'wyodot'}.get(s,s)
 T=('pi','pi_contained','anchors')
+SEEDS=sorted({p.split('seed')[-1][:-5] for p in glob.glob(R+'*__rlda__seed*.json')})
 out=[]
 for arm in ('rlda','mada'):
     per=collections.defaultdict(lambda: collections.defaultdict(list))
@@ -29,7 +30,7 @@ for arm in ('rlda','mada'):
                 d[t+'|emp'].append(np.nanmean([x['emp_fid'] for x in xs])); d[t+'|act'].append(np.mean([x['n_active'] for x in xs]))
                 if t=='anchors': d['self'].append(np.nanmean([x['self_reported_precision'] if x['self_reported_precision'] is not None else np.nan for x in xs]))
             per[ds]['n'].append(r['n'])
-    print(f"\n=== {arm.upper()} per-instance, seeds 42-43, same test points; Anchors-style D(z|A) conditional Fid for all ===")
+    print(f"\n=== {arm.upper()} per-instance, seeds {','.join(SEEDS)}, same test points; Anchors-style D(z|A) conditional Fid for all ===")
     print(f"{'dataset':12s}{'n':>5s} | {'contain π/π+/A':>18s} | {'condFid π/π+/A':>20s} | {'≥0.90 π/π+/A':>17s} | {'cov π/π+/A':>20s} | {'conds π+/A':>10s} | {'A self':>7s}")
     cols=collections.defaultdict(list)
     for ds,d in per.items():
