@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 PY=${1:-python}
 SEEDS=${SEEDS:-"44 45 46"}
 INST=${INST:-runs/paper_final/emp_tc0p10/results}
+# containment_eval rolls out under $INST/../conf (the pert grid trains on conditional Fid).
 OUT=${OUT:-runs/paper_final/containment_fix}
 mkdir -p "$OUT/logs"
 

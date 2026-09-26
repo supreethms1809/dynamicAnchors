@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -108,7 +109,8 @@ def run_cell(arm: str, ds: str, seed: int, max_points: int, inst_dir: Path = INS
                               "self_reported_precision": a.get("perturb_fid"),
                               "rule": a.get("rule")}
         rows.append(row)
-    return {"arm": arm, "dataset": ds, "seed": seed, "n": len(rows), "rows": rows}
+    return {"arm": arm, "dataset": ds, "seed": seed, "n": len(rows),
+            "precision_estimator": cfg.get("precision_estimator"), "rows": rows}
 
 
 def main() -> int:
@@ -120,7 +122,19 @@ def main() -> int:
     ap.add_argument("--inst_dir", type=Path, default=INST,
                     help="folder with {ddpg,maddpg}/*__instances__seed*.json")
     ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--conf_dir", type=Path, default=None,
+                    help="env YAMLs the policies were trained with (default: <inst_dir>/../conf)")
     args = ap.parse_args()
+    # Roll out under the grid's own env YAMLs (the pert grid sets precision_estimator:
+    # conditional); the checkout's defaults are the emp grid's. The training
+    # pipeline passed them the same way, through these two variables.
+    conf = args.conf_dir or args.inst_dir.parent / "conf"
+    if (conf / "anchor.yaml").is_file():
+        os.environ["ANCHOR_CONFIG"] = str((conf / "anchor.yaml").resolve())
+        os.environ["ANCHOR_SINGLE_CONFIG"] = str((conf / "anchor_single.yaml").resolve())
+        print(f"env YAMLs from {conf}")
+    else:
+        print(f"no {conf}/anchor.yaml, using the checkout's env YAMLs")
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     for arm in args.arms:
