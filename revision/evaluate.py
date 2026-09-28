@@ -98,10 +98,10 @@ def _pool_class_anchors(per_class_results: Dict[str, Any], cls: int) -> List[Dic
 
 
 SELECTION_PER_POLICY, SELECTION_POOLED = "per_policy", "pooled"
-# D_val Fid a policy's selected rule needs to enter its class's OR. tau_P (0.90)
-# left about one class per cell without a rule for both RLDA and MADA; 0.60 keeps
-# RLDA near its no-floor rule set and cuts MADA's cross-class overlap from 40% to
-# 11% of test rows (floors 0.5-0.9 compared in revision/perpolicy_report.py).
+# D_val Fid a policy's selected rule needs to enter its class's OR. Chosen on D_val
+# (revision/floor_select_val.py, seeds 42-43, four grids): the highest floor that
+# costs RLDA at most 0.05 D_val Eff. 0.60 costs it 0.040 and cuts MADA's cross-class
+# overlap from 0.40 to 0.11 of D_val rows; 0.70 would cost RLDA 0.076.
 POLICY_FLOOR_DEFAULT = 0.60
 
 
