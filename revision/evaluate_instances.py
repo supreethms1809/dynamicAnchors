@@ -404,6 +404,34 @@ def _load_mada_policies(experiment_dir: str, device: str) -> Tuple[Dict[int, Any
     return policies, agents, index, models_dir
 
 
+def _load_mada_policy_groups(experiment_dir: str, device: str) -> Tuple[Dict[int, List[Tuple[str, Any]]], Dict[str, Any]]:
+    """Every agent's policy per class: class -> [(agent, policy), ...].
+
+    `_load_mada_policies` keeps only the first agent of each class; a MADA class
+    is explained by all of its agents together (their rules are OR'd).
+    """
+    from BenchMARL.inference import load_policy_model
+
+    models_dir = _resolve_mada_models_dir(experiment_dir)
+    with open(os.path.join(models_dir, "policies_index.json")) as f:
+        index = json.load(f)
+    mlp_config = os.path.join(str(REPO / "BenchMARL"), "conf", "mlp.yaml")
+    groups: Dict[int, List[Tuple[str, Any]]] = {}
+    for key, slot in (index.get("policies_by_class") or {}).items():
+        cls = int(slot.get("class", str(key).split("_")[-1]))
+        for info in slot.get("policies") or []:
+            meta = info.get("metadata_file") or ""
+            groups.setdefault(cls, []).append((
+                str(info.get("agent") or info.get("group")),
+                load_policy_model(os.path.join(models_dir, info["policy_file"]),
+                                  os.path.join(models_dir, meta) if meta else "",
+                                  mlp_config, device=device),
+            ))
+    if not groups:
+        raise FileNotFoundError(f"No MADA policies in {models_dir}")
+    return groups, index
+
+
 def _rollout_mada(
     *,
     policies,
@@ -577,7 +605,7 @@ def run_anchors_on_indices(
     tau_p: float,
     seed: int,
 ) -> List[Dict[str, Any]]:
-    from revision.baselines import _try_import_anchor
+    from revision.baselines import _capture_anchor_conditions, _try_import_anchor
 
     anchor_tabular = _try_import_anchor()
     if anchor_tabular is None:
@@ -588,6 +616,7 @@ def run_anchors_on_indices(
         feature_names=list(loader.feature_names),
         train_data=loader.X_train,
     )
+    _capture_anchor_conditions(explainer)
     X_test = loader.X_test
     rows = []
     predict_count = {"n": 0}
@@ -623,7 +652,10 @@ def run_anchors_on_indices(
         wall = time.perf_counter() - t0
         pred_names = []
         precision = coverage = None
+        conditions = None
         if ok and exp is not None:
+            # Exact bins; the printed rule rounds every edge to 2 decimals.
+            conditions = [[int(f), op, float(v)] for f, op, v in exp.exp_map.get("conditions", [])]
             raw = _maybe_call(getattr(exp, "names", []))
             pred_names = list(raw or [])
             precision = _json_float(_maybe_call(getattr(exp, "precision", None)))
@@ -637,6 +669,7 @@ def run_anchors_on_indices(
             "coverage": coverage,
             "n_predicates": len(pred_names),
             "rule": " and ".join(str(p) for p in pred_names) if pred_names else None,
+            "conditions": conditions,
             "queries": int(predict_count["n"]),
             "wall_s": float(wall),
         })
