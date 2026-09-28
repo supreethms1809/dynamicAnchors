@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -96,6 +97,98 @@ def _pool_class_anchors(per_class_results: Dict[str, Any], cls: int) -> List[Dic
     return _dedupe_anchor_boxes(anchors)
 
 
+SELECTION_PER_POLICY, SELECTION_POOLED = "per_policy", "pooled"
+
+
+def _agent_pools(per_class_results: Dict[str, Any], cls: int) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """MADA: each agent's own candidates (its instance and class-level rollouts).
+
+    None when the class has fewer than two agents (RLDA: one policy per class).
+    """
+    cd = per_class_results.get(f"class_{cls}") or {}
+    pa = cd.get("per_agent_results") or {}
+    cb = cd.get("class_based_results") or {}
+    agents = sorted({a for a in (*pa, *cb) if isinstance((pa.get(a) or cb.get(a)), dict)})
+    if len(agents) < 2:
+        return None
+    pools = {}
+    for ag in agents:
+        found = []
+        for src in (pa.get(ag) or {}, cb.get(ag) or {}):
+            found.extend(a for a in (src.get("anchors") or src.get("all_anchors") or [])
+                         if _has_scorable_box(a))
+        pools[ag] = _dedupe_anchor_boxes(found)
+    return pools
+
+
+def apply_policy_floor(selected, y_val, y_hat_val, cls: int, floor: Optional[float]):
+    """Keep the selected rules whose D_val fidelity reaches `floor`; None if none does.
+
+    A policy whose best rule is unreliable adds nothing to the class OR. For MADA
+    the class's other agents still cover it; RLDA's single policy leaves the
+    class without a rule (its rows go undecided). `floor=None` keeps everything.
+    """
+    if selected is None or floor is None:
+        return selected
+    kept = [r for r in selected.individual
+            if np.isfinite(r.metrics.fidelity) and r.metrics.fidelity + 1e-12 >= floor]
+    if not kept:
+        return None
+    if len(kept) == len(selected.individual):
+        return selected
+    return select_topk_union(kept, y_val, y_hat_val, cls, k=len(kept), class_conditional=True,
+                             enforce_min_support=False)
+
+
+def select_per_policy(
+    pools: Dict[str, List[Dict[str, Any]]], X_val_unit: np.ndarray, y_val: np.ndarray,
+    y_hat_val: np.ndarray, cls: int, *, k: int, min_support: int, ranking_formula: str,
+    floor: Optional[float] = None,
+):
+    """Select from each policy's own pool as RLDA selects from its one pool, then OR.
+
+    A MADA class is explained by its agents together: every agent contributes its
+    top-k (k = 1: its best rule), chosen on D_val exactly as the single RLDA policy
+    chooses, and the class rule set is the union of those picks: a two-level OR
+    (within an agent's top-k, then across agents), where RLDA's single policy is a
+    one-level OR. Pooling all agents and keeping the class's top-k instead discards
+    the other agents' rules. An agent whose pick misses `floor` (D_val Fid) is left
+    out of the OR; the others still explain the class.
+    Returns the D_val union over the picks, or None if no agent has a rule.
+    """
+    picked: List[Any] = []
+    seen = set()
+    for ag, anchors in pools.items():
+        ranked = rules_from_anchors(
+            anchors, X_val_unit, y_val, y_hat_val, cls, class_conditional=True,
+            min_support=min_support, ranking_formula=ranking_formula, space="unit",
+        )
+        if not ranked:
+            continue
+        sel = select_topk_union(
+            ranked, y_val, y_hat_val, cls, k=k, class_conditional=True,
+            min_support=min_support, marginal_gain=True, ranking_formula=ranking_formula,
+        )
+        sel = apply_policy_floor(sel, y_val, y_hat_val, cls, floor)
+        if sel is None:
+            continue
+        for r in sel.individual:
+            # Two agents can land on the same box; it is one rule of the union.
+            key = (tuple(np.round(np.asarray(r.lower, dtype=float), 6)),
+                   tuple(np.round(np.asarray(r.upper, dtype=float), 6)))
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append(dataclasses.replace(
+                r, rule_id=f"{ag}:{r.rule_id}", extra={**(r.extra or {}), "agent": ag}))
+    if not picked:
+        return None
+    return select_topk_union(
+        picked, y_val, y_hat_val, cls, k=len(picked), class_conditional=True,
+        min_support=min_support, enforce_min_support=False,
+    )
+
+
 def _has_scorable_box(anchor: Dict[str, Any]) -> bool:
     """Admit unit-space or original-space bounds (evaluate scores unit keys).
 
@@ -170,6 +263,8 @@ def evaluate_rules_file(
     min_support: int = MIN_SUPPORT_DEFAULT,
     ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
     split: str = "test",
+    selection: str = SELECTION_PER_POLICY,
+    policy_floor: Optional[float] = None,
 ) -> str:
     if split != "test":
         raise ValueError(
@@ -239,33 +334,50 @@ def evaluate_rules_file(
     feat_min_orig = X_all_orig.min(axis=0)
     feat_max_orig = X_all_orig.max(axis=0)
 
+    selection_used = set()
+    n_below_floor = 0   # classes whose every policy missed the floor
     for cls in classes:
-        anchors = _pool_class_anchors(per_class_results, int(cls))
-        class_data = per_class_results.get(f"class_{cls}") or per_class_results.get(
-            f"class_{cls}_class_based"
-        ) or {}
+        pools = (_agent_pools(per_class_results, int(cls))
+                 if selection == SELECTION_PER_POLICY else None)
+        if pools is not None:
+            selection_used.add(SELECTION_PER_POLICY)
+            selected_val = select_per_policy(
+                pools, X_val_unit, y_val, y_hat_val, int(cls), k=k,
+                min_support=min_support, ranking_formula=ranking_formula,
+                floor=policy_floor,
+            )
+            if selected_val is None:
+                logger.warning("Class %s: no agent has a rule at D_val Fid >= %s; no rule",
+                               cls, policy_floor)
+                n_below_floor += policy_floor is not None
+                continue
+        else:
+            selection_used.add(SELECTION_POOLED)
+            anchors = _pool_class_anchors(per_class_results, int(cls))
+            ranked_val = rules_from_anchors(
+                anchors, X_val_unit, y_val, y_hat_val, cls,
+                class_conditional=True,
+                min_support=min_support,
+                ranking_formula=ranking_formula,
+                space="unit",
+            )
+            if not ranked_val:
+                logger.warning("Class %s: no anchors with box bounds; skipping", cls)
+                continue
 
-        ranked_val = rules_from_anchors(
-            anchors, X_val_unit, y_val, y_hat_val, cls,
-            class_conditional=True,
-            min_support=min_support,
-            ranking_formula=ranking_formula,
-            space="unit",
-        )
-        if not ranked_val:
-            logger.warning("Class %s: no anchors with box bounds; skipping", cls)
-            continue
-
-        selected_val = select_topk_union(
-            ranked_val, y_val, y_hat_val, cls, k=k,
-            class_conditional=True, min_support=min_support,
-            # Greedy marginal gain, on the SELECTION split only. Blind top-k
-            # admitted rules that added no target-class rows (iris MADA class_0:
-            # +8 covered rows, +0 class rows, fidelity 0.333 -> 0.231).
-            marginal_gain=True, ranking_formula=ranking_formula,
-        )
-        if selected_val is None:
-            continue
+            selected_val = select_topk_union(
+                ranked_val, y_val, y_hat_val, cls, k=k,
+                class_conditional=True, min_support=min_support,
+                # Greedy marginal gain, on the SELECTION split only. Blind top-k
+                # admitted rules that added no target-class rows (iris MADA class_0:
+                # +8 covered rows, +0 class rows, fidelity 0.333 -> 0.231).
+                marginal_gain=True, ranking_formula=ranking_formula,
+            )
+            selected_val = apply_policy_floor(selected_val, y_val, y_hat_val, int(cls), policy_floor)
+            if selected_val is None:
+                logger.warning("Class %s: best rule below D_val Fid %s; no rule", cls, policy_floor)
+                n_below_floor += 1
+                continue
 
         ranked_test = reevaluate_ranked_rules(
             selected_val.individual,
@@ -331,7 +443,9 @@ def evaluate_rules_file(
             union.union_metrics.coverage, union.union_metrics.n_covered,
         )
 
-    if not per_class_out:
+    # A rule set the floor emptied is a real result (it abstains everywhere, Eff 0);
+    # an empty one without the floor means inference lost its boxes.
+    if not per_class_out and not n_below_floor:
         raise RuntimeError(
             f"No scorable boxes in {rules_file} after scoring "
             f"({len(classes)} classes in the rules file). Inference likely failed "
@@ -393,6 +507,13 @@ def evaluate_rules_file(
             "bounds_space": "unit",
             "coverage_basis": __import__("utils.metrics", fromlist=["x"]).get_coverage_basis(),
             "k": k,
+            # per_policy: top-k from each agent's own pool, OR'd into the class
+            # rule set (MADA); pooled: top-k over the class's pooled candidates
+            # (RLDA has one policy per class, so the two coincide).
+            "selection": sorted(selection_used),
+            # A policy's pick enters the class OR only at D_val Fid >= this.
+            "policy_floor": policy_floor,
+            "classes_without_rule_at_floor": n_below_floor,
             "ranking_formula": ranking_formula,
             "sparsity_width_ratio": sparsity,
             "print_box_mismatches": audit_problems,
@@ -432,6 +553,18 @@ def main():
         help="Reported metrics are always test-only; selection always uses validation.",
     )
     p.add_argument("--out_dir", default="revision/results")
+    p.add_argument(
+        "--selection", default=SELECTION_PER_POLICY,
+        choices=[SELECTION_PER_POLICY, SELECTION_POOLED],
+        help="Multi-agent rules: top-k from each agent's own pool, unioned per class "
+             "(per_policy), or top-k over all agents pooled (pooled, the pre-2026-09-28 "
+             "behaviour). Single-policy rules files are unaffected.",
+    )
+    p.add_argument(
+        "--policy_floor", default="tau_p",
+        help="D_val Fid a policy's selected rule must reach to enter the class OR: "
+             "'tau_p' (default), a number, or 'none' (the pre-2026-09-28 behaviour).",
+    )
     p.add_argument(
         "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "predicted"),
         choices=["true_label", "predicted"],
@@ -483,6 +616,9 @@ def main():
         min_support=min_support,
         ranking_formula=ranking_formula,
         split=args.split,
+        selection=args.selection,
+        policy_floor=(None if str(args.policy_floor).lower() == "none"
+                      else tau_p if args.policy_floor == "tau_p" else float(args.policy_floor)),
     )
 
 
