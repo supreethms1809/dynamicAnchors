@@ -32,6 +32,7 @@ from utils.eval_harness import (  # noqa: E402
     write_result_artifact,
 )
 from utils.metrics import (  # noqa: E402
+    COVERAGE_PREDICTED,
     MIN_SUPPORT_DEFAULT,
     active_feature_mask,
     get_coverage_basis,
@@ -123,8 +124,11 @@ def _select_on_val_report_on_test(
     y_hat_test: np.ndarray,
     k: int,
     min_support: int,
-) -> Dict[int, List[RankedRule]]:
+) -> Tuple[Dict[int, List[RankedRule]], Dict[int, float]]:
+    """Returns the D_test-rescored selection and each class union's D_val Fid,
+    which is what `_emit` must use to settle conflicts (never the D_test Fid)."""
     reported: Dict[int, List[RankedRule]] = {}
+    val_union_fid: Dict[int, float] = {}
     for cls, rules in per_class_val.items():
         selected = select_topk_union(
             rules, y_val, y_hat_val, cls, k=k,
@@ -133,6 +137,8 @@ def _select_on_val_report_on_test(
         if selected is None:
             reported[cls] = []
             continue
+        f = selected.union_metrics.fidelity
+        val_union_fid[cls] = f if np.isfinite(f) else -np.inf
         reported[cls] = reevaluate_ranked_rules(
             selected.individual,
             X_test,
@@ -142,7 +148,7 @@ def _select_on_val_report_on_test(
             class_conditional=True,
             min_support=min_support,
         )
-    return reported
+    return reported, val_union_fid
 
 
 def _predict(loader, X_std: np.ndarray) -> np.ndarray:
@@ -170,7 +176,8 @@ def _emit(
     *,
     dataset, method, seed, tau_p, tau_c, out_dir, k, min_support,
     loader, y_eval, y_hat_eval, per_class_ranked: Dict[int, List[RankedRule]],
-    queries: QueryCounter, extra: Dict[str, Any], box_space: str = "unit",
+    queries: QueryCounter, extra: Dict[str, Any], tiebreak_fid: Dict[int, float],
+    box_space: str = "unit",
     ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
 ) -> str:
     # Compactness compares a box side against the feature's full range. The RL
@@ -215,9 +222,7 @@ def _emit(
         for r in union.individual:
             umask |= r.mask
         class_union_masks[cls] = umask
-        class_union_fid[cls] = (
-            union.union_metrics.fidelity if np.isfinite(union.union_metrics.fidelity) else -np.inf
-        )
+        class_union_fid[cls] = tiebreak_fid.get(cls, -np.inf)
     global_res = evaluate_ruleset_as_classifier(class_union_masks, class_union_fid, y_eval, y_hat_eval)
     return write_result_artifact(
         out_dir,
@@ -243,7 +248,10 @@ def _emit(
             f"union over top-k={k} ranked by {ranking_formula}; "
             f"min_support={min_support}."
         ),
-        extra={**extra, "coverage_basis": get_coverage_basis()},
+        extra={
+            **extra, "coverage_basis": get_coverage_basis(),
+            "conflict_tiebreak": "class-union fidelity on D_val",
+        },
         compactness=_compactness_summary(per_class_out),
         ranking_formula=ranking_formula,
         min_support=min_support,
@@ -286,6 +294,112 @@ def _meter_for(loader) -> "QueryMeter":
     return QueryMeter([r for r in refs if r is not None])
 
 
+CART_LEAF_MULTS = (1, 2, 5, 10, 20)
+# Open box face for a tree leaf. Finite so the JSON stays standard; compactness
+# and the D(z|B) sampler treat it as unconstrained (width >> feature span).
+_OPEN = float(np.finfo(np.float32).max)
+
+
+def _cart_leaf_rules(
+    tree, *, X_val, y_val, y_hat_val, n_classes, feature_names, min_support,
+    ranking_formula, pfid, prng, legacy: bool, X_train,
+) -> Tuple[Dict[int, List[RankedRule]], Dict[str, int]]:
+    """One RankedRule per leaf (the root-to-leaf path as a box), scored on D_val.
+
+    legacy=True reproduces the paper_final boxes: the root box is D_train's
+    min/max (a D_val / D_test row outside that range falls in NO leaf, so the
+    "partition" abstains on it) and both children of a split contain x == thr.
+    Otherwise the boxes are the tree's own cells: open outer faces and
+    x > thr (next float32 up) on the right child, so box membership equals
+    `tree.apply` and the leaves partition the space.
+    """
+    from sklearn.tree import _tree
+
+    t = tree.tree_
+    per_class_ranked: Dict[int, List[RankedRule]] = {c: [] for c in range(n_classes)}
+
+    def recurse(node, lower, upper, path):
+        if t.feature[node] == _tree.TREE_UNDEFINED:
+            pred_cls = int(np.argmax(t.value[node][0]))
+            lo = np.array(lower, dtype=np.float32)
+            up = np.array(upper, dtype=np.float32)
+            mask = box_mask(X_val, lo, up)
+            metrics = evaluate_mask(
+                y=y_val, y_hat=y_hat_val, mask=mask, target_class=pred_cls,
+                class_conditional=True, min_support=min_support,
+            )
+            sel_fid = metrics.fidelity if pfid is None else pfid(lo, up, pred_cls, prng)
+            per_class_ranked[pred_cls].append(RankedRule(
+                rule_id=f"cart:{pred_cls}:{node}",
+                lower=lo, upper=up, mask=mask, metrics=metrics,
+                score=ranking_score(
+                    sel_fid, metrics.coverage,
+                    formula=ranking_formula,
+                    n_covered=metrics.n_covered,
+                ),
+                display_rule=" and ".join(path) if path else "any values",
+            ))
+            return
+        feat = t.feature[node]
+        thr = float(t.threshold[node])
+        name = feature_names[feat]
+        if legacy:
+            left_thr = right_thr = thr
+        else:
+            # sklearn routes float32(x) <= thr (thr is a float64 midpoint). Store the
+            # largest float32 <= thr, and the next float32 up for the right child,
+            # so a float32 box reproduces the tree's routing exactly.
+            f = np.float32(thr)
+            if float(f) > thr:
+                f = np.nextafter(f, np.float32(-np.inf))
+            left_thr, right_thr = float(f), float(np.nextafter(f, np.float32(np.inf)))
+        left_up = list(upper); left_up[feat] = min(left_up[feat], left_thr)
+        right_lo = list(lower); right_lo[feat] = max(right_lo[feat], right_thr)
+        recurse(t.children_left[node], lower, left_up, path + [f"{name} <= {thr:.6f}"])
+        recurse(t.children_right[node], right_lo, upper, path + [f"{name} > {thr:.6f}"])
+
+    d = len(feature_names)
+    if legacy:
+        lo0 = np.min(X_train, axis=0).tolist()
+        up0 = np.max(X_train, axis=0).tolist()
+    else:
+        lo0, up0 = [-_OPEN] * d, [_OPEN] * d
+    recurse(0, lo0, up0, [])
+
+    # Box membership vs the tree's own routing on D_val (0 when the fix holds).
+    leaf_of = tree.apply(np.asarray(X_val, dtype=np.float32))
+    n_in = np.zeros(len(X_val), dtype=int)
+    wrong = 0
+    for rules in per_class_ranked.values():
+        for r in rules:
+            node = int(r.rule_id.rsplit(":", 1)[1])
+            n_in += r.mask
+            wrong += int((r.mask != (leaf_of == node)).sum())
+    check = {"val_rows_in_no_leaf": int((n_in == 0).sum()),
+             "val_rows_in_two_leaves": int((n_in > 1).sum()),
+             "val_box_vs_apply_mismatches": int(wrong)}
+    return per_class_ranked, check
+
+
+def _val_ruleset_score(per_class_ranked, y_val, y_hat_val, k, min_support):
+    """Global D_val result of the top-k-per-class selection (what gets reported)."""
+    masks, fids = {}, {}
+    for cls, rules in per_class_ranked.items():
+        sel = select_topk_union(
+            rules, y_val, y_hat_val, cls, k=k,
+            class_conditional=True, min_support=min_support,
+        )
+        if sel is None:
+            continue
+        m = np.zeros(len(y_val), dtype=bool)
+        for r in sel.individual:
+            m |= r.mask
+        masks[cls] = m
+        f = sel.union_metrics.fidelity
+        fids[cls] = f if np.isfinite(f) else -np.inf
+    return evaluate_ruleset_as_classifier(masks, fids, y_val, y_hat_val)
+
+
 def run_cart(
     dataset: str, seed: int, k: int, tau_p: float, tau_c: float, out_dir: str,
     classifier_path: str,
@@ -293,8 +407,23 @@ def run_cart(
     ranking_formula: str = RANKING_SCORE_LCB_COVERAGE,
     fid_estimator: str = FID_EMPIRICAL,
     perturb_samples: int = 512,
+    legacy: bool = False,
+    size_criterion: str = "precision_constrained",
 ) -> str:
-    from sklearn.tree import DecisionTreeClassifier, _tree
+    """CART surrogate of f_hat; per class, the top-k leaves ranked on D_val.
+
+    The tree size is chosen on D_val among L in CART_LEAF_MULTS x n_classes (plus
+    k x n_classes), scoring the rule set each L would report:
+      precision_constrained -- the largest D_val global coverage among sizes with
+          D_val Fid >= tau_P (the objective the RL arms and Anchors pursue); if
+          none reaches tau_P, the highest D_val Fid.
+      effectiveness -- the best D_val Fid x coverage. At k = 1 this nearly always
+          keeps the smallest tree, since a partition covers every row.
+    Ties go to the smaller tree. legacy=True
+    restores the paper_final tree: L = k x n_classes (a single split for a
+    binary task at k = 1) with D_train-range boxes (see `_cart_leaf_rules`).
+    """
+    from sklearn.tree import DecisionTreeClassifier
 
     loader = _load(dataset, seed)
     _ensure_classifier(loader, classifier_path)
@@ -303,21 +432,16 @@ def run_cart(
     _t_construct = time.time()
     # Train on D_train predictions, rank leaves on D_val, report on D_test.
     y_hat_train = _predict(loader, loader.X_train_scaled)
-    # Leaf count matched to k * n_classes (one path-rule per class, k of them)
     n_classes = int(loader.n_classes)
-    max_leaf = max(n_classes, k * n_classes)
-    tree = DecisionTreeClassifier(max_leaf_nodes=max_leaf, random_state=seed)
-    t0 = time.time()
     queries = QueryCounter()
     X_fit, y_fit = loader.X_train, y_hat_train
     queries.add_queries(len(loader.X_train))  # one f_hat call per train row
     if fid_estimator == FID_PERTURBED:
-        # At k=1 the tree has one leaf per class, so ranking leaves on perturbed
-        # Fid changes nothing -- there is nothing to choose between. The fit is
-        # what has to move: augment D_train with coordinate-independent draws
-        # from the per-feature train marginals, labelled by f_hat. That is the
-        # same recombination D(z|B) samples from, so the surrogate is fit to
-        # agree off the data manifold as well as on it.
+        # Ranking leaves on perturbed Fid alone moves little when there are few
+        # leaves per class. The fit has to move too: augment D_train with
+        # coordinate-independent draws from the per-feature train marginals,
+        # labelled by f_hat. That is the same recombination D(z|B) samples from,
+        # so the surrogate is fit to agree off the data manifold as well as on it.
         arng = np.random.default_rng(seed)
         Xtr = np.asarray(loader.X_train, dtype=np.float64)
         Z = np.column_stack([
@@ -329,61 +453,64 @@ def run_cart(
         X_fit = np.vstack([Xtr, Z])
         y_fit = np.concatenate([y_hat_train, y_hat_aug])
         logger.info("CART perturbed fit: %s real + %s recombined rows", len(Xtr), len(Z))
-    tree.fit(X_fit, y_fit)  # original units, like printed rules
-    queries.wall_train_s = time.time() - t0
 
     X_val, X_val_std, _, y_val = _split_arrays(loader, "val")
     X_test, X_test_std, _, y_test = _split_arrays(loader, "test")
+    if not legacy:
+        # The tree routes float32 inputs; match it (and every re-scorer, which
+        # rebuilds boxes on float32 X).
+        X_val = np.asarray(X_val, dtype=np.float32)
+        X_test = np.asarray(X_test, dtype=np.float32)
     y_hat_val = _predict(loader, X_val_std)
     y_hat_test = _predict(loader, X_test_std)
     queries.add_queries(len(X_val))
     queries.add_queries(len(X_test), reporting=True)
 
     feature_names = list(loader.feature_names)
-    t = tree.tree_
-    per_class_ranked: Dict[int, List[RankedRule]] = {c: [] for c in range(n_classes)}
     pfid = (_perturbed_fid_scorer(loader, "original", perturb_samples)
             if fid_estimator == FID_PERTURBED else None)
-    prng = np.random.default_rng(seed)
 
-    def recurse(node, lower, upper, path):
-        if t.feature[node] == _tree.TREE_UNDEFINED:
-            counts = t.value[node][0]
-            pred_cls = int(np.argmax(counts))
-            lo = np.array(lower, dtype=np.float32)
-            up = np.array(upper, dtype=np.float32)
-            mask = box_mask(X_val, lo, up)
-            metrics = evaluate_mask(
-                y=y_val, y_hat=y_hat_val, mask=mask, target_class=pred_cls,
-                class_conditional=True, min_support=min_support,
-            )
-            display = " and ".join(path) if path else "any values"
-            sel_fid = metrics.fidelity if pfid is None else pfid(lo, up, pred_cls, prng)
-            per_class_ranked[pred_cls].append(RankedRule(
-                rule_id=f"cart:{pred_cls}:{node}",
-                lower=lo, upper=up, mask=mask, metrics=metrics,
-                score=ranking_score(
-                    sel_fid, metrics.coverage,
-                    formula=ranking_formula,
-                    n_covered=metrics.n_covered,
-                ),
-                display_rule=display,
-            ))
-            return
-        feat = t.feature[node]
-        thr = t.threshold[node]
-        name = feature_names[feat]
-        left_up = list(upper); left_up[feat] = min(left_up[feat], thr)
-        right_lo = list(lower); right_lo[feat] = max(right_lo[feat], thr)
-        recurse(t.children_left[node], lower, left_up, path + [f"{name} <= {thr:.6f}"])
-        recurse(t.children_right[node], right_lo, upper, path + [f"{name} > {thr:.6f}"])
+    if legacy:
+        grid = [max(n_classes, k * n_classes)]
+    else:
+        grid = sorted({m * n_classes for m in CART_LEAF_MULTS} | {max(n_classes, k * n_classes)})
+    t0 = time.time()
+    candidates = []
+    for L in grid:
+        tree = DecisionTreeClassifier(max_leaf_nodes=L, random_state=seed)
+        tree.fit(X_fit, y_fit)  # original units, like printed rules
+        per_class_ranked, check = _cart_leaf_rules(
+            tree, X_val=X_val, y_val=y_val, y_hat_val=y_hat_val, n_classes=n_classes,
+            feature_names=feature_names, min_support=min_support,
+            ranking_formula=ranking_formula, pfid=pfid,
+            prng=np.random.default_rng(seed), legacy=legacy, X_train=loader.X_train,
+        )
+        res = _val_ruleset_score(per_class_ranked, y_val, y_hat_val, k, min_support)
+        eff = 0.0 if res.n_decided == 0 else float(res.global_fidelity * res.coverage)
+        candidates.append({
+            "max_leaf_nodes": int(L), "n_leaves": int(tree.get_n_leaves()),
+            "val_effectiveness": eff,
+            "val_fidelity": float(res.global_fidelity) if res.n_decided else None,
+            "val_coverage": float(res.coverage),
+            "classes_without_leaf": [c for c, r in per_class_ranked.items() if not r],
+            **check,
+            "_ranked": per_class_ranked,
+        })
+    queries.wall_train_s = time.time() - t0
+    if size_criterion == "effectiveness":
+        best = max(candidates, key=lambda c: (c["val_effectiveness"], -c["max_leaf_nodes"]))
+    elif size_criterion == "precision_constrained":
+        ok = [c for c in candidates if (c["val_fidelity"] or 0.0) + 1e-12 >= tau_p]
+        best = (max(ok, key=lambda c: (c["val_coverage"], -c["max_leaf_nodes"])) if ok
+                else max(candidates, key=lambda c: (c["val_fidelity"] or 0.0, -c["max_leaf_nodes"])))
+    else:
+        raise ValueError(f"unknown size_criterion {size_criterion!r}")
+    logger.info("CART tree size on D_val: %s", [
+        (c["max_leaf_nodes"], c["n_leaves"], round(c["val_effectiveness"], 4)) for c in candidates
+    ])
 
-    lo0 = np.min(loader.X_train, axis=0).tolist()
-    up0 = np.max(loader.X_train, axis=0).tolist()
-    recurse(0, lo0, up0, [])
-
-    per_class_reported = _select_on_val_report_on_test(
-        per_class_ranked,
+    per_class_reported, val_union_fid = _select_on_val_report_on_test(
+        best["_ranked"],
         X_test=X_test,
         y_val=y_val,
         y_hat_val=y_hat_val,
@@ -400,8 +527,15 @@ def run_cart(
         out_dir=out_dir, k=k, min_support=min_support,
         loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
         per_class_ranked=per_class_reported, queries=queries,
+        tiebreak_fid=val_union_fid,
         extra={
-            "max_leaf_nodes": max_leaf,
+            "max_leaf_nodes": best["max_leaf_nodes"],
+            "n_leaves": best["n_leaves"],
+            "cart_variant": "legacy_paper_final" if legacy else "partition_L_on_val",
+            "cart_tree_size_selection": "legacy k x n_classes" if legacy else size_criterion,
+            "cart_candidates": [
+                {k2: v for k2, v in c.items() if k2 != "_ranked"} for c in candidates
+            ],
             "k": k,
             "fid_estimator": fid_estimator,
             "perturb_samples": int(perturb_samples) if fid_estimator == FID_PERTURBED else 0,
@@ -519,10 +653,12 @@ def run_anchors_family(
         feature_names=feature_names,
         train_data=loader.X_train,
     )
+    _capture_anchor_conditions(explainer)
 
     queries.add_queries(len(X_val))
     queries.add_queries(len(X_test), reporting=True)
     per_class_boxes: Dict[int, List[RankedRule]] = {c: [] for c in range(loader.n_classes)}
+    n_empty = {c: 0 for c in range(loader.n_classes)}
 
     rng = np.random.default_rng(seed)
     t0 = time.time()
@@ -551,13 +687,21 @@ def run_anchors_family(
             except Exception as e:
                 logger.warning("Anchors failed on class %s instance %s: %s", cls, row_i, e)
                 continue
-            # Convert predicate list into a box in original units
+            conditions = exp.exp_map.get("conditions")
+            if conditions is None:
+                raise RuntimeError("anchor-exp did not pass through add_names_to_exp; "
+                                   "cannot recover the anchor's exact bins")
+            if not conditions:
+                # The empty anchor ("any values") is the class prior, not a rule;
+                # the RL arms may not submit their empty start rule either.
+                n_empty[cls] += 1
+                continue
+            # The anchor's exact bins as a box in original units. The printed
+            # rule rounds every edge to 2 decimals, so it is display only.
             lo = np.min(loader.X_train, axis=0).astype(np.float32).copy()
             up = np.max(loader.X_train, axis=0).astype(np.float32).copy()
+            _anchor_conditions_box(explainer, conditions, lo, up)
             names = list(getattr(exp, "names", lambda: [])() if callable(getattr(exp, "names", None)) else getattr(exp, "names", []))
-            # Best-effort parse of "feature > v" / "feature <= v" / "feature = v"
-            for pred in names:
-                _apply_anchor_predicate(pred, feature_names, lo, up)
             mask_val = box_mask(X_val, lo, up)
             metrics = evaluate_mask(
                 y=y_val, y_hat=y_hat_val, mask=mask_val, target_class=cls,
@@ -584,6 +728,9 @@ def run_anchors_family(
     meter.__exit__(None, None, None)
     written = []
     base_boxes = per_class_boxes
+    # The pickers count a class's rows on the same basis as coverage is scored.
+    pick_basis = get_coverage_basis()
+    y_pick = y_hat_val if pick_basis == COVERAGE_PREDICTED else y_val
     for formula in ranking_formulas:
         # Same pool for every formula: only the candidate score changes.
         per_class_boxes = {
@@ -613,13 +760,16 @@ def run_anchors_family(
                 "classifier_path": os.path.abspath(classifier_path),
                 "selection_split": "val",
                 "report_split": "test",
+                "anchor_box": "exact discretizer bins (float32 faces)",
+                "empty_anchors_dropped": {str(c): n for c, n in n_empty.items()},
+                "picker_class_basis": pick_basis,
             }
             if "sp_anchors" in methods:
                 picked_val = {
-                    cls: _submodular_pick(rules, y_val, cls, k_i)
+                    cls: _submodular_pick(rules, y_pick, cls, k_i)
                     for cls, rules in per_class_boxes.items()
                 }
-                picked = _select_on_val_report_on_test(
+                picked, val_union_fid = _select_on_val_report_on_test(
                     picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
                     y_test=y_test, y_hat_test=y_hat_test, k=k_i,
                     min_support=min_support,
@@ -630,14 +780,15 @@ def run_anchors_family(
                     out_dir=k_out, k=k_i, min_support=min_support,
                     loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
                     per_class_ranked=picked, queries=queries, ranking_formula=formula,
+                    tiebreak_fid=val_union_fid,
                     extra={**common_extra, "picker": "submodular"},
                 ))
             if "greedy_anchors" in methods:
                 picked_val = {
-                    cls: greedy_set_cover(rules, y_val, cls, k_i, tau_p)
+                    cls: greedy_set_cover(rules, y_pick, cls, k_i, tau_p)
                     for cls, rules in per_class_boxes.items()
                 }
-                picked = _select_on_val_report_on_test(
+                picked, val_union_fid = _select_on_val_report_on_test(
                     picked_val, X_test=X_test, y_val=y_val, y_hat_val=y_hat_val,
                     y_test=y_test, y_hat_test=y_hat_test, k=k_i,
                     min_support=min_support,
@@ -648,9 +799,105 @@ def run_anchors_family(
                     out_dir=k_out, k=k_i, min_support=min_support,
                     loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
                     per_class_ranked=picked, queries=queries, ranking_formula=formula,
+                    tiebreak_fid=val_union_fid,
                     extra={**common_extra, "picker": "greedy_set_cover"},
                 ))
     return written
+
+
+def _f32_le(q: float) -> np.float32:
+    """Largest float32 whose value is <= q (the upper face of `x <= q`)."""
+    v = np.float32(q)
+    return np.nextafter(v, np.float32(-np.inf)) if float(v) > q else v
+
+
+def _f32_gt(q: float) -> np.float32:
+    """Smallest float32 whose value is > q (the lower face of `x > q`)."""
+    v = np.float32(q)
+    return np.nextafter(v, np.float32(np.inf)) if float(v) <= q else v
+
+
+def _anchor_bin_edges(explainer, f: int) -> np.ndarray:
+    """The discretizer's exact cut points for feature f (bin i is (q[i-1], q[i]])."""
+    return np.asarray(explainer.disc.maxs[f][:-1], dtype=np.float64)
+
+
+def _capture_anchor_conditions(explainer) -> None:
+    """Keep the (feature, op, bin) triples an anchor is built from.
+
+    `anchor-exp` only exposes the rule as text, and that text prints every bin
+    edge as '%.2f'. `add_names_to_exp` still receives the exact conditions, so
+    stash them on the explanation before the names replace them.
+    """
+    orig = explainer.add_names_to_exp
+
+    def add_names(data_row, hoeffding_exp, mapping):
+        hoeffding_exp["conditions"] = [
+            (int(mapping[i][0]), str(mapping[i][1]), mapping[i][2])
+            for i in hoeffding_exp["feature"]
+        ]
+        return orig(data_row, hoeffding_exp, mapping)
+
+    explainer.add_names_to_exp = add_names
+
+
+def _anchor_conditions_box(explainer, conditions, lo: np.ndarray, up: np.ndarray) -> None:
+    """Narrow (lo, up) to the anchor's exact bins, as float32 faces.
+
+    `leq v` is Anchors' `bin <= v`, i.e. x <= q[v]; `geq v` is `bin > v`, i.e.
+    x > q[v]. The faces are the float32 values on the right side of q, so a
+    float32 row is inside the box exactly when Anchors' discretizer puts it in
+    the anchor.
+    """
+    for f, op, v in conditions:
+        if op == "eq":
+            lo[f] = max(lo[f], v)
+            up[f] = min(up[f], v)
+            continue
+        q = _anchor_bin_edges(explainer, f)[int(v)]
+        if op == "leq":
+            up[f] = min(up[f], _f32_le(q))
+        elif op == "geq":
+            lo[f] = max(lo[f], _f32_gt(q))
+        else:
+            raise ValueError(f"unknown Anchors condition {op!r}")
+
+
+def _anchor_rule_box(
+    rule: str, feature_names: List[str], explainer, x: np.ndarray,
+    lo: np.ndarray, up: np.ndarray,
+) -> int:
+    """Rebuild an anchor's exact box from its printed rule (for stored rules).
+
+    Each printed '%.2f' edge is matched back to the discretizer cut point it was
+    printed from; the anchor always contains its own instance x, which settles
+    edges that print alike. Returns the number of edges still ambiguous after
+    that (the tightest consistent edge is used). Raises if an edge matches no
+    cut point.
+    """
+    open_ = np.finfo(np.float64).max
+    amb = 0
+    for pred in rule.split(" and "):
+        l0 = np.full(len(feature_names), -open_)
+        u0 = np.full(len(feature_names), open_)
+        _apply_anchor_predicate(pred, feature_names, l0, u0)
+        for f in np.flatnonzero((l0 != -open_) | (u0 != open_)):
+            q = _anchor_bin_edges(explainer, f)
+            bx = int(np.searchsorted(q, float(x[f])))
+            txt = ["%.2f" % v for v in q]
+            if l0[f] != -open_:
+                ia = [i for i in range(len(q)) if txt[i] == "%.2f" % l0[f] and i < bx]
+                if not ia:
+                    raise ValueError(f"no cut point prints as the lower edge of {pred!r}")
+                amb += len(ia) > 1
+                lo[f] = max(lo[f], _f32_gt(q[max(ia)]))
+            if u0[f] != open_:
+                ib = [i for i in range(len(q)) if txt[i] == "%.2f" % u0[f] and i >= bx]
+                if not ib:
+                    raise ValueError(f"no cut point prints as the upper edge of {pred!r}")
+                amb += len(ib) > 1
+                up[f] = min(up[f], _f32_le(q[min(ib)]))
+    return amb
 
 
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
@@ -685,7 +932,13 @@ def _apply_anchor_predicate(pred: str, feature_names: List[str], lo: np.ndarray,
         nm = rf"(?<![\w.]){re.escape(name)}(?![\w.])"
 
         def _lower(v: float, strict: bool) -> None:
-            lo[i] = max(lo[i], np.nextafter(v, np.inf) if strict else v)
+            # Step in the box's own dtype: a float64 nextafter stored into a
+            # float32 box rounds back to v and turns `> v` into `>= v`.
+            if strict:
+                t = lo.dtype.type
+                w = t(v)
+                v = np.nextafter(w, t(np.inf)) if float(w) <= v else w
+            lo[i] = max(lo[i], v)
 
         def _upper(v: float, strict: bool) -> None:
             # Boxes are closed, so a strict `<` is represented by the value
@@ -827,7 +1080,7 @@ def run_random_search(
                 display_rule=f"random box {i}",
             ))
     queries.wall_infer_s = time.time() - t0
-    per_class_reported = _select_on_val_report_on_test(
+    per_class_reported, val_union_fid = _select_on_val_report_on_test(
         per_class_ranked,
         X_test=X_test_unit,
         y_val=y_val,
@@ -844,6 +1097,7 @@ def run_random_search(
         out_dir=out_dir, k=k, min_support=min_support,
         loader=loader, y_eval=y_test, y_hat_eval=y_hat_test,
         per_class_ranked=per_class_reported, queries=queries,
+        tiebreak_fid=val_union_fid,
         extra={
             "n_candidates": n_candidates,
             "k": k,
@@ -890,6 +1144,16 @@ def main():
     )
     p.add_argument("--perturb_samples", type=int, default=512)
     p.add_argument(
+        "--cart_legacy", action="store_true",
+        help="Reproduce the paper_final CART: max_leaf_nodes = k x n_classes and "
+             "leaf boxes bounded by D_train's range (rows outside it get no leaf).",
+    )
+    p.add_argument(
+        "--cart_size_criterion", default="precision_constrained",
+        choices=["precision_constrained", "effectiveness"],
+        help="How run_cart picks the tree size on D_val (see run_cart).",
+    )
+    p.add_argument(
         "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "predicted"),
         choices=["true_label", "predicted"],
         help="Class-conditional coverage denominator: P(x in B | y=c) or P(x in B | f_hat=c).",
@@ -920,6 +1184,7 @@ def main():
                 args.dataset, args.seed, args.k, args.tau_p, args.tau_c,
                 f_out, args.classifier_path, ranking_formula=formula,
                 fid_estimator=args.fid_estimator, perturb_samples=args.perturb_samples,
+                legacy=args.cart_legacy, size_criterion=args.cart_size_criterion,
             ))
         if "random_search" in args.methods:
             written.append(run_random_search(

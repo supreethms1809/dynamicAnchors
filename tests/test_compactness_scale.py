@@ -38,9 +38,14 @@ def test_one_sided_iris_box_reports_one_active_feature():
 
 
 def test_unit_space_default_is_wrong_for_original_units():
-    """Guards the regression itself: without a range the same box reports 0."""
+    """Guards the regression itself: without a range the same box is miscounted.
+
+    The count used to be 0 (a 3.6 cm width read as wider than 0.95); since faces
+    are clipped to the range before measuring, every face lies outside [0, 1] and
+    it reads 4. Either way, not the 1 the right range gives.
+    """
     lower, upper = _cart_style_box()
-    assert compactness_of_box(lower, upper)["n_active_features"] == 0
+    assert compactness_of_box(lower, upper)["n_active_features"] != 1
 
 
 def test_unconstrained_box_has_no_active_features():

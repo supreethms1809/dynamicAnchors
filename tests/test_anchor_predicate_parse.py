@@ -66,3 +66,82 @@ def test_two_sided_bin_is_narrower_than_one_sided():
     i = NAMES.index("feature_6")
     assert up_two[i] == pytest.approx(up_one[i])
     assert lo_two[i] > LO0
+
+
+def test_strict_lower_bound_survives_float32():
+    """`x > 0` must not become `x >= 0` when the box is float32 (binary features)."""
+    lo = np.full(len(NAMES), -100.0, dtype=np.float32)
+    up = np.full(len(NAMES), 100.0, dtype=np.float32)
+    _apply_anchor_predicate("age > 0.00", NAMES, lo, up)
+    assert lo[0] > np.float32(0.0)
+    _apply_anchor_predicate("temp > 31.00", NAMES, lo, up)
+    assert not (np.float32(31.0) >= lo[2])
+
+
+# ---------------------------------------------------------------------------
+# Exact bins: the box must hold exactly the rows Anchors' discretizer puts in
+# the anchor, including edges that print alike at '%.2f' and tied values.
+# ---------------------------------------------------------------------------
+
+anchor_tabular = pytest.importorskip("anchor.anchor_tabular")
+
+from revision.baselines import (  # noqa: E402
+    _anchor_conditions_box, _anchor_rule_box, _capture_anchor_conditions, _f32_gt, _f32_le,
+)
+from utils.metrics import box_mask  # noqa: E402
+
+
+def _data(n=400, seed=0):
+    rng = np.random.default_rng(seed)
+    X = np.column_stack([
+        rng.normal(0.06, 0.004, n),              # quartiles collide at '%.2f'
+        rng.integers(0, 2, n),                   # binary: `> 0.00` is the whole point
+        rng.integers(0, 5, n),                   # ties on the cut points
+        rng.normal(50, 10, n),
+    ]).astype(np.float32)
+    return X, ["small", "flag", "count", "wide"]
+
+
+def _in_anchor(ex, conditions, X):
+    D = ex.disc.discretize(X)
+    ok = np.ones(len(X), dtype=bool)
+    for f, op, v in conditions:
+        ok &= (D[:, f] <= v) if op == "leq" else (D[:, f] > v)
+    return ok
+
+
+def test_f32_faces_bracket_the_cut_point():
+    for q in (0.1, 6.4, 0.0617, -0.37787):
+        assert float(_f32_le(q)) <= q < float(_f32_gt(q))
+        assert float(np.nextafter(_f32_le(q), np.float32(np.inf))) > q
+
+
+def test_conditions_box_matches_discretizer():
+    X, names = _data()
+    ex = anchor_tabular.AnchorTabularExplainer(["0", "1"], names, X)
+    for conds in ([(0, "geq", 0), (0, "leq", 1)], [(1, "geq", 0)], [(2, "leq", 1), (3, "geq", 2)]):
+        lo = np.full(4, -np.inf, dtype=np.float32)
+        up = np.full(4, np.inf, dtype=np.float32)
+        _anchor_conditions_box(ex, conds, lo, up)
+        np.testing.assert_array_equal(box_mask(X, lo, up), _in_anchor(ex, conds, X))
+
+
+def test_real_anchor_box_matches_discretizer():
+    X, names = _data()
+    ex = anchor_tabular.AnchorTabularExplainer(["0", "1"], names, X)
+    _capture_anchor_conditions(ex)
+    clf = lambda Z: ((Z[:, 0] > 0.061) & (Z[:, 1] > 0)).astype(int)  # noqa: E731
+    np.random.seed(0)
+    x = X[np.flatnonzero(clf(X) == 1)[0]]
+    exp = ex.explain_instance(x, clf, threshold=0.95)
+    conds = exp.exp_map["conditions"]
+    assert conds, "expected a non-empty anchor"
+    lo = np.full(4, -np.inf, dtype=np.float32)
+    up = np.full(4, np.inf, dtype=np.float32)
+    _anchor_conditions_box(ex, conds, lo, up)
+    np.testing.assert_array_equal(box_mask(X, lo, up), _in_anchor(ex, conds, X))
+    # The printed rule, matched back to the cut points, gives the same box.
+    lo2 = np.full(4, -np.inf, dtype=np.float32)
+    up2 = np.full(4, np.inf, dtype=np.float32)
+    _anchor_rule_box(" and ".join(exp.names()), names, ex, x, lo2, up2)
+    np.testing.assert_array_equal(box_mask(X, lo2, up2), box_mask(X, lo, up))

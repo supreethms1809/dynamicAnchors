@@ -203,6 +203,22 @@ def clip_quantiles_around_qstar(
     return a, b
 
 
+def contain_point(lower: np.ndarray, upper: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Widen unit bounds just enough to contain x.
+
+    `clip_quantiles_around_qstar` keeps q* = F_c(x*) inside [a, b], but
+    `quantile_to_unit_bounds` maps a and b back through the class-c value knots,
+    so a face at a = q* lands on the next class-c training value above (or
+    below) x* whenever x* is not itself a class-c training value, which is the
+    usual case for a held-out instance. Measured on wine RLDA seed 42: every
+    rollout contained q* in quantile space, about half contained x* in unit space.
+    """
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    lower = np.minimum(np.asarray(lower, dtype=np.float64).reshape(-1), x)
+    upper = np.maximum(np.asarray(upper, dtype=np.float64).reshape(-1), x)
+    return lower, upper
+
+
 def crn_perturb(
     X_unit: np.ndarray,
     idx: np.ndarray,

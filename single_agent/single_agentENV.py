@@ -156,6 +156,8 @@ class SingleAgentAnchorEnv(Env):
         self.n_perturb = int(env_config.get("n_perturb_train", 512))
         self.n_perturb_eval = int(env_config.get("n_perturb_eval", self.n_perturb))
         self.quantile_eps = float(env_config.get("quantile_eps", 1e-3))
+        # Inference-only option: keep x* inside the unit box (see qmdp.contain_point).
+        self.enforce_instance_containment = bool(env_config.get("enforce_instance_containment", False))
         self.max_quantile_step = float(env_config.get("max_quantile_step", 0.10))
         self.min_quantile_width = float(env_config.get("min_quantile_width", 0.02))
         self.leave_threshold = float(env_config.get("leave_threshold", 0.85))
@@ -413,6 +415,8 @@ class SingleAgentAnchorEnv(Env):
         self.lower, self.upper = qmdp.quantile_to_unit_bounds(
             self.a, self.b, self._quantile_cdfs["v_class"], self.quantile_eps
         )
+        if self.enforce_instance_containment and self.x_star_unit is not None:
+            self.lower, self.upper = qmdp.contain_point(self.lower, self.upper, self.x_star_unit)
 
     def _values_to_q(self, x_unit: np.ndarray) -> np.ndarray:
         x_unit = np.asarray(x_unit, dtype=np.float64).reshape(-1)
