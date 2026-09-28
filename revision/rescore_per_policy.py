@@ -5,8 +5,8 @@
 so at k = 1 two of the three policies never contributed. It now selects each
 policy's top-k from that policy's own pool and ORs the picks: a two-level OR for
 MADA (within an agent, across agents), a one-level OR for RLDA's single policy.
-A pick enters the OR only at D_val Fid >= the floor (tau_P = 0.90 by default,
-the same for both methods); a class whose policies all miss it gets no rule.
+A pick enters the OR only at D_val Fid >= the floor (0.60 by default, the same
+for both methods); a class whose policies all miss it gets no rule.
 Nothing is re-rolled: the stored rules files keep each agent's candidates apart.
 
 The manifest lists every RLDA and MADA cell in ../results/paper_final_valtb (main
@@ -67,7 +67,7 @@ def main() -> int:
     ap.add_argument("--check", type=int, default=0,
                     help="instead: re-run N random local cells with --selection pooled and "
                          "compare with the stored global rule set")
-    ap.add_argument("--policy_floor", default="tau_p")
+    ap.add_argument("--policy_floor", default="0.60")
     ap.add_argument("--par", type=int, default=6)
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()

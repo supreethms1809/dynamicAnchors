@@ -98,6 +98,11 @@ def _pool_class_anchors(per_class_results: Dict[str, Any], cls: int) -> List[Dic
 
 
 SELECTION_PER_POLICY, SELECTION_POOLED = "per_policy", "pooled"
+# D_val Fid a policy's selected rule needs to enter its class's OR. tau_P (0.90)
+# left about one class per cell without a rule for both RLDA and MADA; 0.60 keeps
+# RLDA near its no-floor rule set and cuts MADA's cross-class overlap from 40% to
+# 11% of test rows (floors 0.5-0.9 compared in revision/perpolicy_report.py).
+POLICY_FLOOR_DEFAULT = 0.60
 
 
 def _agent_pools(per_class_results: Dict[str, Any], cls: int) -> Optional[Dict[str, List[Dict[str, Any]]]]:
@@ -561,9 +566,10 @@ def main():
              "behaviour). Single-policy rules files are unaffected.",
     )
     p.add_argument(
-        "--policy_floor", default="tau_p",
+        "--policy_floor", default=str(POLICY_FLOOR_DEFAULT),
         help="D_val Fid a policy's selected rule must reach to enter the class OR: "
-             "'tau_p' (default), a number, or 'none' (the pre-2026-09-28 behaviour).",
+             f"a number (default {POLICY_FLOOR_DEFAULT}), 'tau_p', or 'none' (the "
+             "pre-2026-09-28 behaviour).",
     )
     p.add_argument(
         "--coverage_basis", default=os.environ.get("DYNANC_COVERAGE_BASIS", "predicted"),

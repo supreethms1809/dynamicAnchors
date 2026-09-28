@@ -46,6 +46,7 @@ INST = REPO.parent / "results" / "paper_final" / "emp_tc0p10" / "results"
 OUT = REPO.parent / "results" / "containment_fix"
 N_SAMPLES = 2000
 TAU_P = 0.90
+POLICY_FLOOR = 0.60   # same default as revision.evaluate
 MIN_SUPPORT = 10
 
 
@@ -134,17 +135,17 @@ def score_union(sc: Scorer, boxes, cls: int, space: str, x, rng, rng_all) -> Dic
     }
 
 
-def floor_check(lo, hi, X_val, y_hat_val, cls: int) -> Dict[str, Any]:
-    """A box enters the OR at D_val Fid >= TAU_P; one holding < MIN_SUPPORT D_val
+def floor_check(lo, hi, X_val, y_hat_val, cls: int, floor: float = POLICY_FLOOR) -> Dict[str, Any]:
+    """A box enters the OR at D_val Fid >= floor; one holding < MIN_SUPPORT D_val
     rows cannot be judged and is kept."""
     m = np.all((X_val >= np.asarray(lo, np.float32)) & (X_val <= np.asarray(hi, np.float32)), axis=1)
     n = int(m.sum())
     f = float((y_hat_val[m] == cls).mean()) if n else float("nan")
-    return {"n_val": n, "fid_val": f, "kept": bool(n < MIN_SUPPORT or f + 1e-12 >= TAU_P)}
+    return {"n_val": n, "fid_val": f, "kept": bool(n < MIN_SUPPORT or f + 1e-12 >= floor)}
 
 
 def run_cell(arm: str, ds: str, seed: int, max_points: int, inst_dir: Path = INST,
-             existing: Dict[str, Any] | None = None) -> Dict[str, Any]:
+             existing: Dict[str, Any] | None = None, floor: float = POLICY_FLOOR) -> Dict[str, Any]:
     algo = {"rlda": "ddpg", "mada": "maddpg"}[arm]
     J = json.loads((Path(inst_dir) / algo / f"{ds}__{arm}__instances__seed{seed}.json").read_text())
     exp_dir, clf = J["experiment_dir"], J["classifier_path"]
@@ -195,7 +196,13 @@ def run_cell(arm: str, ds: str, seed: int, max_points: int, inst_dir: Path = INS
                 box = None if ep.get("error") else persist_box_from_episode(ep, conf, len(x))
                 if box is not None:
                     cand.append((ag, box["lower_normalized"], box["upper_normalized"]))
-        checks = [{"agent": ag, **floor_check(lo, hi, X_val_unit, y_hat_val, c)} for ag, lo, hi in cand]
+        return _finish_or(cand, x, c)
+
+    def _finish_or(cand, x, c) -> Dict[str, Any]:
+        # Every candidate box is stored, so another floor needs no new rollouts.
+        checks = [{"agent": ag, **floor_check(lo, hi, X_val_unit, y_hat_val, c, floor),
+                   "lower": np.asarray(lo, np.float32).tolist(), "upper": np.asarray(hi, np.float32).tolist()}
+                  for ag, lo, hi in cand]
         kept = [(lo, hi) for (ag, lo, hi), ch in zip(cand, checks) if ch["kept"]]
         if not kept:
             return {"pi_or": None, "pi_or_abstain": True, "pi_or_policies": checks}
@@ -205,9 +212,14 @@ def run_cell(arm: str, ds: str, seed: int, max_points: int, inst_dir: Path = INS
     for idx in [r["index"] for r in J["pi"]["rows"]][:max_points]:
         x, c = X_unit[idx], int(y_hat[idx])
         if idx in old_rows:
-            # Earlier cell: keep its pi / pi_contained / anchors, add only pi_or.
+            # Earlier cell: keep its pi / pi_contained / anchors, (re)do only pi_or,
+            # from the stored candidate boxes when a previous run kept them.
             row = dict(old_rows[idx])
-            row.update(_pi_or(arm, row, x, c, idx))
+            prev = row.get("pi_or_policies") or []
+            if prev and all("lower" in q for q in prev):
+                row.update(_finish_or([(q["agent"], q["lower"], q["upper"]) for q in prev], x, c))
+            else:
+                row.update(_pi_or(arm, row, x, c, idx))
             rows.append(row)
             continue
         row: Dict[str, Any] = {"index": int(idx), "y_hat": c}
@@ -251,7 +263,7 @@ def run_cell(arm: str, ds: str, seed: int, max_points: int, inst_dir: Path = INS
             "anchor_box": "exact discretizer bins",
             # pi_or: the OR of every policy's contained box at D_val Fid >= TAU_P
             # (boxes on < MIN_SUPPORT D_val rows are kept), scored under D(z|union).
-            "pi_or": {"floor": TAU_P, "min_support": MIN_SUPPORT,
+            "pi_or": {"floor": floor, "min_support": MIN_SUPPORT,
                       "policies": "all agents of the class" if arm == "mada" else "the class policy"},
             "rows": rows}
 
@@ -265,6 +277,8 @@ def main() -> int:
     ap.add_argument("--inst_dir", type=Path, default=INST,
                     help="folder with {ddpg,maddpg}/*__instances__seed*.json")
     ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--policy_floor", type=float, default=POLICY_FLOOR,
+                    help="D_val Fid a policy's box needs to enter the OR explanation (pi_or)")
     ap.add_argument("--add_or", action="store_true",
                     help="for cells already in --out, keep pi / pi_contained / anchors and add "
                          "only the floored OR explanation (pi_or)")
@@ -290,11 +304,13 @@ def main() -> int:
                 existing = None
                 if path.is_file():
                     existing = json.loads(path.read_text())
-                    if not args.add_or or all("pi_or" in r for r in existing["rows"]):
+                    same_floor = (existing.get("pi_or") or {}).get("floor") == args.policy_floor
+                    if not args.add_or or (same_floor and all("pi_or" in r for r in existing["rows"])):
                         print(f"skip {path.name}")
                         continue
                 try:
-                    res = run_cell(arm, ds, seed, args.max_points, args.inst_dir, existing)
+                    res = run_cell(arm, ds, seed, args.max_points, args.inst_dir, existing,
+                                   floor=args.policy_floor)
                 except FileNotFoundError as e:
                     print(f"missing {arm} {ds} {seed}: {e}")
                     continue
