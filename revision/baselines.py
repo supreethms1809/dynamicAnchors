@@ -32,6 +32,7 @@ from utils.eval_harness import (  # noqa: E402
     write_result_artifact,
 )
 from utils.metrics import (  # noqa: E402
+    COVERAGE_PREDICTED,
     MIN_SUPPORT_DEFAULT,
     active_feature_mask,
     get_coverage_basis,
@@ -652,10 +653,12 @@ def run_anchors_family(
         feature_names=feature_names,
         train_data=loader.X_train,
     )
+    _capture_anchor_conditions(explainer)
 
     queries.add_queries(len(X_val))
     queries.add_queries(len(X_test), reporting=True)
     per_class_boxes: Dict[int, List[RankedRule]] = {c: [] for c in range(loader.n_classes)}
+    n_empty = {c: 0 for c in range(loader.n_classes)}
 
     rng = np.random.default_rng(seed)
     t0 = time.time()
@@ -684,13 +687,21 @@ def run_anchors_family(
             except Exception as e:
                 logger.warning("Anchors failed on class %s instance %s: %s", cls, row_i, e)
                 continue
-            # Convert predicate list into a box in original units
+            conditions = exp.exp_map.get("conditions")
+            if conditions is None:
+                raise RuntimeError("anchor-exp did not pass through add_names_to_exp; "
+                                   "cannot recover the anchor's exact bins")
+            if not conditions:
+                # The empty anchor ("any values") is the class prior, not a rule;
+                # the RL arms may not submit their empty start rule either.
+                n_empty[cls] += 1
+                continue
+            # The anchor's exact bins as a box in original units. The printed
+            # rule rounds every edge to 2 decimals, so it is display only.
             lo = np.min(loader.X_train, axis=0).astype(np.float32).copy()
             up = np.max(loader.X_train, axis=0).astype(np.float32).copy()
+            _anchor_conditions_box(explainer, conditions, lo, up)
             names = list(getattr(exp, "names", lambda: [])() if callable(getattr(exp, "names", None)) else getattr(exp, "names", []))
-            # Best-effort parse of "feature > v" / "feature <= v" / "feature = v"
-            for pred in names:
-                _apply_anchor_predicate(pred, feature_names, lo, up)
             mask_val = box_mask(X_val, lo, up)
             metrics = evaluate_mask(
                 y=y_val, y_hat=y_hat_val, mask=mask_val, target_class=cls,
@@ -717,6 +728,9 @@ def run_anchors_family(
     meter.__exit__(None, None, None)
     written = []
     base_boxes = per_class_boxes
+    # The pickers count a class's rows on the same basis as coverage is scored.
+    pick_basis = get_coverage_basis()
+    y_pick = y_hat_val if pick_basis == COVERAGE_PREDICTED else y_val
     for formula in ranking_formulas:
         # Same pool for every formula: only the candidate score changes.
         per_class_boxes = {
@@ -746,10 +760,13 @@ def run_anchors_family(
                 "classifier_path": os.path.abspath(classifier_path),
                 "selection_split": "val",
                 "report_split": "test",
+                "anchor_box": "exact discretizer bins (float32 faces)",
+                "empty_anchors_dropped": {str(c): n for c, n in n_empty.items()},
+                "picker_class_basis": pick_basis,
             }
             if "sp_anchors" in methods:
                 picked_val = {
-                    cls: _submodular_pick(rules, y_val, cls, k_i)
+                    cls: _submodular_pick(rules, y_pick, cls, k_i)
                     for cls, rules in per_class_boxes.items()
                 }
                 picked, val_union_fid = _select_on_val_report_on_test(
@@ -768,7 +785,7 @@ def run_anchors_family(
                 ))
             if "greedy_anchors" in methods:
                 picked_val = {
-                    cls: greedy_set_cover(rules, y_val, cls, k_i, tau_p)
+                    cls: greedy_set_cover(rules, y_pick, cls, k_i, tau_p)
                     for cls, rules in per_class_boxes.items()
                 }
                 picked, val_union_fid = _select_on_val_report_on_test(
@@ -786,6 +803,101 @@ def run_anchors_family(
                     extra={**common_extra, "picker": "greedy_set_cover"},
                 ))
     return written
+
+
+def _f32_le(q: float) -> np.float32:
+    """Largest float32 whose value is <= q (the upper face of `x <= q`)."""
+    v = np.float32(q)
+    return np.nextafter(v, np.float32(-np.inf)) if float(v) > q else v
+
+
+def _f32_gt(q: float) -> np.float32:
+    """Smallest float32 whose value is > q (the lower face of `x > q`)."""
+    v = np.float32(q)
+    return np.nextafter(v, np.float32(np.inf)) if float(v) <= q else v
+
+
+def _anchor_bin_edges(explainer, f: int) -> np.ndarray:
+    """The discretizer's exact cut points for feature f (bin i is (q[i-1], q[i]])."""
+    return np.asarray(explainer.disc.maxs[f][:-1], dtype=np.float64)
+
+
+def _capture_anchor_conditions(explainer) -> None:
+    """Keep the (feature, op, bin) triples an anchor is built from.
+
+    `anchor-exp` only exposes the rule as text, and that text prints every bin
+    edge as '%.2f'. `add_names_to_exp` still receives the exact conditions, so
+    stash them on the explanation before the names replace them.
+    """
+    orig = explainer.add_names_to_exp
+
+    def add_names(data_row, hoeffding_exp, mapping):
+        hoeffding_exp["conditions"] = [
+            (int(mapping[i][0]), str(mapping[i][1]), mapping[i][2])
+            for i in hoeffding_exp["feature"]
+        ]
+        return orig(data_row, hoeffding_exp, mapping)
+
+    explainer.add_names_to_exp = add_names
+
+
+def _anchor_conditions_box(explainer, conditions, lo: np.ndarray, up: np.ndarray) -> None:
+    """Narrow (lo, up) to the anchor's exact bins, as float32 faces.
+
+    `leq v` is Anchors' `bin <= v`, i.e. x <= q[v]; `geq v` is `bin > v`, i.e.
+    x > q[v]. The faces are the float32 values on the right side of q, so a
+    float32 row is inside the box exactly when Anchors' discretizer puts it in
+    the anchor.
+    """
+    for f, op, v in conditions:
+        if op == "eq":
+            lo[f] = max(lo[f], v)
+            up[f] = min(up[f], v)
+            continue
+        q = _anchor_bin_edges(explainer, f)[int(v)]
+        if op == "leq":
+            up[f] = min(up[f], _f32_le(q))
+        elif op == "geq":
+            lo[f] = max(lo[f], _f32_gt(q))
+        else:
+            raise ValueError(f"unknown Anchors condition {op!r}")
+
+
+def _anchor_rule_box(
+    rule: str, feature_names: List[str], explainer, x: np.ndarray,
+    lo: np.ndarray, up: np.ndarray,
+) -> int:
+    """Rebuild an anchor's exact box from its printed rule (for stored rules).
+
+    Each printed '%.2f' edge is matched back to the discretizer cut point it was
+    printed from; the anchor always contains its own instance x, which settles
+    edges that print alike. Returns the number of edges still ambiguous after
+    that (the tightest consistent edge is used). Raises if an edge matches no
+    cut point.
+    """
+    open_ = np.finfo(np.float64).max
+    amb = 0
+    for pred in rule.split(" and "):
+        l0 = np.full(len(feature_names), -open_)
+        u0 = np.full(len(feature_names), open_)
+        _apply_anchor_predicate(pred, feature_names, l0, u0)
+        for f in np.flatnonzero((l0 != -open_) | (u0 != open_)):
+            q = _anchor_bin_edges(explainer, f)
+            bx = int(np.searchsorted(q, float(x[f])))
+            txt = ["%.2f" % v for v in q]
+            if l0[f] != -open_:
+                ia = [i for i in range(len(q)) if txt[i] == "%.2f" % l0[f] and i < bx]
+                if not ia:
+                    raise ValueError(f"no cut point prints as the lower edge of {pred!r}")
+                amb += len(ia) > 1
+                lo[f] = max(lo[f], _f32_gt(q[max(ia)]))
+            if u0[f] != open_:
+                ib = [i for i in range(len(q)) if txt[i] == "%.2f" % u0[f] and i >= bx]
+                if not ib:
+                    raise ValueError(f"no cut point prints as the upper edge of {pred!r}")
+                amb += len(ib) > 1
+                up[f] = min(up[f], _f32_le(q[min(ib)]))
+    return amb
 
 
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
@@ -820,7 +932,13 @@ def _apply_anchor_predicate(pred: str, feature_names: List[str], lo: np.ndarray,
         nm = rf"(?<![\w.]){re.escape(name)}(?![\w.])"
 
         def _lower(v: float, strict: bool) -> None:
-            lo[i] = max(lo[i], np.nextafter(v, np.inf) if strict else v)
+            # Step in the box's own dtype: a float64 nextafter stored into a
+            # float32 box rounds back to v and turns `> v` into `>= v`.
+            if strict:
+                t = lo.dtype.type
+                w = t(v)
+                v = np.nextafter(w, t(np.inf)) if float(w) <= v else w
+            lo[i] = max(lo[i], v)
 
         def _upper(v: float, strict: bool) -> None:
             # Boxes are closed, so a strict `<` is represented by the value
