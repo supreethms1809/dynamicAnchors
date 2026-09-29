@@ -53,7 +53,8 @@ RES = REPO.parent / "results"
 OUT = RES / "len_recompute"
 GRIDS = ("emp_tc0p10", "emp_tc0p20", "pert_tc0p10", "pert_tc0p20")
 ALGO = {"rlda": "ddpg", "mada": "maddpg"}
-# group -> folders of rule-set cells (methods inferred from the file names)
+# group -> folders of rule-set cells (methods inferred from the file names); the
+# report reads the first five, the rest give every cell of those trees the same fields
 GROUPS: Dict[str, List[Path]] = {
     "rl_perpolicy": [RES / "paper_final_perpolicy" / g / "results" / a for g in GRIDS for a in ALGO.values()],
     "rl_paper": [RES / "paper_final_valtb" / g / "results" / a for g in GRIDS for a in ALGO.values()],
@@ -61,6 +62,12 @@ GROUPS: Dict[str, List[Path]] = {
     "anchors_pool5": [RES / "paper_final_anchorfix" / "baselines_emp"],
     # CART and random search; this folder's Anchors cells are the superseded unfixed ones
     "cart_random": [RES / "paper_final" / "baselines_emp"],
+    "rl_perpolicy_other": sorted({p.parent for p in (RES / "paper_final_perpolicy").rglob("*.json")
+                                  if p.parts[len(RES.parts) + 1] in ("k_sweep", "ablations")}),
+    "rl_nofloor": sorted({p.parent for p in (RES / "paper_final_perpolicy_nofloor").rglob("*.json")}),
+    "anchors_other": sorted({p.parent for p in (RES / "paper_final_anchorfix").rglob("*_anchors__*.json")
+                             if p.parent.name != "baselines_emp" and p.parent.parent.name != "logs"}
+                            - {RES / "paper_final_anchorfix" / "pool20" / "k1"}),
 }
 GROUP_METHODS = {"cart_random": {"cart", "random_search"}}
 INSTANCE_DIRS = [RES / "containment_fix_exact_emp", RES / "containment_fix_exact_pert"]
@@ -110,7 +117,11 @@ def process_cell(path: Path, apply: bool) -> Optional[Dict[str, Any]]:
     pr = printer(ds, seed, space)
     L = loader(ds, seed)
     rb = rebuild(cell, seed_data(ds, seed))
-    per_class, old_stored_mismatch = [], 0
+    # Cells written by the new code (spark s44-46) already carry Len: leave them as
+    # they are and count where this recomputation disagrees with what they store.
+    native = (cell.get("compactness") or {}).get("len_criterion") == LEN_CRITERION
+    write = apply and not native
+    per_class, old_stored_mismatch, native_mismatch = [], 0, 0
     for key, blk in (cell.get("per_class") or {}).items():
         if not isinstance(blk, dict):
             continue
@@ -127,14 +138,16 @@ def process_cell(path: Path, apply: bool) -> Optional[Dict[str, Any]]:
             n_new, n_old, shown = pr.count(lo, hi), old_count(lo, hi, method, L), pr(lo, hi)
             if i < len(stored_old) and stored_old[i] is not None and stored_old[i] != n_old:
                 old_stored_mismatch += 1
+            if native:
+                native_mismatch += int(rule.get("n_conditions") != n_new or rule.get("display_rule") != shown)
             rows.append({"n_new": n_new, "n_old": n_old, "printed": shown,
                          "stored": rule.get("display_rule_stored", rule.get("display_rule"))})
-            if apply:
+            if write:
                 rule.setdefault("display_rule_stored", rule.get("display_rule"))
                 rule["display_rule"], rule["n_conditions"] = shown, n_new
                 if i < len(comp.get("per_rule") or []):
                     comp["per_rule"][i]["n_conditions"] = n_new
-        if apply and rows:
+        if write and rows:
             comp.update(mean_conditions=float(np.mean([r["n_new"] for r in rows])),
                         total_conditions=int(sum(r["n_new"] for r in rows)), len_criterion=LEN_CRITERION)
             blk["compactness"] = comp
@@ -148,7 +161,7 @@ def process_cell(path: Path, apply: bool) -> Optional[Dict[str, Any]]:
         return None
     len_new = float(np.mean([np.mean([r["n_new"] for r in c["rules"]]) for c in per_class]))
     len_old = float(np.mean([np.mean([r["n_old"] for r in c["rules"]]) for c in per_class]))
-    if apply:
+    if write:
         top = cell.get("compactness") or {}
         top.update(mean_conditions=len_new, len_criterion=LEN_CRITERION)
         cell["compactness"] = top
@@ -157,6 +170,7 @@ def process_cell(path: Path, apply: bool) -> Optional[Dict[str, Any]]:
             "len_new": len_new, "len_old": len_old,
             "len_old_stored": (cell.get("compactness") or {}).get("mean_active_features"),
             "old_stored_mismatch": old_stored_mismatch, "rebuild_failures": len(rb.failures),
+            "native": native, "native_mismatch": native_mismatch,
             "n_rules": sum(len(c["rules"]) for c in per_class), "n_classes": len(per_class),
             "per_class": per_class}
 
@@ -191,36 +205,45 @@ def run_rule_sets(apply: bool, groups=None, datasets=None) -> None:
     for g, rs in results.items():
         (OUT / f"{g}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rs))
         print(f"{g}: {len(rs)} cells, rebuild failures {sum(r['rebuild_failures'] for r in rs)}, "
-              f"old count != stored on {sum(r['old_stored_mismatch'] for r in rs)} rules", flush=True)
+              f"old count != stored on {sum(r['old_stored_mismatch'] for r in rs)} rules; "
+              f"{sum(r['native'] for r in rs)} cells already had Len, recomputation differs on "
+              f"{sum(r['native_mismatch'] for r in rs)} of their rules", flush=True)
 
 
 def run_instances(apply: bool) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     rows_out = []
     for d in INSTANCE_DIRS:
+        total_mism = 0
         for p in sorted(d.glob("*__seed*.json")):
             J = json.loads(p.read_text())
             ds, seed = J["dataset"], int(J["seed"])
             span = {sp: train_span(loader(ds, seed).X_train_unit if sp == "unit" else loader(ds, seed).X_train)
                     for sp in ("unit", "original")}
             agg = defaultdict(list)
+            mism = 0
             for row in J["rows"]:
                 for tag, sp in (("pi", "unit"), ("pi_contained", "unit"), ("anchors", "original")):
                     b = row.get(tag)
                     if b and b.get("lower") is not None:
-                        b["n_cond"] = int(condition_mask(b["lower"], b["upper"], span[sp]).sum())
-                        agg[tag].append((b["n_cond"], b.get("n_active")))
+                        n = int(condition_mask(b["lower"], b["upper"], span[sp]).sum())
+                        mism += int("n_cond" in b and b["n_cond"] != n)
+                        b["n_cond"] = n
+                        agg[tag].append((n, b.get("n_active")))
                 b = row.get("pi_or")
                 if b and b.get("boxes"):
-                    b["n_cond"] = int(sum(condition_mask(x["lower"], x["upper"], span["unit"]).sum()
-                                          for x in b["boxes"]))
-                    agg["pi_or"].append((b["n_cond"], b.get("n_active")))
+                    n = int(sum(condition_mask(x["lower"], x["upper"], span["unit"]).sum() for x in b["boxes"]))
+                    mism += int("n_cond" in b and b["n_cond"] != n)
+                    b["n_cond"] = n
+                    agg["pi_or"].append((n, b.get("n_active")))
             rows_out.append({"path": str(p.relative_to(RES)), "arm": J["arm"], "dataset": ds, "seed": seed,
                              **{f"{t}|new": float(np.mean([a for a, _ in v])) for t, v in agg.items()},
                              **{f"{t}|old": float(np.mean([b for _, b in v])) for t, v in agg.items()}})
+            total_mism += mism
             if apply:
                 p.write_text(json.dumps(J, indent=2))
-        print(f"{d.name}: done", flush=True)
+        print(f"{d.name}: done; stored n_cond differs from the recomputation on {total_mism} explanations",
+              flush=True)
     (OUT / "instances.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows_out))
 
 
