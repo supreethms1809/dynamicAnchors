@@ -153,6 +153,8 @@ class ClassRules:
     val_masks: List[np.ndarray]
     test_masks: List[np.ndarray]
     stored_test_union_fid: float
+    # the float32 box each mask was taken with (after the face repair)
+    boxes: List[Tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
 
     @property
     def val_union(self) -> np.ndarray:
@@ -182,7 +184,7 @@ def rebuild(cell: Dict[str, Any], sd: SeedData) -> Rebuilt:
         cls = union.get("target_class")
         if cls is None:
             cls = int(str(key).split("_")[-1])
-        vms, tms = [], []
+        vms, tms, bxs = [], [], []
         for rule in block.get("selected_rules") or []:
             lo0, up0 = rule.get("lower_bounds"), rule.get("upper_bounds")
             if lo0 is None or up0 is None:
@@ -208,12 +210,14 @@ def rebuild(cell: Dict[str, Any], sd: SeedData) -> Rebuilt:
             out.n_widened += int(i > 0)
             vms.append(vm)
             tms.append(tm)
+            bxs.append(widths[i])
         if not vms:
             continue
         f = union.get("fidelity")
         out.classes[int(cls)] = ClassRules(
             int(cls), vms, tms,
             float(f) if f is not None and np.isfinite(f) else -np.inf,
+            bxs,
         )
     return out
 

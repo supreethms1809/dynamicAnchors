@@ -38,7 +38,7 @@ from revision.baselines import (  # noqa: E402
     _anchor_conditions_box, _anchor_rule_box, _try_import_anchor,
 )
 from revision.dual_estimator_rescore import Scorer, sample_anchors_conditional  # noqa: E402
-from utils.metrics import active_feature_mask  # noqa: E402
+from utils.metrics import active_feature_mask, condition_mask, train_span  # noqa: E402
 from revision.paper_stats import DATASETS  # noqa: E402
 from utils.inference_extract import persist_box_from_episode  # noqa: E402
 
@@ -70,6 +70,8 @@ def score(sc: Scorer, lo, hi, cls: int, space: str, x, rng, rng_all) -> Dict[str
         "n_covered": d["n_covered"],
         "coverage": d["n_covered"] / len(sc.y_test),
         "n_active": d["n_active"],
+        # Len: features whose face excludes at least one D_train row (the printed conditions)
+        "n_cond": int(condition_mask(lo32, hi32, train_span(sc.pools[space])).sum()),
     }
 
 
@@ -130,6 +132,8 @@ def score_union(sc: Scorer, boxes, cls: int, space: str, x, rng, rng_all) -> Dic
         "n_covered": n,
         "coverage": n / len(sc.y_test),
         "n_active": int(sum(a.sum() for a in act)),
+        # Len of the OR: conditions summed over its boxes (each excludes a D_train row)
+        "n_cond": int(sum(condition_mask(lo, hi, train_span(pool)).sum() for lo, hi in B)),
         "n_boxes": len(B),
         "boxes": [{"lower": lo.tolist(), "upper": hi.tolist()} for lo, hi in B],
     }
