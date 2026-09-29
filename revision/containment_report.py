@@ -47,7 +47,8 @@ for arm in ('rlda', 'mada'):
                     continue
                 d[t + '|contain'].append(np.mean([x['contains_x'] for x in xs])); d[t + '|cond'].append(np.nanmean([x[F] for x in xs]))
                 d[t + '|ok'].append(np.mean([x[F] >= 0.9 for x in xs])); d[t + '|cov'].append(np.mean([x['coverage'] for x in xs]))
-                d[t + '|act'].append(np.mean([x['n_active'] for x in xs]))
+                # conditions: n_cond (a face excludes a D_train row) when the cell has it
+                d[t + '|act'].append(np.mean([x.get('n_cond', x['n_active']) for x in xs]))
                 if t == 'anchors':
                     d['self'].append(np.nanmean([x['self_reported_precision'] if x['self_reported_precision'] is not None else np.nan for x in xs]))
             per[ds]['n'].append(len(rows))

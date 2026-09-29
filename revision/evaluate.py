@@ -40,6 +40,7 @@ from utils.eval_harness import (  # noqa: E402
     write_result_artifact,
 )
 from utils.metrics import (
+    LEN_CRITERION,
     RANKING_SCORE_LCB_COVERAGE,  # noqa: E402
     MIN_SUPPORT_DEFAULT,
     active_feature_mask,
@@ -48,6 +49,8 @@ from utils.metrics import (
     evaluate_mask,
     select_topk_union,
 )
+
+from utils.rule_print import RulePrinter  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("revision.evaluate")
@@ -338,6 +341,9 @@ def evaluate_rules_file(
     )
     feat_min_orig = X_all_orig.min(axis=0)
     feat_max_orig = X_all_orig.max(axis=0)
+    # Prints each selected rule from its box with exactly the conditions Len counts
+    # (a condition excludes at least one D_train row), in original units.
+    printer = RulePrinter.for_loader(loader, "unit")
 
     selection_used = set()
     n_below_floor = 0   # classes whose every policy missed the floor
@@ -410,16 +416,18 @@ def evaluate_rules_file(
             class_conditional=False, min_support=min_support,
         )
         per_class_out[f"class_{cls}"] = per_class_block(
-            union, instance_metrics=inst, sparsity_width_ratio=sparsity,
+            union, instance_metrics=inst, sparsity_width_ratio=sparsity, printer=printer,
         )
         compactness_rows.append(
-            compactness_of_ruleset(union.individual, sparsity_width_ratio=sparsity)
+            compactness_of_ruleset(union.individual, sparsity_width_ratio=sparsity,
+                                   span=printer.span)
         )
         audit_problems.extend(
             audit_selected_unit_rules(
                 union.individual,
                 X_test_unit,
                 sparsity_width_ratio=sparsity,
+                span=printer.span,
                 x_min_std=loader.X_min,
                 x_range_std=loader.X_range,
                 scaler_mean=np.asarray(loader.scaler.mean_, dtype=np.float64),
@@ -469,6 +477,13 @@ def evaluate_rules_file(
                               if r.get("mean_active_features") is not None]))
             if compactness_rows else None
         ),
+        # Len: conditions per rule, averaged over each class's rules, then over classes.
+        "mean_conditions": (
+            float(np.nanmean([r["mean_conditions"] for r in compactness_rows
+                              if r.get("mean_conditions") is not None]))
+            if compactness_rows else None
+        ),
+        "len_criterion": LEN_CRITERION,
         "mean_rules_per_class": (
             float(np.mean([r["n_rules"] for r in compactness_rows]))
             if compactness_rows else 0.0

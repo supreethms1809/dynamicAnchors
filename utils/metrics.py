@@ -586,6 +586,42 @@ def active_feature_mask(
     return width < (float(sparsity_width_ratio) * full)
 
 
+# Rule length (Len) and the printed rule count a condition when it excludes at
+# least one D_train row. The 95%-width test above stays for the environments and
+# the D(z|A) sampler; for Len it both dropped real conditions (a face at the 3rd
+# percentile of a skewed feature) and, through the quantile-space mask the
+# printer used, kept vacuous ones (`MAR in [1, 5]` on a feature whose range is 1-5).
+LEN_CRITERION = "excludes_train_row"
+
+
+def train_span(X_ref: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-feature min and max of the reference rows (D_train in the box's space)."""
+    X = np.asarray(X_ref, dtype=np.float32)
+    return X.min(axis=0), X.max(axis=0)
+
+
+def excluding_faces(
+    lower: np.ndarray, upper: np.ndarray, span: Tuple[np.ndarray, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per feature: does the lower face, and does the upper face, exclude a D_train row?
+
+    Compared in float32, the dtype every box is scored in (`box_mask`), against
+    `span = train_span(X_train)` in the box's own space. A face at or beyond the
+    observed range excludes nothing, however narrow the interval looks.
+    """
+    lo = np.asarray(lower, dtype=np.float32).reshape(-1)
+    up = np.asarray(upper, dtype=np.float32).reshape(-1)
+    return np.asarray(span[0], np.float32) < lo, np.asarray(span[1], np.float32) > up
+
+
+def condition_mask(
+    lower: np.ndarray, upper: np.ndarray, span: Tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    """True on the features a rule constrains: at least one face excludes a D_train row."""
+    lo_ex, up_ex = excluding_faces(lower, upper, span)
+    return lo_ex | up_ex
+
+
 def sparsify_box(
     lower: np.ndarray,
     upper: np.ndarray,
@@ -925,6 +961,7 @@ def compactness_of_box(
     sparsity_width_ratio: float = 0.95,
     feature_min: Optional[np.ndarray] = None,
     feature_max: Optional[np.ndarray] = None,
+    span: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """Active features / description length of one box (C-36).
 
@@ -941,12 +978,16 @@ def compactness_of_box(
     )
     n_feat = int(active.size)
     n_active = int(active.sum())
-    return {
+    out = {
         "n_active_features": n_active,
         "n_features": n_feat,
         "sparsity": (1.0 - n_active / n_feat) if n_feat else None,
         "sparsity_width_ratio": float(sparsity_width_ratio),
     }
+    if span is not None:
+        # Len: the conditions the printed rule shows (LEN_CRITERION).
+        out["n_conditions"] = int(condition_mask(lower, upper, span).sum())
+    return out
 
 
 def compactness_of_ruleset(
@@ -954,24 +995,30 @@ def compactness_of_ruleset(
     sparsity_width_ratio: float = 0.95,
     feature_min: Optional[np.ndarray] = None,
     feature_max: Optional[np.ndarray] = None,
+    span: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Dict[str, Any]:
+    """`mean_active_features` is the old 95%-width count; with `span` (D_train
+    min/max in the box's space) `mean_conditions` is Len under LEN_CRITERION."""
     rows = []
     for r in rules:
         if r.lower is None or r.upper is None:
             continue
         rows.append(compactness_of_box(
             r.lower, r.upper, sparsity_width_ratio,
-            feature_min=feature_min, feature_max=feature_max,
+            feature_min=feature_min, feature_max=feature_max, span=span,
         ))
     if not rows:
-        return {
+        out = {
             "n_rules": 0,
             "mean_active_features": None,
             "total_active_features": 0,
             "sparsity_width_ratio": float(sparsity_width_ratio),
         }
+        if span is not None:
+            out.update(mean_conditions=None, total_conditions=0, len_criterion=LEN_CRITERION)
+        return out
     n_active = [r["n_active_features"] for r in rows]
-    return {
+    out = {
         "n_rules": len(rows),
         "mean_active_features": float(np.mean(n_active)),
         "total_active_features": int(np.sum(n_active)),
@@ -979,6 +1026,11 @@ def compactness_of_ruleset(
         "sparsity_width_ratio": float(sparsity_width_ratio),
         "per_rule": rows,
     }
+    if span is not None:
+        n_cond = [r["n_conditions"] for r in rows]
+        out.update(mean_conditions=float(np.mean(n_cond)), total_conditions=int(np.sum(n_cond)),
+                   len_criterion=LEN_CRITERION)
+    return out
 
 
 # ---------------------------------------------------------------------------

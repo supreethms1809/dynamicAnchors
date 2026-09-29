@@ -33,6 +33,7 @@ from utils.eval_harness import (  # noqa: E402
 )
 from utils.metrics import (  # noqa: E402
     COVERAGE_PREDICTED,
+    LEN_CRITERION,
     MIN_SUPPORT_DEFAULT,
     active_feature_mask,
     get_coverage_basis,
@@ -44,6 +45,7 @@ from utils.metrics import (  # noqa: E402
     ranking_score,
     select_topk_union,
 )
+from utils.rule_print import RulePrinter  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("revision.baselines")
@@ -194,6 +196,9 @@ def _emit(
         feature_min = feature_max = None
     else:
         raise ValueError(f"box_space must be 'original' or 'unit', got {box_space!r}")
+    # Len and the printed rule: a condition excludes at least one D_train row,
+    # decided in the box's own space and shown in original units.
+    printer = RulePrinter.for_loader(loader, box_space)
     # Artifact accuracy reporting performs one classifier pass per split.
     queries.add_queries(len(loader.X_train), reporting=True)
     if getattr(loader, "X_val_scaled", None) is not None:
@@ -216,7 +221,7 @@ def _emit(
         )
         per_class_out[f"class_{cls}"] = per_class_block(
             union, instance_metrics=inst,
-            feature_min=feature_min, feature_max=feature_max,
+            feature_min=feature_min, feature_max=feature_max, printer=printer,
         )
         umask = np.zeros(len(y_eval), dtype=bool)
         for r in union.individual:
@@ -264,6 +269,8 @@ def _compactness_summary(per_class_out: Dict[str, Any]) -> Dict[str, Any]:
         for b in per_class_out.values()
     ]
     acts = [a for a in acts if a is not None and np.isfinite(a)]
+    conds = [(b.get("compactness") or {}).get("mean_conditions") for b in per_class_out.values()]
+    conds = [c for c in conds if c is not None and np.isfinite(c)]
     return {
         "mean_rules_per_class": (
             float(np.mean([b.get("n_selected", b.get("k", 0)) for b in per_class_out.values()]))
@@ -271,6 +278,9 @@ def _compactness_summary(per_class_out: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "mean_active_features": float(np.mean(acts)) if acts else None,
         "sparsity_width_ratio": 0.95,
+        # Len: conditions per rule, averaged over each class's rules, then over classes.
+        "mean_conditions": float(np.mean(conds)) if conds else None,
+        "len_criterion": LEN_CRITERION,
     }
 
 

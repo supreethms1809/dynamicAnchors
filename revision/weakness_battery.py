@@ -60,7 +60,7 @@ from revision.rescore_boxes import (  # noqa: E402
     _predictions, cell_classifier, load_seed_data, rebuild, with_classifier,
 )
 from revision.surrogate_weaknesses import EXTRA_NOMINAL, original_boxes  # noqa: E402
-from utils.metrics import active_feature_mask  # noqa: E402
+from utils.metrics import condition_mask, train_span  # noqa: E402
 
 RES = REPO.parent / "results"
 OUT = RES / "weakness_battery"
@@ -122,13 +122,12 @@ def rl_explainer(cell, sd) -> Explainer:
     rb = rebuild(cell, sd)
     ob = original_boxes(cell, sd, "unit")
     rules = []
+    # A condition excludes at least one D_train row (LEN_CRITERION), as for the trees.
+    span = train_span(sd.loader.X_train_unit)
     for c, cr in sorted(rb.classes.items()):
-        blk = cell["per_class"][f"class_{c}"]
-        units = [r for r in blk["selected_rules"] if r.get("lower_bounds") is not None]
         for i, (vm, tm) in enumerate(zip(cr.val_masks, cr.test_masks)):
-            lo_u = np.clip(np.asarray(units[i]["lower_bounds"], float), 0, 1)
-            hi_u = np.clip(np.asarray(units[i]["upper_bounds"], float), 0, 1)
-            act = frozenset(np.flatnonzero(active_feature_mask(lo_u, hi_u, 0.95)).tolist())
+            lo_u, hi_u = cr.boxes[i]
+            act = frozenset(np.flatnonzero(condition_mask(lo_u, hi_u, span)).tolist())
             lo, hi = ob[c][i]
             rules.append(Rule(c, lo, hi, act, vm, tm, _fid(vm, sd.val.y_hat, c), _fid(tm, sd.test.y_hat, c)))
     # Rule set as a classifier: one class fired -> it; several -> best D_val union Fid.

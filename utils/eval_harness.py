@@ -31,6 +31,7 @@ from utils.metrics import (
     evaluate_mask,
     ranking_score,
     select_topk_union,
+    excluding_faces,
     sparsify_box,
 )
 
@@ -549,18 +550,28 @@ def per_class_block(
     sparsity_width_ratio: Optional[float] = None,
     feature_min: Optional[np.ndarray] = None,
     feature_max: Optional[np.ndarray] = None,
+    printer: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """One class row for the result JSON / tables.
 
     `best` is rank-1 of the same top-k used for the union (C-01).
     Instance metrics (overall coverage) are optional and separate.
+    `printer` (`utils.rule_print.RulePrinter` over D_train in the box's space)
+    re-prints every rule from its box with exactly the conditions Len counts, and
+    adds Len (`mean_conditions`) to the compactness block. Without it the stored
+    rule string is kept.
     """
+    def shown(rule) -> str:
+        if printer is None or rule.lower is None or rule.upper is None:
+            return rule.display_rule
+        return printer(rule.lower, rule.upper)
+
     block = {
         "k": union.k,
         "n_selected": union.n_selected,
         "best": {
             "rule_id": union.best.rule_id,
-            "display_rule": union.best.display_rule,
+            "display_rule": shown(union.best),
             "fidelity": union.best.metrics.to_dict(),
             "score": None if not np.isfinite(union.best.score) else float(union.best.score),
             "lower_bounds": (
@@ -577,7 +588,7 @@ def per_class_block(
         "selected_rules": [
             {
                 "rule_id": rule.rule_id,
-                "display_rule": rule.display_rule,
+                "display_rule": shown(rule),
                 "selection_score": (
                     None if not np.isfinite(rule.score) else float(rule.score)
                 ),
@@ -610,7 +621,12 @@ def per_class_block(
         block["compactness"] = compactness_of_ruleset(
             union.individual, sparsity_width_ratio=sparsity,
             feature_min=feature_min, feature_max=feature_max,
+            span=None if printer is None else printer.span,
         )
+        if printer is not None:
+            for out, rule in zip(block["selected_rules"], union.individual):
+                if rule.lower is not None and rule.upper is not None:
+                    out["n_conditions"] = printer.count(rule.lower, rule.upper)
     return block
 
 
@@ -626,15 +642,25 @@ def audit_selected_unit_rules(
     feature_min_orig: np.ndarray,
     feature_max_orig: np.ndarray,
     feature_names: Optional[Sequence[str]] = None,
+    span: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> List[str]:
-    """C-08 / C-13: sparsified printed box vs evaluated coverage; original bounds in range."""
+    """C-08 / C-13: sparsified printed box vs evaluated coverage; original bounds in range.
+
+    With `span` (D_train min/max in unit space) the printed box keeps exactly the
+    faces that exclude a D_train row, as `utils.rule_print.RulePrinter` prints it.
+    """
     problems: List[str] = []
     for rule in rules:
         if rule.lower is None or rule.upper is None:
             continue
-        sparse_lo, sparse_up, _ = sparsify_box(
-            rule.lower, rule.upper, sparsity_width_ratio=sparsity_width_ratio
-        )
+        if span is not None:
+            lo_ex, up_ex = excluding_faces(rule.lower, rule.upper, span)
+            sparse_lo = np.where(lo_ex, np.asarray(rule.lower, np.float32), -np.inf).astype(np.float32)
+            sparse_up = np.where(up_ex, np.asarray(rule.upper, np.float32), np.inf).astype(np.float32)
+        else:
+            sparse_lo, sparse_up, _ = sparsify_box(
+                rule.lower, rule.upper, sparsity_width_ratio=sparsity_width_ratio
+            )
         printed_mask = box_mask(X_unit, sparse_lo, sparse_up)
         try:
             assert_print_matches_box(rule.mask, printed_mask, rule.rule_id)
