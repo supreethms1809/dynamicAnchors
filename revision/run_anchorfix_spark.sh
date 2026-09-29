@@ -22,7 +22,7 @@ PF=$MAIN/runs/paper_final
 OUT=${OUT:-$MAIN/runs/paper_final_anchorfix}
 mkdir -p "$OUT"
 
-git merge-base --is-ancestor 7cb2f4c HEAD || { echo "check out origin/main first (needs 7cb2f4c)" >&2; exit 1; }
+git merge-base --is-ancestor 327d4de HEAD || { echo "check out origin/main first (needs 327d4de)" >&2; exit 1; }
 echo "code: $(git log --oneline -1)"
 $PY -m pytest -q tests/test_anchor_predicate_parse.py tests/test_mada_per_policy_selection.py tests/test_rule_length.py
 
